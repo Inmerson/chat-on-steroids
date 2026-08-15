@@ -137,7 +137,7 @@ That is still arbitrary code execution. Treat it as such.
 - **Credentials are stored with Windows DPAPI** through Electron's `safeStorage`, in a separate file from the settings — never in the JSON config, never in logs, never exposed to the UI process. The API key is passed to the tunnel through the environment, never on a command line.
 - **Logs stay in memory**, are capped at 500 entries and are never written to disk. File contents and command output are not logged, and anything shaped like a key or token is masked as a backstop. `CLF_DEBUG=1` echoes the same redacted lines to stderr for troubleshooting.
 - The UI runs with context isolation on, Node integration off, the sandbox on and a strict CSP. It has no filesystem or network access of its own and talks to the app through a fixed list of named IPC channels, each validated on arrival. External links are limited to a fixed allowlist of documentation URLs.
-- Settings live in a small JSON file in `%APPDATA%\ChatGPT Local Files\`. It is re-validated on load, so a corrupted or hand-edited file cannot widen permissions, and it survives uninstalling and reinstalling the app.
+- Settings live in a small JSON file in `%APPDATA%\chatgpt-local-files\` (Electron's `userData` folder for this package). It is re-validated on load, so a corrupted or hand-edited file cannot widen permissions, and it survives uninstalling and reinstalling the app.
 - The endpoint answers **JSON and nothing else**, including for 404s, so a client performing OAuth discovery against it never has to parse a plain-text body. It serves RFC 9728 protected resource metadata at `/.well-known/oauth-protected-resource<secret-path>` only — never at the bare well-known root, which would disclose the secret path to an unauthenticated caller.
 
 ## Troubleshooting
@@ -158,7 +158,7 @@ That is still arbitrary code execution. Treat it as such.
 
 **Nothing works and the window is blank.** Run the app from a terminal with `CLF_DEBUG=1` set and check the output, or open the **Activity** tab and press **Copy**.
 
-**Settings vanished after reinstalling.** They should not: everything lives in `%APPDATA%\ChatGPT Local Files\` and the uninstaller is configured to leave it alone.
+**Settings vanished after reinstalling.** They should not: everything lives in `%APPDATA%\chatgpt-local-files\` and the uninstaller is configured to leave it alone.
 
 ## Development
 

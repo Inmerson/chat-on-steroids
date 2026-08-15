@@ -42,7 +42,7 @@ nsis:
   shortcutName: ChatGPT Local Files
   artifactName: ChatGPT-Local-Files-Setup-${version}.${ext}
   uninstallDisplayName: ChatGPT Local Files
-  # Settings and the encrypted API key live in %APPDATA%\ChatGPT Local Files and must
+  # Settings and the encrypted API key live in %APPDATA%\chatgpt-local-files and must
   # outlive an uninstall, so reinstalling or updating never asks for them again.
   # This is the default; it is written down because losing it would be silent.
   deleteAppDataOnUninstall: false
