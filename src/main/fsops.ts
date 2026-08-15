@@ -1,0 +1,537 @@
+/**
+ * Filesystem operations with hard output bounds.
+ *
+ * Every read is capped in bytes and reports whether it was truncated, so a large
+ * file can never be dumped into the conversation by accident. Binary files are
+ * detected and refused with a clear message instead of returning mojibake.
+ */
+
+import { createHash } from 'node:crypto';
+import { rawCreateReadStream as createReadStream, rawPromises as fs } from './rawfs.js';
+import path from 'node:path';
+
+export const DEFAULT_READ_BYTES = 64 * 1024;
+export const MAX_READ_BYTES = 512 * 1024;
+export const MAX_WRITE_BYTES = 16 * 1024 * 1024;
+/** Local images returned to the model are capped before base64 expansion. */
+export const MAX_IMAGE_BYTES = 8 * 1024 * 1024;
+/** Keeps a base64 binary-write request comfortably below the MCP server's 8 MiB body cap. */
+export const MAX_BINARY_WRITE_BYTES = 5 * 1024 * 1024;
+export const MAX_BINARY_BASE64_CHARS = 7_000_000;
+const BINARY_SNIFF_BYTES = 8192;
+const MAX_HASH_BYTES = 256 * 1024 * 1024;
+
+export class FsOpError extends Error {}
+
+export interface ReadResult {
+  text: string;
+  /** True when output stopped early because of the byte cap. */
+  truncated: boolean;
+  /**
+   * True when at least one more line exists after lastLine, whether reading
+   * stopped at the requested endLine or at the byte cap. This is what tells the
+   * model a follow-up read is worthwhile.
+   */
+  hasMore: boolean;
+  /** 1-based line number of the first line returned. */
+  firstLine: number;
+  /** 1-based line number of the last line returned. */
+  lastLine: number;
+  /** Total lines in the file, known only when the whole file was scanned. */
+  totalLines: number | null;
+  bytesReturned: number;
+  fileBytes: number;
+}
+
+export type TextEncoding = 'utf-8' | 'utf-16le' | 'utf-16be';
+interface TextFormat {
+  encoding: TextEncoding;
+  bom: boolean;
+}
+
+async function textFormat(realPath: string): Promise<TextFormat> {
+  const handle = await fs.open(realPath, 'r');
+  try {
+    const head = Buffer.alloc(3);
+    const { bytesRead } = await handle.read(head, 0, 3, 0);
+    if (bytesRead >= 2 && head[0] === 0xff && head[1] === 0xfe) {
+      return { encoding: 'utf-16le', bom: true };
+    }
+    if (bytesRead >= 2 && head[0] === 0xfe && head[1] === 0xff) {
+      return { encoding: 'utf-16be', bom: true };
+    }
+    return {
+      encoding: 'utf-8',
+      bom: bytesRead >= 3 && head[0] === 0xef && head[1] === 0xbb && head[2] === 0xbf
+    };
+  } finally {
+    await handle.close();
+  }
+}
+
+/** Encoding detected from a BOM; non-BOM files are treated as UTF-8. */
+export async function detectTextEncoding(realPath: string): Promise<TextEncoding> {
+  return (await textFormat(realPath)).encoding;
+}
+
+function decodeText(data: Buffer, format: TextFormat): string {
+  return stripBom(new TextDecoder(format.encoding).decode(data));
+}
+
+function encodeText(text: string, format: TextFormat, includeBom: boolean): Buffer {
+  if (format.encoding === 'utf-8') {
+    const body = Buffer.from(text, 'utf8');
+    return includeBom && format.bom ? Buffer.concat([Buffer.from([0xef, 0xbb, 0xbf]), body]) : body;
+  }
+  const body = Buffer.from(text, 'utf16le');
+  if (format.encoding === 'utf-16be') body.swap16();
+  if (!includeBom || !format.bom) return body;
+  return Buffer.concat([
+    format.encoding === 'utf-16le' ? Buffer.from([0xff, 0xfe]) : Buffer.from([0xfe, 0xff]),
+    body
+  ]);
+}
+
+/** Reads the first bytes of a file to decide whether it is binary. */
+export async function sniffBinary(realPath: string): Promise<boolean> {
+  const handle = await fs.open(realPath, 'r');
+  try {
+    const buf = Buffer.alloc(BINARY_SNIFF_BYTES);
+    const { bytesRead } = await handle.read(buf, 0, BINARY_SNIFF_BYTES, 0);
+    if (bytesRead === 0) return false;
+    const slice = buf.subarray(0, bytesRead);
+    // UTF-16 text contains NUL bytes by design, so detect its BOM before applying
+    // the usual binary heuristic. UTF-8 BOM is harmless as well.
+    if (
+      (slice.length >= 2 && slice[0] === 0xff && slice[1] === 0xfe) ||
+      (slice.length >= 2 && slice[0] === 0xfe && slice[1] === 0xff) ||
+      (slice.length >= 3 && slice[0] === 0xef && slice[1] === 0xbb && slice[2] === 0xbf)
+    ) {
+      return false;
+    }
+    // A NUL byte in the first 8 KiB is the standard heuristic and is what git uses.
+    if (slice.includes(0)) return true;
+    // A high proportion of bytes that are neither printable nor common whitespace
+    // catches things like compressed data that happen to avoid NUL.
+    let suspicious = 0;
+    for (const byte of slice) {
+      if (byte === 9 || byte === 10 || byte === 13) continue;
+      if (byte < 32 || byte === 127) suspicious++;
+    }
+    return suspicious / slice.length > 0.3;
+  } finally {
+    await handle.close();
+  }
+}
+
+function stripBom(text: string): string {
+  return text.charCodeAt(0) === 0xfeff ? text.slice(1) : text;
+}
+
+export async function replaceTextFile(realPath: string, content: string): Promise<number> {
+  const format = await textFormat(realPath);
+  const encoded = encodeText(content, format, true);
+  await fs.writeFile(realPath, encoded);
+  return encoded.length;
+}
+
+export async function appendTextFile(realPath: string, content: string): Promise<number> {
+  let format: TextFormat = { encoding: 'utf-8', bom: false };
+  try {
+    const stat = await fs.stat(realPath);
+    if (!stat.isFile()) throw new FsOpError('Not a file');
+    format = await textFormat(realPath);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err;
+  }
+  const encoded = encodeText(content, format, false);
+  await fs.appendFile(realPath, encoded);
+  return encoded.length;
+}
+
+export type SupportedImageMime = 'image/png' | 'image/jpeg' | 'image/gif' | 'image/webp';
+
+function imageMime(data: Buffer): SupportedImageMime | null {
+  if (
+    data.length >= 8 &&
+    data[0] === 0x89 && data[1] === 0x50 && data[2] === 0x4e && data[3] === 0x47 &&
+    data[4] === 0x0d && data[5] === 0x0a && data[6] === 0x1a && data[7] === 0x0a
+  ) return 'image/png';
+  if (data.length >= 3 && data[0] === 0xff && data[1] === 0xd8 && data[2] === 0xff) return 'image/jpeg';
+  if (data.length >= 6) {
+    const signature = data.subarray(0, 6).toString('ascii');
+    if (signature === 'GIF87a' || signature === 'GIF89a') return 'image/gif';
+  }
+  if (
+    data.length >= 12 &&
+    data.subarray(0, 4).toString('ascii') === 'RIFF' &&
+    data.subarray(8, 12).toString('ascii') === 'WEBP'
+  ) return 'image/webp';
+  return null;
+}
+
+export async function readImageFile(
+  realPath: string
+): Promise<{ data: string; mimeType: SupportedImageMime; bytes: number }> {
+  const stat = await fs.stat(realPath);
+  if (!stat.isFile()) throw new FsOpError('Not a file');
+  if (stat.size > MAX_IMAGE_BYTES) {
+    throw new FsOpError(
+      `Image is too large to return (${formatBytes(stat.size)}; limit ${formatBytes(MAX_IMAGE_BYTES)})`
+    );
+  }
+  const data = await fs.readFile(realPath);
+  const mimeType = imageMime(data);
+  if (!mimeType) {
+    throw new FsOpError('Unsupported image format. Use PNG, JPEG, GIF or WebP.');
+  }
+  return { data: data.toString('base64'), mimeType, bytes: data.length };
+}
+
+export function decodeBase64Data(input: string): Buffer {
+  const clean = input.replace(/\s+/g, '');
+  if (clean.length === 0) throw new FsOpError('Binary data is empty');
+  if (clean.length > MAX_BINARY_BASE64_CHARS) {
+    throw new FsOpError(`Base64 payload is too large (limit ${MAX_BINARY_BASE64_CHARS} characters)`);
+  }
+  if (!/^[A-Za-z0-9+/_-]*={0,2}$/.test(clean) || /=/.test(clean.slice(0, -2))) {
+    throw new FsOpError('Binary data is not valid base64');
+  }
+  const standard = clean.replace(/-/g, '+').replace(/_/g, '/');
+  if (standard.length % 4 === 1) throw new FsOpError('Binary data is not valid base64');
+  const data = Buffer.from(standard, 'base64');
+  const canonical = data.toString('base64').replace(/=+$/, '');
+  if (canonical !== standard.replace(/=+$/, '')) throw new FsOpError('Binary data is not valid base64');
+  if (data.length > MAX_BINARY_WRITE_BYTES) {
+    throw new FsOpError(
+      `Binary data is too large (${formatBytes(data.length)}; limit ${formatBytes(MAX_BINARY_WRITE_BYTES)})`
+    );
+  }
+  return data;
+}
+
+/**
+ * Reads a file as text, optionally limited to a 1-based inclusive line range.
+ * Streams so that reading lines 10-20 of a 2 GB file does not load the file.
+ */
+export async function readTextFile(
+  realPath: string,
+  opts: { startLine?: number; endLine?: number; maxBytes?: number } = {}
+): Promise<ReadResult> {
+  const stat = await fs.stat(realPath);
+  if (!stat.isFile()) throw new FsOpError('Not a file');
+
+  if (await sniffBinary(realPath)) {
+    throw new FsOpError(
+      `This is a binary file (${formatBytes(stat.size)}). Use file_info for its metadata and hash.`
+    );
+  }
+
+  const maxBytes = clamp(opts.maxBytes ?? DEFAULT_READ_BYTES, 1, MAX_READ_BYTES);
+  const startLine = opts.startLine === undefined ? 1 : Math.max(1, Math.floor(opts.startLine));
+  const endLine = opts.endLine === undefined ? Infinity : Math.floor(opts.endLine);
+  if (endLine < startLine) throw new FsOpError('endLine must be greater than or equal to startLine');
+
+  const wantsWholeFile = opts.startLine === undefined && opts.endLine === undefined;
+
+  const out: string[] = [];
+  let bytesReturned = 0;
+  let lineNo = 0;
+  let firstLine = 0;
+  let lastLine = 0;
+  let truncated = false;
+  let carry = '';
+  let sawAllLines = true;
+
+  const format = await textFormat(realPath);
+  const decoder = new TextDecoder(format.encoding);
+  const stream = createReadStream(realPath, { highWaterMark: 64 * 1024 });
+
+  const pushLine = (line: string): boolean => {
+    lineNo++;
+    if (lineNo < startLine) return true;
+    if (lineNo > endLine) return false;
+    const size = Buffer.byteLength(line, 'utf8') + 1;
+    if (bytesReturned + size > maxBytes) {
+      truncated = true;
+      return false;
+    }
+    if (firstLine === 0) firstLine = lineNo;
+    lastLine = lineNo;
+    out.push(line);
+    bytesReturned += size;
+    return true;
+  };
+
+  try {
+    for await (const chunk of stream) {
+      carry += decoder.decode(chunk as Buffer, { stream: true });
+      let index = carry.indexOf('\n');
+      while (index !== -1) {
+        const line = carry.slice(0, index).replace(/\r$/, '');
+        carry = carry.slice(index + 1);
+        if (!pushLine(line)) {
+          sawAllLines = false;
+          carry = '';
+          stream.destroy();
+          break;
+        }
+        index = carry.indexOf('\n');
+      }
+      if (!sawAllLines) break;
+    }
+    if (sawAllLines) {
+      carry += decoder.decode();
+      if (carry.length > 0) {
+        if (!pushLine(carry.replace(/\r$/, ''))) sawAllLines = false;
+      }
+    }
+  } finally {
+    stream.destroy();
+  }
+
+  if (firstLine === 0) {
+    // Nothing matched: either an empty file or a range past the end.
+    firstLine = startLine;
+    lastLine = startLine - 1;
+  }
+
+  return {
+    text: stripBom(out.join('\n')),
+    truncated,
+    // Reading stopped early exactly when a line existed that we did not return.
+    hasMore: !sawAllLines,
+    firstLine,
+    lastLine,
+    totalLines: sawAllLines ? lineNo : null,
+    bytesReturned,
+    fileBytes: stat.size
+  };
+}
+
+export interface FileInfo {
+  virtualPath: string;
+  type: 'file' | 'directory' | 'other';
+  bytes: number;
+  modified: string;
+  created: string;
+  readOnly: boolean;
+  binary: boolean | null;
+  lines: number | null;
+  sha256: string | null;
+}
+
+export async function statInfo(
+  realPath: string,
+  virtualPath: string,
+  opts: { hash?: boolean } = {}
+): Promise<FileInfo> {
+  const stat = await fs.lstat(realPath);
+  const type = stat.isDirectory() ? 'directory' : stat.isFile() ? 'file' : 'other';
+  const info: FileInfo = {
+    virtualPath,
+    type,
+    bytes: stat.size,
+    modified: stat.mtime.toISOString(),
+    created: stat.birthtime.toISOString(),
+    // 0o200 is the owner-write bit; Node maps the Windows read-only attribute onto it.
+    readOnly: (stat.mode & 0o200) === 0,
+    binary: null,
+    lines: null,
+    sha256: null
+  };
+  if (type !== 'file') return info;
+
+  info.binary = await sniffBinary(realPath);
+  if (!info.binary && stat.size <= MAX_READ_BYTES * 8) {
+    info.lines = await countLines(realPath);
+  }
+  if (opts.hash) {
+    if (stat.size > MAX_HASH_BYTES) {
+      throw new FsOpError(`File is too large to hash (${formatBytes(stat.size)})`);
+    }
+    info.sha256 = await hashFile(realPath);
+  }
+  return info;
+}
+
+async function countLines(realPath: string): Promise<number> {
+  let count = 0;
+  let sawAny = false;
+  let endsWithNewline = true;
+  const stream = createReadStream(realPath);
+  for await (const chunk of stream) {
+    const buf = chunk as Buffer;
+    if (buf.length === 0) continue;
+    sawAny = true;
+    for (const byte of buf) if (byte === 10) count++;
+    endsWithNewline = buf[buf.length - 1] === 10;
+  }
+  if (!sawAny) return 0;
+  return endsWithNewline ? count : count + 1;
+}
+
+async function hashFile(realPath: string): Promise<string> {
+  const hash = createHash('sha256');
+  const stream = createReadStream(realPath);
+  for await (const chunk of stream) hash.update(chunk as Buffer);
+  return hash.digest('hex');
+}
+
+export function isExcludedFolderName(name: string, patterns: readonly string[]): boolean {
+  const lower = name.toLowerCase();
+  return patterns.some((raw) => {
+    const pattern = raw.toLowerCase();
+    return pattern.endsWith('*') ? lower.startsWith(pattern.slice(0, -1)) : lower === pattern;
+  });
+}
+
+export interface DirEntry {
+  name: string;
+  virtualPath: string;
+  type: 'file' | 'directory' | 'other';
+  bytes: number | null;
+}
+
+/** Lists a directory, optionally recursing, always bounded by maxEntries. */
+export async function listDirectory(
+  realDir: string,
+  virtualDir: string,
+  opts: { recursive?: boolean; maxEntries: number; exclude: readonly string[] }
+): Promise<{ entries: DirEntry[]; truncated: boolean }> {
+  const entries: DirEntry[] = [];
+  let truncated = false;
+
+  const walk = async (dir: string, virt: string, depth: number): Promise<void> => {
+    if (truncated) return;
+    let dirents;
+    try {
+      dirents = await fs.readdir(dir, { withFileTypes: true });
+    } catch (err) {
+      if (depth === 0) throw err;
+      return; // Unreadable subdirectory: skip rather than fail the whole listing.
+    }
+    dirents.sort((a, b) => {
+      const ad = a.isDirectory() ? 0 : 1;
+      const bd = b.isDirectory() ? 0 : 1;
+      return ad !== bd ? ad - bd : a.name.localeCompare(b.name);
+    });
+    for (const dirent of dirents) {
+      if (entries.length >= opts.maxEntries) {
+        truncated = true;
+        return;
+      }
+      const isDir = dirent.isDirectory();
+      if (isDir && opts.recursive && isExcludedFolderName(dirent.name, opts.exclude)) continue;
+      const childVirtual = `${virt}/${dirent.name}`;
+      let bytes: number | null = null;
+      if (dirent.isFile()) {
+        try {
+          bytes = (await fs.stat(path.join(dir, dirent.name))).size;
+        } catch {
+          bytes = null;
+        }
+      }
+      entries.push({
+        name: dirent.name,
+        virtualPath: childVirtual,
+        type: isDir ? 'directory' : dirent.isFile() ? 'file' : 'other',
+        bytes
+      });
+      if (isDir && opts.recursive) {
+        await walk(path.join(dir, dirent.name), childVirtual, depth + 1);
+      }
+    }
+  };
+
+  await walk(realDir, virtualDir, 0);
+  return { entries, truncated };
+}
+
+export interface EditOp {
+  oldText: string;
+  newText: string;
+  replaceAll?: boolean;
+}
+
+/**
+ * Applies exact-text replacements. Line numbers are deliberately not used as an edit
+ * primitive: they drift the moment an earlier edit lands, and models get them wrong.
+ * A non-unique oldText is an error rather than a guess.
+ */
+export async function editTextFile(
+  realPath: string,
+  edits: readonly EditOp[]
+): Promise<{ replacements: number; bytes: number }> {
+  const stat = await fs.stat(realPath);
+  if (!stat.isFile()) throw new FsOpError('Not a file');
+  if (stat.size > MAX_WRITE_BYTES) {
+    throw new FsOpError(`File is too large to edit (${formatBytes(stat.size)})`);
+  }
+  if (await sniffBinary(realPath)) throw new FsOpError('Cannot edit a binary file');
+
+  const format = await textFormat(realPath);
+  const original = decodeText(await fs.readFile(realPath), format);
+  let content = original;
+  let replacements = 0;
+
+  for (const [index, edit] of edits.entries()) {
+    if (typeof edit.oldText !== 'string' || edit.oldText.length === 0) {
+      throw new FsOpError(`Edit ${index + 1}: oldText must be a non-empty string`);
+    }
+    if (typeof edit.newText !== 'string') {
+      throw new FsOpError(`Edit ${index + 1}: newText must be a string`);
+    }
+    const occurrences = countOccurrences(content, edit.oldText);
+    if (occurrences === 0) {
+      throw new FsOpError(
+        `Edit ${index + 1}: oldText was not found. Read the file again — it may have changed.`
+      );
+    }
+    if (occurrences > 1 && !edit.replaceAll) {
+      throw new FsOpError(
+        `Edit ${index + 1}: oldText appears ${occurrences} times. Include more surrounding text, or set replaceAll.`
+      );
+    }
+    content = edit.replaceAll
+      ? content.split(edit.oldText).join(edit.newText)
+      : content.replace(edit.oldText, edit.newText);
+    replacements += edit.replaceAll ? occurrences : 1;
+  }
+
+  if (content === original) {
+    throw new FsOpError('Edits produced no change');
+  }
+  const encoded = encodeText(content, format, true);
+  await fs.writeFile(realPath, encoded);
+  return { replacements, bytes: encoded.length };
+}
+
+function countOccurrences(haystack: string, needle: string): number {
+  let count = 0;
+  let index = haystack.indexOf(needle);
+  while (index !== -1) {
+    count++;
+    index = haystack.indexOf(needle, index + needle.length);
+  }
+  return count;
+}
+
+export function assertWritableSize(content: string): void {
+  const bytes = Buffer.byteLength(content, 'utf8');
+  if (bytes > MAX_WRITE_BYTES) {
+    throw new FsOpError(`Content is too large to write (${formatBytes(bytes)})`);
+  }
+}
+
+export function formatBytes(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  if (bytes < 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+  return `${(bytes / (1024 * 1024 * 1024)).toFixed(2)} GB`;
+}
+
+export function clamp(value: number, min: number, max: number): number {
+  if (!Number.isFinite(value)) return min;
+  return Math.min(max, Math.max(min, Math.floor(value)));
+}

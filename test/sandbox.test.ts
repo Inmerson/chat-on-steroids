@@ -1,0 +1,351 @@
+/**
+ * The security core. If any test in this file stops passing, the model can reach
+ * files the user never approved.
+ */
+
+import { promises as fs } from 'node:fs';
+import path from 'node:path';
+import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import type { Root } from '../src/shared/types.js';
+import {
+  SandboxError,
+  isContained,
+  normaliseRootName,
+  resolvePath,
+  splitVirtualPath,
+  toVirtualPath,
+  uniqueRootName,
+  validateNewRoot
+} from '../src/main/sandbox.js';
+import { DIR_LINK, IS_WINDOWS, makeTempDir, removeTempDir, writeTree } from './helpers.js';
+
+let base: string;
+let approved: string;
+let outside: string;
+let roots: Root[];
+
+beforeAll(async () => {
+  base = await makeTempDir('clf-sandbox-');
+  approved = path.join(base, 'approved');
+  outside = path.join(base, 'outside');
+  await writeTree(approved, {
+    'file.txt': 'hello',
+    'sub/nested.txt': 'nested',
+    'sub/deep/leaf.txt': 'leaf'
+  });
+  await writeTree(outside, { 'secret.txt': 'TOP SECRET' });
+  roots = [{ name: 'project', path: approved }];
+});
+
+afterAll(async () => {
+  await removeTempDir(base);
+});
+
+/** Asserts the call is refused, and that it is refused by the sandbox itself. */
+async function expectRefused(virtualPath: string, allowMissing = false): Promise<SandboxError> {
+  try {
+    await resolvePath(roots, virtualPath, { allowMissing });
+  } catch (err) {
+    expect(err, `expected a SandboxError for ${JSON.stringify(virtualPath)}`).toBeInstanceOf(
+      SandboxError
+    );
+    return err as SandboxError;
+  }
+  throw new Error(`expected ${JSON.stringify(virtualPath)} to be refused, but it resolved`);
+}
+
+describe('resolvePath — happy path', () => {
+  it('resolves a file inside an approved root', async () => {
+    const resolved = await resolvePath(roots, '/project/file.txt');
+    expect(resolved.real).toBe(path.join(approved, 'file.txt'));
+    expect(resolved.virtual).toBe('/project/file.txt');
+    expect(resolved.root.name).toBe('project');
+  });
+
+  it('resolves the root itself', async () => {
+    const resolved = await resolvePath(roots, '/project');
+    expect(resolved.real).toBe(approved);
+    expect(resolved.virtual).toBe('/project');
+  });
+
+  it('accepts backslashes as separators', async () => {
+    const resolved = await resolvePath(roots, '\\project\\sub\\nested.txt');
+    expect(resolved.real).toBe(path.join(approved, 'sub', 'nested.txt'));
+    expect(resolved.virtual).toBe('/project/sub/nested.txt');
+  });
+
+  it('accepts redundant separators', async () => {
+    const resolved = await resolvePath(roots, '//project///sub//nested.txt');
+    expect(resolved.virtual).toBe('/project/sub/nested.txt');
+  });
+
+  it('matches the root name case-insensitively', async () => {
+    const resolved = await resolvePath(roots, '/PROJECT/file.txt');
+    expect(resolved.virtual).toBe('/project/file.txt');
+  });
+
+  it('allows a path that does not exist yet only when asked', async () => {
+    await expectRefused('/project/brand-new.txt');
+    const resolved = await resolvePath(roots, '/project/brand-new.txt', { allowMissing: true });
+    expect(resolved.real).toBe(path.join(approved, 'brand-new.txt'));
+  });
+
+  it('allows missing intermediate folders when allowMissing is set', async () => {
+    const resolved = await resolvePath(roots, '/project/a/b/c.txt', { allowMissing: true });
+    expect(resolved.real).toBe(path.join(approved, 'a', 'b', 'c.txt'));
+    expect(resolved.virtual).toBe('/project/a/b/c.txt');
+  });
+});
+
+describe('resolvePath — traversal', () => {
+  it('rejects ".." segments', async () => {
+    const err = await expectRefused('/project/../outside/secret.txt');
+    expect(err.message).toMatch(/traversal/i);
+  });
+
+  it('rejects ".." buried deeper in the path', async () => {
+    await expectRefused('/project/sub/deep/../../../outside/secret.txt');
+  });
+
+  it('rejects ".." written with backslashes', async () => {
+    await expectRefused('\\project\\..\\outside\\secret.txt');
+  });
+
+  it('rejects ".." even when the result would stay inside the root', async () => {
+    // Refusing unconditionally keeps the rule simple enough to audit.
+    await expectRefused('/project/sub/../file.txt');
+  });
+
+  it('rejects ".." when creating a file', async () => {
+    await expectRefused('/project/../outside/planted.txt', true);
+  });
+
+  it('rejects a bare ".."', async () => {
+    await expectRefused('/..');
+  });
+});
+
+describe('resolvePath — Windows path tricks', () => {
+  it('rejects an absolute Windows path', async () => {
+    await expectRefused('C:\\Windows\\System32\\drivers\\etc\\hosts');
+  });
+
+  it('rejects a drive-relative path', async () => {
+    await expectRefused('/project/C:file.txt');
+  });
+
+  it('rejects an NTFS alternate data stream', async () => {
+    const err = await expectRefused('/project/file.txt:hidden');
+    expect(err.message).toMatch(/":"/);
+  });
+
+  it('rejects reserved device names', async () => {
+    for (const name of ['CON', 'nul', 'com1', 'LPT9', 'aux.txt', 'CONIN$']) {
+      const err = await expectRefused(`/project/${name}`);
+      expect(err.message, name).toMatch(/reserved Windows device name/);
+    }
+  });
+
+  it('rejects a trailing dot, which Windows would strip', async () => {
+    // "file.txt." addresses "file.txt" on Windows, so allowing it would let the
+    // same file be reached by a name the checks above never saw.
+    const err = await expectRefused('/project/file.txt.');
+    expect(err.message).toMatch(/dot or space/);
+  });
+
+  it('rejects a trailing space', async () => {
+    await expectRefused('/project/file.txt ');
+  });
+
+  it('rejects wildcards and other illegal characters', async () => {
+    for (const bad of ['*', '?', '<a>', 'a|b', 'a"b']) {
+      await expectRefused(`/project/${bad}`);
+    }
+  });
+
+  it('rejects a null byte', async () => {
+    const err = await expectRefused('/project/file.txt\0.png');
+    expect(err.message).toMatch(/null byte/);
+  });
+
+  it('rejects a control character', async () => {
+    await expectRefused('/project/fi\x07le.txt');
+  });
+
+  it('rejects a UNC path', async () => {
+    await expectRefused('\\\\server\\share\\secret.txt');
+  });
+});
+
+describe('resolvePath — roots', () => {
+  it('rejects an unknown root and names the approved ones', async () => {
+    const err = await expectRefused('/nope/file.txt');
+    expect(err.message).toContain('/project');
+  });
+
+  it('rejects an empty path', async () => {
+    await expectRefused('/');
+  });
+
+  it('rejects an over-long path', async () => {
+    await expectRefused(`/project/${'a'.repeat(5000)}`);
+  });
+
+  it('rejects an over-long segment', async () => {
+    await expectRefused(`/project/${'a'.repeat(300)}.txt`);
+  });
+
+  it('does not treat a root name as a prefix of another', async () => {
+    const two: Root[] = [
+      { name: 'project', path: approved },
+      { name: 'project-two', path: outside }
+    ];
+    const resolved = await resolvePath(two, '/project-two/secret.txt');
+    expect(resolved.real).toBe(path.join(outside, 'secret.txt'));
+  });
+});
+
+describe('resolvePath — links and reparse points', () => {
+  let escapeLink: string;
+  let innerLink: string;
+
+  beforeAll(async () => {
+    escapeLink = path.join(approved, 'escape');
+    innerLink = path.join(approved, 'inner');
+    await fs.symlink(outside, escapeLink, DIR_LINK);
+    await fs.symlink(path.join(approved, 'sub'), innerLink, DIR_LINK);
+  });
+
+  it('creates a real reparse point for the test to be meaningful', async () => {
+    const stat = await fs.lstat(escapeLink);
+    expect(stat.isSymbolicLink() || stat.isDirectory()).toBe(true);
+    // Sanity: without canonicalisation this path really would reach the secret.
+    const leaked = await fs.readFile(path.join(escapeLink, 'secret.txt'), 'utf8');
+    expect(leaked).toBe('TOP SECRET');
+  });
+
+  it('rejects reading through a junction that leaves the root', async () => {
+    const err = await expectRefused('/project/escape/secret.txt');
+    expect(err.message).toMatch(/escapes its approved folder/);
+  });
+
+  it('rejects the junction itself', async () => {
+    await expectRefused('/project/escape');
+  });
+
+  it('rejects creating a file through an escaping junction', async () => {
+    await expectRefused('/project/escape/planted.txt', true);
+  });
+
+  it('allows a junction that stays inside the root, reporting the canonical path', async () => {
+    const resolved = await resolvePath(roots, '/project/inner/nested.txt');
+    expect(resolved.real).toBe(path.join(approved, 'sub', 'nested.txt'));
+    // The virtual path reflects where the file really is, not how it was reached.
+    expect(resolved.virtual).toBe('/project/sub/nested.txt');
+  });
+
+  it.runIf(!IS_WINDOWS)('rejects a file symlink that leaves the root', async () => {
+    const link = path.join(approved, 'secret-link.txt');
+    await fs.symlink(path.join(outside, 'secret.txt'), link);
+    await expectRefused('/project/secret-link.txt');
+    await fs.unlink(link);
+  });
+});
+
+describe('isContained', () => {
+  it('treats a path as containing itself', () => {
+    expect(isContained('C:\\Root', 'C:\\Root')).toBe(true);
+  });
+
+  it('accepts a descendant', () => {
+    expect(isContained('C:\\Root', path.join('C:\\Root', 'a', 'b'))).toBe(true);
+  });
+
+  it('rejects a sibling that shares a name prefix', () => {
+    expect(isContained('C:\\Root', 'C:\\RootEvil')).toBe(false);
+    expect(isContained('C:\\Root', 'C:\\Root-2\\a')).toBe(false);
+  });
+
+  it.runIf(IS_WINDOWS)('ignores case on Windows', () => {
+    expect(isContained('C:\\Root', 'c:\\root\\a')).toBe(true);
+  });
+});
+
+describe('splitVirtualPath', () => {
+  it('splits and validates', () => {
+    expect(splitVirtualPath('/a/b/c')).toEqual(['a', 'b', 'c']);
+  });
+
+  it('rejects a non-string', () => {
+    expect(() => splitVirtualPath(42 as unknown as string)).toThrow(SandboxError);
+  });
+});
+
+describe('toVirtualPath', () => {
+  const root: Root = { name: 'docs', path: 'C:\\Docs' };
+
+  it('maps the root itself', () => {
+    expect(toVirtualPath(root, 'C:\\Docs', 'C:\\Docs')).toBe('/docs');
+  });
+
+  it('uses forward slashes', () => {
+    expect(toVirtualPath(root, 'C:\\Docs', path.join('C:\\Docs', 'a', 'b.txt'))).toBe('/docs/a/b.txt');
+  });
+});
+
+describe('root names', () => {
+  it('normalises to a safe slug', () => {
+    expect(normaliseRootName('My Documents')).toBe('my-documents');
+    expect(normaliseRootName('C++ Projects!')).toBe('c-projects');
+    expect(normaliseRootName('...')).toBe('folder');
+    expect(normaliseRootName('')).toBe('folder');
+    expect(normaliseRootName('a'.repeat(80)).length).toBe(32);
+  });
+
+  it('avoids collisions', () => {
+    const existing: Root[] = [
+      { name: 'src', path: 'C:\\a' },
+      { name: 'src-2', path: 'C:\\b' }
+    ];
+    expect(uniqueRootName('C:\\x\\src', existing)).toBe('src-3');
+    expect(uniqueRootName('C:\\x\\other', existing)).toBe('other');
+  });
+});
+
+describe('validateNewRoot', () => {
+  it('accepts a normal folder', async () => {
+    expect(await validateNewRoot(approved, [])).toBe(approved);
+  });
+
+  it('rejects a relative path', async () => {
+    await expect(validateNewRoot('relative\\path', [])).rejects.toBeInstanceOf(SandboxError);
+  });
+
+  it('rejects a UNC path', async () => {
+    await expect(validateNewRoot('\\\\server\\share', [])).rejects.toThrow(/UNC/);
+  });
+
+  it.runIf(IS_WINDOWS)('rejects a whole drive', async () => {
+    await expect(validateNewRoot(path.parse(base).root, [])).rejects.toThrow(/entire drive/);
+  });
+
+  it('rejects a file', async () => {
+    await expect(validateNewRoot(path.join(approved, 'file.txt'), [])).rejects.toThrow(/not a folder/);
+  });
+
+  it('rejects a folder inside an existing root', async () => {
+    await expect(
+      validateNewRoot(path.join(approved, 'sub'), [{ name: 'project', path: approved }])
+    ).rejects.toThrow(/overlaps/);
+  });
+
+  it('rejects a folder that contains an existing root', async () => {
+    await expect(
+      validateNewRoot(base, [{ name: 'project', path: approved }])
+    ).rejects.toThrow(/overlaps/);
+  });
+
+  it('accepts a sibling folder', async () => {
+    expect(await validateNewRoot(outside, [{ name: 'project', path: approved }])).toBe(outside);
+  });
+});

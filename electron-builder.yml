@@ -1,0 +1,48 @@
+appId: com.chatgptlocalfiles.app
+productName: ChatGPT Local Files
+copyright: MIT licensed
+
+directories:
+  output: release
+  buildResources: build
+
+# Only the built output ships. Source, tests and dev config stay out of the asar.
+files:
+  - out/**
+  - package.json
+
+# tunnel-client (Apache-2.0) is fetched at build time by scripts/fetch-tunnel-client.mjs
+# and shipped unpacked, because it has to be executable as a file on disk.
+extraResources:
+  - from: resources/tunnel
+    to: tunnel
+    filter:
+      - '**/*'
+
+# No native modules, so there is nothing to rebuild.
+npmRebuild: false
+compression: maximum
+
+win:
+  target:
+    - target: nsis
+      arch:
+        - x64
+  icon: build/icon.ico
+  # The app is an ordinary user-level utility. It must never ask for elevation,
+  # and a per-user install means the installer does not need it either.
+  requestedExecutionLevel: asInvoker
+
+nsis:
+  oneClick: false
+  perMachine: false
+  allowToChangeInstallationDirectory: true
+  createDesktopShortcut: true
+  createStartMenuShortcut: true
+  shortcutName: ChatGPT Local Files
+  artifactName: ChatGPT-Local-Files-Setup-${version}.${ext}
+  uninstallDisplayName: ChatGPT Local Files
+  # Settings and the encrypted API key live in %APPDATA%\ChatGPT Local Files and must
+  # outlive an uninstall, so reinstalling or updating never asks for them again.
+  # This is the default; it is written down because losing it would be silent.
+  deleteAppDataOnUninstall: false

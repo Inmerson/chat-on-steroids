@@ -1,0 +1,1197 @@
+/* ---------------------------------------------------------------------------
+   Two themes, light and dark, chosen in the app and remembered — never taken
+   from what Windows happens to be set to, because a desktop tool that changes
+   colour under you is a tool you distrust.
+
+   Grey carries the structure — borders, labels, secondary text. Blue is the
+   contrast colour and appears only on things that matter: section titles, the
+   two live numbers, folder names, a switch that is on, the selected tab, and
+   the dot that says the link to OpenAI is verified. Red only on real failures,
+   green only on Connect. Everything else is ink on page.
+
+   The window is a fixed 1080x700 frame (see createWindow), so the layout is
+   built as a grid that fits exactly and scrolls inside its own panes rather
+   than growing the page.
+   --------------------------------------------------------------------------- */
+
+:root {
+  --page: #fff;
+  --card: #fff;
+  --ink: #0a0a0a;
+  --soft: #55555b;
+  --faint: #9a9aa0;
+  --line: #e6e6e9;
+  --hover: #f5f6f8;
+  --sunk: #fafafb;
+  /* Switch track, control outline, and the raised knob / selected segment. */
+  --track: #dcdce0;
+  --edge: #d5d5db;
+  --raise: #fff;
+
+  --blue: #2563eb;
+  --wash: #eff4ff;
+  --blue-line: #cfdefb;
+
+  --green: #15803d;
+  --green-wash: #f2faf5;
+  --green-line: #c2e5cd;
+
+  --red: #dc2626;
+  --red-wash: #fdf3f3;
+  --red-line: #f2c8c8;
+
+  --mono: "Cascadia Mono", Consolas, "Courier New", monospace;
+}
+
+/*
+ * Dark is an explicit choice, stored in settings and applied by script — it is never
+ * inherited from Windows. The structure is identical; only these values change, so a
+ * colour used anywhere below is correct in both themes without a second rule.
+ */
+:root[data-theme='dark'] {
+  --page: #0e0e11;
+  --card: #16161a;
+  --ink: #f1f1f4;
+  --soft: #a6a6ae;
+  --faint: #74747d;
+  --line: #26262c;
+  --hover: #1e1e24;
+  --sunk: #1a1a20;
+  --track: #3a3a44;
+  --edge: #3a3a44;
+  --raise: #2a2a32;
+
+  --blue: #6f9dff;
+  --wash: #17203a;
+  --blue-line: #2f4270;
+
+  --green: #4ade80;
+  --green-wash: #12241a;
+  --green-line: #2b5236;
+
+  --red: #f87171;
+  --red-wash: #2a1618;
+  --red-line: #58282c;
+}
+
+* {
+  box-sizing: border-box;
+  margin: 0;
+}
+
+html,
+body {
+  height: 100%;
+  overflow: hidden;
+}
+
+body {
+  background: var(--page);
+  color: var(--ink);
+  font: 14px/1.45 "Segoe UI Variable Text", "Segoe UI", system-ui, sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+.sprite {
+  display: none;
+}
+
+/* Author display rules outrank the UA's [hidden], and several things here are
+   hidden by setting .hidden from script. Make the attribute win. */
+[hidden] {
+  display: none !important;
+}
+
+.ico {
+  width: 17px;
+  height: 17px;
+  flex: 0 0 auto;
+  stroke: currentColor;
+  fill: none;
+  stroke-width: 1.7;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+code {
+  font-family: var(--mono);
+  font-size: 0.92em;
+}
+
+/* The whole window: header, one scrolling middle, nav. Nothing else grows. */
+.app {
+  height: 100%;
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr) auto;
+  background: var(--page);
+}
+
+/* ------------------------------------------------------------------ header */
+
+header {
+  display: flex;
+  align-items: center;
+  gap: 11px;
+  padding: 11px 18px;
+  border-bottom: 1px solid var(--line);
+}
+
+.mark {
+  display: grid;
+  place-items: center;
+  width: 30px;
+  height: 30px;
+  border-radius: 8px;
+  background: var(--blue);
+  color: #fff;
+}
+
+.title {
+  font-size: 14px;
+  font-weight: 650;
+  letter-spacing: -0.01em;
+}
+
+.title span {
+  display: block;
+  font-size: 11px;
+  font-weight: 400;
+  color: var(--faint);
+  font-family: var(--mono);
+}
+
+.state {
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: 14px;
+}
+
+/* The honest status line: a colour, a word, and how old the proof is. */
+.live {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12.5px;
+  font-weight: 600;
+}
+
+.live .dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--track);
+}
+
+.live em {
+  font-style: normal;
+  font-weight: 400;
+  color: var(--faint);
+  font-variant-numeric: tabular-nums;
+}
+
+.live.is-connected .dot {
+  background: var(--blue);
+}
+
+.live.is-busy .dot {
+  background: var(--blue);
+  animation: blink 1.1s ease-in-out infinite;
+}
+
+.live.is-offline .dot,
+.live.is-error .dot {
+  background: var(--red);
+}
+
+.live.is-error {
+  color: var(--red);
+}
+
+@keyframes blink {
+  50% {
+    opacity: 0.25;
+  }
+}
+
+/* The only green and the only red button in the app. */
+.power {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  border: 1px solid var(--green-line);
+  border-radius: 8px;
+  padding: 8px 15px;
+  font: inherit;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  background: var(--green-wash);
+  color: var(--green);
+}
+
+.power.is-running {
+  background: var(--red-wash);
+  color: var(--red);
+  border-color: var(--red-line);
+}
+
+.power:hover:not(:disabled) {
+  filter: brightness(0.975);
+}
+
+/* Darkening a dark wash does nothing; lift it instead. */
+:root[data-theme='dark'] .power:hover:not(:disabled) {
+  filter: brightness(1.35);
+}
+
+.power:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
+/* ------------------------------------------------------------------ panels */
+
+main {
+  min-height: 0;
+  display: grid;
+  grid-template-rows: minmax(0, 1fr);
+}
+
+.panel {
+  display: none;
+  min-height: 0;
+}
+
+.panel.is-active {
+  display: grid;
+}
+
+/* Home: three cards over the log, both sized so nothing ever reflows. */
+[data-panel='home'] {
+  grid-template-rows: minmax(0, 1fr) 218px;
+  gap: 13px;
+  padding: 13px;
+}
+
+[data-panel='activity'] {
+  padding: 13px;
+  grid-template-rows: minmax(0, 1fr);
+}
+
+[data-panel='setup'].is-active {
+  display: block;
+  overflow: auto;
+}
+
+.top {
+  display: grid;
+  grid-template-columns: 1.15fr 1fr 1fr;
+  gap: 13px;
+  min-height: 0;
+}
+
+/* ------------------------------------------------------------------- cards */
+
+.card {
+  background: var(--card);
+  border: 1px solid var(--line);
+  border-radius: 11px;
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  min-height: 0;
+  overflow: hidden;
+}
+
+.card > h2 {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 11px 14px 9px;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+  color: var(--blue);
+}
+
+/* Everything after the title lives in one right-aligned cluster. */
+.acts {
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+/* Vertical only. Nothing in this app may scroll sideways: long values are cut
+   with an ellipsis instead, so a card never hides half a line off to the right. */
+.scroll {
+  overflow: hidden auto;
+  min-height: 0;
+  scrollbar-width: thin;
+  scrollbar-color: var(--edge) transparent;
+}
+
+.empty {
+  padding: 4px 14px 14px;
+  font-size: 12px;
+  color: var(--faint);
+}
+
+/* -------------------------------------------------------------- quiet button */
+
+.btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  border: 0;
+  background: none;
+  color: var(--faint);
+  border-radius: 7px;
+  padding: 4px 8px;
+  font: inherit;
+  font-size: 12px;
+  font-weight: 550;
+  cursor: pointer;
+}
+
+.btn:hover:not(:disabled) {
+  background: var(--hover);
+  color: var(--ink);
+}
+
+.btn:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
+.btn .ico {
+  width: 15px;
+  height: 15px;
+}
+
+.btn.is-on {
+  background: var(--wash);
+  color: var(--blue);
+}
+
+.btn-solid {
+  background: var(--sunk);
+  border: 1px solid var(--line);
+  color: var(--ink);
+  padding: 6px 11px;
+  font-size: 12.5px;
+}
+
+.btn-solid:hover:not(:disabled) {
+  background: var(--hover);
+}
+
+.btn-quiet {
+  padding: 2px 4px;
+}
+
+.btn-icon {
+  padding: 7px;
+}
+
+/* A two-button segmented control, used for the log filter. */
+.seg {
+  display: inline-flex;
+  gap: 2px;
+  padding: 2px;
+  border-radius: 8px;
+  background: var(--sunk);
+}
+
+.seg button {
+  border: 0;
+  background: none;
+  border-radius: 6px;
+  padding: 3px 9px;
+  font: inherit;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0;
+  text-transform: none;
+  color: var(--faint);
+  cursor: pointer;
+}
+
+.seg button:hover {
+  color: var(--ink);
+}
+
+.seg button.is-sel {
+  background: var(--raise);
+  color: var(--blue);
+  box-shadow: 0 1px 2px rgb(0 0 0 / 8%);
+}
+
+.problems {
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0;
+  text-transform: none;
+  color: var(--red);
+  background: var(--red-wash);
+  border-radius: 999px;
+  padding: 2px 8px;
+}
+
+/* ------------------------------------------------------------- permissions */
+
+.perm + .perm {
+  border-top: 1px solid var(--line);
+}
+
+/* The row is a container, not a control: the name expands the group, the switch
+   turns it on. Two separate targets, so neither click can mean the other. */
+.perm-head {
+  display: flex;
+  align-items: center;
+  gap: 11px;
+  padding: 9px 14px;
+}
+
+.perm-head:hover {
+  background: var(--hover);
+}
+
+.perm-main {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 11px;
+  padding: 0;
+  border: 0;
+  background: none;
+  font: inherit;
+  color: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.perm-main > .ico:first-child {
+  color: var(--faint);
+}
+
+.perm.is-on .perm-main > .ico:first-child {
+  color: var(--ink);
+}
+
+.perm-main b {
+  font-size: 13.5px;
+  font-weight: 550;
+  display: block;
+}
+
+.perm-main em {
+  font-style: normal;
+  font-size: 11.5px;
+  color: var(--faint);
+}
+
+.perm.is-on .perm-main em {
+  color: var(--soft);
+}
+
+.perm-main .chev {
+  width: 13px;
+  height: 13px;
+  color: #c8c8ce;
+  transition: transform 0.15s;
+}
+
+.perm.is-open .perm-main .chev {
+  transform: rotate(90deg);
+}
+
+.perm.is-locked {
+  opacity: 0.55;
+}
+
+/* The switch. A real checkbox underneath, so the keyboard still works. */
+.sw {
+  margin-left: auto;
+  flex: 0 0 auto;
+  position: relative;
+  width: 34px;
+  height: 20px;
+}
+
+.sw input {
+  position: absolute;
+  inset: 0;
+  margin: 0;
+  opacity: 0;
+  cursor: pointer;
+}
+
+.sw i {
+  position: absolute;
+  inset: 0;
+  border-radius: 999px;
+  background: var(--track);
+  transition: background 0.15s;
+  pointer-events: none;
+}
+
+.sw i::after {
+  content: '';
+  position: absolute;
+  inset: 2px auto 2px 2px;
+  width: 16px;
+  border-radius: 50%;
+  background: #fff;
+  box-shadow: 0 1px 2px rgb(0 0 0 / 22%);
+  transition: transform 0.15s;
+}
+
+.sw input:checked + i {
+  background: var(--blue);
+}
+
+.sw input:checked + i::after {
+  transform: translateX(14px);
+}
+
+.sw input:indeterminate + i {
+  background: var(--blue-line);
+}
+
+.sw input:indeterminate + i::after {
+  transform: translateX(7px);
+}
+
+.sw input:focus-visible + i {
+  outline: 2px solid var(--blue);
+  outline-offset: 2px;
+}
+
+.sw input:disabled + i {
+  opacity: 0.5;
+}
+
+/* Individual tools, revealed one group at a time so nothing else moves. */
+.tools {
+  display: none;
+  padding: 0 14px 9px 42px;
+}
+
+.perm.is-open .tools {
+  display: grid;
+}
+
+.tool {
+  display: flex;
+  align-items: flex-start;
+  gap: 9px;
+  padding: 4px 0;
+  font-size: 12.5px;
+  color: var(--soft);
+  cursor: pointer;
+}
+
+.tool input {
+  appearance: none;
+  margin: 2px 0 0;
+  width: 14px;
+  height: 14px;
+  flex: 0 0 auto;
+  border: 1.5px solid var(--edge);
+  border-radius: 4px;
+  background: var(--card);
+  display: grid;
+  place-items: center;
+  cursor: pointer;
+}
+
+.tool input:checked {
+  background: var(--blue);
+  border-color: var(--blue);
+}
+
+.tool input:checked::after {
+  content: '';
+  width: 7px;
+  height: 4px;
+  border: 1.6px solid #fff;
+  border-top: 0;
+  border-right: 0;
+  transform: translateY(-1px) rotate(-45deg);
+}
+
+.tool input:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
+.tool strong {
+  font-weight: 550;
+  color: var(--ink);
+}
+
+.tool em {
+  display: block;
+  font-style: normal;
+  font-size: 11.5px;
+  color: var(--faint);
+}
+
+/* ----------------------------------------------------------------- folders */
+
+.root {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 9px 14px;
+  font-size: 13px;
+}
+
+.root + .root {
+  border-top: 1px solid var(--line);
+}
+
+.root > .ico {
+  color: var(--faint);
+  width: 15px;
+  height: 15px;
+}
+
+.root b {
+  font-weight: 600;
+  color: var(--blue);
+}
+
+.root span {
+  margin-left: auto;
+  color: var(--faint);
+  font-size: 11.5px;
+  max-width: 58%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.root .btn {
+  margin-left: 0;
+  padding: 3px 5px;
+  opacity: 0;
+}
+
+.root:hover .btn {
+  opacity: 1;
+}
+
+/* ------------------------------------------------------------------ health */
+
+.big {
+  display: flex;
+  gap: 26px;
+  padding: 3px 14px 12px;
+}
+
+.big b {
+  display: block;
+  font-size: 22px;
+  font-weight: 650;
+  letter-spacing: -0.02em;
+  font-variant-numeric: tabular-nums;
+  color: var(--blue);
+}
+
+.big b.is-cold {
+  color: var(--faint);
+}
+
+.big b.is-bad {
+  color: var(--red);
+}
+
+.big span {
+  font-size: 11px;
+  color: var(--faint);
+}
+
+/* The wiring, as plain facts. Nothing here is an action, so nothing is coloured. */
+.facts {
+  padding: 10px 14px 12px;
+  display: grid;
+  gap: 5px;
+  font-size: 12px;
+  color: var(--soft);
+  border-top: 1px solid var(--line);
+}
+
+/* Both columns are allowed to shrink to nothing, so a long route or a long
+   version string is cut short instead of widening the card. */
+.fact {
+  display: grid;
+  grid-template-columns: minmax(0, auto) minmax(0, 1fr);
+  gap: 10px;
+  align-items: baseline;
+}
+
+.fact > span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.fact code {
+  justify-self: end;
+  max-width: 100%;
+  color: var(--ink);
+  font-size: 11.5px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.fact code.is-bad {
+  color: var(--red);
+}
+
+/* Self-test results, in the same card as the facts they explain. */
+.checks {
+  border-top: 1px solid var(--line);
+  padding: 10px 14px 12px;
+}
+
+.checks-head {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  font-size: 12px;
+  margin-bottom: 8px;
+}
+
+.checks-head strong {
+  font-weight: 600;
+}
+
+.checks-head .btn {
+  margin-left: auto;
+}
+
+.checks ul {
+  list-style: none;
+  padding: 0;
+  display: grid;
+  gap: 7px;
+}
+
+.check {
+  display: flex;
+  gap: 9px;
+  font-size: 12px;
+}
+
+.check-mark {
+  flex: 0 0 auto;
+  width: 15px;
+  height: 15px;
+  margin-top: 1px;
+  border-radius: 50%;
+  display: grid;
+  place-items: center;
+  font-size: 9px;
+  font-weight: 700;
+  background: var(--sunk);
+  color: var(--faint);
+}
+
+.check.is-ok .check-mark {
+  background: var(--wash);
+  color: var(--blue);
+}
+
+.check.is-bad .check-mark {
+  background: var(--red-wash);
+  color: var(--red);
+}
+
+.check strong {
+  font-weight: 600;
+  display: block;
+}
+
+.check p {
+  color: var(--soft);
+  font-size: 11.5px;
+}
+
+.check.is-bad strong {
+  color: var(--red);
+}
+
+/* ---------------------------------------------------------------- activity
+   Grey monospace, one line per event. The only colour is red, and only when
+   something actually failed — so a red line is always worth looking at. */
+
+.feed {
+  padding: 2px 10px 10px;
+  font-size: 12px;
+  color: var(--soft);
+  font-family: var(--mono);
+}
+
+.feed p {
+  display: flex;
+  gap: 12px;
+  padding: 3px 6px;
+  border-radius: 5px;
+}
+
+.feed p:hover {
+  background: var(--hover);
+}
+
+.feed time {
+  color: var(--faint);
+  font-variant-numeric: tabular-nums;
+  flex: 0 0 auto;
+}
+
+/* A fixed column, so the subjects line up however long they are. */
+.feed .what {
+  color: var(--ink);
+  flex: 0 0 132px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.feed .rest {
+  overflow-wrap: anywhere;
+}
+
+.feed .bad,
+.feed .bad .what {
+  color: var(--red);
+}
+
+.feed.only-bad p:not(.bad) {
+  display: none;
+}
+
+[data-panel='activity'] .card {
+  grid-template-rows: auto minmax(0, 1fr) auto;
+}
+
+.foot {
+  padding: 7px 14px;
+  border-top: 1px solid var(--line);
+  font-size: 11px;
+  color: var(--faint);
+}
+
+/* ------------------------------------------------------------------- setup */
+
+.sheet {
+  max-width: 720px;
+  margin: 0 auto;
+  padding: 20px 24px 32px;
+}
+
+.lede {
+  font-size: 13px;
+  color: var(--soft);
+  margin-bottom: 18px;
+  display: flex;
+  align-items: flex-start;
+  gap: 16px;
+}
+
+.lede p {
+  flex: 1;
+}
+
+/*
+ * Once every step is done, the instructions have served their purpose and only get
+ * in the way of the one line that still changes — whether ChatGPT is actually using
+ * this. Finished steps shrink to their title; the last step stays open because it
+ * carries the live status. "Show all steps" brings the instructions back.
+ */
+.wizard.is-tidy .step.is-done {
+  padding: 8px 0;
+}
+
+.wizard.is-tidy .step.is-done .step-body > :not(h3) {
+  display: none;
+}
+
+.wizard.is-tidy .step.is-done[data-step='chatgpt'] {
+  padding: 14px 0;
+}
+
+.wizard.is-tidy .step.is-done[data-step='chatgpt'] .step-body > .step-actions {
+  display: flex;
+}
+
+.wizard.is-tidy .step.is-done h3 {
+  margin-bottom: 0;
+}
+
+.wizard {
+  list-style: none;
+  padding: 0;
+  display: grid;
+  gap: 2px;
+}
+
+.step {
+  display: grid;
+  grid-template-columns: 26px 1fr;
+  gap: 13px;
+  padding: 14px 0;
+  border-top: 1px solid var(--line);
+}
+
+.step:first-child {
+  border-top: 0;
+}
+
+.step-mark {
+  width: 22px;
+  height: 22px;
+  margin-top: 1px;
+  border-radius: 50%;
+  border: 1.5px solid var(--line);
+  display: grid;
+  place-items: center;
+  color: transparent;
+}
+
+.step-mark .tick {
+  width: 13px;
+  height: 13px;
+  stroke-width: 2.4;
+}
+
+.step.is-done .step-mark {
+  background: var(--blue);
+  border-color: var(--blue);
+  color: #fff;
+}
+
+.step.is-current .step-mark {
+  border-color: var(--blue);
+  box-shadow: 0 0 0 3px var(--wash);
+}
+
+.step h3 {
+  font-size: 14px;
+  font-weight: 600;
+  margin-bottom: 4px;
+}
+
+.step.is-done h3 {
+  color: var(--soft);
+}
+
+.step p {
+  font-size: 12.5px;
+  color: var(--soft);
+}
+
+.step-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin-top: 10px;
+}
+
+.chosen {
+  font-size: 12px;
+  color: var(--faint);
+}
+
+/* A note that is telling you something is wrong has to read as louder than a hint. */
+.chosen.is-warn {
+  color: var(--red);
+}
+
+.ticks {
+  margin: 8px 0 0 16px;
+  padding: 0;
+  font-size: 12.5px;
+  color: var(--soft);
+}
+
+.ticks li {
+  margin-bottom: 3px;
+}
+
+.field {
+  margin-top: 12px;
+  display: grid;
+  gap: 6px;
+}
+
+.field > label {
+  font-size: 11px;
+  font-weight: 650;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  color: var(--faint);
+}
+
+.field label.inline {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  font-size: 12.5px;
+  font-weight: 400;
+  letter-spacing: 0;
+  text-transform: none;
+  color: var(--soft);
+}
+
+input[type='text'],
+input[type='password'],
+select {
+  width: 100%;
+  padding: 7px 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--card);
+  font: inherit;
+  font-size: 13px;
+  color: var(--ink);
+}
+
+input[type='text']:focus,
+input[type='password']:focus,
+select:focus {
+  outline: 0;
+  border-color: var(--blue);
+  box-shadow: 0 0 0 3px var(--wash);
+}
+
+input[readonly] {
+  background: var(--sunk);
+  color: var(--soft);
+}
+
+.row-inline {
+  display: flex;
+  gap: 8px;
+}
+
+.row-inline input {
+  flex: 1;
+  min-width: 0;
+}
+
+.row-inline .btn {
+  flex: 0 0 auto;
+}
+
+.hint {
+  font-size: 11.5px;
+  color: var(--faint);
+}
+
+.advanced {
+  margin-top: 20px;
+  border: 1px solid var(--line);
+  border-radius: 11px;
+  padding: 0 14px;
+}
+
+.advanced summary {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 12px 0;
+  font-size: 12.5px;
+  font-weight: 600;
+  cursor: pointer;
+  list-style: none;
+}
+
+.advanced summary::-webkit-details-marker {
+  display: none;
+}
+
+.advanced[open] summary {
+  border-bottom: 1px solid var(--line);
+  margin-bottom: 4px;
+}
+
+.sum-chev {
+  transition: transform 0.15s;
+  color: var(--faint);
+}
+
+.advanced[open] .sum-chev {
+  transform: rotate(90deg);
+}
+
+.advanced .field:last-child {
+  padding-bottom: 14px;
+}
+
+/* --------------------------------------------------------------------- nav */
+
+nav {
+  display: flex;
+  gap: 4px;
+  padding: 6px 12px 8px;
+  border-top: 1px solid var(--line);
+}
+
+nav button {
+  flex: 1;
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  padding: 9px 0;
+  border: 0;
+  border-radius: 8px;
+  background: none;
+  color: var(--faint);
+  font: inherit;
+  font-size: 12.5px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+nav button:hover {
+  background: var(--hover);
+  color: var(--ink);
+}
+
+nav button.is-sel {
+  color: var(--blue);
+  background: var(--wash);
+}
+
+.badge {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--red);
+}
+
+/* ------------------------------------------------------------------- toast */
+
+.toast {
+  position: fixed;
+  left: 50%;
+  bottom: 66px;
+  transform: translateX(-50%);
+  background: var(--ink);
+  color: var(--page);
+  font-size: 12.5px;
+  padding: 8px 14px;
+  border-radius: 8px;
+  box-shadow: 0 8px 24px -8px rgb(0 0 0 / 45%);
+  z-index: 10;
+}

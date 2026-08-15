@@ -1,0 +1,244 @@
+import { promises as fs } from 'node:fs';
+import path from 'node:path';
+import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { DEFAULT_EXCLUDES, globToRegExp, search, searchOneFile } from '../src/main/search.js';
+import { makeTempDir, removeTempDir, writeTree } from './helpers.js';
+
+let dir: string;
+
+beforeAll(async () => {
+  dir = await makeTempDir('clf-search-');
+  await writeTree(dir, {
+    'src/index.ts': 'export const answer = 42;\nconsole.log(answer);\n',
+    'src/util.ts': 'export function helper(): void {}\n',
+    'src/deep/nested.ts': 'const NEEDLE = "findme";\n',
+    'src/notes.md': '# Notes\nfindme in markdown\n',
+    'README.md': 'findme at the top level\n',
+    'node_modules/pkg/index.js': 'findme in a dependency\n',
+    'dist/bundle.js': 'findme in a build artifact\n',
+    '.git/config': 'findme in git\n',
+    '.claude-acct2/history/noise.txt': 'findme in a profile cache\n',
+    'CaseTest.txt': 'MixedCase content here\n'
+  });
+  await fs.writeFile(path.join(dir, 'src', 'blob.bin'), Buffer.from('findme\0binary'));
+  await fs.writeFile(
+    path.join(dir, 'src', 'utf16.txt'),
+    Buffer.concat([Buffer.from([0xff, 0xfe]), Buffer.from('alpha\nfindme utf16\n', 'utf16le')])
+  );
+});
+
+afterAll(async () => {
+  await removeTempDir(dir);
+});
+
+function req(overrides: Partial<Parameters<typeof search>[0]> = {}) {
+  return {
+    realDir: dir,
+    virtualDir: '/root',
+    query: '',
+    mode: 'name' as const,
+    exclude: DEFAULT_EXCLUDES,
+    caseSensitive: false,
+    maxResults: 100,
+    ...overrides
+  };
+}
+
+describe('globToRegExp', () => {
+  it('matches * within one path segment only', () => {
+    const re = globToRegExp('*.ts', false);
+    expect(re.test('index.ts')).toBe(true);
+    expect(re.test('src/index.ts')).toBe(false);
+  });
+
+  it('matches **/ across segments, including zero', () => {
+    const re = globToRegExp('**/*.ts', false);
+    expect(re.test('index.ts')).toBe(true);
+    expect(re.test('src/index.ts')).toBe(true);
+    expect(re.test('src/deep/nested.ts')).toBe(true);
+    expect(re.test('src/index.js')).toBe(false);
+  });
+
+  it('matches ? as a single character', () => {
+    const re = globToRegExp('a?c.txt', false);
+    expect(re.test('abc.txt')).toBe(true);
+    expect(re.test('ac.txt')).toBe(false);
+  });
+
+  it('escapes regex metacharacters in the literal parts', () => {
+    const re = globToRegExp('a+b(c).txt', false);
+    expect(re.test('a+b(c).txt')).toBe(true);
+    expect(re.test('aab(c).txt')).toBe(false);
+  });
+
+  it('honours case sensitivity', () => {
+    expect(globToRegExp('*.TS', false).test('index.ts')).toBe(true);
+    expect(globToRegExp('*.TS', true).test('index.ts')).toBe(false);
+  });
+});
+
+describe('name search', () => {
+  it('finds files by substring', async () => {
+    const out = await search(req({ query: 'index' }));
+    expect(out.hits.map((h) => h.path)).toContain('/root/src/index.ts');
+  });
+
+  it('returns virtual paths, never real ones', async () => {
+    const out = await search(req({ query: '.ts' }));
+    for (const hit of out.hits) {
+      expect(hit.path.startsWith('/root/')).toBe(true);
+      expect(hit.path).not.toContain('\\');
+    }
+  });
+
+  it('skips build, dependency and prefix-matched tooling folders by default', async () => {
+    const index = await search(req({ query: 'index' }));
+    const indexPaths = index.hits.map((h) => h.path);
+    expect(indexPaths).not.toContain('/root/node_modules/pkg/index.js');
+    expect(indexPaths).not.toContain('/root/dist/bundle.js');
+
+    const profile = await search(req({ query: 'noise' }));
+    expect(profile.hits.map((h) => h.path)).not.toContain('/root/.claude-acct2/history/noise.txt');
+  });
+
+  it('searches everywhere when the exclude list is empty', async () => {
+    const out = await search(req({ query: 'index', exclude: [] }));
+    expect(out.hits.map((h) => h.path)).toContain('/root/node_modules/pkg/index.js');
+    const profile = await search(req({ query: 'noise', exclude: [] }));
+    expect(profile.hits.map((h) => h.path)).toContain('/root/.claude-acct2/history/noise.txt');
+  });
+
+  it('applies an include glob', async () => {
+    const out = await search(req({ query: '', include: '**/*.md' }));
+    const paths = out.hits.map((h) => h.path).sort();
+    expect(paths).toEqual(['/root/README.md', '/root/src/notes.md']);
+  });
+
+  it('matches a slash-free include glob against the file name', async () => {
+    const out = await search(req({ query: '', include: '*.md' }));
+    expect(out.hits.map((h) => h.path).sort()).toEqual(['/root/README.md', '/root/src/notes.md']);
+  });
+
+  it('is case-insensitive by default and exact when asked', async () => {
+    expect((await search(req({ query: 'casetest' }))).hits).toHaveLength(1);
+    expect((await search(req({ query: 'casetest', caseSensitive: true }))).hits).toHaveLength(0);
+    expect((await search(req({ query: 'CaseTest', caseSensitive: true }))).hits).toHaveLength(1);
+  });
+
+  it('stops at maxResults and says why', async () => {
+    const out = await search(req({ query: '', maxResults: 2 }));
+    expect(out.hits).toHaveLength(2);
+    expect(out.truncated).toBe(true);
+    expect(out.stoppedBecause).toBe('limit');
+  });
+
+  it('reports no truncation when everything fit', async () => {
+    const out = await search(req({ query: 'README' }));
+    expect(out.truncated).toBe(false);
+    expect(out.stoppedBecause).toBeNull();
+  });
+});
+
+describe('single-file search', () => {
+  it('searches the exact file without walking its parent directory', async () => {
+    const real = path.join(dir, 'src', 'index.ts');
+    const out = await searchOneFile(real, '/root/src/index.ts', {
+      query: 'console.log',
+      mode: 'content',
+      caseSensitive: false,
+      maxResults: 10
+    });
+    expect(out.filesScanned).toBe(1);
+    expect(out.hits).toEqual([
+      { path: '/root/src/index.ts', line: 2, text: 'console.log(answer);' }
+    ]);
+  });
+
+  it('also supports filename matching against the exact file', async () => {
+    const out = await searchOneFile(path.join(dir, 'src', 'index.ts'), '/root/src/index.ts', {
+      query: 'index',
+      mode: 'name',
+      caseSensitive: false,
+      maxResults: 10
+    });
+    expect(out.hits.map((hit) => hit.path)).toEqual(['/root/src/index.ts']);
+  });
+
+  it('searches BOM-marked UTF-16 text correctly', async () => {
+    const out = await searchOneFile(path.join(dir, 'src', 'utf16.txt'), '/root/src/utf16.txt', {
+      query: 'findme',
+      mode: 'content',
+      caseSensitive: false,
+      maxResults: 10
+    });
+    expect(out.hits).toEqual([
+      { path: '/root/src/utf16.txt', line: 2, text: 'findme utf16' }
+    ]);
+  });
+});
+
+describe('content search', () => {
+  it('returns the line number and the matching line', async () => {
+    const out = await search(req({ query: 'findme', mode: 'content' }));
+    const hit = out.hits.find((h) => h.path === '/root/README.md');
+    expect(hit?.line).toBe(1);
+    expect(hit?.text).toBe('findme at the top level');
+  });
+
+  it('finds matches on later lines', async () => {
+    const out = await search(req({ query: 'findme', mode: 'content', include: '**/*.md' }));
+    const hit = out.hits.find((h) => h.path === '/root/src/notes.md');
+    expect(hit?.line).toBe(2);
+  });
+
+  it('skips binary files', async () => {
+    const out = await search(req({ query: 'findme', mode: 'content' }));
+    expect(out.hits.map((h) => h.path)).not.toContain('/root/src/blob.bin');
+  });
+
+  it('honours the default exclusions', async () => {
+    const out = await search(req({ query: 'findme', mode: 'content' }));
+    const paths = out.hits.map((h) => h.path);
+    expect(paths).not.toContain('/root/node_modules/pkg/index.js');
+    expect(paths).not.toContain('/root/.git/config');
+  });
+
+  it('caps results', async () => {
+    const out = await search(req({ query: 'e', mode: 'content', maxResults: 3 }));
+    expect(out.hits.length).toBeLessThanOrEqual(3);
+    expect(out.truncated).toBe(true);
+  });
+
+  it('reports how many files it looked at', async () => {
+    const out = await search(req({ query: 'findme', mode: 'content' }));
+    expect(out.filesScanned).toBeGreaterThan(0);
+  });
+});
+
+describe('bounded output', () => {
+  it('truncates a very long matching line', async () => {
+    const long = await makeTempDir('clf-search-long-');
+    try {
+      await writeTree(long, { 'wide.txt': `${'z'.repeat(5000)}needle\n` });
+      const out = await search(
+        req({ realDir: long, query: 'needle', mode: 'content', exclude: [] })
+      );
+      expect(out.hits).toHaveLength(1);
+      expect(out.hits[0]?.text?.length).toBeLessThanOrEqual(301);
+      expect(out.hits[0]?.text?.endsWith('…')).toBe(true);
+    } finally {
+      await removeTempDir(long);
+    }
+  });
+
+  it('survives a large file with no newlines', async () => {
+    const wide = await makeTempDir('clf-search-wide-');
+    try {
+      await fs.writeFile(path.join(wide, 'oneline.txt'), 'a'.repeat(3 * 1024 * 1024));
+      const out = await search(req({ realDir: wide, query: 'zzz', mode: 'content', exclude: [] }));
+      expect(out.hits).toHaveLength(0);
+    } finally {
+      await removeTempDir(wide);
+    }
+  });
+});
