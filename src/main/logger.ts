@@ -4,9 +4,17 @@
  * Nothing here is written to disk. Callers are responsible for not passing secrets;
  * as a backstop, anything that looks like an OpenAI key or a tunnel token is masked
  * before it is stored, so a mistake upstream cannot leak a credential into the UI.
+ * Live agent keys are stripped separately, because they are short enough to slip past
+ * the generic opaque-token rule below.
+ *
+ * A line written while a tool call is running inherits that call's agent, which is what
+ * makes the per-agent Activity filter mean anything. Lines written outside a call —
+ * startup, the tunnel, the servers — stay unattributed, because they genuinely are.
  */
 
 import type { LogEntry } from '../shared/types.js';
+import { scrubAgentSecrets } from './agent-secrets.js';
+import { currentAgent } from './mcp/call-context.js';
 
 const MAX_ENTRIES = 500;
 
@@ -32,7 +40,13 @@ export function redact(message: string): string {
 const ECHO_TO_CONSOLE = process.env['CLF_DEBUG'] === '1';
 
 export function log(level: LogEntry['level'], message: string): void {
-  const entry: LogEntry = { time: Date.now(), level, message: redact(message) };
+  const agent = currentAgent();
+  const entry: LogEntry = {
+    time: Date.now(),
+    level,
+    message: redact(scrubAgentSecrets(message)),
+    ...(agent ? { agent } : {})
+  };
   entries.push(entry);
   if (entries.length > MAX_ENTRIES) entries.shift();
   if (ECHO_TO_CONSOLE) process.stderr.write(`[${level}] ${entry.message}\n`);

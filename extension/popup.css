@@ -1,0 +1,109 @@
+:root {
+  color-scheme: light dark;
+  --line: color-mix(in srgb, currentColor 16%, transparent);
+  --soft: color-mix(in srgb, currentColor 55%, transparent);
+}
+
+body {
+  width: 280px;
+  margin: 0;
+  padding: 14px;
+  font: 13px/1.45 system-ui, -apple-system, 'Segoe UI', sans-serif;
+}
+
+h1 {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  margin: 0 0 10px;
+  font-size: 13px;
+  font-weight: 600;
+}
+
+h1 img {
+  border-radius: 5px;
+}
+
+.row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #9ca3af;
+  flex: none;
+}
+
+.dot.on {
+  background: #17a34a;
+}
+
+.dot.warn {
+  background: #d97706;
+}
+
+.hint,
+.foot {
+  margin: 8px 0 0;
+  color: var(--soft);
+  font-size: 11.5px;
+}
+
+.foot {
+  margin-top: 12px;
+  padding-top: 10px;
+  border-top: 1px solid var(--line);
+}
+
+form {
+  display: flex;
+  gap: 6px;
+  margin-top: 10px;
+}
+
+input {
+  flex: 1;
+  min-width: 0;
+  padding: 6px 8px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  letter-spacing: 3px;
+  text-align: center;
+}
+
+button {
+  padding: 6px 12px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: color-mix(in srgb, currentColor 8%, transparent);
+  color: inherit;
+  font: inherit;
+  cursor: pointer;
+}
+
+button:hover:not(:disabled) {
+  background: color-mix(in srgb, currentColor 14%, transparent);
+}
+
+button:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.ghost {
+  margin-top: 10px;
+  width: 100%;
+}
+
+.err {
+  margin: 8px 0 0;
+  color: #dc2626;
+  font-size: 11.5px;
+}

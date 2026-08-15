@@ -11,6 +11,14 @@
          viewBox or the browser shows the top-left corner of that grid. -->
     <svg class="sprite" aria-hidden="true">
       <defs>
+        <!-- The product mark: the same folder-behind-a-message shape as the app and
+             extension icons (scripts/make-icon.mjs), drawn in stroke for this grid. -->
+        <g id="i-mark">
+          <path d="M3.5 8.5V5.5a1 1 0 0 1 1-1h3.1L9 6.4h6.5" />
+          <path
+            d="M5.5 8.5h13a1 1 0 0 1 1 1v6a1 1 0 0 1-1 1h-8L7 20v-3.5H5.5a1 1 0 0 1-1-1v-6a1 1 0 0 1 1-1Z"
+          />
+        </g>
         <g id="i-bolt"><path d="M13 2 4 14h7l-1 8 9-12h-7l1-8Z" /></g>
         <g id="i-home"><path d="M4 11 12 4l8 7v8a1 1 0 0 1-1 1h-4v-6H9v6H5a1 1 0 0 1-1-1Z" /></g>
         <g id="i-steps"><path d="M8 6h12M8 12h12M8 18h12M4 6h.01M4 12h.01M4 18h.01" /></g>
@@ -45,13 +53,17 @@
           <path d="M12 2.5v2M12 19.5v2M2.5 12h2M19.5 12h2M5.2 5.2l1.4 1.4M17.4 17.4l1.4 1.4M18.8 5.2l-1.4 1.4M6.6 17.4l-1.4 1.4" />
         </g>
         <g id="i-moon"><path d="M20 14.5A8 8 0 0 1 9.5 4a8 8 0 1 0 10.5 10.5Z" /></g>
+        <g id="i-chat">
+          <path d="M4 5.5h16a1 1 0 0 1 1 1v8.5a1 1 0 0 1-1 1h-8.5L7 19.5V16H4a1 1 0 0 1-1-1V6.5a1 1 0 0 1 1-1Z" />
+        </g>
+        <g id="i-search"><circle cx="11" cy="11" r="6" /><path d="M15.4 15.4 20 20" /></g>
       </defs>
     </svg>
 
     <div class="app">
       <!-- ------------------------------------------------------------ header -->
       <header>
-        <span class="mark"><svg class="ico" viewBox="0 0 24 24"><use href="#i-bolt" /></svg></span>
+        <span class="mark"><svg class="ico" viewBox="0 0 24 24"><use href="#i-mark" /></svg></span>
         <span class="title">
           Local Files
           <span id="headerSub">Not set up yet</span>
@@ -344,12 +356,212 @@
           </div>
         </section>
 
+        <!-- ============================================================ Chat -->
+        <section class="panel" data-panel="chat">
+          <!-- --------------------------------------------------- sessions -->
+          <section class="card">
+            <h2>
+              Sessions
+              <span class="acts">
+                <button class="btn" id="chatRefresh" type="button">
+                  <svg class="ico" viewBox="0 0 24 24"><use href="#i-pulse" /></svg>Refresh
+                </button>
+              </span>
+            </h2>
+            <div class="scroll">
+              <div id="sessionList"></div>
+              <p class="empty" id="sessionsEmpty" hidden>
+                Nothing recorded yet. Turn on recording in Settings, pair the Chrome extension,
+                and this fills up as you work in ChatGPT.
+              </p>
+            </div>
+            <p class="foot" id="sessionsFoot"></p>
+          </section>
+
+          <!-- ------------------------------------------------ session body -->
+          <section class="card">
+            <h2>
+              <span id="chatTitle">No session selected</span>
+              <span class="acts">
+                <span class="seg" id="chatView">
+                  <button class="is-sel" data-view="timeline" type="button">Timeline</button>
+                  <button data-view="compact" type="button">Compaction</button>
+                  <button data-view="settings" type="button">Settings</button>
+                </span>
+                <button class="btn" id="cancelCompact" type="button" hidden>
+                  <svg class="ico" viewBox="0 0 24 24"><use href="#i-x" /></svg>Cancel
+                </button>
+                <button class="btn" id="compactBtn" type="button">
+                  <svg class="ico" viewBox="0 0 24 24"><use href="#i-bolt" /></svg>Compact
+                </button>
+                <button class="btn" id="resumeBtn" type="button">
+                  <svg class="ico" viewBox="0 0 24 24"><use href="#i-out" /></svg>Compact &amp; resume
+                </button>
+              </span>
+            </h2>
+
+            <div class="scroll" id="chatBody">
+              <!-- timeline -->
+              <div class="view" data-view="timeline">
+                <!-- Only shown while a multi-agent run has agents in this session. -->
+                <div class="seg" id="agentFilter" hidden></div>
+                <div id="timeline"></div>
+                <p class="empty" id="timelineEmpty">
+                  No events for this session yet. Tool calls are recorded here as they happen;
+                  what ChatGPT shows on screen arrives from the browser extension.
+                </p>
+              </div>
+
+              <!-- compaction -->
+              <div class="view" data-view="compact" hidden>
+                <div class="pane">
+                  <h3>Compaction</h3>
+                  <div id="compactState"></div>
+                  <h3 id="handoffHead" hidden>
+                    Latest handoff
+                    <button class="btn" id="copyHandoff" type="button" hidden>
+                      <svg class="ico" viewBox="0 0 24 24"><use href="#i-copy" /></svg>Copy
+                    </button>
+                  </h3>
+                  <div id="handoffBox"></div>
+                </div>
+              </div>
+
+              <!-- settings -->
+              <div class="view" data-view="settings" hidden>
+                <div class="pane">
+                  <h3>Recording</h3>
+                  <p class="hint">
+                    Off by default. When on, this app writes a full local record of the session —
+                    every message you send, what ChatGPT showed, and the exact tool calls — to
+                    <code>sessions\</code> in its own data folder. Nothing is uploaded. The same
+                    switch starts the loopback bridge the Chrome extension talks to.
+                  </p>
+                  <div class="field">
+                    <label class="inline">
+                      <input type="checkbox" id="sessRecord" /> Record sessions to disk
+                    </label>
+                  </div>
+                  <div class="grid3">
+                    <div class="field">
+                      <label for="sessRetain">Keep for (days, 0 = forever)</label>
+                      <input id="sessRetain" type="number" min="0" max="3650" step="1" />
+                    </div>
+                    <div class="field">
+                      <label for="sessAdvisory">Suggest compaction at</label>
+                      <input id="sessAdvisory" type="number" min="10000" max="2000000" step="10000" />
+                    </div>
+                    <div class="field">
+                      <label for="sessLimit">Urgent at</label>
+                      <input id="sessLimit" type="number" min="10000" max="4000000" step="10000" />
+                    </div>
+                  </div>
+                  <p class="hint">
+                    Both numbers are estimated tokens of the text this app recorded — a local
+                    approximation, not ChatGPT's own context counter, which is not visible from
+                    here.
+                  </p>
+
+                  <h3>Chrome extension</h3>
+                  <p class="hint" id="bridgeState"></p>
+                  <div class="step-actions">
+                    <button class="btn btn-solid" id="bridgePair" type="button">Pair extension</button>
+                    <button class="btn btn-solid" id="bridgeCancel" type="button" hidden>Cancel pairing</button>
+                    <button class="btn" id="bridgeUnpair" type="button">Unpair</button>
+                    <button class="btn" id="bridgeFolder" type="button">
+                      <svg class="ico" viewBox="0 0 24 24"><use href="#i-folder" /></svg>Open extension folder
+                    </button>
+                    <span class="chosen" id="pairCodeBox" hidden>Code <code id="pairCode"></code></span>
+                  </div>
+                  <p class="hint">
+                    Open <code>chrome://extensions</code>, turn Developer mode on, choose
+                    <b>Load unpacked</b> and pick the folder the button above opens. Then open the
+                    extension's popup and type the code. The code is valid once, for three minutes.
+                  </p>
+                  <p class="hint" id="extensionPath"></p>
+
+                  <h3>OpenRouter</h3>
+                  <div class="field">
+                    <label for="orKey">API key</label>
+                    <input id="orKey" type="password" spellcheck="false" placeholder="sk-or-…" autocomplete="off" />
+                    <p class="hint" id="orKeyState"></p>
+                    <div class="step-actions">
+                      <button class="btn" id="orRemove" type="button">Remove stored key</button>
+                    </div>
+                  </div>
+                  <div class="field">
+                    <label for="compactModel">Compaction model</label>
+                    <input id="compactModel" type="text" readonly spellcheck="false" placeholder="resolved on first use" />
+                  </div>
+                  <div class="row-inline">
+                    <input id="modelSearch" type="text" spellcheck="false" placeholder="Search models…" />
+                    <button class="btn btn-solid" id="modelRefresh" type="button">
+                      <svg class="ico" viewBox="0 0 24 24"><use href="#i-search" /></svg>Reload
+                    </button>
+                  </div>
+                  <div id="modelList"></div>
+                  <div class="pager">
+                    <button class="btn" id="modelPrev" type="button">Previous</button>
+                    <span id="modelPage"></span>
+                    <button class="btn" id="modelNext" type="button">Next</button>
+                  </div>
+                  <div class="grid2">
+                    <div class="field">
+                      <label for="compactReasoning">Reasoning effort</label>
+                      <!-- Options are enabled from the chosen model's live catalogue
+                           entry; an effort it does not advertise is never sent. -->
+                      <select id="compactReasoning">
+                        <option value="off">Off</option>
+                        <option value="low">Low</option>
+                        <option value="medium">Medium</option>
+                        <option value="high">High</option>
+                        <option value="xhigh">Extra high</option>
+                      </select>
+                    </div>
+                    <div class="field">
+                      <label class="inline">
+                        <input type="checkbox" id="compactShowReasoning" /> Show the reasoning stream
+                        while it works
+                      </label>
+                    </div>
+                  </div>
+                  <p class="hint" id="reasoningHint"></p>
+
+                  <h3>Multi-agent mode (experimental)</h3>
+                  <p class="hint">
+                    Lets one ChatGPT chat create worker chats and message them through this app.
+                    Off by default: several chats driving the same files at once is a real risk.
+                    Workers can only talk to the prime agent, never to each other.
+                  </p>
+                  <div class="grid2">
+                    <div class="field">
+                      <label class="inline">
+                        <input type="checkbox" id="maEnabled" /> Enable multi-agent tools
+                      </label>
+                    </div>
+                    <div class="field">
+                      <label for="maWorkers">Maximum workers</label>
+                      <input id="maWorkers" type="number" min="1" max="8" step="1" />
+                    </div>
+                  </div>
+                  <div id="swarmList"></div>
+                  <div class="step-actions">
+                    <button class="btn" id="swarmReset" type="button">Clear swarm</button>
+                  </div>
+                </div>
+              </div>
+            </div>
+            <p class="foot" id="chatFoot"></p>
+          </section>
+        </section>
+
         <!-- ======================================================== Activity -->
         <section class="panel" data-panel="activity">
           <section class="card">
             <h2>
               Activity
               <span class="acts">
+                <span class="seg" id="agentFilter" hidden></span>
                 <span class="seg" id="logFilter">
                   <button class="is-sel" data-filter="all" type="button">All</button>
                   <button data-filter="bad" type="button">Problems</button>
@@ -377,6 +589,9 @@
         <button data-tab="setup" type="button">
           <svg class="ico" viewBox="0 0 24 24"><use href="#i-steps" /></svg>Setup
           <span class="badge" id="setupBadge" hidden></span>
+        </button>
+        <button data-tab="chat" type="button">
+          <svg class="ico" viewBox="0 0 24 24"><use href="#i-chat" /></svg>Chat
         </button>
         <button data-tab="activity" type="button">
           <svg class="ico" viewBox="0 0 24 24"><use href="#i-pulse" /></svg>Activity

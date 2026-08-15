@@ -1053,6 +1053,7 @@ main {
 
 input[type='text'],
 input[type='password'],
+input[type='number'],
 select {
   width: 100%;
   padding: 7px 10px;
@@ -1066,6 +1067,7 @@ select {
 
 input[type='text']:focus,
 input[type='password']:focus,
+input[type='number']:focus,
 select:focus {
   outline: 0;
   border-color: var(--blue);
@@ -1134,6 +1136,515 @@ input[readonly] {
 
 .advanced .field:last-child {
   padding-bottom: 14px;
+}
+
+/* -------------------------------------------------------------------- chat
+   Sessions on the left, one session on the right. The right card switches
+   between three views rather than stacking them, because the window cannot
+   grow and a timeline that shares the screen with a settings form reads as
+   neither. */
+
+[data-panel='chat'] {
+  padding: 13px;
+  gap: 13px;
+  grid-template-columns: 288px minmax(0, 1fr);
+  grid-template-rows: minmax(0, 1fr);
+}
+
+[data-panel='chat'] .card {
+  grid-template-rows: auto minmax(0, 1fr) auto;
+}
+
+#chatTitle {
+  text-transform: none;
+  letter-spacing: 0;
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--ink);
+  max-width: 28%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* ------------------------------------------------------- session list */
+
+.sess {
+  position: relative;
+  padding: 9px 12px;
+  cursor: pointer;
+  border-left: 2px solid transparent;
+}
+
+.sess + .sess {
+  border-top: 1px solid var(--line);
+}
+
+.sess:hover {
+  background: var(--hover);
+}
+
+.sess.is-sel {
+  background: var(--wash);
+  border-left-color: var(--blue);
+}
+
+.sess-top {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+}
+
+.sess-top b {
+  flex: 1;
+  min-width: 0;
+  font-size: 13px;
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.sess.is-live .sess-top b::before {
+  content: '';
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  margin-right: 6px;
+  border-radius: 50%;
+  background: var(--blue);
+}
+
+.sess-top em {
+  flex: 0 0 auto;
+  font-style: normal;
+  font-size: 11px;
+  color: var(--faint);
+}
+
+.sess-sub {
+  margin-top: 2px;
+  font-size: 11.5px;
+  color: var(--faint);
+}
+
+/* Estimated tokens against the urgent threshold. Red only past it, because past
+   it is the one case where carrying on is genuinely a mistake. */
+.bar {
+  height: 3px;
+  margin-top: 7px;
+  border-radius: 999px;
+  background: var(--track);
+  overflow: hidden;
+}
+
+.bar i {
+  display: block;
+  height: 100%;
+  background: var(--blue);
+}
+
+.bar.is-huge i {
+  background: var(--red);
+}
+
+.sess-del {
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  padding: 3px 5px;
+  opacity: 0;
+}
+
+.sess:hover .sess-del {
+  opacity: 1;
+}
+
+/* ---------------------------------------------------------- timeline */
+
+#timeline {
+  padding: 6px 0 8px;
+}
+
+.ev {
+  display: grid;
+  grid-template-columns: 62px minmax(0, 1fr);
+  gap: 10px;
+  padding: 3px 14px;
+}
+
+.ev > time {
+  padding-top: 2px;
+  font-family: var(--mono);
+  font-size: 10.5px;
+  color: var(--faint);
+  font-variant-numeric: tabular-nums;
+}
+
+.ev-body {
+  min-width: 0;
+}
+
+.ev-turn_start {
+  margin-top: 6px;
+}
+
+.meta {
+  font-size: 12px;
+  color: var(--faint);
+}
+
+.meta.is-warn {
+  color: var(--soft);
+  font-weight: 600;
+}
+
+.meta.is-bad {
+  color: var(--red);
+}
+
+.meta.is-good {
+  color: var(--green);
+}
+
+.said {
+  padding: 6px 10px;
+  border-radius: 8px;
+  background: var(--sunk);
+}
+
+.said.is-user {
+  background: var(--wash);
+  border: 1px solid var(--blue-line);
+}
+
+.said b {
+  display: block;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+  color: var(--faint);
+}
+
+.msg {
+  font-size: 12.5px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  max-height: 300px;
+  overflow: hidden auto;
+  scrollbar-width: thin;
+}
+
+.cut {
+  color: var(--faint);
+  font-style: italic;
+}
+
+/* One recorded tool call, closed. Expanding shows exactly what crossed the wire. */
+.tool {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+}
+
+.tool > summary {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 9px;
+  font-size: 12.5px;
+  cursor: pointer;
+  list-style: none;
+}
+
+.tool > summary::-webkit-details-marker {
+  display: none;
+}
+
+.tool > summary:hover {
+  background: var(--hover);
+  border-radius: 7px;
+}
+
+.tool summary b {
+  font-weight: 600;
+  flex: 0 1 auto;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.tool summary em {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-style: normal;
+  font-size: 11.5px;
+  color: var(--faint);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.tool-ico {
+  width: 14px;
+  height: 14px;
+  color: var(--faint);
+}
+
+.metric {
+  margin-left: auto;
+  flex: 0 0 auto;
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--soft);
+}
+
+.tool.tone-good .metric {
+  color: var(--green);
+}
+
+.tool.tone-bad {
+  border-color: var(--red-line);
+  background: var(--red-wash);
+}
+
+.tool.tone-bad .metric {
+  color: var(--red);
+}
+
+.raw {
+  border-top: 1px solid var(--line);
+  padding: 8px 9px 10px;
+  display: grid;
+  gap: 4px;
+}
+
+.raw h4 {
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+  color: var(--faint);
+}
+
+.raw-facts {
+  font-family: var(--mono);
+  font-size: 10.5px;
+  color: var(--faint);
+}
+
+.changes {
+  list-style: none;
+  padding: 0;
+  display: grid;
+  gap: 2px;
+  font-size: 11.5px;
+}
+
+.changes li {
+  display: flex;
+  gap: 10px;
+}
+
+.changes code {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.pre {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--soft);
+  background: var(--sunk);
+  border-radius: 6px;
+  padding: 6px 8px;
+  max-height: 260px;
+  overflow: hidden auto;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  scrollbar-width: thin;
+}
+
+.pre.is-quiet {
+  color: var(--faint);
+}
+
+.chip {
+  display: inline-block;
+  margin-right: 6px;
+  padding: 1px 7px;
+  border-radius: 999px;
+  background: var(--sunk);
+  color: var(--faint);
+  font-size: 10px;
+  font-weight: 600;
+}
+
+.chip.is-active {
+  background: var(--wash);
+  color: var(--blue);
+}
+
+.chip.is-finished {
+  background: var(--green-wash);
+  color: var(--green);
+}
+
+.chip.is-failed {
+  background: var(--red-wash);
+  color: var(--red);
+}
+
+/* -------------------------------------------------- compaction + panes */
+
+.pane {
+  padding: 12px 14px 18px;
+  display: grid;
+  gap: 8px;
+  align-content: start;
+}
+
+.pane h3 {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 12px;
+  font-size: 10.5px;
+  font-weight: 700;
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+  color: var(--blue);
+}
+
+.pane h3:first-child {
+  margin-top: 0;
+}
+
+.pane .field {
+  margin-top: 0;
+}
+
+.stages {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+
+.stage {
+  padding: 3px 9px;
+  border-radius: 999px;
+  background: var(--sunk);
+  color: var(--faint);
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.stage.is-done {
+  background: var(--wash);
+  color: var(--blue);
+}
+
+.stage.is-now {
+  background: var(--blue);
+  color: #fff;
+}
+
+/* Which pass of a staged compaction is running. */
+.hint.is-step {
+  color: var(--blue);
+  font-weight: 600;
+}
+
+/* Per-agent timeline filter. Hidden unless a session has more than one attribution. */
+#agentFilter {
+  margin-bottom: 10px;
+}
+
+.errbox {
+  padding: 8px 10px;
+  border: 1px solid var(--red-line);
+  border-radius: 8px;
+  background: var(--red-wash);
+  color: var(--red);
+  font-size: 12px;
+}
+
+.hint.is-warn {
+  color: var(--soft);
+  font-weight: 600;
+}
+
+.foot.is-warn {
+  color: var(--red);
+}
+
+.grid2 {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+  align-items: end;
+}
+
+.grid3 {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 12px;
+}
+
+.model,
+.agent {
+  padding: 6px 9px;
+  border-radius: 8px;
+  border: 1px solid transparent;
+}
+
+.model {
+  cursor: pointer;
+}
+
+.model:hover {
+  background: var(--hover);
+}
+
+.model.is-sel {
+  background: var(--wash);
+  border-color: var(--blue-line);
+}
+
+.agent {
+  border-color: var(--line);
+}
+
+.model-top {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.model-top b {
+  font-size: 12.5px;
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.model-sub {
+  font-family: var(--mono);
+  font-size: 10.5px;
+  color: var(--faint);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.pager {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 11.5px;
+  color: var(--faint);
 }
 
 /* --------------------------------------------------------------------- nav */

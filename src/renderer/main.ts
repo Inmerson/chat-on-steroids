@@ -15,6 +15,9 @@
 import type { AppApi } from '../preload/index.js';
 import type { AppState, Capability, LogEntry } from '../shared/types.js';
 import { CAPABILITY_DETAILS, CAPABILITY_LABELS, WRITE_CAPABILITIES } from '../shared/types.js';
+import type { SwarmState } from '../shared/session.js';
+import { $, ago, el, icon, run, shortAgo, toast } from './dom.js';
+import { chatApply, chatSettingsPatch, chatVisible, initChat } from './chat.js';
 
 declare global {
   interface Window {
@@ -87,28 +90,6 @@ const GROUPS: Group[] = [
   }
 ];
 
-const SVG_NS = 'http://www.w3.org/2000/svg';
-
-/** One icon from the sprite in index.html. */
-function icon(name: string, className = 'ico'): SVGElement {
-  const svg = document.createElementNS(SVG_NS, 'svg');
-  svg.setAttribute('class', className);
-  svg.setAttribute('viewBox', '0 0 24 24');
-  const use = document.createElementNS(SVG_NS, 'use');
-  use.setAttribute('href', `#${name}`);
-  svg.append(use);
-  return svg;
-}
-
-function el(tag: string, className = '', text = ''): HTMLElement {
-  const node = document.createElement(tag);
-  if (className) node.className = className;
-  if (text) node.textContent = text;
-  return node;
-}
-
-const $ = <T extends HTMLElement>(id: string): T => document.getElementById(id) as T;
-
 let state: AppState | null = null;
 /** Guards against saving while we are writing values into the controls. */
 let applying = false;
@@ -116,28 +97,6 @@ let applying = false;
 let openGroup: string | null = null;
 /** Whether the finished setup steps are unfolded again. Reset on every app start. */
 let showAllSteps = false;
-
-// ------------------------------------------------------------------ toast
-
-let toastTimer: number | undefined;
-function toast(message: string): void {
-  document.querySelector('.toast')?.remove();
-  const node = el('div', 'toast', message);
-  document.body.append(node);
-  window.clearTimeout(toastTimer);
-  toastTimer = window.setTimeout(() => node.remove(), 3200);
-}
-
-async function run<T>(
-  promise: Promise<{ ok: true; data: T } | { ok: false; error: string }>
-): Promise<T | null> {
-  const reply = await promise;
-  if (!reply.ok) {
-    toast(reply.error);
-    return null;
-  }
-  return reply.data;
-}
 
 // ------------------------------------------------------------------- tabs
 
@@ -148,6 +107,9 @@ function showTab(name: string): void {
   for (const panel of document.querySelectorAll<HTMLElement>('.panel')) {
     panel.classList.toggle('is-active', panel.dataset.panel === name);
   }
+  // The Chat panel is the only one that costs anything to keep fresh, so it only
+  // reloads while it is on screen.
+  chatVisible(name === 'chat');
 }
 
 $('tabs').addEventListener('click', (event) => {
@@ -295,7 +257,10 @@ async function save(over: { readOnly?: boolean; theme?: 'light' | 'dark' } = {})
         minimizeToTray: $<HTMLInputElement>('minimizeToTray').checked,
         privacyScreenshots: $<HTMLInputElement>('privacyScreenshots').checked,
         theme: over.theme ?? state.config.ui.theme
-      }
+      },
+      // Recording, compaction and multi-agent live in the Chat panel but travel in
+      // the same patch, so one save can never write a half-updated config.
+      ...chatSettingsPatch(state.config)
     })
   );
   if (next) {
@@ -325,26 +290,6 @@ const METHOD_HINT: Record<string, string> = {
     'Creates a temporary public https address with Cloudflare. The address changes on every restart.',
   manual: 'This app only listens on localhost. You are responsible for exposing it.'
 };
-
-/** "12s ago" for a timestamp the main process vouched for, "never" for null. */
-function ago(atMs: number | null): string {
-  if (atMs === null) return 'never';
-  const seconds = Math.max(0, Math.round((Date.now() - atMs) / 1000));
-  if (seconds < 3) return 'just now';
-  if (seconds < 90) return `${seconds}s ago`;
-  const minutes = Math.round(seconds / 60);
-  return minutes < 90 ? `${minutes}m ago` : `${Math.round(minutes / 60)}h ago`;
-}
-
-/** The same age as one glanceable token: "8s", "2m", "—" when there is nothing. */
-function shortAgo(atMs: number | null): string {
-  if (atMs === null) return '—';
-  const seconds = Math.max(0, Math.round((Date.now() - atMs) / 1000));
-  if (seconds < 3) return 'now';
-  if (seconds < 90) return `${seconds}s`;
-  const minutes = Math.round(seconds / 60);
-  return minutes < 90 ? `${minutes}m` : `${Math.round(minutes / 60)}h`;
-}
 
 function duration(seconds: number | null): string {
   if (seconds === null) return '—';
@@ -544,6 +489,8 @@ function apply(next: AppState): void {
     ? `Recent activity only — no file contents, no credentials. Bundled tunnel-client ${next.bundledTunnelVersion}.`
     : 'Recent activity only. File contents and credentials are never recorded.';
 
+  chatApply(next);
+
   applying = false;
 }
 
@@ -661,6 +608,7 @@ function splitMessage(message: string): [string, string] {
 function logRow(entry: LogEntry): HTMLElement {
   const [what, rest] = splitMessage(entry.message);
   const line = el('p', entry.level === 'info' ? '' : 'bad');
+  if (entry.agent) line.dataset.agent = entry.agent;
   const time = document.createElement('time');
   time.textContent = new Date(entry.time).toLocaleTimeString();
   line.append(time, el('span', 'what', what), el('span', 'rest', rest));
@@ -679,7 +627,10 @@ function addLogLine(entry: LogEntry): void {
   for (const id of ['homeFeed', 'fullFeed']) {
     const view = $(id);
     const atBottom = view.scrollTop + view.clientHeight >= view.scrollHeight - 24;
-    view.append(logRow(entry));
+    const row = logRow(entry);
+    // Home always shows everything; only the Activity panel has the agent filter.
+    if (id === 'fullFeed' && agentFilter !== null) row.hidden = entry.agent !== agentFilter;
+    view.append(row);
     while (view.childElementCount > 500) view.firstElementChild?.remove();
     if (atBottom) view.scrollTop = view.scrollHeight;
   }
@@ -693,6 +644,55 @@ $('logFilter').addEventListener('click', (event) => {
   }
   $('fullFeed').classList.toggle('only-bad', button.dataset.filter === 'bad');
 });
+
+/**
+ * Agent filter for the Activity panel.
+ *
+ * Only exists while a swarm is running: with no workers there is nothing to separate,
+ * and the plain single view is the one people already know. null means "All".
+ */
+let agentFilter: string | null = null;
+
+function applyAgentFilter(): void {
+  for (const row of $('fullFeed').querySelectorAll<HTMLElement>('p')) {
+    row.hidden = agentFilter !== null && (row.dataset.agent ?? null) !== agentFilter;
+  }
+}
+
+function paintAgentFilter(swarm: SwarmState): void {
+  const box = $('agentFilter');
+  if (!swarm.running) {
+    box.hidden = true;
+    box.replaceChildren();
+    if (agentFilter !== null) {
+      agentFilter = null;
+      applyAgentFilter();
+    }
+    return;
+  }
+  // Prime first, then workers in creation order — the order the broker reports them.
+  const choices: Array<{ id: string | null; label: string }> = [{ id: null, label: 'All' }];
+  for (const agent of swarm.agents) choices.push({ id: agent.id, label: agent.label || agent.id });
+  if (agentFilter !== null && !swarm.agents.some((agent) => agent.id === agentFilter)) {
+    agentFilter = null;
+  }
+  box.replaceChildren(
+    ...choices.map((choice) => {
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.textContent = choice.label;
+      button.classList.toggle('is-sel', choice.id === agentFilter);
+      button.addEventListener('click', () => {
+        agentFilter = choice.id;
+        paintAgentFilter(swarm);
+        applyAgentFilter();
+      });
+      return button;
+    })
+  );
+  box.hidden = false;
+  applyAgentFilter();
+}
 
 // --------------------------------------------------------------- wiring
 
@@ -822,6 +822,7 @@ document.addEventListener('click', (event) => {
 
 api.onStateChanged(apply);
 api.onLogEntry(addLogLine);
+api.onSwarmChanged(paintAgentFilter);
 
 async function refresh(): Promise<void> {
   const next = await run(api.getState());
@@ -829,6 +830,7 @@ async function refresh(): Promise<void> {
 }
 
 buildGroups();
+initChat({ save: () => save(), state: () => state });
 
 void (async () => {
   await refresh();
@@ -836,4 +838,6 @@ void (async () => {
   if (state && missingStep(state)?.step === 'folder') showTab('setup');
   const entries = await run(api.getLog());
   for (const entry of entries ?? []) addLogLine(entry);
+  const swarm = await run(api.getSwarm());
+  if (swarm) paintAgentFilter(swarm);
 })();

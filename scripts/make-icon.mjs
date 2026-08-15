@@ -1,8 +1,17 @@
 /**
- * Generates build/icon.ico (and a preview PNG) with no image dependencies.
+ * Generates every icon the project ships, with no image dependencies.
  *
- * Kept as a script rather than a committed binary so the icon is reviewable and
- * reproducible: run `node scripts/make-icon.mjs` to regenerate it.
+ *   build/icon.ico            the Windows app icon (6 sizes in one file)
+ *   build/icon-preview.png    256px preview, for looking at what changed
+ *   extension/icons/*.png     16/32/48/128 for the Chrome extension
+ *
+ * Kept as a script rather than committed binaries so the icon is reviewable and
+ * reproducible: run `node scripts/make-icon.mjs` (or `npm run icon`) to regenerate.
+ *
+ * The mark is a folder drawn as a conversation — a two-plane folder with a message
+ * tail — because that is exactly what the app is: local files on one side, a chat on
+ * the other. Below 48px the tail and the plane split stop resolving, so those sizes
+ * drop them and keep the silhouette instead of turning to mush.
  */
 
 import { deflateSync } from 'node:zlib';
@@ -11,16 +20,19 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-const SIZES = [256, 128, 64, 48, 32, 16];
+const ICO_SIZES = [256, 128, 64, 48, 32, 16];
+const EXTENSION_SIZES = [128, 48, 32, 16];
 
-const ACCENT = [16, 163, 127]; // #10a37f, the same accent the UI uses
-const ACCENT_DARK = [13, 138, 107];
-const GLYPH = [255, 255, 255];
+// A deeper, warmer range than the flat UI accent: #10a37f sits between these two, so
+// the tile reads as the same brand at a glance but has somewhere to go across 256px.
+const TOP_LEFT = [22, 190, 150];
+const BOTTOM_RIGHT = [7, 106, 87];
+const WHITE = [255, 255, 255];
 
-// ------------------------------------------------------------------ shapes
+// ------------------------------------------------------------------ geometry
 
-/** Signed coverage test for a rounded rectangle, in unit coordinates. */
-function insideRoundedRect(x, y, x0, y0, x1, y1, r) {
+/** Coverage test for a rounded rectangle, in unit coordinates. */
+function inRoundedRect(x, y, x0, y0, x1, y1, r) {
   if (x < x0 || x > x1 || y < y0 || y > y1) return false;
   const cx = Math.min(Math.max(x, x0 + r), x1 - r);
   const cy = Math.min(Math.max(y, y0 + r), y1 - r);
@@ -29,41 +41,94 @@ function insideRoundedRect(x, y, x0, y0, x1, y1, r) {
   return dx * dx + dy * dy <= r * r;
 }
 
-/** A folder silhouette: a tab merged into a body. */
-function insideFolder(x, y) {
-  const tab = insideRoundedRect(x, y, 0.2, 0.3, 0.48, 0.44, 0.035);
-  const body = insideRoundedRect(x, y, 0.2, 0.37, 0.8, 0.72, 0.055);
-  return tab || body;
+/** Half-plane sign, for the triangle test. */
+function side(px, py, ax, ay, bx, by) {
+  return (px - bx) * (ay - by) - (ax - bx) * (py - by);
 }
 
-/** Renders one square RGBA bitmap with 4x4 supersampling. */
+function inTriangle(x, y, [ax, ay], [bx, by], [cx, cy]) {
+  const d1 = side(x, y, ax, ay, bx, by);
+  const d2 = side(x, y, bx, by, cx, cy);
+  const d3 = side(x, y, cx, cy, ax, ay);
+  const negative = d1 < 0 || d2 < 0 || d3 < 0;
+  const positive = d1 > 0 || d2 > 0 || d3 > 0;
+  return !(negative && positive);
+}
+
+/** The back plate: the tab and the part of the body that shows above the front. */
+function inFolderBack(x, y) {
+  return (
+    inRoundedRect(x, y, 0.205, 0.275, 0.505, 0.40, 0.035) ||
+    inRoundedRect(x, y, 0.205, 0.335, 0.795, 0.70, 0.055)
+  );
+}
+
+/** The front flap, inset so the back plate reads as a separate plane behind it. */
+function inFolderFront(x, y, detailed) {
+  const body = inRoundedRect(x, y, 0.225, detailed ? 0.445 : 0.335, 0.775, 0.705, 0.05);
+  // The message tail. Merged into the flap so the whole glyph is one silhouette.
+  const tail = inTriangle(x, y, [0.285, 0.66], [0.44, 0.66], [0.265, 0.83]);
+  return body || tail;
+}
+
+/**
+ * Renders one square RGBA bitmap.
+ *
+ * Supersampled rather than analytically antialiased: at these sizes the cost is
+ * milliseconds, and it keeps every shape above a plain boolean test.
+ */
 function render(size) {
   const pixels = Buffer.alloc(size * size * 4);
-  const samples = 4;
+  const detailed = size >= 48;
+  // Small icons need more samples, not fewer: one pixel covers far more of the shape.
+  const samples = size >= 128 ? 4 : size >= 32 ? 6 : 8;
+  const total = samples * samples;
+  const shadowDrop = 0.018;
+
   for (let py = 0; py < size; py++) {
     for (let px = 0; px < size; px++) {
-      let bgHits = 0;
-      let glyphHits = 0;
+      let tile = 0;
+      let back = 0;
+      let front = 0;
+      let shadow = 0;
+
       for (let sy = 0; sy < samples; sy++) {
         for (let sx = 0; sx < samples; sx++) {
           const x = (px + (sx + 0.5) / samples) / size;
           const y = (py + (sy + 0.5) / samples) / size;
-          if (insideRoundedRect(x, y, 0.02, 0.02, 0.98, 0.98, 0.22)) bgHits++;
-          if (insideFolder(x, y)) glyphHits++;
+          if (inRoundedRect(x, y, 0.02, 0.02, 0.98, 0.98, 0.235)) tile++;
+          if (inFolderBack(x, y)) back++;
+          if (inFolderFront(x, y, detailed)) front++;
+          if (detailed && (inFolderBack(x, y - shadowDrop) || inFolderFront(x, y - shadowDrop, detailed))) {
+            shadow++;
+          }
         }
       }
-      const total = samples * samples;
-      const bgA = bgHits / total;
-      const glyphA = glyphHits / total;
-      // Vertical gradient keeps the tile from looking flat at large sizes.
-      const t = py / Math.max(1, size - 1);
-      const base = ACCENT.map((c, i) => c + (ACCENT_DARK[i] - c) * t);
-      const rgb = base.map((c, i) => c * (1 - glyphA) + GLYPH[i] * glyphA);
+
+      const tileA = tile / total;
+      const backA = back / total;
+      const frontA = front / total;
+      const shadowA = Math.max(0, shadow / total - Math.max(backA, frontA));
+
+      // Diagonal gradient, so the light has a direction instead of just a top and a
+      // bottom. t runs corner to corner.
+      const t = (px / Math.max(1, size - 1) + py / Math.max(1, size - 1)) / 2;
+      let rgb = TOP_LEFT.map((c, i) => c + (BOTTOM_RIGHT[i] - c) * t);
+
+      // A specular band across the top third keeps the tile from looking like paper.
+      const gloss = Math.max(0, 1 - py / (size * 0.55)) ** 2 * 0.16;
+      rgb = rgb.map((c) => c + (255 - c) * gloss);
+
+      // Shadow first, then the two glyph planes over it, back to front.
+      rgb = rgb.map((c) => c * (1 - shadowA * 0.28));
+      rgb = rgb.map((c, i) => c * (1 - backA * 0.82) + WHITE[i] * backA * 0.82);
+      rgb = rgb.map((c, i) => c * (1 - frontA) + WHITE[i] * frontA);
+
       const offset = (py * size + px) * 4;
-      pixels[offset] = Math.round(rgb[0]);
-      pixels[offset + 1] = Math.round(rgb[1]);
-      pixels[offset + 2] = Math.round(rgb[2]);
-      pixels[offset + 3] = Math.round(bgA * 255);
+      pixels[offset] = Math.round(Math.min(255, Math.max(0, rgb[0])));
+      pixels[offset + 1] = Math.round(Math.min(255, Math.max(0, rgb[1])));
+      pixels[offset + 2] = Math.round(Math.min(255, Math.max(0, rgb[2])));
+      pixels[offset + 3] = Math.round(tileA * 255);
     }
   }
   return pixels;
@@ -143,8 +208,21 @@ function encodeIco(images) {
 
 // ------------------------------------------------------------------- main
 
-const images = SIZES.map((size) => ({ size, png: encodePng(size, render(size)) }));
+const cache = new Map();
+const pngFor = (size) => {
+  if (!cache.has(size)) cache.set(size, encodePng(size, render(size)));
+  return cache.get(size);
+};
+
 mkdirSync(path.join(root, 'build'), { recursive: true });
-writeFileSync(path.join(root, 'build', 'icon.ico'), encodeIco(images));
-writeFileSync(path.join(root, 'build', 'icon-preview.png'), images[0].png);
-console.log(`Wrote build/icon.ico (${SIZES.join(', ')})`);
+const icoImages = ICO_SIZES.map((size) => ({ size, png: pngFor(size) }));
+writeFileSync(path.join(root, 'build', 'icon.ico'), encodeIco(icoImages));
+writeFileSync(path.join(root, 'build', 'icon-preview.png'), pngFor(256));
+console.log(`Wrote build/icon.ico (${ICO_SIZES.join(', ')}) and build/icon-preview.png`);
+
+const iconsDir = path.join(root, 'extension', 'icons');
+mkdirSync(iconsDir, { recursive: true });
+for (const size of EXTENSION_SIZES) {
+  writeFileSync(path.join(iconsDir, `icon${size}.png`), pngFor(size));
+}
+console.log(`Wrote extension/icons/icon{${EXTENSION_SIZES.join(',')}}.png`);

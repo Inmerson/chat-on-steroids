@@ -14,9 +14,26 @@ import {
   DEFAULT_CAPABILITIES,
   WRITE_CAPABILITIES,
   type Capabilities,
-  type Config
+  type CompactionSettings,
+  type Config,
+  type MultiAgentSettings,
+  type SessionSettings
 } from '../shared/types.js';
 import { logError } from './logger.js';
+
+/**
+ * Defaults for the newer sections, in one place so the schema and defaultConfig()
+ * cannot drift apart. Recording, compaction and multi-agent all start switched off or
+ * unconfigured: none of them should begin writing to disk or opening tabs uninvited.
+ */
+const DEFAULT_SESSIONS: SessionSettings = {
+  record: false,
+  retainDays: 30,
+  advisoryTokens: 180_000,
+  limitTokens: 200_000
+};
+const DEFAULT_COMPACTION: CompactionSettings = { model: '', reasoning: 'medium', showReasoning: true };
+const DEFAULT_MULTI_AGENT: MultiAgentSettings = { enabled: false, maxWorkers: 3 };
 
 const rootSchema = z.object({
   name: z
@@ -52,7 +69,40 @@ const configSchema = z.object({
     autoConnect: z.boolean(),
     privacyScreenshots: z.boolean().optional().default(false),
     theme: z.enum(['light', 'dark']).optional().default('light')
-  })
+  }),
+  // Whole sections are optional, so a config written by an older build keeps working
+  // and simply gains the new features switched off. The default object is spelled out
+  // rather than left as {} because zod 4 returns a default as-is instead of parsing it.
+  sessions: z
+    .object({
+      record: z.boolean().optional().default(DEFAULT_SESSIONS.record),
+      retainDays: z.number().int().min(0).max(3650).optional().default(DEFAULT_SESSIONS.retainDays),
+      advisoryTokens: z
+        .number()
+        .int()
+        .min(10_000)
+        .max(2_000_000)
+        .optional()
+        .default(DEFAULT_SESSIONS.advisoryTokens),
+      limitTokens: z.number().int().min(10_000).max(4_000_000).optional().default(DEFAULT_SESSIONS.limitTokens)
+    })
+    .optional()
+    .default({ ...DEFAULT_SESSIONS }),
+  compaction: z
+    .object({
+      model: z.string().max(200).optional().default(DEFAULT_COMPACTION.model),
+      reasoning: z.enum(['off', 'low', 'medium', 'high']).optional().default(DEFAULT_COMPACTION.reasoning),
+      showReasoning: z.boolean().optional().default(DEFAULT_COMPACTION.showReasoning)
+    })
+    .optional()
+    .default({ ...DEFAULT_COMPACTION }),
+  multiAgent: z
+    .object({
+      enabled: z.boolean().optional().default(DEFAULT_MULTI_AGENT.enabled),
+      maxWorkers: z.number().int().min(1).max(8).optional().default(DEFAULT_MULTI_AGENT.maxWorkers)
+    })
+    .optional()
+    .default({ ...DEFAULT_MULTI_AGENT })
 });
 
 export function defaultConfig(): Config {
@@ -61,7 +111,10 @@ export function defaultConfig(): Config {
     capabilities: { ...DEFAULT_CAPABILITIES },
     readOnly: true,
     tunnel: { kind: 'openai', tunnelId: '', binaryPath: '' },
-    ui: { minimizeToTray: true, autoConnect: false, privacyScreenshots: false, theme: 'light' }
+    ui: { minimizeToTray: true, autoConnect: false, privacyScreenshots: false, theme: 'light' },
+    sessions: { ...DEFAULT_SESSIONS },
+    compaction: { ...DEFAULT_COMPACTION },
+    multiAgent: { ...DEFAULT_MULTI_AGENT }
   };
 }
 

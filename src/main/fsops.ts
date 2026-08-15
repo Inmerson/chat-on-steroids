@@ -9,6 +9,7 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { rawCreateReadStream as createReadStream, rawPromises as fs } from './rawfs.js';
 import path from 'node:path';
+import { lineDelta, type LineDelta } from './diffstat.js';
 
 export const DEFAULT_READ_BYTES = 64 * 1024;
 export const MAX_READ_BYTES = 512 * 1024;
@@ -128,14 +129,63 @@ function stripBom(text: string): string {
   return text.charCodeAt(0) === 0xfeff ? text.slice(1) : text;
 }
 
-export async function replaceTextFile(realPath: string, content: string): Promise<number> {
+/** Above this the pre-read that makes a whole-file rewrite countable is skipped. */
+const MAX_DIFF_READ_BYTES = 8 * 1024 * 1024;
+
+/**
+ * Rewrites a text file and reports how many lines that changed.
+ *
+ * The original is read back first purely to make the count real. That costs one read
+ * of a file we are about to overwrite anyway, and it is skipped for very large files,
+ * where the delta falls back to the honest approximation of "all lines replaced".
+ */
+export async function replaceTextFile(
+  realPath: string,
+  content: string
+): Promise<{ bytes: number; delta: LineDelta }> {
   const format = await textFormat(realPath);
+  let original: string | null = null;
+  try {
+    const stat = await fs.stat(realPath);
+    if (stat.size <= MAX_DIFF_READ_BYTES) original = decodeText(await fs.readFile(realPath), format);
+  } catch {
+    // Unreadable or missing: the file is still written, only the count is coarser.
+  }
   const encoded = encodeText(content, format, true);
   await fs.writeFile(realPath, encoded);
-  return encoded.length;
+  return {
+    bytes: encoded.length,
+    delta:
+      original === null
+        ? { added: countTextLines(content), removed: 0, approximate: true }
+        : lineDelta(original, content)
+  };
 }
 
-export async function appendTextFile(realPath: string, content: string): Promise<number> {
+function countTextLines(text: string): number {
+  if (text === '') return 0;
+  const trimmed = text.endsWith('\n') ? text.slice(0, -1) : text;
+  return trimmed.split('\n').length;
+}
+
+/**
+ * Lines in a file, or null when it is binary, too large, or unreadable.
+ *
+ * Streams rather than reads, because the one caller is delete_file: counting what is
+ * about to be removed must not become a reason a delete gets slower on a big file.
+ */
+export async function countFileLines(realPath: string): Promise<number | null> {
+  try {
+    const stat = await fs.stat(realPath);
+    if (!stat.isFile() || stat.size > MAX_DIFF_READ_BYTES) return null;
+    if (await sniffBinary(realPath)) return null;
+    return await countLines(realPath);
+  } catch {
+    return null;
+  }
+}
+
+export async function appendTextFile(realPath: string, content: string): Promise<{ bytes: number; added: number }> {
   let format: TextFormat = { encoding: 'utf-8', bom: false };
   try {
     const stat = await fs.stat(realPath);
@@ -146,7 +196,7 @@ export async function appendTextFile(realPath: string, content: string): Promise
   }
   const encoded = encodeText(content, format, false);
   await fs.appendFile(realPath, encoded);
-  return encoded.length;
+  return { bytes: encoded.length, added: countTextLines(content) };
 }
 
 export type SupportedImageMime = 'image/png' | 'image/jpeg' | 'image/gif' | 'image/webp';
@@ -576,6 +626,7 @@ interface PreparedTextEdit {
   originalBytes: Buffer;
   nextBytes: Buffer;
   replacements: number;
+  delta: LineDelta;
 }
 
 export interface BatchTextEditInput {
@@ -588,6 +639,7 @@ export interface BatchTextEditResult {
   virtualPath: string;
   replacements: number;
   bytes: number;
+  delta: LineDelta;
 }
 
 async function prepareTextEdit(
@@ -634,7 +686,7 @@ async function prepareTextEdit(
 
   if (content === original) throw new FsOpError(`${virtualPath}: edits produced no change`);
   const nextBytes = encodeText(content, format, true);
-  return { realPath, virtualPath, originalBytes, nextBytes, replacements };
+  return { realPath, virtualPath, originalBytes, nextBytes, replacements, delta: lineDelta(original, content) };
 }
 
 /**
@@ -645,10 +697,10 @@ async function prepareTextEdit(
 export async function editTextFile(
   realPath: string,
   edits: readonly EditOp[]
-): Promise<{ replacements: number; bytes: number }> {
+): Promise<{ replacements: number; bytes: number; delta: LineDelta }> {
   const prepared = await prepareTextEdit(realPath, 'file', edits);
   await fs.writeFile(realPath, prepared.nextBytes);
-  return { replacements: prepared.replacements, bytes: prepared.nextBytes.length };
+  return { replacements: prepared.replacements, bytes: prepared.nextBytes.length, delta: prepared.delta };
 }
 
 /**
@@ -763,7 +815,8 @@ export async function editTextFiles(
   return prepared.map((item) => ({
     virtualPath: item.virtualPath,
     replacements: item.replacements,
-    bytes: item.nextBytes.length
+    bytes: item.nextBytes.length,
+    delta: item.delta
   }));
 }
 

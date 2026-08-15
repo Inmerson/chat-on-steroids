@@ -8,6 +8,7 @@ It is only a bridge and a permission manager. It has no chat interface of its ow
 - ChatGPT sees short virtual paths like `/project`, never your real Windows paths.
 - Optionally let it see the screen and drive the mouse and keyboard.
 - Read-only by default. Writing, controlling and running commands are separate opt-ins.
+- Optionally record a long coding session locally, show what each tool call actually did, and [compact it into a handoff](#compaction-and-resuming-a-session) you can resume in a fresh chat.
 - Runs quietly in the tray once it is set up.
 
 ## Requirements
@@ -83,6 +84,8 @@ None of this is left to the model to respect. It is enforced before every operat
 | Control mouse and keyboard | `computer` | Batched actions with optional `captureAfter`; see the warning below |
 | Read clipboard | `read_clipboard` | Text only, capped and separately permissioned |
 | Write clipboard | `write_clipboard` | Replaces clipboard text without synthesizing keystrokes |
+| Continue a session | `resume_session`, `session_history` | Only with [session recording](#session-history-and-the-chrome-extension) on |
+| Coordinate agents | `create_agents`, `join_agent`, `send_agent_message`, `agent_inbox`, `agent_status`, `finish_agent` | Only with [multi-agent mode](#multi-agent-mode-experimental) on |
 
 Output is bounded everywhere. Reads are capped and report which lines you got and where to continue; listings and searches report when they stopped early; searches have a time budget. Ordinary binary files are refused rather than dumped as mojibake, while `view_image` validates supported PNG/JPEG/GIF/WebP structure before returning native MCP image content for vision.
 
@@ -130,14 +133,81 @@ On Windows, managed-process shutdown uses the built-in process-tree termination 
 
 That is still arbitrary code execution. Treat it as such.
 
+## Session history and the Chrome extension
+
+A long coding session in ChatGPT is hard to review: the tool calls collapse into identical `Called tool` rows, progress lines scroll away, and when the conversation finally runs out of room there is nothing to carry into the next one.
+
+Turning on **Chat → Record this session** fixes both halves of that. It is **off by default**, and while it is off nothing about your conversations is written to session history on disk. Multi-agent mode can still start the browser bridge when recording is off, but it does not silently enable session recording.
+
+With it on:
+
+- Every MCP call this app runs is recorded **as it executes** — the real tool name, the real arguments, the real result, timing, and edit metadata such as which files changed and by how many lines. It is not reconstructed from log strings, and it does not depend on reading anything back out of the ChatGPT page.
+- The **Chat** tab lists your recent sessions and shows the current one as a single chronological timeline: your messages, ChatGPT's visible replies, its progress lines, and every tool call in the order they happened.
+- The small in-memory **Activity** log is unchanged. It stays redacted, capped and off-disk; the recorder is a separate, explicitly enabled feature with its own storage.
+
+The optional Chrome extension in [`extension/`](extension/) adds the browser half: what you typed, what ChatGPT said, its live progress, and whether a turn finished, failed, was stopped or was interrupted. It also **relabels ChatGPT's tool-call blocks** with what the call actually did — `Edited src/main/mcp/tools.ts +18 −4`, `Read tools.ts · lines 200–420`, `Searched "registerTool" · 30 matches`, `Ran npm run verify ✓ 4.8s`. The complete recorded arguments/results remain available from the Chat timeline and `session_history`; the relabel itself does not claim to reconstruct data the page did not render.
+
+### Installing the extension
+
+It is not on the Chrome Web Store; load it directly.
+
+1. In the app, turn on **Chat → Record this session**. The local bridge also runs when experimental multi-agent mode is enabled, because workers need the extension even if session recording is off.
+2. Open `chrome://extensions`, turn on **Developer mode**, press **Load unpacked** and pick the `extension` folder.
+3. In the app, press **Pair extension**. It shows a six-digit code, good for three minutes.
+4. Click the extension's toolbar icon and type the code.
+
+The extension only runs on `chatgpt.com` and `chat.openai.com`, and only talks to `127.0.0.1` on the five ports the app may use (8765–8769). One wrong code cancels the pairing — you have to press **Pair extension** again — so the code cannot be guessed at.
+
+### What is written, and where
+
+Sessions live under `%APPDATA%\chatgpt-local-files\sessions\<id>\`:
+
+```
+events.jsonl      one JSON event per line, appended and never rewritten
+meta.json         the summary the Chat tab lists (rewritten atomically)
+assets/<sha256>   large payloads — screenshots, images — stored once by content hash
+handoffs/<id>.json  compaction results
+```
+
+The event log is the source of truth and is **append-only**. Compacting never rewrites or deletes it. A crash mid-write can cost the one event that was being appended; the next open seals the torn line rather than gluing the next event onto the damage.
+
+Recording is *more* revealing than the Activity log, because that is the point — it keeps what a summary would need. Environment-variable values, clipboard contents and live agent credentials are still redacted. Large message/tool fields are bounded inline and, where supported, spilled into local session assets so recovery does not quietly lose the rest. Old sessions are deleted after **30 days** by default (**Chat → Settings**; `0` keeps everything), except that the session behind the newest handoff is always kept so a resume never dangles.
+
+## Compaction and resuming a session
+
+When a session gets long, the Chat tab shows a local **estimate** of its size and starts advising a compaction around 180k tokens, urgently at 200k. That estimate is ours, computed from what we recorded. ChatGPT's own context counter is private, so the app does not pretend to know it, and it does not label every unexplained stop as an output limit — a turn is reported as completed, failed, stopped by you, apparently interrupted, stalled, or simply unknown, according to what was actually observed.
+
+Compaction sends the recorded session to **OpenRouter** and asks for a handoff brief written for a coding agent rather than a reader: the original task and every later correction, exact paths and versions, what is definitely done versus only discussed, files changed, command and test results, unresolved failures, what remains, and what must not be repeated. It leans on tool evidence rather than on the assistant having said it planned to do something. If the essential history itself is larger than one model request, it is staged across several passes instead of silently exceeding the model input budget or dropping user requirements.
+
+To set it up, open **Chat → Settings**, paste an [OpenRouter API key](https://openrouter.ai/keys) and pick a model. The key is stored with DPAPI like every other credential and never reaches the UI process. The model list is fetched live, filtered to text-capable models and paged; the default is DeepSeek's small fast model, matched against the live catalogue rather than pinned to an id that would go stale. Reasoning effort is selectable, and the model's reasoning can be streamed next to the brief while it works.
+
+**Compact** shows each stage as it happens — collecting, preparing, sending, thinking, streaming, saving, ready — with the brief growing live, and reports the real error if one occurs.
+
+**Compact & resume** does the same and then opens a fresh ChatGPT tab with a short instruction telling the model to call `resume_session`. The new chat is opened **only after the handoff is safely on disk**; if compaction fails, nothing navigates and the current conversation is left alone. In the new chat the model calls `resume_session` (paged, if the brief is long) and can call `session_history` to pull a narrow slice of the original recorded events — a specific tool call, a search, a range — when the brief is not enough. The raw history stays available; the brief never replaces it.
+
+## Multi-agent mode (experimental)
+
+**Off by default, and worth leaving off unless you want it.** Several ChatGPT tabs editing the same files at once is a genuine hazard, and this is the least settled part of the app.
+
+When enabled under **Chat → Settings**, the chat you are in becomes the **prime** agent and gains six tools: `create_agents`, `join_agent`, `send_agent_message`, `agent_inbox`, `agent_status` and `finish_agent`. Creating workers asks the extension to open that many fresh ChatGPT tabs, each bootstrapped with an instruction to join as a specific worker and report back.
+
+- The hierarchy is enforced, not merely suggested: **workers talk only to the prime, and the prime talks to individual workers. Worker-to-worker messages are refused.**
+- Messages are delivered by riding along on authenticated tool results, so an agent that is working picks up whatever was said to it without polling. Delivery is at-least-once: an offered message is retired only when that agent makes its next authenticated call, so a dropped connector response causes a repeat rather than silent loss.
+- Routing, pending messages and swarm state survive app restarts. The extension only opens/manages the fresh chats and types their bootstrap instruction; worker ↔ prime messages themselves stay in the MCP broker.
+- Agent identity is capability-based. Each agent gets an unguessable `agent_key`; caller-supplied agent ids are never accepted as proof, and reusable agent credentials are not written into session history, renderer state, Activity or the durable browser-command queue.
+- Authenticated recorded tool calls and Activity rows are attributed to their agent, and the Activity tab gains an All / Prime / per-worker filter. Calls that cannot be proven to belong to an agent stay explicitly unattributed rather than being guessed into the wrong worker. With no swarm running, that view is exactly as it was.
+- Workers are capped (three by default, eight maximum), and the app warns when two agents are working on the same file.
+
 ## Privacy and security
 
 - **Your files stay on your PC.** The app sends nothing anywhere by itself; ChatGPT receives exactly what a tool call returns.
 - **The local server binds to `127.0.0.1` only**, never `0.0.0.0`, on a random port. Nothing on your network can reach it.
 - Requests must carry a **32-byte secret path token**, regenerated on every app start and compared in constant time. The `Host` and `Origin` headers must be loopback, so a web page cannot drive the endpoint, and oversized bodies are rejected.
 - **Credentials are stored with Windows DPAPI** through Electron's `safeStorage`, in a separate file from the settings — never in the JSON config, never in logs, never exposed to the UI process. The API key is passed to the tunnel through the environment, never on a command line.
+- **The extension bridge is a second loopback server with a deliberately tiny surface**, and it runs only while session recording or experimental multi-agent mode needs it. It binds `127.0.0.1`, offers no filesystem, command or configuration route at all, and every route except the identifying `/hello` and the code-gated `/pair` needs a bearer token issued by pairing. Pairing needs a six-digit code you can only get from the app window, and one wrong guess destroys it. It rejects every `http(s)` origin, so no web page — including chatgpt.com itself — can reach it; only an extension can. The token lives in the extension's service worker and is never handed to a content script or the page. Browser commands are narrowly limited to opening a fresh ChatGPT chat and inserting a bootstrap instruction, with leases/retries so a failed tab does not silently consume the command.
 - **Logs stay in memory**, are capped at 500 entries and are never written to disk. File contents and command output are not logged, and anything shaped like a key or token is masked as a backstop. `CLF_DEBUG=1` echoes the same redacted lines to stderr for troubleshooting.
 - The UI runs with context isolation on, Node integration off, the sandbox on and a strict CSP. It has no filesystem or network access of its own and talks to the app through a fixed list of named IPC channels, each validated on arrival. External links are limited to a fixed allowlist of documentation URLs.
+- **Session recording is off until you turn it on**, and only then does anything about a conversation reach the disk. Compaction is the one feature that sends recorded content off this PC — to OpenRouter, only when you press **Compact**, and only from the session you are compacting.
 - Settings live in a small JSON file in `%APPDATA%\chatgpt-local-files\` (Electron's `userData` folder for this package). It is re-validated on load, so a corrupted or hand-edited file cannot widen permissions, and it survives uninstalling and reinstalling the app.
 - The endpoint answers **JSON and nothing else**, including for 404s, so a client performing OAuth discovery against it never has to parse a plain-text body. It serves RFC 9728 protected resource metadata at `/.well-known/oauth-protected-resource<secret-path>` only — never at the bare well-known root, which would disclose the secret path to an unauthenticated caller.
 
@@ -159,6 +229,12 @@ That is still arbitrary code execution. Treat it as such.
 
 **Nothing works and the window is blank.** Run the app from a terminal with `CLF_DEBUG=1` set and check the output, or open the **Activity** tab and press **Copy**.
 
+**The extension says "app not found".** The bridge listens while **Chat → Record this session** or experimental multi-agent mode is on. Turn on the feature you intend to use, then reopen the extension popup.
+
+**The extension is paired but tool blocks are not relabelled.** Relabelling is deliberately all-or-nothing per logical turn: if the number of tool blocks ChatGPT rendered does not match the number of calls recorded for that `data-turn-id`, or a call could not be attributed to a turn with confidence, the original ChatGPT UI is left exactly as it is rather than guessing. The adapter groups split assistant sections that share one turn id, reads assistant prose from the current `.markdown` shape when no assistant `data-message-id` exists, and scans multiple progress/interruption sections. The Chat tab still shows the full timeline. ChatGPT can change this private markup at any time; an unrecognised shape should degrade by leaving the page alone rather than relabelling a guess.
+
+**Compaction fails.** The Chat tab shows the actual error. The usual causes are a missing or rejected OpenRouter key, a model that has been withdrawn (pick another — the list is live), or a session larger than the chosen model's context. Nothing is deleted when it fails, and **Compact & resume** will not open a new chat unless the handoff was saved.
+
 **Settings vanished after reinstalling.** They should not: everything lives in `%APPDATA%\chatgpt-local-files\` and the uninstaller is configured to leave it alone.
 
 ## Development
@@ -174,16 +250,22 @@ The code is deliberately small and direct. Layout:
 
 ```
 src/main/          privileged process: sandbox, filesystem, search, exec, MCP server, tunnel
-src/main/mcp/      MCP server, tool definitions, server instructions
+src/main/mcp/      MCP server, tool definitions, server instructions, per-call context
+src/main/session/  append-only session store, recorder, summaries, compaction
 src/main/tunnel/   connection adapters (OpenAI tunnel, cloudflared, manual)
 src/main/computer/ screenshots and input, and the PowerShell helper they drive
+src/main/bridge.ts loopback server the Chrome extension pairs with
+src/main/agents.ts multi-agent broker: membership, routing, delivery
 src/preload/     the entire renderer-facing API surface
 src/renderer/    the UI — no Node, no filesystem, no network
 src/shared/      types shared across the boundary
+extension/       the Chrome extension (MV3, load unpacked)
 test/            vitest suites
 ```
 
-`src/main/sandbox.ts` is the security core; every filesystem tool goes through it. The tests in `test/sandbox.test.ts` cover traversal, Windows path tricks and a real NTFS junction escape, and `test/mcp.test.ts` drives the actual MCP endpoint over HTTP in both protocol eras.
+`src/main/sandbox.ts` is the security core; every filesystem tool goes through it. The tests in `test/sandbox.test.ts` cover traversal, Windows path tricks and a real NTFS junction escape, and `test/mcp.test.ts` drives the actual MCP endpoint over HTTP in both protocol eras. `test/bridge.test.ts` drives the extension bridge over real HTTP — origins, pairing, tokens, and the routes it must not have — and `test/session.test.ts` and `test/agents.test.ts` cover the store's durability and the agent hierarchy.
+
+The extension has no build step: it is plain ES modules, loaded unpacked. All of its HTTP lives in the service worker, all of its ChatGPT-specific selectors live in `extension/chatgpt-dom.js`, and everything there is written to return nothing rather than throw when ChatGPT's markup moves.
 
 ## Building
 
@@ -192,7 +274,7 @@ npm run dist       # Windows installer in release/
 npm run dist:dir   # unpacked build, no installer
 ```
 
-`npm run dist` regenerates the icon (`scripts/make-icon.mjs`), downloads and checksum-verifies the current `tunnel-client` release into `resources/tunnel` (`scripts/fetch-tunnel-client.mjs`, cached between builds), builds the three bundles with electron-vite, and packages an NSIS installer with electron-builder. `tunnel-client` is Apache-2.0 and ships with its licence.
+`npm run dist` regenerates the icons — `scripts/make-icon.mjs` draws the app `.ico` and the extension PNGs from the same code, so both share one mark. The extension PNGs are kept in `extension/icons/` as part of the directly loadable unpacked extension; the build-time `.ico` remains generated under ignored `build/`. The command also downloads and checksum-verifies the current `tunnel-client` release into `resources/tunnel` (`scripts/fetch-tunnel-client.mjs`, cached between builds), builds the three bundles with electron-vite, and packages an NSIS installer with electron-builder. `tunnel-client` is Apache-2.0 and ships with its licence.
 
 ## Licence
 

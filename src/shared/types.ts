@@ -72,12 +72,53 @@ export interface UiPrefs {
   theme: 'light' | 'dark';
 }
 
+/**
+ * Session recording. Off by default, because unlike the diagnostics log this one
+ * writes what happened to disk and keeps it.
+ *
+ * The same switch starts the local bridge the Chrome extension talks to: recording
+ * without the extension only sees our own tool calls, and the extension has nothing
+ * to report to if nothing is recording.
+ */
+export interface SessionSettings {
+  record: boolean;
+  /** Days of history kept. 0 keeps everything. */
+  retainDays: number;
+  /** Estimated tokens at which the app starts suggesting a compaction. */
+  advisoryTokens: number;
+  /** Estimated tokens at which that suggestion becomes urgent. */
+  limitTokens: number;
+}
+
+export type ReasoningLevel = 'off' | 'low' | 'medium' | 'high';
+
+export interface CompactionSettings {
+  /** OpenRouter model id. Empty means "resolve the default at first use". */
+  model: string;
+  reasoning: ReasoningLevel;
+  /** Show the model's reasoning stream separately while it works. */
+  showReasoning: boolean;
+}
+
+/**
+ * Experimental multi-agent mode. Disabled by default and deliberately hard to turn on
+ * by accident: several ChatGPT tabs driving the same filesystem is a real risk.
+ */
+export interface MultiAgentSettings {
+  enabled: boolean;
+  /** Upper bound on workers the prime agent may create. */
+  maxWorkers: number;
+}
+
 export interface Config {
   roots: Root[];
   capabilities: Capabilities;
   readOnly: boolean;
   tunnel: TunnelSettings;
   ui: UiPrefs;
+  sessions: SessionSettings;
+  compaction: CompactionSettings;
+  multiAgent: MultiAgentSettings;
 }
 
 export type ConnectionState =
@@ -149,6 +190,21 @@ export interface LogEntry {
   time: number;
   level: 'info' | 'warn' | 'error';
   message: string;
+  /** Agent that caused this line, in multi-agent mode only. Absent otherwise. */
+  agent?: string;
+}
+
+/** What the renderer needs to know about the extension bridge, without any secrets. */
+export interface BridgeStatus {
+  running: boolean;
+  port: number | null;
+  /** True once a browser extension has paired with this app. */
+  paired: boolean;
+  /** Epoch ms of the last message from the extension, or null. */
+  lastSeenAt: number | null;
+  /** Pairing code while one is being shown, else null. Short-lived and single-use. */
+  pairingCode: string | null;
+  pairingExpiresAt: number | null;
 }
 
 export interface AppState {
@@ -156,10 +212,13 @@ export interface AppState {
   status: ConnectionStatus;
   /** True when an OpenAI control-plane API key is stored. The key itself never leaves the main process. */
   hasApiKey: boolean;
+  /** True when an OpenRouter key is stored, for compaction. Also never leaves main. */
+  hasOpenRouterKey: boolean;
   /** Resolved path of the tunnel binary we would run, or null if we cannot find one. */
   resolvedBinary: string | null;
   /** Version of the tunnel-client copy shipped inside the app, for diagnostics. */
   bundledTunnelVersion: string | null;
+  bridge: BridgeStatus;
 }
 
 export const DEFAULT_CAPABILITIES: Capabilities = {

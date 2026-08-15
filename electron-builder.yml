@@ -11,13 +11,24 @@ files:
   - out/**
   - package.json
 
-# tunnel-client (Apache-2.0) is fetched at build time by scripts/fetch-tunnel-client.mjs
-# and shipped unpacked, because it has to be executable as a file on disk.
+# Two things ship outside the asar because they must exist as real files on disk:
+#   · tunnel-client (Apache-2.0), fetched at build time by scripts/fetch-tunnel-client.mjs,
+#     because it has to be executable
+#   · the Chrome extension, because chrome://extensions → Load unpacked reads a folder,
+#     and Chrome cannot see inside an asar. Without this the installed app would tell
+#     users to load a folder that is not on their machine.
+# The app opens resources/extension from its own Chrome extension settings, so this
+# path is not merely documentation — extension-path.ts depends on it.
 extraResources:
   - from: resources/tunnel
     to: tunnel
     filter:
       - '**/*'
+  - from: extension
+    to: extension
+    filter:
+      - '**/*'
+      - '!**/*.map'
 
 # No native modules, so there is nothing to rebuild.
 npmRebuild: false

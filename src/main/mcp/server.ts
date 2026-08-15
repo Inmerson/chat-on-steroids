@@ -21,6 +21,7 @@ import { randomBytes, timingSafeEqual } from 'node:crypto';
 import http from 'node:http';
 import { createMcpHandler } from '@modelcontextprotocol/server';
 import { localhostHostValidation, localhostOriginValidation, toNodeHandler } from '@modelcontextprotocol/node';
+import { getConfig } from '../config.js';
 import { logError, logInfo, logWarn } from '../logger.js';
 import { buildServer, resetToolClock, type ToolContext } from './tools.js';
 
@@ -142,6 +143,12 @@ export async function startMcpServer(getContext: () => ToolContext): Promise<Mcp
   // TOOL_DISABLED result while the live capability is off. A fresh app/server start
   // resets the surface to the permissions that are enabled at that point.
   let exposedCaps: ToolContext['caps'] | null = null;
+  // The same rule applies to the two whole features — session recording and
+  // multi-agent mode. They were derived live, so switching either off mid-conversation
+  // deleted resume_session/session_history or the six agent tools from under a cached
+  // snapshot and reproduced exactly the failure the monotonic design exists to avoid.
+  let exposedSessionTools = false;
+  let exposedAgentTools = false;
   const stableContext = (): ToolContext => {
     const live = getContext();
     if (exposedCaps === null) {
@@ -151,7 +158,19 @@ export async function startMcpServer(getContext: () => ToolContext): Promise<Mcp
         if (live.caps[key]) exposedCaps[key] = true;
       }
     }
-    return { ...live, exposedCaps: { ...exposedCaps } };
+    const config = getConfig();
+    const sessionTools = live.sessionTools ?? config.sessions.record;
+    const agentTools = live.agentTools ?? config.multiAgent.enabled;
+    exposedSessionTools = exposedSessionTools || sessionTools;
+    exposedAgentTools = exposedAgentTools || agentTools;
+    return {
+      ...live,
+      sessionTools,
+      agentTools,
+      exposedCaps: { ...exposedCaps },
+      exposedSessionTools,
+      exposedAgentTools
+    };
   };
 
   const handler = createMcpHandler(() => buildServer(stableContext()));

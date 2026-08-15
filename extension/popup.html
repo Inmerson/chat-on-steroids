@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>ChatGPT Local Files</title>
+    <link rel="stylesheet" href="popup.css" />
+  </head>
+  <body>
+    <h1><img src="icons/icon48.png" alt="" width="20" height="20" />ChatGPT Local Files</h1>
+
+    <div class="row">
+      <span class="dot" id="dot"></span>
+      <span id="state">Looking for the app…</span>
+    </div>
+
+    <p class="hint" id="hint">
+      The desktop app has to be running. Open it, go to <b>Chat → Settings</b> and press
+      <b>Pair extension</b> to get a code.
+    </p>
+
+    <form id="pairForm" hidden>
+      <input
+        id="code"
+        inputmode="numeric"
+        autocomplete="off"
+        maxlength="6"
+        placeholder="000000"
+        aria-label="Six digit pairing code"
+      />
+      <button type="submit" id="pairBtn">Pair</button>
+    </form>
+
+    <button id="unpairBtn" class="ghost" hidden>Unpair</button>
+
+    <p class="err" id="err" hidden></p>
+
+    <p class="foot">
+      Observations from chatgpt.com are sent to the app on 127.0.0.1 only. Nothing leaves
+      this machine.
+    </p>
+
+    <script src="popup.js"></script>
+  </body>
+</html>

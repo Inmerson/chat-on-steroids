@@ -25,6 +25,7 @@ import {
   MAX_READ_BYTES,
   appendTextFile,
   assertWritableSize,
+  countFileLines,
   decodeBase64Data,
   editTextFile,
   editTextFiles,
@@ -75,6 +76,36 @@ import {
   type Action
 } from '../computer/index.js';
 import { serverInstructions } from './instructions.js';
+import { getConfig } from '../config.js';
+import {
+  AgentError,
+  acknowledgeOffers,
+  agentForCaller,
+  createAgents,
+  finishAgent,
+  identify,
+  joinAgent,
+  offerMessages,
+  sendMessage,
+  swarmState
+} from '../agents.js';
+import {
+  currentCaller,
+  emptyEvidence,
+  noteChange,
+  noteChanges,
+  noteCount,
+  noteDetail,
+  noteExec,
+  noteOutcome,
+  runInCallContext,
+  type CallContext
+} from './call-context.js';
+import { recordAgentMessage, recordToolCall } from '../session/recorder.js';
+import { formatDelta } from '../diffstat.js';
+import { APP_VERSION } from '../version.js';
+import { findHandoff, latestHandoff, readEvents, readOverflowText } from '../session/store.js';
+import type { SessionEvent, StoredText } from '../../shared/session.js';
 
 export interface ToolContext {
   roots: Root[];
@@ -90,6 +121,18 @@ export interface ToolContext {
   readOnly: boolean;
   /** When on, an unspecified screenshot captures only the foreground window. */
   privacyScreenshots?: boolean;
+  /** Whether session recording is live right now. Defaults to the live setting. */
+  sessionTools?: boolean;
+  /** Whether multi-agent mode is live right now. Defaults to the live setting. */
+  agentTools?: boolean;
+  /**
+   * Whether these feature tools must stay registered for the lifetime of the endpoint,
+   * for the same reason as `exposedCaps`: ChatGPT caches a tools/list snapshot, and a
+   * tool that disappears from under a cached snapshot surfaces as a transport-level
+   * failure rather than a tidy error. Default to the live values.
+   */
+  exposedSessionTools?: boolean;
+  exposedAgentTools?: boolean;
 }
 
 type ToolContent =
@@ -100,6 +143,12 @@ type ToolResult = { content: ToolContent[]; isError?: boolean };
 
 const ok = (text: string): ToolResult => ({ content: [{ type: 'text', text }] });
 const fail = (text: string): ToolResult => ({ content: [{ type: 'text', text }], isError: true });
+
+/** Lines in a string, for the "+214" on a newly created file. */
+function countTextLines(text: string): number {
+  if (text === '') return 0;
+  return (text.endsWith('\n') ? text.slice(0, -1) : text).split(/\r\n|\n|\r/).length;
+}
 
 /** Maps runtime errors to short model-facing text without ever exposing real paths. */
 function friendlyError(err: unknown): string {
@@ -130,6 +179,7 @@ export function lastToolCallAt(): number | null {
 /** Cleared with the server, so the answer is always about the current session. */
 export function resetToolClock(): void {
   toolCallSeenAt = null;
+  transportIdentity = { checked: false, present: false };
 }
 
 /**
@@ -152,21 +202,155 @@ async function guard(name: string, fn: () => Promise<ToolResult>): Promise<ToolR
         ?.slice(0, 500);
       // A rejected edit, disabled permission, stale cursor, etc. is a normal tool
       // outcome, not evidence that the connector itself is unhealthy.
+      noteOutcome('rejected');
       logInfo(`tool ${name} rejected in ${elapsed} ms${summary ? `: ${summary}` : ''}`);
     } else {
+      noteOutcome('ok');
       logInfo(`tool ${name} ok in ${elapsed} ms`);
     }
     return result;
   } catch (err) {
     const message = friendlyError(err);
     const elapsed = Date.now() - started;
-    if (err instanceof SandboxError || err instanceof ComputerError || err instanceof FsOpError || err instanceof ExecError || err instanceof ProcessError) {
+    if (err instanceof SandboxError || err instanceof ComputerError || err instanceof FsOpError || err instanceof ExecError || err instanceof ProcessError || err instanceof AgentError) {
+      noteOutcome('rejected');
       logInfo(`tool ${name} rejected in ${elapsed} ms: ${message}`);
     } else {
+      noteOutcome('error');
       logWarn(`tool ${name} failed in ${elapsed} ms: ${message}`);
     }
     return fail(message);
   }
+}
+
+/**
+ * The one field every tool gains while multi-agent mode is exposed.
+ *
+ * There is no way to tell two ChatGPT conversations apart from inside an ordinary tool
+ * call: the connector transport is stateless and supplies no session id (measured, not
+ * assumed — see transportIdentityStatus below), and the HTTP request is identical
+ * whichever chat produced it. Without something the caller carries, a worker's file
+ * edits cannot be attributed and messages cannot be handed back on ordinary results.
+ *
+ * So each agent gets an unguessable key when it joins and passes it here. It is added
+ * centrally rather than to thirty handlers, validated centrally in dispatch, and never
+ * written to disk. An agent that omits it is not guessed at: its calls are recorded as
+ * unattributed and its messages wait for an explicit agent_inbox.
+ */
+const agentKeyArg = z
+  .string()
+  .min(8)
+  .max(200)
+  .optional()
+  .describe(
+    'Multi-agent mode only. The agent key you were given by join_agent, or when you created the workers. ' +
+      'Pass it on every call so this app knows which agent is acting and can deliver messages waiting for you. ' +
+      'Leave it out if this conversation is not part of an agent run.'
+  );
+
+function agentKeyOf(args: unknown): string | null {
+  if (!args || typeof args !== 'object') return null;
+  const value = (args as Record<string, unknown>)['agent_key'];
+  return typeof value === 'string' && value.length > 0 ? value : null;
+}
+
+/**
+ * Whether the MCP transport ever gave us a session id, once a real call has arrived.
+ *
+ * Recorded rather than assumed, because the entire identity design hangs on it: if a
+ * future ChatGPT connector does supply a stable session, binding to it is strictly
+ * better than a key the model has to remember to pass. This is what the Activity log
+ * reports on the first tool call of each run.
+ */
+let transportIdentity: { checked: boolean; present: boolean } = { checked: false, present: false };
+
+export function transportIdentityStatus(): { checked: boolean; present: boolean } {
+  return { ...transportIdentity };
+}
+
+function noteTransportIdentity(transportKey: string | null): void {
+  if (transportIdentity.checked) return;
+  transportIdentity = { checked: true, present: transportKey !== null };
+  logInfo(
+    transportKey
+      ? 'MCP transport supplied a session id — agent identity can be bound to the transport'
+      : 'MCP transport supplied no session id (stateless connector) — agent identity relies on per-agent keys'
+  );
+}
+
+/**
+ * Appends the messages waiting for this agent to the tool result.
+ *
+ * This is the push-like delivery: an agent that passes its key gets whatever has been
+ * said to it since its last call, at the end of every result, with no polling loop. It
+ * only works for a caller that identified itself — which is exactly why the key exists
+ * — and the tool descriptions say so rather than promising delivery that cannot happen.
+ *
+ * Messages are *offered* here, not retired. They are retired when this agent calls
+ * again, because that is the first real evidence this result reached ChatGPT.
+ */
+function withInbox(agent: string | null, result: ToolResult): ToolResult {
+  if (!agent) return result;
+  const messages = offerMessages(agent);
+  if (messages.length === 0) return result;
+  const lines = messages
+    .map(
+      (message) =>
+        `• [${message.id}] from ${message.from}${message.offers > 1 ? ' (repeat — you may have seen this)' : ''}: ${message.text}`
+    )
+    .join('\n');
+  return {
+    ...result,
+    content: [
+      ...result.content,
+      { type: 'text', text: `\n--- ${messages.length} message(s) for ${agent} ---\n${lines}` }
+    ]
+  };
+}
+
+/**
+ * Runs one tool call inside a recording context.
+ *
+ * Registration is wrapped rather than each of the thirty handlers, so the arguments
+ * and the result recorded are exactly the ones that crossed the wire — the recorder
+ * never has to reconstruct a call from a log line — and so identity is resolved in one
+ * place instead of thirty.
+ */
+async function dispatch(
+  name: string,
+  args: unknown,
+  transportKey: string | null,
+  run: () => Promise<ToolResult>
+): Promise<ToolResult> {
+  noteTransportIdentity(transportKey);
+  const caller = { transportKey, secret: agentKeyOf(args) };
+  const agent = agentForCaller(caller);
+  // This call is the proof that the previous result reached the agent's conversation,
+  // so anything offered then can finally be retired and written to its history.
+  if (agent) {
+    for (const message of acknowledgeOffers(agent)) await recordAgentMessage(message, 'delivered');
+  }
+  const context: CallContext = {
+    transportKey,
+    agent,
+    caller,
+    outcome: null,
+    evidence: emptyEvidence()
+  };
+  const startedAt = Date.now();
+  const result = await runInCallContext(context, run);
+  const durationMs = context.evidence.durationMs ?? Date.now() - startedAt;
+  await recordToolCall({
+    tool: name,
+    args,
+    content: result.content,
+    outcome: context.outcome ?? (result.isError ? 'rejected' : 'ok'),
+    durationMs,
+    startedAt,
+    evidence: context.evidence,
+    agent: context.agent
+  });
+  return withInbox(context.agent, result);
 }
 
 /** The working directory a command tool may use, restricted to an approved root. */
@@ -255,12 +439,66 @@ const computerActionArg = z.discriminatedUnion('type', [
 
 export function buildServer(ctx: ToolContext): McpServer {
   const server = new McpServer(
-    { name: 'chatgpt-local-files', version: '1.4.1' },
+    { name: 'chatgpt-local-files', version: APP_VERSION },
     { capabilities: { tools: {} }, instructions: serverInstructions(ctx) }
   );
 
   const caps = ctx.caps;
   const exposedCaps = ctx.exposedCaps ?? caps;
+  // These two do not follow a capability checkbox: they are whole features the user
+  // switches on in the app, and neither touches the filesystem. Like the capability
+  // tools they are exposed monotonically and disabled at the handler, so switching a
+  // feature off does not delete a tool a cached ChatGPT snapshot still believes in.
+  const sessionToolsLive = ctx.sessionTools ?? getConfig().sessions.record;
+  const agentToolsLive = ctx.agentTools ?? getConfig().multiAgent.enabled;
+  const sessionToolsExposed = ctx.exposedSessionTools ?? sessionToolsLive;
+  const agentToolsExposed = ctx.exposedAgentTools ?? agentToolsLive;
+
+  /**
+   * Adds the central agent capability field while multi-agent mode is exposed.
+   *
+   * Guarded on ZodObject because that is what every tool here uses; anything else is
+   * left untouched rather than being coerced into a shape it was not written for.
+   */
+  const withAgentKey = <Schema extends z.ZodType>(schema: Schema): z.ZodType => {
+    if (!agentToolsExposed) return schema;
+    if (schema instanceof z.ZodObject) return schema.extend({ agent_key: agentKeyArg });
+    return schema;
+  };
+
+  /**
+   * Registers a tool. Identical to server.registerTool, except that the call runs
+   * inside the recorder's context so arguments, result and evidence are captured once
+   * in one place instead of thirty times at the call sites, and the caller's identity
+   * is resolved once from the transport and the agent key.
+   */
+  const register = <Schema extends z.ZodType>(
+    name: string,
+    config: {
+      title: string;
+      description: string;
+      inputSchema: Schema;
+      annotations: {
+        readOnlyHint: boolean;
+        destructiveHint: boolean;
+        idempotentHint: boolean;
+        openWorldHint: boolean;
+      };
+    },
+    handler: (args: z.output<Schema>) => Promise<ToolResult>
+  ): void => {
+    const registered = { ...config, inputSchema: withAgentKey(config.inputSchema) };
+    server.registerTool(name, registered, ((args: z.output<Schema>, mcpCtx?: { sessionId?: string }) =>
+      dispatch(name, args, mcpCtx?.sessionId ?? null, () => handler(args))) as never);
+  };
+
+  /** Refusal used when a whole feature is off but its tools are still exposed. */
+  const featureDisabled = (feature: string, setting: string): ToolResult =>
+    fail(
+      `FEATURE_DISABLED: ${feature} is switched off in ChatGPT Local Files. ` +
+        `Ask the user to enable "${setting}" in the app, then try again.`
+    );
+
   const guarded = (cap: keyof Capabilities, name: string, fn: () => Promise<ToolResult>): Promise<ToolResult> =>
     guard(name, async () => {
       if (!caps[cap]) {
@@ -274,7 +512,7 @@ export function buildServer(ctx: ToolContext): McpServer {
 
   // ---------------------------------------------------------------- roots
 
-  server.registerTool(
+  register(
     'list_roots',
     {
       title: 'List approved folders',
@@ -303,7 +541,7 @@ export function buildServer(ctx: ToolContext): McpServer {
   // ---------------------------------------------------------------- browse
 
   if (exposedCaps.browse) {
-    server.registerTool(
+    register(
       'list_directory',
       {
         title: 'List a folder',
@@ -339,6 +577,7 @@ export function buildServer(ctx: ToolContext): McpServer {
             exclude: exclude ?? DEFAULT_EXCLUDES
           });
           logInfo(`tool list_directory ${resolved.virtual}`);
+          noteCount(entries.length);
           if (entries.length === 0) return ok(`${resolved.virtual} is empty`);
           const prefixLength = resolved.virtual.length + 1;
           const body = entries
@@ -358,7 +597,7 @@ export function buildServer(ctx: ToolContext): McpServer {
   // ---------------------------------------------------------------- search
 
   if (exposedCaps.search) {
-    server.registerTool(
+    register(
       'search_files',
       {
         title: 'Search files',
@@ -405,6 +644,7 @@ export function buildServer(ctx: ToolContext): McpServer {
                 hit.line === undefined ? hit.path : `${hit.path}:${hit.line}: ${hit.text}`
               );
               const meta = `files_scanned: ${outcome.filesScanned}\nelapsed_ms: ${outcome.elapsedMs}\nresults_returned: ${hits.length}`;
+              noteCount(hits.length);
               return ok(hits.length === 0 ? `No matches\n\n${meta}` : `${hits.length} matches\n${hits.join('\n')}\n\n${meta}`);
             }
             if (!stat.isDirectory()) return fail(`${resolved.virtual} is not a regular file or folder`);
@@ -443,6 +683,7 @@ export function buildServer(ctx: ToolContext): McpServer {
             }
           }
           logInfo(`tool search_files mode=${mode ?? 'name'} query="${query.slice(0, 60)}"`);
+          noteCount(hits.length);
           const stats = `${scanned} files scanned, ${elapsedMs} ms`;
           const reason = stopReasons.size > 0 ? [...stopReasons].join(',') : null;
           if (hits.length === 0) {
@@ -462,7 +703,7 @@ export function buildServer(ctx: ToolContext): McpServer {
   // ---------------------------------------------------------------- read
 
   if (exposedCaps.read) {
-    server.registerTool(
+    register(
       'read_file',
       {
         title: 'Read a file',
@@ -487,6 +728,7 @@ export function buildServer(ctx: ToolContext): McpServer {
           const resolved = await resolvePath(ctx.roots, p);
           const result = await readTextFile(resolved.real, { startLine, endLine, maxBytes });
           logInfo(`tool read_file ${resolved.virtual}`);
+          if (result.lastLine >= result.firstLine) noteDetail(`lines ${result.firstLine}–${result.lastLine}`);
           // The total is only known when the file was read to the end; rather than
           // print "of ?", the note below tells the model where to resume instead.
           const range =
@@ -506,7 +748,7 @@ export function buildServer(ctx: ToolContext): McpServer {
         })
     );
 
-    server.registerTool(
+    register(
       'read_files',
       {
         title: 'Read several files',
@@ -569,11 +811,12 @@ export function buildServer(ctx: ToolContext): McpServer {
             }
           }
           logInfo(`tool read_files (${files.length} requested, ${failures} failed)`);
+          noteCount(files.length);
           return ok(sections.join('\n\n'));
         })
     );
 
-    server.registerTool(
+    register(
       'view_image',
       {
         title: 'View a local image',
@@ -600,7 +843,7 @@ export function buildServer(ctx: ToolContext): McpServer {
   // ---------------------------------------------------------------- metadata
 
   if (exposedCaps.metadata) {
-    server.registerTool(
+    register(
       'file_info',
       {
         title: 'File metadata',
@@ -641,7 +884,7 @@ export function buildServer(ctx: ToolContext): McpServer {
   // ---------------------------------------------------------------- create
 
   if (exposedCaps.create) {
-    server.registerTool(
+    register(
       'create_file',
       {
         title: 'Create a file',
@@ -658,11 +901,12 @@ export function buildServer(ctx: ToolContext): McpServer {
           const resolved = await resolvePath(ctx.roots, p, { allowMissing: true });
           await fs.writeFile(resolved.real, content, { encoding: 'utf8', flag: 'wx' });
           logInfo(`tool create_file ${resolved.virtual}`);
+          noteChange({ path: resolved.virtual, added: countTextLines(content), removed: 0, approximate: false });
           return ok(`Created ${resolved.virtual} (${formatBytes(Buffer.byteLength(content, 'utf8'))})`);
         })
     );
 
-    server.registerTool(
+    register(
       'create_directory',
       {
         title: 'Create a folder',
@@ -683,7 +927,7 @@ export function buildServer(ctx: ToolContext): McpServer {
   // ---------------------------------------------------------------- edit
 
   if (exposedCaps.edit) {
-    server.registerTool(
+    register(
       'edit_file',
       {
         title: 'Edit a file',
@@ -709,14 +953,15 @@ export function buildServer(ctx: ToolContext): McpServer {
         guarded('edit', 'edit_file', async () => {
           const resolved = await resolvePath(ctx.roots, p);
           const result = await editTextFile(resolved.real, edits);
+          noteChange({ path: resolved.virtual, ...result.delta });
           logInfo(`tool edit_file ${resolved.virtual} (${result.replacements} replacements)`);
           return ok(
-            `Edited ${resolved.virtual} — ${result.replacements} replacement(s), now ${formatBytes(result.bytes)}`
+            `Edited ${resolved.virtual} — ${result.replacements} replacement(s), ${formatDelta(result.delta) ?? 'no line change'}, now ${formatBytes(result.bytes)}`
           );
         })
     );
 
-    server.registerTool(
+    register(
       'edit_files',
       {
         title: 'Edit several files',
@@ -754,20 +999,21 @@ export function buildServer(ctx: ToolContext): McpServer {
           }
           const results = await editTextFiles(resolvedFiles);
           const replacements = results.reduce((sum, result) => sum + result.replacements, 0);
+          noteChanges(results.map((result) => ({ path: result.virtualPath, ...result.delta })));
           logInfo(`tool edit_files (${results.length} files, ${replacements} replacements)`);
           return ok(
             `Edited ${results.length} file(s), ${replacements} replacement(s) total\n` +
               results
                 .map(
                   (result) =>
-                    `${result.virtualPath} — ${result.replacements} replacement(s), now ${formatBytes(result.bytes)}`
+                    `${result.virtualPath} — ${result.replacements} replacement(s), ${formatDelta(result.delta) ?? 'no line change'}, now ${formatBytes(result.bytes)}`
                 )
                 .join('\n')
           );
         })
     );
 
-    server.registerTool(
+    register(
       'write_file',
       {
         title: 'Overwrite a file',
@@ -785,13 +1031,16 @@ export function buildServer(ctx: ToolContext): McpServer {
           const resolved = await resolvePath(ctx.roots, p);
           const stat = await fs.stat(resolved.real);
           if (!stat.isFile()) return fail(`${resolved.virtual} is not a file`);
-          const bytes = await replaceTextFile(resolved.real, content);
+          const result = await replaceTextFile(resolved.real, content);
+          noteChange({ path: resolved.virtual, ...result.delta });
           logInfo(`tool write_file ${resolved.virtual}`);
-          return ok(`Wrote ${resolved.virtual} (${formatBytes(bytes)})`);
+          return ok(
+            `Wrote ${resolved.virtual} (${formatBytes(result.bytes)}${formatDelta(result.delta) ? `, ${formatDelta(result.delta)}` : ''})`
+          );
         })
     );
 
-    server.registerTool(
+    register(
       'append_file',
       {
         title: 'Append to a file',
@@ -806,9 +1055,10 @@ export function buildServer(ctx: ToolContext): McpServer {
         guarded('edit', 'append_file', async () => {
           assertWritableSize(content);
           const resolved = await resolvePath(ctx.roots, p, { allowMissing: true });
-          const bytes = await appendTextFile(resolved.real, content);
+          const result = await appendTextFile(resolved.real, content);
+          noteChange({ path: resolved.virtual, added: result.added, removed: 0, approximate: false });
           logInfo(`tool append_file ${resolved.virtual}`);
-          return ok(`Appended ${formatBytes(bytes)} to ${resolved.virtual}`);
+          return ok(`Appended ${formatBytes(result.bytes)} to ${resolved.virtual}`);
         })
     );
   }
@@ -816,7 +1066,7 @@ export function buildServer(ctx: ToolContext): McpServer {
   // ------------------------------------------------------------- binary write
 
   if (exposedCaps.create || exposedCaps.edit) {
-    server.registerTool(
+    register(
       'write_binary_file',
       {
         title: 'Write a binary file',
@@ -865,7 +1115,7 @@ export function buildServer(ctx: ToolContext): McpServer {
   // ---------------------------------------------------------------- move
 
   if (exposedCaps.move) {
-    server.registerTool(
+    register(
       'move_path',
       {
         title: 'Move or rename',
@@ -890,6 +1140,7 @@ export function buildServer(ctx: ToolContext): McpServer {
           }
           await fs.rename(src.real, dest.real);
           logInfo(`tool move_path ${src.virtual} -> ${dest.virtual}`);
+          noteDetail(`${src.virtual} → ${dest.virtual}`);
           return ok(`Moved ${src.virtual} to ${dest.virtual}`);
         })
     );
@@ -898,7 +1149,7 @@ export function buildServer(ctx: ToolContext): McpServer {
   // ---------------------------------------------------------------- delete
 
   if (exposedCaps.deleteFile) {
-    server.registerTool(
+    register(
       'delete_file',
       {
         title: 'Delete a file',
@@ -911,15 +1162,18 @@ export function buildServer(ctx: ToolContext): McpServer {
           const resolved = await resolvePath(ctx.roots, p);
           const stat = await fs.lstat(resolved.real);
           if (stat.isDirectory()) return fail('That is a folder. Use delete_directory.');
+          // Counted before the file stops existing; this is the only chance to know.
+          const lines = await countFileLines(resolved.real);
           await fs.unlink(resolved.real);
           logInfo(`tool delete_file ${resolved.virtual}`);
+          noteChange({ path: resolved.virtual, added: 0, removed: lines ?? 0, approximate: lines === null });
           return ok(`Deleted ${resolved.virtual}`);
         })
     );
   }
 
   if (exposedCaps.deleteFolder) {
-    server.registerTool(
+    register(
       'delete_directory',
       {
         title: 'Delete a folder',
@@ -954,7 +1208,7 @@ export function buildServer(ctx: ToolContext): McpServer {
   // ---------------------------------------------------------------- commands
 
   if (exposedCaps.powershell) {
-    server.registerTool(
+    register(
       'run_powershell',
       {
         title: 'Run PowerShell',
@@ -978,13 +1232,14 @@ export function buildServer(ctx: ToolContext): McpServer {
           const dir = await resolveCwd(ctx, cwd);
           logInfo(`tool run_powershell (${script.length} chars)`);
           const result = await runPowerShell(script, dir, normaliseTimeout(timeoutMs));
+          noteExec(result);
           return result.timedOut ? fail(formatExec(result)) : ok(formatExec(result));
         })
     );
   }
 
   if (exposedCaps.command) {
-    server.registerTool(
+    register(
       'run_command',
       {
         title: 'Run a command',
@@ -1010,11 +1265,13 @@ export function buildServer(ctx: ToolContext): McpServer {
           const dir = await resolveCwd(ctx, cwd);
           logInfo(`tool run_command ${command}`);
           const result = await runCommand(command, args ?? [], dir, normaliseTimeout(timeoutMs), env);
+          noteExec(result);
+          noteDetail([command, ...(args ?? [])].join(' ').slice(0, 120));
           return result.timedOut ? fail(formatExec(result)) : ok(formatExec(result));
         })
     );
 
-    server.registerTool(
+    register(
       'launch_app',
       {
         title: 'Launch an app',
@@ -1035,7 +1292,7 @@ export function buildServer(ctx: ToolContext): McpServer {
         })
     );
 
-    server.registerTool(
+    register(
       'process',
       {
         title: 'Manage a background process',
@@ -1095,7 +1352,7 @@ export function buildServer(ctx: ToolContext): McpServer {
         })
     );
 
-    server.registerTool(
+    register(
       'open_url',
       {
         title: 'Open a URL',
@@ -1111,6 +1368,7 @@ export function buildServer(ctx: ToolContext): McpServer {
             return fail('Only http and https URLs are allowed');
           }
           await shell.openExternal(parsed.toString());
+          noteDetail(`${parsed.origin}${parsed.pathname}`);
           return ok(`Opened ${parsed.origin}${parsed.pathname}`);
         })
     );
@@ -1119,7 +1377,7 @@ export function buildServer(ctx: ToolContext): McpServer {
   // ---------------------------------------------------------------- clipboard
 
   if (exposedCaps.clipboardRead) {
-    server.registerTool(
+    register(
       'read_clipboard',
       {
         title: 'Read clipboard',
@@ -1141,7 +1399,7 @@ export function buildServer(ctx: ToolContext): McpServer {
   }
 
   if (exposedCaps.clipboardWrite) {
-    server.registerTool(
+    register(
       'write_clipboard',
       {
         title: 'Write clipboard',
@@ -1161,7 +1419,7 @@ export function buildServer(ctx: ToolContext): McpServer {
   // ---------------------------------------------------------------- computer
 
   if (exposedCaps.screen) {
-    server.registerTool(
+    register(
       'screenshot',
       {
         title: 'See the screen',
@@ -1194,6 +1452,7 @@ export function buildServer(ctx: ToolContext): McpServer {
           }
           const shot = await screenshot({ window: targetWindow, full, maxWidth, crop });
           logInfo(`tool screenshot ${shot.width}x${shot.height}`);
+          noteDetail(`${shot.width}×${shot.height}`);
           return {
             content: [
               {
@@ -1209,7 +1468,7 @@ export function buildServer(ctx: ToolContext): McpServer {
         })
     );
 
-    server.registerTool(
+    register(
       'list_windows',
       {
         title: 'List open windows',
@@ -1222,6 +1481,7 @@ export function buildServer(ctx: ToolContext): McpServer {
         guarded('screen', 'list_windows', async () => {
           const { windows, screen } = await listWindows();
           logInfo(`tool list_windows (${windows.length})`);
+          noteCount(windows.length);
           if (windows.length === 0) return ok('No visible windows.');
           const lines = windows.map(
             (w) => `${w.id}  ${w.process}  ${w.x},${w.y}  ${w.width}x${w.height}  ${w.state}  ${w.title}`
@@ -1232,7 +1492,7 @@ export function buildServer(ctx: ToolContext): McpServer {
         })
     );
 
-    server.registerTool(
+    register(
       'get_active_window',
       {
         title: 'Get active window',
@@ -1252,7 +1512,7 @@ export function buildServer(ctx: ToolContext): McpServer {
         })
     );
 
-    server.registerTool(
+    register(
       'find_ui',
       {
         title: 'Find UI elements',
@@ -1271,6 +1531,7 @@ export function buildServer(ctx: ToolContext): McpServer {
       async ({ window, query, role, maxResults }) =>
         guarded('screen', 'find_ui', async () => {
           const result = await findUi({ window, query, role, maxResults });
+          noteCount(result.elements.length);
           if (result.elements.length === 0) return ok(`No matching UI elements in window ${result.window}.`);
           const lines = result.elements.map((element, index) => {
             const desktop = `${element.bounds.x},${element.bounds.y} ${element.bounds.width}x${element.bounds.height}`;
@@ -1285,7 +1546,7 @@ export function buildServer(ctx: ToolContext): McpServer {
         })
     );
 
-    server.registerTool(
+    register(
       'wait_for_window',
       {
         title: 'Wait for a window',
@@ -1312,7 +1573,7 @@ export function buildServer(ctx: ToolContext): McpServer {
   }
 
   if (exposedCaps.control) {
-    server.registerTool(
+    register(
       'computer',
       {
         title: 'Control mouse and keyboard',
@@ -1382,6 +1643,7 @@ export function buildServer(ctx: ToolContext): McpServer {
             }
           }
           logInfo(`tool computer ${parsed.map((a) => a.type).join(', ')}`);
+          noteDetail(parsed.map((a) => a.type).join(', '));
           const result = await act(parsed);
           const cursor = result.cursor;
           const pointer = cursor.image
@@ -1424,7 +1686,375 @@ export function buildServer(ctx: ToolContext): McpServer {
     );
   }
 
+  // ---------------------------------------------------------------- session
+
+  if (sessionToolsExposed) {
+    register(
+      'resume_session',
+      {
+        title: 'Resume a previous session',
+        description:
+          'Fetch the handoff brief written when the previous ChatGPT session was compacted, and continue that work. Call this first if the user says you are continuing earlier work. Long briefs arrive in parts — keep calling with the next part until the brief says it is complete.',
+        inputSchema: z.object({
+          handoffId: z
+            .string()
+            .max(64)
+            .optional()
+            .describe('Specific handoff id. Omit for the most recent one.'),
+          part: z.number().int().min(1).max(50).optional().describe('Part number to fetch. Default 1.')
+        }),
+        annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false }
+      },
+      async ({ handoffId, part }) =>
+        guard('resume_session', async () => {
+          if (!sessionToolsLive) return featureDisabled('Session recording', 'Record sessions');
+          const handoff = handoffId ? await findHandoff(handoffId) : await latestHandoff();
+          if (!handoff) {
+            return fail(
+              'No handoff has been saved. Ask the user to press "Compact & Resume in New Chat" in ChatGPT Local Files, or just ask them what to continue.'
+            );
+          }
+          const parts = chunkText(handoff.text, MAX_RESUME_CHARS);
+          const index = Math.min(Math.max(1, Math.floor(part ?? 1)), parts.length);
+          const header =
+            `Handoff ${handoff.id} · session ${handoff.sessionId} · written ${new Date(handoff.createdAt).toISOString()} ` +
+            `by ${handoff.model} · part ${index} of ${parts.length}`;
+          const notes = handoff.notes.length > 0 ? `\nCaveats: ${handoff.notes.join('; ')}` : '';
+          const more =
+            index < parts.length
+              ? `\n\n(continues — call resume_session with part=${index + 1})`
+              : `\n\n(end of brief. Use session_history with sessionId "${handoff.sessionId}" if you need the underlying detail.)`;
+          noteDetail(`part ${index}/${parts.length}`);
+          return ok(`${header}${notes}\n\n${parts[index - 1] ?? ''}${more}`);
+        })
+    );
+
+    register(
+      'session_history',
+      {
+        title: 'Look inside a recorded session',
+        description:
+          'Search the raw local recording of a session — user messages, tool calls, errors — when the handoff brief is not specific enough. Returns compact entries; pass callId to get the exact arguments and result of one recorded tool call.',
+        inputSchema: z.object({
+          sessionId: z.string().max(64).optional().describe('Session id. Omit to use the most recent handoff’s session.'),
+          query: z.string().max(200).optional().describe('Case-insensitive text filter.'),
+          kind: z
+            .enum(['user_message', 'assistant_message', 'tool_call', 'chat_error', 'progress', 'handoff'])
+            .optional()
+            .describe('Only entries of this kind.'),
+          callId: z.string().max(64).optional().describe('Return the full record of one tool call.'),
+          part: z
+            .number()
+            .int()
+            .min(1)
+            .max(200)
+            .optional()
+            .describe('With callId: which part of a large recorded call to return. Default 1.'),
+          from: z.number().int().min(0).max(10_000_000).optional().describe('First sequence number to return.'),
+          limit: z.number().int().min(1).max(100).optional().describe('Maximum entries. Default 40.')
+        }),
+        annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false }
+      },
+      async ({ sessionId, query, kind, callId, part, from, limit }) =>
+        guard('session_history', async () => {
+          if (!sessionToolsLive) return featureDisabled('Session recording', 'Record sessions');
+          const id = sessionId ?? (await latestHandoff())?.sessionId ?? null;
+          if (!id) return fail('No recorded session is available.');
+          const events = await readEvents(id, kind ? { kinds: [kind] } : {});
+          if (events.length === 0) return fail(`Session ${id} has no recorded events.`);
+
+          if (callId) {
+            const found = events.find((event) => event.kind === 'tool_call' && event.call.callId === callId);
+            if (!found || found.kind !== 'tool_call') return fail(`No recorded tool call with id ${callId}.`);
+            const call = found.call;
+            // Anything too long for the log line was written beside it in full, so the
+            // exact edit payload or command output is genuinely recoverable rather
+            // than described as exact and quietly cut.
+            const args = await expandStored(id, call.args);
+            const result = await expandStored(id, call.result);
+            const whole =
+              `#${found.seq} ${call.tool} — ${call.outcome} in ${call.durationMs} ms\n` +
+              `arguments (${call.args.chars} chars${args.complete ? '' : ', partial'}):\n${args.text}\n\n` +
+              `result (${call.result.chars} chars${result.complete ? '' : ', partial'}):\n${result.text}`;
+            const parts = chunkText(whole, MAX_RESUME_CHARS);
+            const index = Math.min(Math.max(1, Math.floor(part ?? 1)), parts.length);
+            noteDetail(`part ${index}/${parts.length}`);
+            const more =
+              index < parts.length ? `\n\n(continues — call again with part=${index + 1})` : '';
+            return ok(
+              `${parts[index - 1] ?? ''}${more}` +
+                (parts.length > 1 ? `\n[part ${index} of ${parts.length}]` : '')
+            );
+          }
+
+          const needle = query?.toLowerCase() ?? null;
+          const cap = Math.min(100, Math.max(1, Math.floor(limit ?? 40)));
+          const lines: string[] = [];
+          for (const event of events) {
+            if (from !== undefined && event.seq < from) continue;
+            const line = describeEvent(event);
+            if (needle && !line.toLowerCase().includes(needle)) continue;
+            lines.push(line);
+            if (lines.length >= cap) break;
+          }
+          noteCount(lines.length);
+          if (lines.length === 0) return ok(`No matching entries in session ${id}.`);
+          return ok(
+            `Session ${id} — ${lines.length} entr${lines.length === 1 ? 'y' : 'ies'} of ${events.length} recorded\n` +
+              lines.join('\n') +
+              '\n\n(pass callId to expand a tool call, or from/limit to page)'
+          );
+        })
+    );
+  }
+
+  // ----------------------------------------------------------------- agents
+
+  if (agentToolsExposed) {
+    /** Every broker tool needs the feature on and the caller proven. */
+    const agentGuard = (name: string, fn: () => Promise<ToolResult>): Promise<ToolResult> =>
+      guard(name, async () => {
+        if (!agentToolsLive) return featureDisabled('Multi-agent mode', 'Multi-agent mode (experimental)');
+        return fn();
+      });
+
+    register(
+      'create_agents',
+      {
+        title: 'Create worker agents',
+        description:
+          'Create worker agents for parts of the current task. Each worker opens in its own ChatGPT conversation and reports back to you. You are the prime agent: workers cannot talk to each other, only to you. The first call establishes you as prime and returns your agent key — pass it as agent_key on every later call.',
+        inputSchema: z.object({
+          workers: z
+            .array(
+              z.object({
+                label: z.string().max(60).optional().describe('Short name shown to the user'),
+                task: z.string().min(1).max(4000).describe('Self-contained brief. The worker sees only this.')
+              })
+            )
+            .min(1)
+            .max(8)
+        }),
+        annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true }
+      },
+      async ({ workers }) =>
+        agentGuard('create_agents', async () => {
+          const { created, primeSecret } = createAgents({ workers, caller: currentCaller() });
+          // The key is returned to the model and nowhere else: it is stripped from the
+          // recorded history, the Activity feed and the logs, so this reply is the only
+          // copy that exists.
+          const keyLine = primeSecret
+            ? `\n\nYour prime agent key is: ${primeSecret}\nPass it as agent_key on every tool call from now on. ` +
+              'It is deliberately not stored anywhere in this app, so keep using it from this conversation.'
+            : '';
+          return ok(
+            `Created ${created.length} worker(s):\n` +
+              created.map((info) => `${info.id} — ${info.label}`).join('\n') +
+              keyLine +
+              '\n\nTheir chats are being opened. Each will call join_agent and then report to you. ' +
+              'While you pass agent_key, messages addressed to you arrive at the end of every tool result; ' +
+              'without it, call agent_inbox to collect them.'
+          );
+        })
+    );
+
+    register(
+      'join_agent',
+      {
+        title: 'Join as a worker agent',
+        description:
+          'Register this conversation as a worker agent and receive your task and your agent key. Call this once, first, using the one-time key from the message that opened this chat.',
+        inputSchema: z.object({
+          joinKey: z.string().min(8).max(200).describe('The one-time key from the message that opened this chat')
+        }),
+        annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false }
+      },
+      async ({ joinKey }) =>
+        agentGuard('join_agent', async () => {
+          const { info, secret } = joinAgent(joinKey, currentCaller());
+          const keyLine = secret
+            ? `Your agent key is: ${secret}\nPass it as agent_key on every tool call from now on — it is how this app knows the work is yours and how messages reach you.\n\n`
+            : 'You are already joined; keep using the agent key you were given.\n\n';
+          return ok(
+            `You are ${info.id} (${info.label}).\n\n${keyLine}Your task:\n${info.task}\n\n` +
+              'Report progress and results to the prime agent with send_agent_message, and call finish_agent when you are done. ' +
+              'You cannot message other workers.'
+          );
+        })
+    );
+
+    register(
+      'send_agent_message',
+      {
+        title: 'Message another agent',
+        description:
+          'Send a message. Workers may only message the prime agent; the prime may message any worker. It reaches the recipient on its next tool call if it passes its agent key, and otherwise when it calls agent_inbox.',
+        inputSchema: z.object({
+          to: z.string().min(1).max(40).describe('Recipient agent id, e.g. prime or worker-2'),
+          text: z.string().min(1).max(4000)
+        }),
+        annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false }
+      },
+      async ({ to, text }) =>
+        agentGuard('send_agent_message', async () => {
+          const message = sendMessage(currentCaller(), to, text);
+          await recordAgentMessage(message, 'sent');
+          return ok(`Sent to ${to} (message ${message.id}).`);
+        })
+    );
+
+    register(
+      'agent_inbox',
+      {
+        title: 'Read agent messages',
+        description:
+          'Collect the messages waiting for you. If you pass agent_key on your ordinary tool calls, messages also arrive at the end of those results and you rarely need this.',
+        inputSchema: z.object({}),
+        annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false }
+      },
+      async () =>
+        agentGuard('agent_inbox', async () => {
+          // Identity is proven the same way as anywhere else; dispatch has already
+          // offered and acknowledged for this caller, so this is only the report.
+          const info = identify(currentCaller());
+          const pending = swarmState().agents.find((entry) => entry.id === info.id)?.pending ?? 0;
+          if (pending === 0) return ok(`No messages waiting for ${info.id}.`);
+          return ok(`${pending} message(s) waiting for ${info.id}; they are appended to this result.`);
+        })
+    );
+
+    register(
+      'agent_status',
+      {
+        title: 'Agent status',
+        description: 'List every agent in this run, what it was asked to do, and whether it is still working.',
+        inputSchema: z.object({}),
+        annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false }
+      },
+      async () =>
+        agentGuard('agent_status', async () => {
+          const state = swarmState();
+          if (state.agents.length === 0) return ok('No agents have been created.');
+          return ok(
+            state.agents
+              .map(
+                (info) =>
+                  `${info.id}  ${info.role}  ${info.state}  waiting ${info.pending} (${info.awaitingAck} unacknowledged)  ${info.label}` +
+                  (info.result ? `\n    result: ${info.result.slice(0, 300)}` : '')
+              )
+              .join('\n')
+          );
+        })
+    );
+
+    register(
+      'finish_agent',
+      {
+        title: 'Finish as an agent',
+        description:
+          'Mark yourself finished and hand your result to the prime agent. Include what you changed and anything left undone.',
+        inputSchema: z.object({
+          result: z.string().min(1).max(4000).describe('What you did, what is left, what broke')
+        }),
+        annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false }
+      },
+      async ({ result }) =>
+        agentGuard('finish_agent', async () => {
+          const { info, report } = finishAgent(currentCaller(), result);
+          if (report) await recordAgentMessage(report, 'sent');
+          return ok(`${info.id} marked finished. The prime agent has your result.`);
+        })
+    );
+  }
+
   return server;
+}
+
+/** Per-part cap for a handoff returned through resume_session. */
+const MAX_RESUME_CHARS = 12_000;
+
+/**
+ * Recovers the complete text behind a stored field.
+ *
+ * A long tool argument or result is bounded inline in the log and written whole beside
+ * it; this reads the whole one back so recovery means the exact payload rather than
+ * its first eight thousand characters. `complete` is false only when even the overflow
+ * copy could not be written, and the caller says so instead of implying otherwise.
+ */
+async function expandStored(
+  sessionId: string,
+  stored: StoredText
+): Promise<{ text: string; complete: boolean }> {
+  if (!stored.truncated) return { text: stored.text, complete: true };
+  if (stored.assetId) {
+    const full = await readOverflowText(sessionId, stored.assetId);
+    if (full !== null) return { text: full, complete: true };
+  }
+  return { text: stored.text, complete: false };
+}
+
+/** Splits on blank lines so a part never ends mid-sentence unless a block is huge. */
+export function chunkText(text: string, size: number): string[] {
+  if (text.length <= size) return [text];
+  const parts: string[] = [];
+  let current = '';
+  for (const block of text.split(/\n{2,}/)) {
+    const candidate = current ? `${current}\n\n${block}` : block;
+    if (candidate.length <= size) {
+      current = candidate;
+      continue;
+    }
+    if (current) parts.push(current);
+    if (block.length <= size) {
+      current = block;
+    } else {
+      for (let at = 0; at < block.length; at += size) parts.push(block.slice(at, at + size));
+      current = '';
+    }
+  }
+  if (current) parts.push(current);
+  return parts.length > 0 ? parts : [''];
+}
+
+/** One recorded event as a single compact line for session_history. */
+function describeEvent(event: SessionEvent): string {
+  const stamp = new Date(event.time).toISOString().slice(11, 19);
+  const who = event.agent ? ` [${event.agent}]` : '';
+  switch (event.kind) {
+    case 'user_message':
+      return `#${event.seq} ${stamp}${who} USER: ${oneLine(event.message.text, 400)}`;
+    case 'assistant_message':
+      return `#${event.seq} ${stamp}${who} ASSISTANT: ${oneLine(event.message.text, 300)}`;
+    case 'progress':
+      return `#${event.seq} ${stamp}${who} progress: ${oneLine(event.message.text, 200)}`;
+    case 'chat_error':
+      return `#${event.seq} ${stamp}${who} ERROR: ${oneLine(event.message.text, 300)}`;
+    case 'tool_call': {
+      const call = event.call;
+      const metric = call.summary.metric ? ` ${call.summary.metric}` : '';
+      return `#${event.seq} ${stamp}${who} ${call.tool} (${call.outcome}) ${call.summary.title}${metric} · callId ${call.callId}`;
+    }
+    case 'turn_end':
+      return `#${event.seq} ${stamp}${who} turn ended: ${event.outcome}${event.detail ? ` — ${event.detail}` : ''}`;
+    case 'turn_start':
+      return `#${event.seq} ${stamp}${who} turn started`;
+    case 'handoff':
+      return `#${event.seq} ${stamp} handoff ${event.handoffId} written by ${event.model}`;
+    case 'agent_message':
+      return (
+        `#${event.seq} ${stamp}${who} ${event.delivery === 'sent' ? 'sent to' : 'received from'} ` +
+        `${event.delivery === 'sent' ? event.to : event.from} [${event.messageId}]: ${oneLine(event.message.text, 400)}`
+      );
+    case 'note':
+      return `#${event.seq} ${stamp} note: ${oneLine(event.message.text, 200)}`;
+    case 'session_start':
+      return `#${event.seq} ${stamp} session started: ${event.title}`;
+  }
+}
+
+function oneLine(text: string, cap: number): string {
+  const flat = text.replace(/\s+/g, ' ').trim();
+  return flat.length <= cap ? flat : `${flat.slice(0, cap)}…`;
 }
 
 function formatFileInfo(info: FileInfo): string {

@@ -12,6 +12,21 @@ import { IS_WINDOWS, makeTempDir, removeTempDir } from './helpers.js';
 let cwd: string;
 const node = process.execPath;
 
+async function waitForOutput(
+  id: string,
+  needle: string,
+  stream: 'stdout' | 'stderr' = 'stdout',
+  timeoutMs = 3000
+): Promise<ReturnType<typeof getManagedProcess>> {
+  const deadline = Date.now() + timeoutMs;
+  let status = getManagedProcess(id, 80);
+  while (!status[stream].includes(needle) && status.running && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    status = getManagedProcess(id, 80);
+  }
+  return status;
+}
+
 beforeAll(async () => {
   cwd = await makeTempDir('clf-process-');
 });
@@ -32,8 +47,9 @@ describe('managed processes', () => {
     expect(started.pid).toBeGreaterThan(0);
     expect(started.running).toBe(true);
 
-    await new Promise((resolve) => setTimeout(resolve, 100));
-    const status = getManagedProcess(started.id, 20);
+    const ready = await waitForOutput(started.id, 'ready');
+    expect(ready.stdout).toContain('ready');
+    const status = await waitForOutput(started.id, 'warn', 'stderr');
     expect(status.stdout).toContain('ready');
     expect(status.stderr).toContain('warn');
     expect(status.running).toBe(true);
@@ -52,8 +68,7 @@ describe('managed processes', () => {
       cwd,
       { TEST_PROCESS_ENV: 'process-ok' }
     );
-    await new Promise((resolve) => setTimeout(resolve, 100));
-    const before = getManagedProcess(started.id, 20);
+    const before = await waitForOutput(started.id, 'env=process-ok');
     expect(before.stdout).toContain('env=process-ok');
     await writeManagedProcess(started.id, 'hello-process');
     const deadline = Date.now() + 3000;
@@ -125,8 +140,7 @@ describe('managed processes', () => {
       ],
       cwd
     );
-    await new Promise((resolve) => setTimeout(resolve, 150));
-    const status = getManagedProcess(started.id, 20);
+    const status = await waitForOutput(started.id, 'child=');
     const childPid = Number(status.stdout.match(/child=(\d+)/)?.[1]);
     expect(childPid).toBeGreaterThan(0);
 
@@ -144,8 +158,7 @@ describe('managed processes', () => {
       ],
       cwd
     );
-    await new Promise((resolve) => setTimeout(resolve, 100));
-    const first = getManagedProcess(started.id, 20);
+    const first = await waitForOutput(started.id, 'first');
     expect(first.stdout).toContain('first');
     expect(first.cursor).toMatch(new RegExp(`^${first.id}\\.`));
 

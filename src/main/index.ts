@@ -10,6 +10,20 @@ import { registerIpc } from './ipc.js';
 import { logError, logInfo } from './logger.js';
 import { stopAllManagedProcesses } from './process-manager.js';
 import { initSecretsPath } from './secrets.js';
+import { startBridge, stopBridge } from './bridge.js';
+import { flushSessions, initSessionStore, pruneSessions } from './session/store.js';
+import { setAgentConversationLookup } from './session/recorder.js';
+import {
+  agentConversation,
+  onSwarmPersist,
+  restoreSwarm,
+  snapshotSwarm,
+  type SwarmSnapshot
+} from './agents.js';
+import { flushDurable, initDurableStore, readDurable, writeDurableSoon } from './durable.js';
+
+/** Durable state file holding the multi-agent run. Hashes only, never credentials. */
+const SWARM_STATE = 'swarm';
 
 let window: BrowserWindow | null = null;
 let tray: Tray | null = null;
@@ -151,7 +165,18 @@ void app.whenReady().then(async () => {
   const userData = app.getPath('userData');
   initConfigPath(userData);
   initSecretsPath(userData);
+  initSessionStore(userData);
+  initDurableStore(userData);
   await loadConfig();
+  setAgentConversationLookup(agentConversation);
+
+  // A multi-agent run outlives this process. Restoring it before the bridge starts
+  // means a worker that never joined gets its chat re-requested through the same queue
+  // as a fresh one, rather than being stranded with a key nobody has.
+  if (getConfig().multiAgent.enabled) {
+    onSwarmPersist(() => writeDurableSoon(SWARM_STATE, snapshotSwarm()));
+    restoreSwarm(await readDurable<SwarmSnapshot>(SWARM_STATE));
+  }
 
   // Strict CSP for our own page. There is no remote content and no inline script.
   session.defaultSession.webRequest.onHeadersReceived((details, callback) => {
@@ -178,6 +203,20 @@ void app.whenReady().then(async () => {
 
   logInfo('app started');
 
+  // The bridge serves recording and multi-agent mode both: recording needs the
+  // extension to observe the chat, and multi-agent mode needs it to open worker tabs.
+  // Either switch being on starts it. ipc.ts applies the same rule on a settings save.
+  if (getConfig().sessions.record || getConfig().multiAgent.enabled) {
+    void startBridge();
+  }
+  if (getConfig().sessions.record) {
+    void pruneSessions(getConfig().sessions.retainDays)
+      .then((removed) => {
+        if (removed > 0) logInfo(`removed ${removed} session(s) past the retention window`);
+      })
+      .catch((err: Error) => logError(`session pruning failed: ${err.message}`));
+  }
+
   if (getConfig().ui.autoConnect || connectOnStart) void connect();
 });
 
@@ -195,7 +234,11 @@ app.on('will-quit', (event) => {
   event.preventDefault();
   tray.destroy();
   tray = null;
-  void Promise.all([disconnect(), stopAllManagedProcesses()]).finally(() => app.quit());
+  // flushSessions and flushDurable last, so a summary or a swarm change written during
+  // shutdown still lands on disk instead of dying with the debounce timer.
+  void Promise.all([disconnect(), stopAllManagedProcesses(), stopBridge()])
+    .then(() => Promise.all([flushSessions(), flushDurable()]))
+    .finally(() => app.quit());
 });
 
 // Belt and braces: no web contents anywhere in this app may open a window or

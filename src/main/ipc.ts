@@ -19,6 +19,36 @@ import { uniqueRootName, validateNewRoot, SandboxError } from './sandbox.js';
 import { hasSecret, isEncryptionAvailable, setSecret } from './secrets.js';
 import { bundledVersion, locateBinary } from './tunnel/locate.js';
 import { TUNNEL_ID_PATTERN } from './tunnel/index.js';
+import {
+  bridgeStatus,
+  cancelPairing,
+  onBridgeChange,
+  queueResume,
+  startBridge,
+  startPairing,
+  stopBridge,
+  unpair
+} from './bridge.js';
+import { extensionDir } from './extension-path.js';
+import {
+  deleteSession,
+  getSession,
+  listSessions,
+  readEvents,
+  readHandoff,
+  latestHandoff
+} from './session/store.js';
+import { activeSessionId, forgetSession, onSessionChange } from './session/recorder.js';
+import {
+  cancelCompaction,
+  clearCompaction,
+  compactSession,
+  compactionState,
+  onCompactionChange
+} from './session/compact.js';
+import { listModels } from './openrouter.js';
+import { onSwarmChange, resetSwarm, swarmState } from './agents.js';
+import { tokenPressure } from '../shared/session.js';
 
 /** The only URLs the renderer may ask the OS to open. */
 const ALLOWED_LINKS = new Set([
@@ -53,8 +83,25 @@ const settingsPatch = z.object({
     autoConnect: z.boolean(),
     privacyScreenshots: z.boolean(),
     theme: z.enum(['light', 'dark'])
+  }),
+  sessions: z.object({
+    record: z.boolean(),
+    retainDays: z.number().int().min(0).max(3650),
+    advisoryTokens: z.number().int().min(10_000).max(2_000_000),
+    limitTokens: z.number().int().min(10_000).max(4_000_000)
+  }),
+  compaction: z.object({
+    model: z.string().max(200),
+    reasoning: z.enum(['off', 'low', 'medium', 'high']),
+    showReasoning: z.boolean()
+  }),
+  multiAgent: z.object({
+    enabled: z.boolean(),
+    maxWorkers: z.number().int().min(1).max(8)
   })
 });
+
+const sessionIdArg = z.object({ id: z.string().min(8).max(64).regex(/^[0-9a-z-]+$/i) });
 
 const renameRoot = z.object({
   name: z.string().min(1).max(32),
@@ -77,8 +124,10 @@ async function buildState(): Promise<AppState> {
     config,
     status: getStatus(),
     hasApiKey: await hasSecret('openaiApiKey'),
+    hasOpenRouterKey: await hasSecret('openrouterApiKey'),
     resolvedBinary: resolvedBinary(config),
-    bundledTunnelVersion: bundledVersion()
+    bundledTunnelVersion: bundledVersion(),
+    bridge: await bridgeStatus()
   };
 }
 
@@ -104,7 +153,14 @@ export function registerIpc(getWindow: () => BrowserWindow | null): void {
 
   handle('settings:save', async (payload) => {
     const patch = settingsPatch.parse(payload);
-    await updateConfig((config) => ({ ...config, ...patch }));
+    const next = await updateConfig((config) => ({ ...config, ...patch }));
+    // The extension bridge serves both features: recording needs it to observe the
+    // chat, and multi-agent mode needs it to open worker tabs. Either one being on is
+    // enough, and this must match the startup rule in index.ts exactly — a bridge that
+    // runs at startup but not after a settings save is the worst of both.
+    if (next.sessions.record || next.multiAgent.enabled) await startBridge();
+    else await stopBridge();
+    if (!next.multiAgent.enabled) resetSwarm();
     logInfo('settings updated');
     return buildState();
   });
@@ -202,9 +258,179 @@ export function registerIpc(getWindow: () => BrowserWindow | null): void {
     return true;
   });
 
-  // Push updates so the UI reflects tunnel progress without polling.
-  onStatusChange(() => {
-    void buildState().then((state) => getWindow()?.webContents.send('state:changed', state));
+  // ------------------------------------------------------------- sessions
+
+  handle('sessions:list', async () => {
+    const config = getConfig();
+    const sessions = await listSessions();
+    return {
+      sessions: sessions.slice(0, 60),
+      activeId: activeSessionId(),
+      pressure: sessions.map((summary) => ({
+        id: summary.id,
+        ...tokenPressure(summary.estimatedTokens, config.sessions.advisoryTokens, config.sessions.limitTokens)
+      }))
+    };
   });
+
+  handle('sessions:events', async (payload) => {
+    const { id, from, limit } = z
+      .object({
+        id: z.string().min(8).max(64).regex(/^[0-9a-z-]+$/i),
+        from: z.number().int().min(0).max(10_000_000).optional(),
+        limit: z.number().int().min(1).max(1000).optional()
+      })
+      .parse(payload);
+    const summary = await getSession(id);
+    // The renderer draws a timeline, not the whole log: the tail is what matters and
+    // the rest stays one click away rather than being pushed over IPC every refresh.
+    const all = await readEvents(id, from === undefined ? {} : { from });
+    const cap = limit ?? 300;
+    const events = all.length > cap ? all.slice(all.length - cap) : all;
+    return { summary, events, total: all.length };
+  });
+
+  handle('sessions:delete', async (payload) => {
+    const { id } = sessionIdArg.parse(payload);
+    // Detach first. The recorder maps live ChatGPT conversations to session ids, so
+    // deleting the folder underneath a live one left it appending to a session that no
+    // longer existed — the events went to a resurrected half-session with no summary.
+    // Forgetting the mapping makes the next observation open a fresh session instead.
+    const detached = forgetSession(id);
+    await deleteSession(id);
+    logInfo(
+      detached.length > 0
+        ? `session ${id} deleted; ${detached.length} live conversation(s) will start a new session`
+        : `session ${id} deleted`
+    );
+    return true;
+  });
+
+  handle('handoff:get', async (payload) => {
+    const { id, handoffId } = z
+      .object({
+        id: z.string().min(8).max(64).regex(/^[0-9a-z-]+$/i),
+        handoffId: z.string().min(8).max(64).regex(/^[0-9a-z-]+$/i).optional()
+      })
+      .parse(payload);
+    if (handoffId) return readHandoff(id, handoffId);
+    const summary = await getSession(id);
+    return summary?.lastHandoffId ? readHandoff(id, summary.lastHandoffId) : null;
+  });
+
+  // ------------------------------------------------------------ compaction
+
+  handle('compaction:state', async () => compactionState());
+  handle('compaction:clear', async () => {
+    clearCompaction();
+    return compactionState();
+  });
+  handle('compaction:cancel', async () => {
+    cancelCompaction();
+    return true;
+  });
+
+  handle('compaction:start', async (payload) => {
+    const { id, resume } = z
+      .object({
+        id: z.string().min(8).max(64).regex(/^[0-9a-z-]+$/i),
+        resume: z.boolean().optional()
+      })
+      .parse(payload);
+    const handoff = await compactSession({
+      sessionId: id,
+      reason: resume ? 'compact and resume' : 'manual compaction',
+      resume: resume === true
+    });
+    // The fresh chat is only opened once the handoff exists on disk. If compaction
+    // had failed, compactSession would have thrown and nothing would navigate.
+    if (resume) {
+      queueResume(handoff.id);
+      logInfo(`compaction: queued a fresh chat for handoff ${handoff.id}`);
+    }
+    return handoff;
+  });
+
+  handle('openrouter:key', async (payload) => {
+    const { value } = z.object({ value: z.string().max(500) }).parse(payload);
+    if (!isEncryptionAvailable()) {
+      throw new Error('Windows credential encryption is unavailable, so the key cannot be stored safely.');
+    }
+    await setSecret('openrouterApiKey', value);
+    logInfo(value.trim() === '' ? 'openrouter key cleared' : 'openrouter key stored');
+    return buildState();
+  });
+
+  handle('openrouter:models', async (payload) => {
+    const { refresh, offset, limit, query } = z
+      .object({
+        refresh: z.boolean().optional(),
+        offset: z.number().int().min(0).max(10_000).optional(),
+        limit: z.number().int().min(1).max(100).optional(),
+        query: z.string().max(100).optional()
+      })
+      .parse(payload ?? {});
+    const all = await listModels(refresh === true);
+    const needle = query?.trim().toLowerCase() ?? '';
+    const filtered = needle
+      ? all.filter((model) => model.id.toLowerCase().includes(needle) || model.name.toLowerCase().includes(needle))
+      : all;
+    const start = offset ?? 0;
+    const size = limit ?? 25;
+    return { total: filtered.length, offset: start, models: filtered.slice(start, start + size) };
+  });
+
+  // ---------------------------------------------------------------- bridge
+
+  handle('bridge:pair', async () => {
+    startPairing();
+    return buildState();
+  });
+  handle('bridge:cancelPairing', async () => {
+    cancelPairing();
+    return buildState();
+  });
+  handle('bridge:unpair', async () => {
+    await unpair();
+    return buildState();
+  });
+
+  /**
+   * Opens the folder Chrome should load the extension from.
+   *
+   * The renderer never learns the path unless it asks for it here, and all it can do
+   * with the answer is show it; the open itself happens in the main process against a
+   * path the renderer did not choose.
+   */
+  handle('bridge:openExtensionFolder', async () => {
+    const dir = extensionDir();
+    if (!dir) {
+      throw new Error(
+        'The extension folder is missing from this installation. Reinstall the app, or use the extension/ folder from the source checkout.'
+      );
+    }
+    await shell.openPath(dir);
+    return dir;
+  });
+
+  handle('bridge:extensionPath', async () => extensionDir());
+
+  // ----------------------------------------------------------------- swarm
+
+  handle('swarm:get', async () => swarmState());
+  handle('swarm:reset', async () => {
+    resetSwarm();
+    return swarmState();
+  });
+
+  // Push updates so the UI reflects tunnel progress without polling.
+  const pushState = (): void => {
+    void buildState().then((state) => getWindow()?.webContents.send('state:changed', state));
+  };
+  onStatusChange(pushState);
+  onBridgeChange(pushState);
   onLog((entry) => getWindow()?.webContents.send('log:entry', entry));
+  onSessionChange(() => getWindow()?.webContents.send('session:changed'));
+  onCompactionChange((state) => getWindow()?.webContents.send('compaction:changed', state));
+  onSwarmChange(() => getWindow()?.webContents.send('swarm:changed', swarmState()));
 }

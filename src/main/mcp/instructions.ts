@@ -6,9 +6,13 @@
  * It states what exists and how to be efficient — it is not where security is enforced.
  */
 
+import { getConfig } from '../config.js';
 import type { ToolContext } from './tools.js';
 
 export function serverInstructions(ctx: ToolContext): string {
+  const config = getConfig();
+  const sessionTools = ctx.sessionTools ?? config.sessions.record;
+  const agentTools = ctx.agentTools ?? config.multiAgent.enabled;
   const roots =
     ctx.roots.length === 0
       ? 'None yet — the user must approve a folder in the ChatGPT Local Files app.'
@@ -39,6 +43,28 @@ export function serverInstructions(ctx: ToolContext): string {
     'Report useful findings, changes, failures and plan changes immediately, and name paths modified.',
     'Batch routine reads/searches/actions instead of narrating every trivial call.'
   ];
+
+  if (sessionTools) {
+    lines.push(
+      '',
+      // A resumed chat has no memory of the run it is continuing, so say plainly that
+      // the brief exists and where the detail behind it lives.
+      'If the user opens this chat to continue earlier work, call resume_session first: it returns a',
+      'handoff brief written from the recorded session, in parts. Read every part before acting, then',
+      'continue that work instead of restarting it. session_history returns the underlying recorded',
+      'events of a session when the brief is not specific enough; ask it for a narrow slice, not everything.'
+    );
+  }
+
+  if (agentTools) {
+    lines.push(
+      '',
+      'Multi-agent mode is on. As the prime agent you may create_agents with one task each, then keep',
+      'working; their messages are appended to your tool results as they arrive. As a worker, call',
+      'join_agent to get your task, send_agent_message to report to the prime agent, and finish_agent',
+      'when done. Workers talk only to the prime agent, never to each other.'
+    );
+  }
 
   if (ctx.caps.screen || ctx.caps.control) {
     lines.push(

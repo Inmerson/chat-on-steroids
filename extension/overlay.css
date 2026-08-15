@@ -1,0 +1,112 @@
+/*
+ * Styling for the parts of the page this extension changes.
+ *
+ * Two rules keep it out of ChatGPT's way: nothing here is a bare element selector, and
+ * no colour is hard-coded to a theme. Text inherits `currentColor`, accents are drawn
+ * with `color-mix` against the surrounding colour, so light and dark both look right
+ * without the extension having to know which one is on.
+ */
+
+.clf-metric {
+  margin-left: 0.4em;
+  font-variant-numeric: tabular-nums;
+  font-size: 0.9em;
+  opacity: 0.75;
+}
+
+.clf-good > * .clf-metric,
+.clf-good .clf-metric {
+  color: color-mix(in srgb, currentColor 45%, #17a34a);
+  opacity: 1;
+}
+
+.clf-bad > * .clf-metric,
+.clf-bad .clf-metric {
+  color: color-mix(in srgb, currentColor 40%, #dc2626);
+  opacity: 1;
+}
+
+.clf-warn > * .clf-metric,
+.clf-warn .clf-metric {
+  color: color-mix(in srgb, currentColor 40%, #d97706);
+  opacity: 1;
+}
+
+/* The relabelled tool row. Deliberately almost invisible: it is still ChatGPT's
+   component, and the only visible change should be that the words are now true. */
+.clf-tool [data-clf-label] {
+  font-variant-numeric: tabular-nums;
+}
+
+/* --- the injected chronological view ------------------------------------- */
+
+.clf-timeline {
+  margin: 0.5em 0 0;
+  padding: 0;
+  border-left: 2px solid color-mix(in srgb, currentColor 22%, transparent);
+  font-size: 0.82em;
+  line-height: 1.5;
+  opacity: 0.85;
+}
+
+.clf-timeline > summary {
+  margin-left: 0.7em;
+  cursor: pointer;
+  list-style: none;
+  opacity: 0.7;
+  user-select: none;
+}
+
+.clf-timeline > summary::-webkit-details-marker {
+  display: none;
+}
+
+.clf-timeline > summary::before {
+  content: '▸ ';
+  display: inline-block;
+  width: 1em;
+}
+
+.clf-timeline[open] > summary::before {
+  content: '▾ ';
+}
+
+.clf-timeline > summary:hover {
+  opacity: 1;
+}
+
+.clf-timeline-body {
+  margin: 0.35em 0 0.2em 0.7em;
+  display: flex;
+  flex-direction: column;
+  gap: 0.15em;
+}
+
+.clf-row {
+  display: flex;
+  gap: 0.6em;
+  align-items: baseline;
+  min-width: 0;
+}
+
+.clf-time {
+  flex: none;
+  font-variant-numeric: tabular-nums;
+  opacity: 0.5;
+}
+
+.clf-label {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.clf-row.clf-progress .clf-label {
+  opacity: 0.72;
+  font-style: italic;
+}
+
+.clf-row.clf-bad .clf-label {
+  color: color-mix(in srgb, currentColor 40%, #dc2626);
+}
