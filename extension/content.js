@@ -55,6 +55,7 @@
   let since = 0;
   let entries = [];
   let bootstrapTried = false;
+  let compactBusy = false;
 
   const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -231,6 +232,8 @@
     // Progress lines are only meaningful while they are moving. Captured live they
     // give the one thing a page reloaded from history can never reconstruct: the
     // order things happened in.
+    if (turn) CLF_DOM.markProgress(turn);
+
     if (nowGenerating && turn) {
       const line = CLF_DOM.progressLine(turn);
       if (line && line !== lastProgress) {
@@ -296,31 +299,89 @@
 
   // ------------------------------------------------------------ relabelling
 
+  const TOOL_GLYPHS = {
+    edit: '✎',
+    create: '+',
+    delete: '×',
+    move: '↗',
+    read: '◉',
+    search: '⌕',
+    browse: '▱',
+    run: '›_',
+    process: '›_',
+    screen: '▣',
+    input: '↖',
+    clipboard: '▤',
+    session: '◷',
+    agent: '◆',
+    other: '◇'
+  };
+
+  function glyph(kind) {
+    return TOOL_GLYPHS[kind] || TOOL_GLYPHS.other;
+  }
+
   function labelText(entry) {
     return entry.summary.detail ? `${entry.summary.title} · ${entry.summary.detail}` : entry.summary.title;
   }
 
+  /**
+   * Turns ChatGPT's generic tool header into the same semantic shape as the app:
+   * icon + strong title + secondary input/detail + result metric. The app remains the
+   * source of truth for the words; this page code only lays out the summary it receives.
+   */
   function applyLabel(block, entry) {
     const label = CLF_DOM.toolLabel(block);
     if (!label) return;
-    const wanted = labelText(entry);
     const metric = block.querySelector('.clf-metric');
-    const metricOk = Boolean(entry.summary.metric) === Boolean(metric);
-    if (block.dataset.clfCall === entry.callId && label.textContent === wanted && metricOk) return;
+    const detail = block.querySelector('.clf-tool-detail');
+    const icon = block.querySelector('.clf-tool-icon');
+    const wantedDetail = entry.summary.detail || '';
+    const metricOk = Boolean(entry.summary.metric) === Boolean(metric) &&
+      (!entry.summary.metric || metric.textContent === entry.summary.metric);
+    const detailOk = Boolean(wantedDetail) === Boolean(detail) && (!wantedDetail || detail.textContent === wantedDetail);
+    const iconOk = icon && icon.textContent === glyph(entry.summary.kind);
+    if (
+      block.dataset.clfCall === entry.callId &&
+      label.textContent === entry.summary.title &&
+      metricOk &&
+      detailOk &&
+      iconOk
+    ) return;
 
     if (!block.dataset.clfOriginal) block.dataset.clfOriginal = label.textContent || '';
     block.dataset.clfCall = entry.callId;
-    label.textContent = wanted;
+    block.dataset.clfKind = entry.summary.kind || 'other';
+    label.textContent = entry.summary.title;
+    label.classList.add('clf-tool-title');
     label.title = `${entry.tool} — ${entry.outcome}${
       entry.durationMs ? ` in ${Math.round(entry.durationMs)} ms` : ''
     }\nOriginally: ${block.dataset.clfOriginal}`;
+    block.classList.remove('clf-good', 'clf-bad', 'clf-warn', 'clf-neutral');
     block.classList.add('clf-tool', `clf-${entry.summary.tone}`);
+
+    const glyphNode = icon || document.createElement('span');
+    glyphNode.className = 'clf-tool-icon';
+    glyphNode.setAttribute('aria-hidden', 'true');
+    glyphNode.textContent = glyph(entry.summary.kind);
+    if (!icon && label.parentElement) label.parentElement.insertBefore(glyphNode, label);
+
+    let detailNode = detail;
+    if (wantedDetail) {
+      detailNode = detailNode || document.createElement('span');
+      detailNode.className = 'clf-tool-detail';
+      detailNode.textContent = wantedDetail;
+      if (!detail) label.insertAdjacentElement('afterend', detailNode);
+    } else if (detailNode) {
+      detailNode.remove();
+      detailNode = null;
+    }
 
     if (entry.summary.metric) {
       const chip = metric || document.createElement('span');
       chip.className = 'clf-metric';
       chip.textContent = entry.summary.metric;
-      if (!metric) label.insertAdjacentElement('afterend', chip);
+      if (!metric) (detailNode || label).insertAdjacentElement('afterend', chip);
     } else if (metric) {
       metric.remove();
     }
@@ -329,12 +390,21 @@
   function timelineRows(turn, calls) {
     const progress = progressByTurn.get(turn.id || 'current') || [];
     const rows = [
-      ...progress.map((item) => ({ time: item.time, text: item.text, metric: '', tone: 'progress' })),
+      ...progress.map((item) => ({
+        time: item.time,
+        text: item.text,
+        metric: '',
+        tone: 'progress',
+        kind: 'progress',
+        type: 'progress'
+      })),
       ...calls.map((call) => ({
         time: call.time,
         text: labelText(call),
         metric: call.summary.metric || '',
-        tone: call.summary.tone
+        tone: call.summary.tone,
+        kind: call.summary.kind || 'other',
+        type: 'tool'
       }))
     ];
     rows.sort((a, b) => a.time - b.time);
@@ -360,6 +430,7 @@
     if (!box) {
       box = document.createElement('details');
       box.className = 'clf-timeline';
+      box.open = true;
       const head = document.createElement('summary');
       head.textContent = 'Local timeline';
       box.append(head);
@@ -377,14 +448,18 @@
     body.replaceChildren(
       ...rows.map((row) => {
         const line = document.createElement('div');
-        line.className = `clf-row clf-${row.tone}`;
+        line.className = `clf-row clf-${row.tone} clf-${row.type}`;
         const time = document.createElement('span');
         time.className = 'clf-time';
         time.textContent = new Date(row.time).toLocaleTimeString();
+        const rowIcon = document.createElement('span');
+        rowIcon.className = 'clf-row-icon';
+        rowIcon.setAttribute('aria-hidden', 'true');
+        rowIcon.textContent = row.type === 'progress' ? '·' : glyph(row.kind);
         const label = document.createElement('span');
         label.className = 'clf-label';
         label.textContent = row.text;
-        line.append(time, label);
+        line.append(time, rowIcon, label);
         if (row.metric) {
           const metric = document.createElement('span');
           metric.className = 'clf-metric';
@@ -450,6 +525,77 @@
   }
 
   /**
+   * Adds one Local Files action to ChatGPT's own + submenu instead of another floating
+   * control beside the composer. We clone the menu's first row only for its current
+   * spacing/classes; no ChatGPT listener or id is copied, and the action itself is ours.
+   */
+  function injectCompactMenu() {
+    if (!conversationId || !status.paired || compactBusy) return;
+    const plus = document.querySelector('[data-testid="composer-plus-btn"][aria-expanded="true"]');
+    if (!plus) return;
+    const menus = [...document.querySelectorAll('[role="menu"][data-state="open"], [role="menu"]')].filter(
+      (node) => node.querySelector('[role="menuitem"]')
+    );
+    const menu = menus[menus.length - 1];
+    if (!menu || menu.querySelector('[data-clf-compact-menu]')) return;
+    const template = menu.querySelector('[role="menuitem"]');
+    if (!template || !template.parentElement) return;
+
+    const item = template.cloneNode(true);
+    if (!(item instanceof HTMLElement)) return;
+    item.dataset.clfCompactMenu = '1';
+    item.removeAttribute('id');
+    item.removeAttribute('data-testid');
+    item.removeAttribute('data-radix-collection-item');
+    item.setAttribute('role', 'menuitem');
+    item.tabIndex = 0;
+    for (const child of item.querySelectorAll('[id], [data-testid], [data-radix-collection-item]')) {
+      child.removeAttribute('id');
+      child.removeAttribute('data-testid');
+      child.removeAttribute('data-radix-collection-item');
+    }
+
+    const leaves = [...item.querySelectorAll('*')].filter(
+      (node) => node.children.length === 0 && (node.textContent || '').trim().length > 0
+    );
+    const label = leaves[0] || item;
+    label.textContent = 'Compact & continue';
+    const trailing = [...item.children].find((node) => String(node.className).includes('trailing'));
+    trailing?.remove();
+    const iconBox = item.querySelector('svg')?.parentElement;
+    if (iconBox) {
+      iconBox.replaceChildren(document.createTextNode('↻'));
+      iconBox.classList.add('clf-compact-icon');
+    }
+
+    const activate = async (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      if (compactBusy) return;
+      compactBusy = true;
+      label.textContent = 'Starting compaction…';
+      const reply = await ask({ type: 'compact', conversationId, resume: true });
+      if (reply && reply.ok === true) {
+        label.textContent = 'Compaction started';
+      } else {
+        label.textContent = 'Compaction failed — open Local Files';
+      }
+      // The bridge only acknowledges that compaction started; the long request runs in
+      // the app. Release the local click guard so a provider failure can be retried by
+      // reopening the menu instead of requiring a page reload. A still-running job is
+      // rejected by /compact with 409, so this cannot start two at once.
+      setTimeout(() => {
+        compactBusy = false;
+      }, 1500);
+    };
+    item.addEventListener('click', activate);
+    item.addEventListener('keydown', (event) => {
+      if (event.key === 'Enter' || event.key === ' ') void activate(event);
+    });
+    template.parentElement.append(item);
+  }
+
+  /**
    * Picks up a "continue in a fresh chat" instruction, if this tab is the fresh chat.
    *
    * Only ever runs on a conversation that does not exist yet and whose composer is
@@ -471,10 +617,24 @@
 
     const fail = (why) => ask({ type: 'ack', id: boot.id, status: 'failed', error: why });
 
-    for (let tries = 0; tries < 40 && !CLF_DOM.composer(); tries++) await sleep(250);
-    if (!CLF_DOM.composer()) return void (await fail('the ChatGPT composer never appeared'));
+    // ChatGPT paints the composer before the app has fully hydrated. Touching it during
+    // that window can look successful for a frame and then React replaces the subtree,
+    // which is exactly how we ended up with a blank worker tab holding a live lease.
+    // Require four consecutive ready samples before inserting anything.
+    let stable = 0;
+    for (let tries = 0; tries < 80 && stable < 4; tries++) {
+      const composer = CLF_DOM.composer();
+      const ready = document.readyState === 'complete' && composer && composer.isConnected;
+      stable = ready ? stable + 1 : 0;
+      if (stable < 4) await sleep(250);
+    }
+    if (stable < 4) return void (await fail('ChatGPT never became stably ready for bootstrap'));
     if (!CLF_DOM.insertPrompt(boot.text)) return void (await fail('ChatGPT refused the inserted text'));
-    await sleep(250);
+    await sleep(500);
+    const composer = CLF_DOM.composer();
+    if (!composer || !(composer.textContent || '').includes(boot.text.slice(0, 80))) {
+      return void (await fail('ChatGPT replaced the composer while inserting the bootstrap'));
+    }
     if (!CLF_DOM.send()) return void (await fail('the send button never became usable'));
     agent = boot.agent || null;
 
@@ -503,6 +663,10 @@
     (event) => {
       const stop = CLF_DOM.stopButton();
       if (stop && event.target instanceof Node && stop.contains(event.target)) userStopped = true;
+      const plus = document.querySelector('[data-testid="composer-plus-btn"]');
+      if (plus && event.target instanceof Node && plus.contains(event.target)) {
+        setTimeout(injectCompactMenu, 0);
+      }
     },
     true
   );
@@ -535,7 +699,10 @@
     void pullActivity();
   });
 
-  every(OBSERVE_MS, observe);
+  every(OBSERVE_MS, () => {
+    observe();
+    injectCompactMenu();
+  });
   every(ACTIVITY_MS, pullActivity);
   every(STATUS_MS, checkStatus);
   every(COMMAND_MS, pollCommands);

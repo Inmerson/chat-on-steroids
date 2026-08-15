@@ -457,9 +457,9 @@
                     </div>
                   </div>
                   <p class="hint">
-                    Both numbers are estimated tokens of the text this app recorded — a local
-                    approximation, not ChatGPT's own context counter, which is not visible from
-                    here.
+                    Both numbers are a rough context estimate from messages and tool input/output.
+                    Transient progress/reasoning captions are excluded because they often restate the
+                    same work. ChatGPT's hidden/system context is not visible from here.
                   </p>
 
                   <h3>Chrome extension</h3>
@@ -512,10 +512,12 @@
                            entry; an effort it does not advertise is never sent. -->
                       <select id="compactReasoning">
                         <option value="off">Off</option>
+                        <option value="minimal">Minimal</option>
                         <option value="low">Low</option>
                         <option value="medium">Medium</option>
                         <option value="high">High</option>
                         <option value="xhigh">Extra high</option>
+                        <option value="max">Max</option>
                       </select>
                     </div>
                     <div class="field">

@@ -23,7 +23,7 @@
 const PORTS = [8765, 8766, 8767, 8768, 8769];
 const HELLO_TIMEOUT_MS = 1200;
 /** Bumped only when the request/response shape changes; the app compares it. */
-const BRIDGE_PROTOCOL = 2;
+const BRIDGE_PROTOCOL = 3;
 
 /**
  * Journal caps. The byte figure is what actually matters — chrome.storage.session has a
@@ -445,7 +445,18 @@ async function pair(code) {
  */
 async function pollCommands() {
   await load();
-  if (pendingBootstrap) return { ok: true, waiting: true };
+  if (pendingBootstrap) {
+    const expired = Date.now() - pendingBootstrap.createdAt > pendingBootstrap.leaseMs;
+    if (!expired) return { ok: true, waiting: true };
+    // A tab was opened but never collected the bootstrap. Previously this memory slot
+    // blocked every later worker/resume command forever because only takeBootstrap()
+    // knew how to expire it. Release and report it here too, since polling is what keeps
+    // running even when the fresh tab died before its content script came up.
+    const stale = pendingBootstrap;
+    pendingBootstrap = null;
+    await persistLive();
+    await ackCommand(stale.id, 'failed', 'no fresh ChatGPT tab collected it before the lease expired');
+  }
   const result = await call('/commands');
   if (!result.ok) return result;
   const commands = Array.isArray(result.data.commands) ? result.data.commands : [];
@@ -496,7 +507,11 @@ async function takeBootstrap() {
 }
 
 async function ackCommand(id, status, error, conversationId, agent) {
-  if (status === 'sent') {
+  if (status === 'sent' && !agent) {
+    // Resume commands are finished once their bootstrap message was sent. Worker
+    // commands are different: the app deliberately keeps them until join_agent really
+    // succeeds, so do not blacklist their id here or a post-safety-block retry could
+    // never be collected by this service worker.
     settled.push(id);
     await persistLive();
   }
@@ -596,6 +611,12 @@ const HANDLERS = {
     return call('/closed', {
       method: 'POST',
       body: JSON.stringify({ conversationId: message.conversationId })
+    });
+  },
+  async compact(message) {
+    return call('/compact', {
+      method: 'POST',
+      body: JSON.stringify({ conversationId: message.conversationId, resume: message.resume !== false })
     });
   },
   async poll() {

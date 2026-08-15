@@ -278,27 +278,30 @@ export interface CompactionState {
 export interface OpenRouterModel {
   id: string;
   name: string;
+  /** Gateway-advertised context window. */
   contextLength: number | null;
+  /** Primary provider's context window, when OpenRouter exposes it. */
+  providerContextLength: number | null;
+  /** Primary provider's maximum completion, used to clamp compaction output. */
+  maxCompletionTokens: number | null;
   /** True when the model advertises reasoning support of any kind. */
   reasoning: boolean;
-  /**
-   * Efforts this model actually accepts, from its live metadata.
-   *
-   * Empty means "do not send a reasoning setting at all". OpenRouter's catalogue
-   * advertises that a model takes a reasoning parameter but not, in general, which
-   * efforts it accepts, so the standard three are assumed when it does and anything
-   * further (xhigh) only appears when the metadata names it.
-   */
+  /** Exact effort levels advertised by OpenRouter, excluding our local `off` choice. */
   reasoningLevels: ReasoningEffort[];
+  /** A mandatory-reasoning model must not offer the local Off choice. */
+  reasoningMandatory: boolean;
+  /** Provider's preferred effort. `off` represents OpenRouter's wire value `none`. */
+  reasoningDefault: ReasoningEffort | 'off' | null;
   /** Unix seconds the model was listed, for newest-first ordering. Null if absent. */
   created: number | null;
   promptPrice: number | null;
   completionPrice: number | null;
 }
 
-export type ReasoningEffort = 'off' | 'low' | 'medium' | 'high' | 'xhigh';
+/** OpenRouter's selectable effort values. `off` is a local UI value mapped to wire `none`. */
+export type ReasoningEffort = 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max';
 
-export const REASONING_EFFORTS: readonly ReasoningEffort[] = ['off', 'low', 'medium', 'high', 'xhigh'];
+export const REASONING_EFFORTS: readonly ReasoningEffort[] = ['minimal', 'low', 'medium', 'high', 'xhigh', 'max'];
 
 // ---------------------------------------------------------------- agents
 
@@ -379,10 +382,15 @@ export function eventTokens(event: SessionEvent): number {
   switch (event.kind) {
     case 'user_message':
     case 'assistant_message':
-    case 'progress':
     case 'chat_error':
     case 'note':
       return estimateTokens(event.message.text);
+    case 'progress':
+      // Live progress/reasoning captions are useful audit evidence but are not stable
+      // conversation context, and often restate work that later appears in the final
+      // assistant message. Counting every transient caption made the advisory meter
+      // roughly double what users saw in the actual conversation on tool-heavy turns.
+      return 0;
     case 'tool_call':
       return (
         estimateTokens(event.call.args.text) +

@@ -54,6 +54,13 @@ describe('settings migration', () => {
     expect(loaded.tunnel.tunnelId).toBe(oldConfig.tunnel.tunnelId);
   });
 
+  it('round-trips the full OpenRouter reasoning selector including xhigh', async () => {
+    const config = defaultConfig();
+    await saveConfig({ ...config, compaction: { ...config.compaction, reasoning: 'xhigh' } });
+    const loaded = await loadConfig();
+    expect(loaded.compaction.reasoning).toBe('xhigh');
+  });
+
   it('serializes concurrent read-modify-write changes instead of losing one', async () => {
     await saveConfig(defaultConfig());
     const first = updateConfig(async (config) => {

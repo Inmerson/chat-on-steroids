@@ -22,7 +22,11 @@
 
 var CLF_DOM = (() => {
   const TURN = 'section[data-testid^="conversation-turn"]';
-  const TOOL = 'span[class*="tool-message"]';
+  // ChatGPT has used both shapes in the live renderer: the older tool-message span
+  // and, as of 2026-08-15, a display-contents row wrapping the visible tool label.
+  // Keep both explicit structural anchors; hashed CSS-module names remain off limits.
+  const TOOL_LEGACY = 'span[class*="tool-message"]';
+  const TOOL = `${TOOL_LEGACY}, div.pointer-events-none.contents`;
   const STOP =
     'button[data-testid="stop-button"], button[data-testid="composer-stop-button"], ' +
     'button[aria-label="Stop streaming"], button[aria-label="Stop generating"]';
@@ -39,6 +43,17 @@ var CLF_DOM = (() => {
 
   const text = (node, cap = 200_000) =>
     node ? (node.textContent || '').replace(/ /g, ' ').trim().slice(0, cap) : '';
+
+  /**
+   * ChatGPT sometimes renders transport failures inside the same `.markdown` shape as
+   * a final assistant answer. Treating "Message delivery timed out … Retry" as model
+   * prose makes a broken/reloaded turn look completed. role=alert remains the primary
+   * signal; these are narrow fallbacks for failure copy observed on the live site.
+   */
+  function transportFailure(value) {
+    const line = String(value || '').replace(/\s+/g, ' ').trim();
+    return /(?:message delivery timed out|unknown error occurred|there was an error generating (?:a|the) response|error in message stream|network error|something went wrong)/i.test(line);
+  }
 
   /** The conversation this tab is on, or null for a chat that has not been sent yet. */
   function conversationId() {
@@ -130,13 +145,16 @@ var CLF_DOM = (() => {
             }
           }
           if (parts.length > 0) {
-            out.push({
-              id: `assistant:${turn.id || index}`,
-              role: 'assistant',
-              text: parts.join('\n\n'),
-              turnId: turn.id,
-              interrupted: interrupted(turn)
-            });
+            const value = parts.join('\n\n');
+            if (!transportFailure(value)) {
+              out.push({
+                id: `assistant:${turn.id || index}`,
+                role: 'assistant',
+                text: value,
+                turnId: turn.id,
+                interrupted: interrupted(turn)
+              });
+            }
           }
         }
       }
@@ -182,10 +200,28 @@ var CLF_DOM = (() => {
     );
   }
 
+  /** Marks ChatGPT's own progress/reasoning containers so our CSS can make them legible. */
+  function markProgress(turn) {
+    return safe(() => {
+      let marked = 0;
+      for (const section of turnNodes(turn)) {
+        for (const box of section.querySelectorAll('[data-interrupted]')) {
+          if (!box.hasAttribute('data-clf-progress')) marked++;
+          box.setAttribute('data-clf-progress', '1');
+        }
+      }
+      return marked;
+    }, 0);
+  }
+
   /** The tool-call blocks of one logical turn, across every split section, in DOM order. */
   function toolBlocks(turn) {
     return safe(
-      () => turnNodes(turn).flatMap((section) => [...section.querySelectorAll(TOOL)]),
+      () =>
+        turnNodes(turn).flatMap((section) => {
+          const current = [...section.querySelectorAll(TOOL)];
+          return current.length > 0 ? current : [...section.querySelectorAll(TOOL_LEGACY)];
+        }),
       []
     );
   }
@@ -211,15 +247,23 @@ var CLF_DOM = (() => {
     }, null);
   }
 
-  /** Visible error banners. role=alert keeps the false-positive rate near zero. */
+  /** Visible error banners plus narrowly recognised transport-failure markdown. */
   function errors() {
-    return safe(
-      () =>
-        [...document.querySelectorAll('[role="alert"]')]
-          .map((node) => (node.innerText || '').replace(/\s+/g, ' ').trim())
-          .filter((value) => value.length > 2 && value.length < 500),
-      []
-    );
+    return safe(() => {
+      const out = [...document.querySelectorAll('[role="alert"]')]
+        .map((node) => (node.innerText || node.textContent || '').replace(/\s+/g, ' ').trim())
+        .filter((value) => value.length > 2 && value.length < 500);
+      for (const turn of turns()) {
+        if (turn.role !== 'assistant') continue;
+        for (const section of turnNodes(turn)) {
+          for (const markdown of section.querySelectorAll('.markdown')) {
+            const value = text(markdown, 500).replace(/\s+/g, ' ').trim();
+            if (value && transportFailure(value) && !out.includes(value)) out.push(value);
+          }
+        }
+      }
+      return out;
+    }, []);
   }
 
   function composer() {
@@ -233,10 +277,11 @@ var CLF_DOM = (() => {
       if (!box) return false;
       if ((box.textContent || '').trim() !== '') return false;
       box.focus();
-      // execCommand is the one insertion path that produces the input events the
-      // composer's own state depends on; setting textContent leaves it thinking it
-      // is still empty and the send button never appears.
+      // execCommand still produces the native editing path ChatGPT listens for. Newer
+      // composer builds occasionally ignore its return value, so verify the DOM and
+      // also emit input so React cannot miss the mutation.
       document.execCommand('insertText', false, value);
+      box.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: value }));
       return (box.textContent || '').trim().length > 0;
     }, false);
   }
@@ -265,6 +310,7 @@ var CLF_DOM = (() => {
     stopButton,
     progressLine,
     interrupted,
+    markProgress,
     toolBlocks,
     toolLabel,
     errors,

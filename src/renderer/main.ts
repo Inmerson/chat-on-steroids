@@ -50,7 +50,7 @@ const TOOL_COUNT_BY_CAPABILITY: Record<Capability, number> = {
   deleteFile: 1,
   deleteFolder: 1,
   powershell: 1,
-  command: 4,
+  command: 6,
   screen: 5,
   control: 1,
   clipboardRead: 1,
@@ -771,24 +771,24 @@ $('pickBinary').addEventListener('click', async () => {
 });
 
 $('copyUrl').addEventListener('click', async () => {
-  await navigator.clipboard.writeText($<HTMLInputElement>('publicUrl').value);
-  toast('URL copied');
+  const copied = await run(api.writeClipboard($<HTMLInputElement>('publicUrl').value));
+  if (copied) toast('URL copied');
 });
 
 for (const id of ['copyLog', 'copyLogText']) {
   $(id).addEventListener('click', async () => {
     const text = await run(api.getLogText());
     if (text === null) return;
-    await navigator.clipboard.writeText(text);
-    toast('Activity copied');
+    const copied = await run(api.writeClipboard(text));
+    if (copied) toast('Activity copied');
   });
 }
 
 $('copyLogJson').addEventListener('click', async () => {
   const text = await run(api.getLogJson());
   if (text === null) return;
-  await navigator.clipboard.writeText(text);
-  toast('Activity JSON copied');
+  const copied = await run(api.writeClipboard(text));
+  if (copied) toast('Activity JSON copied');
 });
 
 // The API key is written on blur so it is not saved keystroke by keystroke.

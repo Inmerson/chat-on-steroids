@@ -80,12 +80,17 @@ import { getConfig } from '../config.js';
 import {
   AgentError,
   acknowledgeOffers,
+  agentConversation,
   agentForCaller,
+  bindConversation,
   createAgents,
   finishAgent,
   identify,
   joinAgent,
+  joinBoundConversation,
   offerMessages,
+  pendingWorkerSpawns,
+  PRIME_ID,
   sendMessage,
   swarmState
 } from '../agents.js';
@@ -101,7 +106,7 @@ import {
   runInCallContext,
   type CallContext
 } from './call-context.js';
-import { recordAgentMessage, recordToolCall } from '../session/recorder.js';
+import { liveConversations, recordAgentMessage, recordToolCall, soleGeneratingConversation } from '../session/recorder.js';
 import { formatDelta } from '../diffstat.js';
 import { APP_VERSION } from '../version.js';
 import { findHandoff, latestHandoff, readEvents, readOverflowText } from '../session/store.js';
@@ -397,7 +402,7 @@ function enabledToolNames(caps: Capabilities): string[] {
   if (caps.deleteFile) names.push('delete_file');
   if (caps.deleteFolder) names.push('delete_directory');
   if (caps.powershell) names.push('run_powershell');
-  if (caps.command) names.push('run_command', 'launch_app', 'process', 'open_url');
+  if (caps.command) names.push('inspect_repo', 'run_command', 'launch_app', 'process_status', 'process', 'open_url');
   if (caps.screen) names.push('screenshot', 'list_windows', 'get_active_window', 'find_ui', 'wait_for_window');
   if (caps.control) names.push('computer');
   if (caps.clipboardRead) names.push('read_clipboard');
@@ -1240,6 +1245,74 @@ export function buildServer(ctx: ToolContext): McpServer {
 
   if (exposedCaps.command) {
     register(
+      'inspect_repo',
+      {
+        title: 'Inspect a Git repository',
+        description:
+          'Read-only Git inspection in an approved folder. Supports status, HEAD, diff, show and log without accepting arbitrary Git flags. It invokes git directly (no shell), disables pagers, fsmonitor, external diffs and textconv, performs no network access, and does not mutate the repository.',
+        inputSchema: z.object({
+          action: z.enum(['status', 'head', 'diff', 'show', 'log']).describe('Read-only repository query.'),
+          cwd: pathArg.optional().describe('Approved repository folder. Defaults to the first root.'),
+          staged: z.boolean().optional().describe('diff only: inspect the staged diff instead of the working-tree diff.'),
+          ref: z.string().min(1).max(200).optional().describe('show only: revision to inspect. Defaults to HEAD. Values beginning with - are refused.'),
+          count: z.number().int().min(1).max(100).optional().describe('log only: number of commits. Default 20.')
+        }),
+        annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false }
+      },
+      async ({ action, cwd, staged, ref, count }) =>
+        guarded('command', 'inspect_repo', async () => {
+          const dir = await resolveCwd(ctx, cwd);
+          if (ref?.startsWith('-')) return fail('ref must not begin with -');
+          const common = [
+            '-c',
+            'core.pager=cat',
+            '-c',
+            'pager.status=false',
+            '-c',
+            'pager.log=false',
+            '-c',
+            'pager.diff=false',
+            '-c',
+            'core.fsmonitor=false'
+          ];
+          let args: string[];
+          if (action === 'status') {
+            args = [...common, 'status', '--short', '--branch', '--untracked-files=normal'];
+          } else if (action === 'head') {
+            args = [...common, 'rev-parse', '--abbrev-ref', 'HEAD', 'HEAD'];
+          } else if (action === 'diff') {
+            args = [
+              ...common,
+              'diff',
+              '--no-ext-diff',
+              '--no-textconv',
+              ...(staged === true ? ['--cached'] : [])
+            ];
+          } else if (action === 'show') {
+            args = [
+              ...common,
+              'show',
+              '--no-ext-diff',
+              '--no-textconv',
+              '--format=fuller',
+              '--stat',
+              '--patch',
+              ref ?? 'HEAD'
+            ];
+          } else {
+            args = [...common, 'log', '--oneline', '--decorate=short', '-n', String(count ?? 20)];
+          }
+          logInfo(`tool inspect_repo ${action}`);
+          const result = await runCommand('git', args, dir, DEFAULT_TIMEOUT_MS, { GIT_OPTIONAL_LOCKS: '0' });
+          noteExec(result);
+          noteDetail(`git ${action}`);
+          return result.timedOut || (result.exitCode !== null && result.exitCode !== 0)
+            ? fail(formatExec(result))
+            : ok(formatExec(result));
+        })
+    );
+
+    register(
       'run_command',
       {
         title: 'Run a command',
@@ -1289,6 +1362,30 @@ export function buildServer(ctx: ToolContext): McpServer {
           const dir = await resolveCwd(ctx, cwd);
           const result = await launchCommand(command, args ?? [], dir);
           return ok(`Process spawned: ${command} (pid ${result.pid}). Execution after spawn is not verified.`);
+        })
+    );
+
+    register(
+      'process_status',
+      {
+        title: 'Inspect background processes',
+        description:
+          'Read-only status for managed long-running processes. Lists managed processes or returns bounded stdout/stderr for one process. It cannot start, write to or stop anything.',
+        inputSchema: z.object({
+          id: z.string().min(1).max(32).optional().describe('Managed process id. Omit to list all managed processes.'),
+          lines: z.number().int().min(1).max(200).optional().describe('Lines per stream. Default 80.'),
+          cursor: z.string().min(1).max(100).optional().describe('Previous opaque cursor for delta-only output.')
+        }),
+        annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false }
+      },
+      async ({ id, lines, cursor }) =>
+        guarded('command', 'process_status', async () => {
+          if (!id) {
+            const entries = listManagedProcesses();
+            if (entries.length === 0) return ok('No managed processes in this app session.');
+            return ok(entries.map((entry) => formatManagedProcess(entry, false)).join('\n'));
+          }
+          return ok(formatManagedProcess(getManagedProcess(id, lines ?? 80, cursor)));
         })
     );
 
@@ -1359,7 +1456,7 @@ export function buildServer(ctx: ToolContext): McpServer {
         description:
           'Open an http or https URL in the Windows default browser. This changes the desktop but does not interpret shell syntax.',
         inputSchema: z.object({ url: z.string().url().max(4000) }),
-        annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true }
+        annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true }
       },
       async ({ url }) =>
         guarded('command', 'open_url', async () => {
@@ -1839,7 +1936,13 @@ export function buildServer(ctx: ToolContext): McpServer {
       },
       async ({ workers }) =>
         agentGuard('create_agents', async () => {
+          const primeConversation = soleGeneratingConversation();
           const { created, primeSecret } = createAgents({ workers, caller: currentCaller() });
+          // The first create_agents call itself is still attributed by the active turn,
+          // because no prime key existed before it. Bind that proven conversation to
+          // prime immediately so every later keyed call stays in the same session and
+          // the extension can match it back to ChatGPT's tool blocks.
+          if (primeSecret && primeConversation) bindConversation(PRIME_ID, primeConversation);
           // The key is returned to the model and nowhere else: it is stripped from the
           // recorded history, the Activity feed and the logs, so this reply is the only
           // copy that exists.
@@ -1863,15 +1966,45 @@ export function buildServer(ctx: ToolContext): McpServer {
       {
         title: 'Join as a worker agent',
         description:
-          'Register this conversation as a worker agent and receive your task and your agent key. Call this once, first, using the one-time key from the message that opened this chat.',
+          'Register this fresh ChatGPT conversation as the worker/prime agent the paired extension opened. Normally call with no arguments; joinKey is only a manual/recovery fallback. Returns your task and agent key.',
         inputSchema: z.object({
-          joinKey: z.string().min(8).max(200).describe('The one-time key from the message that opened this chat')
+          joinKey: z.string().min(8).max(200).optional().describe('Optional one-time fallback key from an older/manual bootstrap')
         }),
         annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false }
       },
       async ({ joinKey }) =>
         agentGuard('join_agent', async () => {
-          const { info, secret } = joinAgent(joinKey, currentCaller());
+          let conversation: string | null = null;
+          if (!joinKey) {
+            const generating = new Set(
+              liveConversations().filter((entry) => entry.generating).map((entry) => entry.conversationId)
+            );
+            const workerCandidates = pendingWorkerSpawns()
+              .map((worker) => agentConversation(worker.id))
+              .filter((id): id is string => Boolean(id && generating.has(id)));
+            if (workerCandidates.length > 1) {
+              throw new AgentError(
+                'More than one invited worker is trying to join at once. The browser bootstrap queue should serialize joins; retry in a moment.'
+              );
+            }
+            conversation = workerCandidates[0] ?? null;
+            // Compact & Resume can hand the existing prime identity to a fresh chat.
+            // Prefer an invited worker above, because create_agents normally runs while
+            // the prime's own turn is still generating too.
+            if (!conversation) {
+              const prime = agentConversation(PRIME_ID);
+              if (prime && generating.has(prime)) conversation = prime;
+            }
+          }
+          const { info, secret } = joinKey
+            ? joinAgent(joinKey, currentCaller())
+            : conversation
+              ? joinBoundConversation(conversation, currentCaller())
+              : (() => {
+                  throw new AgentError(
+                    'Cannot safely identify this agent chat right now. The paired extension must bind the fresh conversation before join_agent runs. Retry in a moment.'
+                  );
+                })();
           const keyLine = secret
             ? `Your agent key is: ${secret}\nPass it as agent_key on every tool call from now on — it is how this app knows the work is yours and how messages reach you.\n\n`
             : 'You are already joined; keep using the agent key you were given.\n\n';

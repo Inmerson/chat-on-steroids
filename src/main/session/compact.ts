@@ -15,10 +15,13 @@ import type {
   CompactionStage,
   CompactionState,
   Handoff,
+  OpenRouterModel,
+  ReasoningEffort,
   SessionEvent,
   SessionSummary
 } from '../../shared/session.js';
 import { estimateTokens } from '../../shared/session.js';
+import type { ReasoningLevel } from '../../shared/types.js';
 import { getConfig, updateConfig } from '../config.js';
 import { logError, logInfo } from '../logger.js';
 import { OpenRouterError, complete, listModels, pickDefaultModel } from '../openrouter.js';
@@ -29,9 +32,16 @@ import { getSession, readEvents, saveHandoff } from './store.js';
 const DEFAULT_PACK_CHARS = 400_000;
 /** Never send more than this, whatever the model claims to accept. */
 const MAX_PACK_CHARS = 1_200_000;
-/** Room left for the model's own output, in characters of input given up. */
-const OUTPUT_RESERVE_CHARS = 40_000;
-const MAX_OUTPUT_TOKENS = 8_000;
+/** Desired handoff ceiling. Provider/model metadata may clamp it lower. */
+const TARGET_MAX_OUTPUT_TOKENS = 64_000;
+/** Conservative fallback when the live catalogue has no completion limit. */
+const FALLBACK_MAX_OUTPUT_TOKENS = 8_000;
+/** Hard packing uses a safer ratio than the UI's rough four-chars-per-token meter. */
+const PACK_CHARS_PER_TOKEN = 3;
+/** Slack for tokenizer variance, routing wrappers and provider-side accounting. */
+const CONTEXT_SAFETY_TOKENS = 4_096;
+/** Keep enough room for an actual recorded session even on a small-context model. */
+const MIN_HISTORY_TOKENS = 16_000;
 /** Tail of the brief kept for the UI while it streams. */
 const PREVIEW_CHARS = 2_000;
 
@@ -63,6 +73,80 @@ FILES — paths touched and what changed in each.
 ENVIRONMENT — commands, versions, running processes, repo state.
 NEXT — the concrete next actions, in order.
 DO NOT — what the next agent should not redo or undo.`;
+
+/** Space for per-pass markers/instructions in addition to the system prompt itself. */
+const REQUEST_OVERHEAD_TOKENS = Math.ceil((SYSTEM_PROMPT.length + 4_000) / PACK_CHARS_PER_TOKEN);
+
+export interface CompactionLimits {
+  contextTokens: number;
+  maxOutputTokens: number;
+  /** History chars available in a one-pass compaction. */
+  historyChars: number;
+  /** History chars per part when a carried brief also has to fit. */
+  partChars: number;
+  carryChars: number;
+}
+
+/**
+ * Turns live provider metadata into a request budget that cannot overcommit context.
+ *
+ * The old implementation converted context straight to characters and then subtracted
+ * a fixed 40k chars, which was only approximately compatible with an 8k output. A 64k
+ * completion needs a token budget first; only the history slice is converted to chars.
+ */
+export function compactionLimits(model: OpenRouterModel | null): CompactionLimits {
+  const advertisedContext = [model?.contextLength ?? null, model?.providerContextLength ?? null].filter(
+    (value): value is number => typeof value === 'number' && Number.isFinite(value) && value > 0
+  );
+  const fallbackContext =
+    Math.floor(DEFAULT_PACK_CHARS / PACK_CHARS_PER_TOKEN) +
+    FALLBACK_MAX_OUTPUT_TOKENS +
+    CONTEXT_SAFETY_TOKENS +
+    REQUEST_OVERHEAD_TOKENS;
+  const contextTokens = advertisedContext.length > 0 ? Math.min(...advertisedContext) : fallbackContext;
+  const providerOutput =
+    model?.maxCompletionTokens && model.maxCompletionTokens > 0
+      ? model.maxCompletionTokens
+      : FALLBACK_MAX_OUTPUT_TOKENS;
+  const roomAfterMinimumHistory = Math.max(
+    1_024,
+    contextTokens - MIN_HISTORY_TOKENS - CONTEXT_SAFETY_TOKENS - REQUEST_OVERHEAD_TOKENS
+  );
+  const maxOutputTokens = Math.max(
+    1_024,
+    Math.min(TARGET_MAX_OUTPUT_TOKENS, providerOutput, roomAfterMinimumHistory)
+  );
+  const historyTokens = Math.max(
+    2_000,
+    contextTokens - maxOutputTokens - CONTEXT_SAFETY_TOKENS - REQUEST_OVERHEAD_TOKENS
+  );
+  const historyChars = Math.min(MAX_PACK_CHARS, Math.max(20_000, historyTokens * PACK_CHARS_PER_TOKEN));
+  const carryChars = Math.min(MAX_CARRY_CHARS, Math.floor(historyChars * CARRY_FRACTION));
+  return {
+    contextTokens,
+    maxOutputTokens,
+    historyChars,
+    partChars: Math.max(2_000, historyChars - carryChars),
+    carryChars
+  };
+}
+
+function effectiveReasoning(configured: ReasoningLevel, model: OpenRouterModel | null): ReasoningLevel {
+  if (!model || !model.reasoning) return configured;
+  if (configured === 'off') {
+    if (!model.reasoningMandatory) return 'off';
+    const fallback = model.reasoningDefault ?? model.reasoningLevels[0] ?? 'high';
+    logInfo(`compaction: ${model.id} requires reasoning; using ${fallback} instead of Off`);
+    return fallback;
+  }
+  if (model.reasoningLevels.length === 0 || model.reasoningLevels.includes(configured as ReasoningEffort)) {
+    return configured;
+  }
+  const fallback: ReasoningLevel =
+    model.reasoningDefault ?? model.reasoningLevels[0] ?? (model.reasoningMandatory ? 'high' : 'off');
+  logInfo(`compaction: ${model.id} does not advertise ${configured}; using ${fallback}`);
+  return fallback;
+}
 
 // ------------------------------------------------------------------ state
 
@@ -150,7 +234,8 @@ function flat(text: string, cap: number): string {
  * exact failure staging exists to prevent.
  */
 const CARRY_FRACTION = 0.35;
-const MAX_CARRY_CHARS = 60_000;
+/** Enough to carry a full 64k-token intermediate brief at the normal ~4 chars/token. */
+const MAX_CARRY_CHARS = TARGET_MAX_OUTPUT_TOKENS * 4;
 
 /**
  * Builds the text sent to the model, in priority order.
@@ -349,20 +434,21 @@ export async function compactSession(request: CompactRequest): Promise<Handoff> 
     const model = await resolveModel();
     setState({ model });
     const models = await listModels().catch(() => []);
-    const chosen = models.find((entry) => entry.id === model);
-    const budget = Math.min(
-      MAX_PACK_CHARS,
-      Math.max(20_000, (chosen?.contextLength ? chosen.contextLength * 4 : DEFAULT_PACK_CHARS) - OUTPUT_RESERVE_CHARS)
-    );
-    const pack = packSession(summary, events, budget);
+    const chosen = models.find((entry) => entry.id === model) ?? null;
+    const limits = compactionLimits(chosen);
+    // A single pass can use the whole history budget. If essentials need staging,
+    // repack with explicit room for the carried brief so pass 2+ cannot exceed context.
+    let pack = packSession(summary, events, limits.historyChars);
+    if (pack.parts.length > 1) pack = packSession(summary, events, limits.partChars);
     logInfo(
-      `compaction: packed ${pack.events} events into ~${pack.tokens} tokens for ${model}` +
+      `compaction: packed ${pack.events} events into ~${pack.tokens} tokens for ${model}; ` +
+        `output cap ${limits.maxOutputTokens} tokens` +
         (pack.parts.length > 1 ? ` across ${pack.parts.length} passes` : '')
     );
 
-    const reasoningWanted = getConfig().compaction.reasoning;
+    const reasoningWanted = effectiveReasoning(getConfig().compaction.reasoning, chosen);
     const notes = [...pack.notes];
-    const carryCap = Math.min(MAX_CARRY_CHARS, Math.floor(budget * CARRY_FRACTION));
+    const carryCap = limits.carryChars;
     let brief = '';
 
     for (const [index, part] of pack.parts.entries()) {
@@ -376,7 +462,13 @@ export async function compactSession(request: CompactRequest): Promise<Handoff> 
       });
       stage('sending');
       let first = true;
-      const carried = brief ? `${'=== BRIEF SO FAR ==='}\n${brief.slice(-carryCap)}\n\n` : '';
+      if (brief.length > carryCap) {
+        throw new Error(
+          `The intermediate brief grew to ${brief.length} characters, beyond the ${carryCap}-character carry budget. ` +
+            'Compaction stopped instead of silently dropping the beginning of the handoff.'
+        );
+      }
+      const carried = brief ? `${'=== BRIEF SO FAR ==='}\n${brief}\n\n` : '';
       const instruction = last
         ? total > 1
           ? 'This is the final part of the recording. Produce the complete, final brief, keeping everything still true from the brief so far.'
@@ -388,8 +480,14 @@ export async function compactSession(request: CompactRequest): Promise<Handoff> 
           system: SYSTEM_PROMPT,
           user: `${carried}${part}\n\n=== END OF THIS PART ===\n${instruction}`,
           reasoning: reasoningWanted,
-          ...(chosen ? { reasoningLevels: chosen.reasoningLevels } : {}),
-          maxTokens: MAX_OUTPUT_TOKENS,
+          ...(chosen
+            ? {
+                reasoningSupported: chosen.reasoning,
+                reasoningLevels: chosen.reasoningLevels,
+                reasoningMandatory: chosen.reasoningMandatory
+              }
+            : {}),
+          maxCompletionTokens: limits.maxOutputTokens,
           signal: abort.signal
         },
         {
@@ -407,17 +505,22 @@ export async function compactSession(request: CompactRequest): Promise<Handoff> 
           }
         }
       );
-      if (!result.text.trim()) {
+      if (result.truncated) {
         throw new Error(
-          total > 1 ? `The model returned nothing for part ${index + 1} of ${total}` : 'The model returned an empty brief'
+          `The model stopped early (${result.finishReason ?? 'unknown'})${
+            total > 1 ? ` on part ${index + 1} of ${total}` : ''
+          }. No incomplete handoff was saved.`
+        );
+      }
+      if (!result.text.trim()) {
+        const reasoningOnly = result.reasoning.trim().length > 0 ? ' It returned reasoning but no final answer.' : '';
+        throw new Error(
+          (total > 1
+            ? `The model returned no final brief for part ${index + 1} of ${total}.`
+            : 'The model returned an empty brief.') + reasoningOnly
         );
       }
       brief = result.text.trim();
-      if (result.truncated) {
-        notes.push(
-          `the model stopped early (${result.finishReason})${total > 1 ? ` on part ${index + 1} of ${total}` : ''}; the brief may be missing its last sections`
-        );
-      }
     }
 
     stage('saving');

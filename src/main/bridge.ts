@@ -30,13 +30,16 @@ import {
   recordChatObservations,
   type ChatObservation
 } from './session/recorder.js';
-import { getSession, readEvents } from './session/store.js';
+import { getSession, listSessions, readEvents } from './session/store.js';
+import { compactSession, compactionRunning } from './session/compact.js';
 import {
   agentForConversation,
   bindConversation,
+  hasPrimeAgent,
   mintPrimeHandover,
   mintWorkerJoinKey,
-  onSpawnRequest
+  onSpawnRequest,
+  pendingWorkerSpawns
 } from './agents.js';
 import { readDurable, writeDurableSoon } from './durable.js';
 import { APP_VERSION, BRIDGE_PROTOCOL } from './version.js';
@@ -494,6 +497,47 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
     );
   }
 
+  if (route === '/compact' && req.method === 'POST') {
+    let body: Record<string, unknown>;
+    try {
+      body = (await readBody(req)) as Record<string, unknown>;
+    } catch (err) {
+      if ((err as Error).message === 'body_too_large') return tooLarge(res, origin);
+      return json(res, 400, { error: 'bad_request' }, origin);
+    }
+    const id = conversationId(body['conversationId']);
+    if (!id) return json(res, 400, { error: 'bad_conversation_id' }, origin);
+    if (compactionRunning()) return json(res, 409, { error: 'compaction_running' }, origin);
+    const live = liveConversations().find((entry) => entry.conversationId === id);
+    const known = live ? null : (await listSessions()).find((entry) => entry.conversationId === id);
+    const sessionId = live?.sessionId ?? known?.id ?? null;
+    if (!sessionId) {
+      return json(
+        res,
+        409,
+        { error: 'session_not_recorded', message: 'This chat has no recorded local session to compact.' },
+        origin
+      );
+    }
+    const resume = body['resume'] !== false;
+    // Return immediately: a real compaction can stream for minutes, while the bridge's
+    // HTTP request timeout is intentionally short. The app publishes progress through
+    // its normal compaction state and queues the fresh chat only after a complete
+    // handoff has been saved.
+    void compactSession({
+      sessionId,
+      reason: resume ? 'browser compact and resume' : 'browser compaction',
+      resume
+    })
+      .then((handoff) => {
+        if (resume) queueResume(handoff.id);
+        logInfo(`bridge: browser compaction finished for ${sessionId}`);
+      })
+      .catch((err: Error) => logWarn(`bridge: browser compaction failed — ${err.message}`));
+    logInfo(`bridge: browser requested ${resume ? 'compact and resume' : 'compaction'} for ${sessionId}`);
+    return json(res, 202, { started: true, sessionId, resume }, origin);
+  }
+
   if (route === '/commands') {
     return json(res, 200, { commands: takeCommands() }, origin);
   }
@@ -656,14 +700,14 @@ function bootstrapText(spec: CommandSpec, key: string | null): string {
   if (spec.type === 'worker') {
     return (
       `You are worker agent "${spec.agent}" in a ChatGPT Local Files multi-agent run. ` +
-      `Call the join_agent tool with joinKey "${key ?? ''}" — it returns your task and your agent key. ` +
-      'Pass that agent key as agent_key on every later tool call so your messages reach you. ' +
+      'Call the join_agent tool with no arguments — the paired extension already bound this fresh ChatGPT conversation to your worker slot. ' +
+      'It returns your task and your agent key. Pass that agent key as agent_key on every later tool call so your messages reach you. ' +
       'Report progress to the prime agent with send_agent_message, and call finish_agent when you are done. ' +
       'Do not try to contact other workers; everything goes through the prime agent.'
     );
   }
-  const handover = key
-    ? ` This run also has a multi-agent swarm: call join_agent with joinKey "${key}" to take over as the prime agent, and pass the agent key it returns as agent_key on every later call.`
+  const handover = hasPrimeAgent()
+    ? ' This run also has a multi-agent swarm: call join_agent with no arguments to take over as the prime agent, then pass the returned agent key as agent_key on every later call.'
     : '';
   return (
     'Continue the previous ChatGPT Local Files session. Call the resume_session tool with ' +
@@ -678,7 +722,7 @@ function describe(command: Command, key: string | null): BridgeCommand {
     id: command.id,
     kind: 'open-chat',
     text: bootstrapText(command.spec, key),
-    agent: command.spec.type === 'worker' ? command.spec.agent : null,
+    agent: command.spec.type === 'worker' ? command.spec.agent : hasPrimeAgent() ? 'prime' : null,
     leaseMs: COMMAND_LEASE_MS,
     attempt: command.attempts
   };
@@ -701,33 +745,46 @@ function drop(command: Command, why: string): void {
 function takeCommands(): BridgeCommand[] {
   const now = Date.now();
   const out: BridgeCommand[] = [];
+  const pendingWorkers = new Set(pendingWorkerSpawns().map((worker) => worker.id));
+  // Browser-bound joining deliberately carries no random credential through ChatGPT.
+  // Keep only one not-yet-joined worker bootstrap in flight so join_agent can identify
+  // that worker from the extension binding even while the prime keeps working in
+  // parallel. Once it joins (or exhausts retries), the next worker may open.
+  let workerLeaseHeld = commands.some(
+    (command) =>
+      command.spec.type === 'worker' &&
+      pendingWorkers.has(command.spec.agent) &&
+      command.claimedAt !== null &&
+      now - command.claimedAt < COMMAND_LEASE_MS
+  );
   for (const command of [...commands]) {
+    const workerAgent = command.spec.type === 'worker' ? command.spec.agent : null;
+    if (workerAgent && !pendingWorkers.has(workerAgent)) {
+      // The worker joined (or the run ended) after its bootstrap was sent. Only now is
+      // the command truly complete; retiring it on "message sent" stranded workers
+      // when ChatGPT's harness false-positive blocked join_agent afterwards.
+      commands = commands.filter((entry) => entry !== command);
+      persistCommands();
+      continue;
+    }
     if (now - command.createdAt > COMMAND_TTL_MS) {
       drop(command, 'it has been waiting too long to still be what the user expects');
       continue;
     }
     if (command.claimedAt !== null && now - command.claimedAt < COMMAND_LEASE_MS) continue;
+    if (workerAgent && workerLeaseHeld) continue;
     if (command.attempts >= MAX_ATTEMPTS) {
       drop(command, `${command.attempts} attempts failed${command.lastError ? ` (${command.lastError})` : ''}`);
       continue;
     }
-    // Re-use the key from a lease that timed out rather than rotating it: the previous
-    // attempt may have typed it successfully and simply lost the acknowledgement.
-    if (command.spec.type === 'worker' && command.key === null) {
-      const key = mintWorkerJoinKey(command.spec.agent);
-      if (!key) {
-        // The worker joined already, or the run ended. Nothing left to bootstrap.
-        commands = commands.filter((entry) => entry !== command);
-        persistCommands();
-        continue;
-      }
-      command.key = key;
-    } else if (command.spec.type === 'resume' && command.key === null) {
-      command.key = mintPrimeHandover();
-    }
+    // Protocol 3 authenticates browser bootstraps by the extension-bound ChatGPT
+    // conversation. Do not shuttle a random capability string through the model's tool
+    // arguments: ChatGPT can block those before the MCP request reaches this server.
+    command.key = null;
     command.claimedAt = now;
     command.attempts += 1;
-    out.push(describe(command, command.key));
+    if (workerAgent) workerLeaseHeld = true;
+    out.push(describe(command, null));
     if (out.length >= 5) break;
   }
   if (out.length > 0) {
@@ -748,8 +805,19 @@ function ackCommand(id: string, status: AckStatus, error: string | null): void {
     return;
   }
   if (status === 'sent') {
-    commands = commands.filter((entry) => entry !== command);
-    logInfo(`bridge: ${specKey(command.spec)} bootstrap sent`);
+    if (command.spec.type === 'worker') {
+      // Sending the bootstrap is not success for a worker: it still has to redeem its
+      // one-time join capability. Keep the command leased; if the harness blocks every
+      // join attempt, a fresh tab gets another attempt after the lease instead of the
+      // worker remaining invited forever.
+      command.claimedAt = Date.now();
+      command.key = null;
+      command.lastError = null;
+      logInfo(`bridge: ${specKey(command.spec)} bootstrap sent; waiting for worker to join`);
+    } else {
+      commands = commands.filter((entry) => entry !== command);
+      logInfo(`bridge: ${specKey(command.spec)} bootstrap sent`);
+    }
   } else {
     // Released immediately, so a retry does not have to wait out the lease.
     command.claimedAt = null;

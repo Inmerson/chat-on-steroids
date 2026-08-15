@@ -11,6 +11,7 @@
  */
 
 import type { OpenRouterModel, ReasoningEffort } from '../shared/session.js';
+import type { ReasoningLevel } from '../shared/types.js';
 import { getSecret } from './secrets.js';
 import { logInfo, logWarn } from './logger.js';
 
@@ -32,6 +33,13 @@ interface RawModel {
   architecture?: { input_modalities?: unknown; output_modalities?: unknown; modality?: unknown };
   supported_parameters?: unknown;
   pricing?: { prompt?: unknown; completion?: unknown };
+  top_provider?: { context_length?: unknown; max_completion_tokens?: unknown };
+  reasoning?: {
+    supported_efforts?: unknown;
+    default_effort?: unknown;
+    default_enabled?: unknown;
+    mandatory?: unknown;
+  };
 }
 
 let cache: { at: number; models: OpenRouterModel[] } | null = null;
@@ -56,24 +64,56 @@ function isTextModel(raw: RawModel): boolean {
   return typeof architecture.modality !== 'string' || architecture.modality.includes('text');
 }
 
-/**
- * Which reasoning efforts a model will actually accept.
- *
- * OpenRouter's catalogue says whether a model takes a `reasoning` parameter, not which
- * efforts it honours, so the standard three are assumed for a model that takes one and
- * nothing is assumed for a model that does not. `xhigh` is added only when the entry
- * itself mentions it — the alternative, offering it everywhere, means the app sends a
- * setting the provider rejects and blames the compaction.
- */
+const REASONING_WIRE_LEVELS = new Set<ReasoningEffort>(['minimal', 'low', 'medium', 'high', 'xhigh', 'max']);
+
+function reasoningEffort(value: unknown): ReasoningEffort | null {
+  return typeof value === 'string' && REASONING_WIRE_LEVELS.has(value as ReasoningEffort)
+    ? (value as ReasoningEffort)
+    : null;
+}
+
+function reasoningDefault(value: unknown): ReasoningEffort | 'off' | null {
+  return value === 'none' ? 'off' : reasoningEffort(value);
+}
+
+/** Exact modern model reasoning metadata, with a conservative legacy fallback. */
 function reasoningLevelsOf(raw: RawModel, supported: boolean): ReasoningEffort[] {
   if (!supported) return [];
-  const levels: ReasoningEffort[] = ['low', 'medium', 'high'];
-  try {
-    if (JSON.stringify(raw).toLowerCase().includes('xhigh')) levels.push('xhigh');
-  } catch {
-    // A model entry that will not serialise is not worth failing the whole list over.
+  const advertised = raw.reasoning?.supported_efforts;
+  if (Array.isArray(advertised)) {
+    return advertised.flatMap((value) => {
+      const effort = reasoningEffort(value);
+      return effort ? [effort] : [];
+    });
   }
-  return levels;
+  if (advertised === null) return ['minimal', 'low', 'medium', 'high', 'xhigh', 'max'];
+  // A modern reasoning object with the field omitted explicitly means the model does
+  // not expose effort selection. Only legacy catalogue rows need the old three-level
+  // fallback when all we know is that a `reasoning` parameter exists.
+  if (raw.reasoning !== undefined) return [];
+  return ['low', 'medium', 'high'];
+}
+
+/** Pure parser kept exported so provider-metadata regressions are cheap to test. */
+export function parseOpenRouterModel(raw: RawModel): OpenRouterModel | null {
+  if (typeof raw.id !== 'string' || !isTextModel(raw)) return null;
+  const parameters = Array.isArray(raw.supported_parameters) ? raw.supported_parameters : [];
+  const reasoning =
+    raw.reasoning !== undefined || parameters.includes('reasoning') || parameters.includes('include_reasoning');
+  return {
+    id: raw.id,
+    name: typeof raw.name === 'string' ? raw.name : raw.id,
+    contextLength: toNumber(raw.context_length),
+    providerContextLength: toNumber(raw.top_provider?.context_length),
+    maxCompletionTokens: toNumber(raw.top_provider?.max_completion_tokens),
+    reasoning,
+    reasoningLevels: reasoningLevelsOf(raw, reasoning),
+    reasoningMandatory: raw.reasoning?.mandatory === true,
+    reasoningDefault: reasoningDefault(raw.reasoning?.default_effort),
+    created: toNumber(raw.created),
+    promptPrice: toNumber(raw.pricing?.prompt),
+    completionPrice: toNumber(raw.pricing?.completion)
+  };
 }
 
 /** The catalogue, cached for half an hour. Force a refresh with `refresh`. */
@@ -88,19 +128,8 @@ export async function listModels(refresh = false): Promise<OpenRouterModel[]> {
   const body = (await response.json()) as { data?: RawModel[] };
   const models: OpenRouterModel[] = [];
   for (const raw of body.data ?? []) {
-    if (typeof raw.id !== 'string' || !isTextModel(raw)) continue;
-    const parameters = Array.isArray(raw.supported_parameters) ? raw.supported_parameters : [];
-    const reasoning = parameters.includes('reasoning') || parameters.includes('include_reasoning');
-    models.push({
-      id: raw.id,
-      name: typeof raw.name === 'string' ? raw.name : raw.id,
-      contextLength: toNumber(raw.context_length),
-      reasoning,
-      reasoningLevels: reasoningLevelsOf(raw, reasoning),
-      created: toNumber(raw.created),
-      promptPrice: toNumber(raw.pricing?.prompt),
-      completionPrice: toNumber(raw.pricing?.completion)
-    });
+    const parsed = parseOpenRouterModel(raw);
+    if (parsed) models.push(parsed);
   }
   // Newest first: someone choosing a compaction model wants this month's models at the
   // top, not whichever vendor's name sorts earliest. Entries with no listing date fall
@@ -143,17 +172,14 @@ export interface CompletionRequest {
   model: string;
   system: string;
   user: string;
-  reasoning: ReasoningEffort;
-  /**
-   * Efforts this model accepts, from its live catalogue entry.
-   *
-   * Omit only when the catalogue could not be read. An effort outside this list is not
-   * sent at all: telling the user an unsupported setting "will be ignored" while still
-   * putting it in the request body is how a compaction fails with a provider error
-   * instead of being quietly downgraded.
-   */
+  reasoning: ReasoningLevel;
+  /** Whether the catalogue says this is a reasoning model. Unknown when omitted. */
+  reasoningSupported?: boolean;
+  /** Exact efforts this model accepts, from its live catalogue entry. */
   reasoningLevels?: readonly ReasoningEffort[];
-  maxTokens?: number;
+  /** True means OpenRouter says reasoning cannot be disabled for this model. */
+  reasoningMandatory?: boolean;
+  maxCompletionTokens?: number;
   signal?: AbortSignal;
 }
 
@@ -178,10 +204,7 @@ export interface CompletionResult {
  * a final `data: [DONE]`, and occasional `: comment` keepalives. Anything unparseable
  * is skipped rather than aborting a compaction that is otherwise going fine.
  */
-export async function complete(
-  request: CompletionRequest,
-  handlers: CompletionHandlers
-): Promise<CompletionResult> {
+export function buildCompletionBody(request: CompletionRequest): Record<string, unknown> {
   const body: Record<string, unknown> = {
     model: request.model,
     stream: true,
@@ -190,21 +213,30 @@ export async function complete(
       { role: 'user', content: request.user }
     ]
   };
-  if (request.maxTokens) body['max_tokens'] = request.maxTokens;
+  if (request.maxCompletionTokens) body['max_completion_tokens'] = request.maxCompletionTokens;
   const levels = request.reasoningLevels;
-  const supportsReasoning = levels === undefined || levels.length > 0;
-  if (!supportsReasoning) {
-    // The model takes no reasoning parameter at all; sending one is an error, not a
-    // no-op, so nothing about reasoning goes in the body.
-  } else if (request.reasoning === 'off') {
-    body['reasoning'] = { exclude: true };
-  } else if (levels === undefined || levels.includes(request.reasoning)) {
+  const supportsReasoning = request.reasoningSupported ?? (levels === undefined || levels.length > 0);
+  if (!supportsReasoning) return body;
+
+  if (request.reasoning === 'off') {
+    if (request.reasoningMandatory !== true) body['reasoning'] = { effort: 'none' };
+    return body;
+  }
+  if (levels === undefined || levels.includes(request.reasoning as ReasoningEffort)) {
     body['reasoning'] = { effort: request.reasoning };
   } else {
     logWarn(
       `openrouter: ${request.model} does not advertise "${request.reasoning}" reasoning; sending the request without a reasoning setting`
     );
   }
+  return body;
+}
+
+export async function complete(
+  request: CompletionRequest,
+  handlers: CompletionHandlers
+): Promise<CompletionResult> {
+  const body = buildCompletionBody(request);
 
   const response = await fetch(`${BASE}/chat/completions`, {
     method: 'POST',

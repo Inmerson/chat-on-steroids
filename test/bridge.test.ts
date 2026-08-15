@@ -39,7 +39,7 @@ const {
 const { flushDurable, initDurableStore, readDurable, writeDurableSoon } = await import('../src/main/durable.js');
 const { initSessionStore, readEvents, resetSessionStoreForTests } = await import('../src/main/session/store.js');
 const { recordToolCall, resetRecorderForTests } = await import('../src/main/session/recorder.js');
-const { createAgents, resetSwarm } = await import('../src/main/agents.js');
+const { createAgents, joinBoundConversation, resetSwarm } = await import('../src/main/agents.js');
 const { makeTempDir, removeTempDir } = await import('./helpers.js');
 
 const EXTENSION_ORIGIN = 'chrome-extension://abcdefghijklmnopabcdefghijklmnop';
@@ -150,8 +150,8 @@ describe('who is allowed to talk to it', () => {
     const reply = await request('GET', '/hello', { auth: null });
     expect(reply.status).toBe(200);
     expect(reply.body.app).toBe('chatgpt-local-files');
-    expect(reply.body.version).toBe('1.5.0');
-    expect(reply.body.bridge).toBe(2);
+    expect(reply.body.version).toBe('1.5.1');
+    expect(reply.body.bridge).toBe(3);
     expect(reply.body.paired).toBe(false);
     // Identification must not double as a status leak.
     expect(Object.keys(reply.body)).toEqual(['app', 'version', 'bridge', 'paired']);
@@ -486,14 +486,65 @@ describe('leased commands', () => {
     expect(command.agent).toBe('worker-1');
     expect(command.text).toContain('join_agent');
     expect(command.text).toContain('worker-1');
-    const joinKey = /joinKey "([A-Za-z0-9_-]{20,})"/.exec(command.text)?.[1];
-    expect(joinKey).toBeTruthy();
+    expect(command.text).toContain('with no arguments');
     expect(command.text).not.toContain('SECRET TASK BODY');
+    expect(command.text).not.toContain('joinKey');
 
     await flushDurable();
     const stored = await readDurable<unknown>('bridge-commands');
-    expect(JSON.stringify(stored)).not.toContain(joinKey!);
     expect(JSON.stringify(stored)).not.toContain('joinKey');
+  });
+
+  it('keeps a worker bootstrap leased after send and retires it only once the worker really joins', async () => {
+    await pair();
+    createAgents({ workers: [{ task: 'audit the compaction' }], caller: {} });
+    const listed = await request('GET', '/commands');
+    const command = listed.body.commands[0];
+    const conversationId = 'abcdef12-3456-7890-abcd-ef1234567890';
+    expect(command.text).toContain('join_agent tool with no arguments');
+
+    await request('POST', '/commands/ack', {
+      body: {
+        id: command.id,
+        status: 'sent',
+        conversationId,
+        agent: 'worker-1'
+      }
+    });
+    expect(pendingCommands()).toHaveLength(1);
+    expect((await request('GET', '/commands')).body.commands).toEqual([]);
+
+    joinBoundConversation(conversationId);
+    expect((await request('GET', '/commands')).body.commands).toEqual([]);
+    expect(pendingCommands()).toEqual([]);
+  });
+
+  it('serializes fresh worker bootstraps so browser-bound joins stay unambiguous', async () => {
+    await pair();
+    createAgents({
+      workers: [
+        { task: 'first audit' },
+        { task: 'second audit' }
+      ],
+      caller: {}
+    });
+
+    const firstPage = await request('GET', '/commands');
+    expect(firstPage.body.commands).toHaveLength(1);
+    expect(firstPage.body.commands[0].agent).toBe('worker-1');
+    const first = firstPage.body.commands[0];
+    const firstConversation = '11111111-2222-3333-4444-555555555555';
+    await request('POST', '/commands/ack', {
+      body: { id: first.id, status: 'sent', conversationId: firstConversation, agent: 'worker-1' }
+    });
+
+    // worker-2 is queued, but cannot open until worker-1 has actually joined.
+    expect((await request('GET', '/commands')).body.commands).toEqual([]);
+    joinBoundConversation(firstConversation);
+
+    const secondPage = await request('GET', '/commands');
+    expect(secondPage.body.commands).toHaveLength(1);
+    expect(secondPage.body.commands[0].agent).toBe('worker-2');
   });
 
   it('persists retry state across an app restart without persisting the minted credential', async () => {

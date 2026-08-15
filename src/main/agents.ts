@@ -376,6 +376,37 @@ export function joinAgent(joinKey: string, caller: Caller = {}): JoinResult {
 }
 
 /**
+ * Joins the agent already bound to a ChatGPT conversation by the paired extension.
+ *
+ * This is the normal browser bootstrap path. It avoids making the model echo a random
+ * capability string through ChatGPT's tool arguments, which can be rejected by the
+ * platform before this MCP server ever sees the call. The binding itself comes from an
+ * authenticated bridge command that this app created for that exact agent slot.
+ */
+export function joinBoundConversation(conversationId: string, caller: Caller = {}): JoinResult {
+  requireEnabled();
+  const agent = [...agents.values()].find((entry) => entry.info.conversationId === conversationId);
+  if (!agent) throw new AgentError('This ChatGPT conversation is not bound to an agent bootstrap.');
+  if (agent.info.state === 'finished') throw new AgentError(`${agent.info.id} has already finished`);
+
+  // A retry from the same bound conversation is legitimate recovery when the previous
+  // result was lost after state changed but before ChatGPT received the returned key.
+  agent.joinKeyHash = null;
+  agent.info.state = 'active';
+  agent.info.joinedAt = agent.info.joinedAt ?? Date.now();
+  unbind(agent);
+  bind(agent, caller.transportKey);
+  const secret = mintFor(agent, 'secret');
+  logInfo(`multi-agent: ${agent.info.id} joined via extension-bound conversation`);
+  changed();
+  return { info: { ...agent.info }, secret };
+}
+
+export function hasPrimeAgent(): boolean {
+  return agents.has(PRIME_ID);
+}
+
+/**
  * A fresh one-time join key for a worker that has not joined yet.
  *
  * The bridge asks for this when it is about to hand a bootstrap command to the

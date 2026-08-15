@@ -90,7 +90,7 @@ export interface SessionSettings {
   limitTokens: number;
 }
 
-export type ReasoningLevel = 'off' | 'low' | 'medium' | 'high';
+export type ReasoningLevel = 'off' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max';
 
 export interface CompactionSettings {
   /** OpenRouter model id. Empty means "resolve the default at first use". */

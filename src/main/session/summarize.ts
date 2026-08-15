@@ -239,6 +239,18 @@ function build(
       return { kind: 'browse', tone: 'neutral', title: 'Listed approved folders' };
 
     // ---------------------------------------------------------- commands
+    case 'inspect_repo': {
+      const action = str(args['action']) ?? 'status';
+      const count = num(args['count']);
+      const titles: Record<string, string> = {
+        status: 'Checked Git status',
+        head: 'Inspected repository HEAD',
+        diff: args['staged'] === true ? 'Read staged Git diff' : 'Read Git diff',
+        show: `Inspected Git ${str(args['ref']) ?? 'HEAD'}`,
+        log: `Read Git log${count ? ` · ${count} commits` : ''}`
+      };
+      return { kind: 'read', tone: 'neutral', title: titles[action] ?? `Inspected Git ${action}` };
+    }
     case 'run_command':
     case 'run_powershell': {
       const command =
@@ -260,6 +272,12 @@ function build(
     }
     case 'launch_app':
       return { kind: 'run', tone: 'neutral', title: `Launched ${str(args['command']) ?? 'a program'}` };
+    case 'process_status':
+      return {
+        kind: 'process',
+        tone: 'neutral',
+        title: str(args['id']) ? `Checked process ${str(args['id'])}` : 'Listed processes'
+      };
     case 'process': {
       const action = str(args['action']) ?? 'status';
       const id = str(args['id']);

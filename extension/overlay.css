@@ -32,10 +32,46 @@
   opacity: 1;
 }
 
-/* The relabelled tool row. Deliberately almost invisible: it is still ChatGPT's
-   component, and the only visible change should be that the words are now true. */
+/* The relabelled tool row keeps ChatGPT's component but makes its semantics readable. */
 .clf-tool [data-clf-label] {
   font-variant-numeric: tabular-nums;
+}
+
+.clf-tool-icon {
+  display: inline-flex;
+  min-width: 1.2em;
+  margin-right: 0.35em;
+  justify-content: center;
+  font-weight: 700;
+  opacity: 0.9;
+}
+
+.clf-tool-title {
+  font-weight: 650;
+}
+
+.clf-tool-detail {
+  margin-left: 0.45em;
+  font-size: 0.92em;
+  opacity: 0.74;
+}
+
+/* ChatGPT renders live reasoning/progress noticeably fainter than answer text. The
+   companion marks only the exact progress containers it observed, then restores full
+   opacity without trying to restyle arbitrary assistant prose. */
+[data-clf-progress='1'] {
+  opacity: 1 !important;
+}
+
+[data-clf-progress='1'] .markdown,
+[data-clf-progress='1'] p {
+  opacity: 1 !important;
+  font-weight: 550;
+}
+
+.clf-compact-icon {
+  font-size: 1.05em;
+  font-weight: 700;
 }
 
 /* --- the injected chronological view ------------------------------------- */
@@ -89,6 +125,14 @@
   min-width: 0;
 }
 
+.clf-row-icon {
+  width: 1.15em;
+  flex: none;
+  text-align: center;
+  font-weight: 700;
+  opacity: 0.9;
+}
+
 .clf-time {
   flex: none;
   font-variant-numeric: tabular-nums;
@@ -103,8 +147,9 @@
 }
 
 .clf-row.clf-progress .clf-label {
-  opacity: 0.72;
-  font-style: italic;
+  opacity: 1;
+  font-style: normal;
+  font-weight: 600;
 }
 
 .clf-row.clf-bad .clf-label {

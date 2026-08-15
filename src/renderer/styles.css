@@ -1294,6 +1294,12 @@ input[readonly] {
   color: var(--faint);
 }
 
+.meta.is-progress {
+  color: var(--ink);
+  font-weight: 650;
+  letter-spacing: 0.005em;
+}
+
 .meta.is-warn {
   color: var(--soft);
   font-weight: 600;

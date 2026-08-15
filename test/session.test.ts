@@ -14,7 +14,7 @@ import { defaultConfig, initConfigPath, saveConfig } from '../src/main/config.js
 import { lineDelta, formatDelta } from '../src/main/diffstat.js';
 import { chunkText } from '../src/main/mcp/tools.js';
 import { emptyEvidence } from '../src/main/mcp/call-context.js';
-import { packSession } from '../src/main/session/compact.js';
+import { compactionLimits, packSession } from '../src/main/session/compact.js';
 import {
   closeConversation,
   liveConversations,
@@ -354,6 +354,27 @@ describe('recorder', () => {
     expect(stored[0]!.turnId).toBe('turn-77');
   });
 
+  it('files an authenticated but not-yet-bound agent into the sole generating conversation', async () => {
+    const sessionId = await sessionForConversation('conv-restored-prime');
+    await recordChatObservations('conv-restored-prime', [
+      { kind: 'turn_start', time: Date.now(), turnId: 'turn-prime' }
+    ]);
+    const call = await recordToolCall({
+      tool: 'read_file',
+      args: { path: '/project/a.ts' },
+      content: [{ type: 'text', text: 'ok' }],
+      outcome: 'ok',
+      durationMs: 2,
+      startedAt: Date.now(),
+      agent: 'prime'
+    });
+    expect(call?.attribution).toBe('agent');
+    const stored = await readEvents(sessionId!, { kinds: ['tool_call'] });
+    expect(stored).toHaveLength(1);
+    expect(stored[0]!.turnId).toBe('turn-prime');
+    expect(stored[0]!.agent).toBe('prime');
+  });
+
   it('marks a call inferred when no conversation is demonstrably generating', async () => {
     await sessionForConversation('conv-a');
     await sessionForConversation('conv-b');
@@ -412,16 +433,46 @@ describe('recorder', () => {
     expect(await readEvents(first!, { kinds: ['session_start'] })).toHaveLength(1);
   });
 
-  it('closes an open turn as interrupted when the tab goes away', async () => {
+  it('marks a page detach as unknown and reconciles a final answer after reload', async () => {
     const sessionId = await sessionForConversation('conv-closing');
-    await recordChatObservations('conv-closing', [{ kind: 'turn_start', time: Date.now(), turnId: 't1' }]);
+    await recordChatObservations('conv-closing', [{ kind: 'turn_start', time: 10, turnId: 't1' }]);
     expect(liveConversations()[0]?.generating).toBe(true);
 
     await closeConversation('conv-closing');
-    const ends = await readEvents(sessionId!, { kinds: ['turn_end'] });
+    let ends = await readEvents(sessionId!, { kinds: ['turn_end'] });
     expect(ends).toHaveLength(1);
-    expect(ends[0]!.kind === 'turn_end' && ends[0]!.outcome).toBe('interrupted');
+    expect(ends[0]!.kind === 'turn_end' && ends[0]!.outcome).toBe('unknown');
     expect(liveConversations()).toHaveLength(0);
+
+    const reopened = await recordChatObservations('conv-closing', [
+      {
+        kind: 'assistant_message',
+        time: 20,
+        turnId: 't1',
+        messageId: 'assistant-after-reload',
+        text: 'the answer finished while the page was gone',
+        final: true
+      }
+    ]);
+    expect(reopened.sessionId).toBe(sessionId);
+    ends = await readEvents(sessionId!, { kinds: ['turn_end'] });
+    expect(ends.map((event) => (event.kind === 'turn_end' ? event.outcome : null))).toEqual(['unknown', 'completed']);
+    expect(ends[1]!.kind === 'turn_end' && ends[1]!.detail).toMatch(/recovered/);
+
+    // A second reload re-observes the same final message but must not append another
+    // synthetic completion.
+    const duplicate = await recordChatObservations('conv-closing', [
+      {
+        kind: 'assistant_message',
+        time: 30,
+        turnId: 't1',
+        messageId: 'assistant-after-reload',
+        text: 'the answer finished while the page was gone',
+        final: true
+      }
+    ]);
+    expect(duplicate.stored).toBe(0);
+    expect(await readEvents(sessionId!, { kinds: ['turn_end'] })).toHaveLength(2);
   });
 
   it('records the outcome the page reported, without upgrading a guess', async () => {
@@ -642,6 +693,17 @@ describe('token estimation', () => {
     expect(eventTokens(event)).toBe(100 + 200 + Math.ceil('Read a.ts'.length / 4));
   });
 
+  it('does not inflate the context advisory with transient progress captions', () => {
+    const event = {
+      seq: 1,
+      time: 1,
+      source: 'extension',
+      kind: 'progress',
+      message: { text: 'reasoning status '.repeat(100), truncated: false, chars: 1700 }
+    } as SessionEvent;
+    expect(eventTokens(event)).toBe(0);
+  });
+
   it('grades pressure against the configured thresholds', () => {
     expect(tokenPressure(50_000, 180_000, 200_000).level).toBe('ok');
     expect(tokenPressure(185_000, 180_000, 200_000).level).toBe('large');
@@ -784,6 +846,44 @@ describe('compaction pack', () => {
     // Header/markers add a small fixed overhead, but no part may balloon anywhere near
     // the complete essential history just because tier 1 did not fit in one request.
     expect(Math.max(...pack.parts.map((part) => part.length))).toBeLessThan(12_000);
+  });
+
+  it('derives a 64k Flash output cap without overcommitting provider context', () => {
+    const limits = compactionLimits({
+      id: 'deepseek/deepseek-v4-flash',
+      name: 'DeepSeek V4 Flash',
+      contextLength: 1_048_576,
+      providerContextLength: 1_024_000,
+      maxCompletionTokens: 384_000,
+      reasoning: true,
+      reasoningLevels: ['xhigh', 'high'],
+      reasoningMandatory: false,
+      reasoningDefault: 'high',
+      created: 0,
+      promptPrice: 0,
+      completionPrice: 0
+    });
+    expect(limits.maxOutputTokens).toBe(64_000);
+    expect(limits.partChars + limits.carryChars).toBeLessThanOrEqual(limits.historyChars);
+    expect(Math.ceil(limits.historyChars / 3) + limits.maxOutputTokens).toBeLessThan(1_024_000);
+  });
+
+  it('clamps output to a smaller provider completion limit', () => {
+    const limits = compactionLimits({
+      id: 'small/model',
+      name: 'Small model',
+      contextLength: 128_000,
+      providerContextLength: 128_000,
+      maxCompletionTokens: 16_000,
+      reasoning: false,
+      reasoningLevels: [],
+      reasoningMandatory: false,
+      reasoningDefault: null,
+      created: 0,
+      promptPrice: 0,
+      completionPrice: 0
+    });
+    expect(limits.maxOutputTokens).toBe(16_000);
   });
 
   it('states what the recording itself already lost', () => {

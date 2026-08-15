@@ -12,10 +12,11 @@
  * extension does nothing" into a diagnosable mismatch.
  */
 
-export const APP_VERSION = '1.5.0';
+export const APP_VERSION = '1.5.1';
 
 /**
  * 1 — original observations/activity bridge.
  * 2 — leased commands: /commands hands out a claim, /commands/ack reports the outcome.
+ * 3 — browser-triggered compaction via /compact and worker bootstrap completion semantics.
  */
-export const BRIDGE_PROTOCOL = 2;
+export const BRIDGE_PROTOCOL = 3;

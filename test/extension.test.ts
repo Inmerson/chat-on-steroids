@@ -32,8 +32,8 @@ describe('extension release metadata', () => {
     ) as { version: string };
     expect(pkg.version).toBe(APP_VERSION);
     expect(manifest.version).toBe(APP_VERSION);
-    expect(BRIDGE_PROTOCOL).toBe(2);
-    expect(backgroundSource).toContain('const BRIDGE_PROTOCOL = 2;');
+    expect(BRIDGE_PROTOCOL).toBe(3);
+    expect(backgroundSource).toContain('const BRIDGE_PROTOCOL = 3;');
   });
 });
 
@@ -61,6 +61,10 @@ class FakeNode {
 
   getAttribute(name: string): string | null {
     return this.attrs.get(name) ?? null;
+  }
+
+  hasAttribute(name: string): boolean {
+    return this.attrs.has(name);
   }
 
   setAttribute(name: string, value: string): void {
@@ -95,7 +99,9 @@ interface DomApi {
   messages(): Array<{ id: string; role: string; text: string; turnId: string | null }>;
   progressLine(turn: unknown): string | null;
   interrupted(turn: unknown): boolean;
+  markProgress(turn: unknown): number;
   toolBlocks(turn: unknown): FakeNode[];
+  errors(): string[];
 }
 
 function loadDom(sections: FakeNode[]): DomApi {
@@ -127,6 +133,18 @@ describe('ChatGPT DOM adapter', () => {
     expect(dom.toolBlocks(assistant)).toHaveLength(5);
   });
 
+  it('does not mistake ChatGPT transport-failure markdown for a completed assistant answer', () => {
+    const failure = new FakeNode({}, 'Message delivery timed out. Please try again. Retry');
+    const assistant = turn('assistant', 'request-failed')
+      .with('[data-message-id]', [])
+      .with('.markdown', [failure])
+      .with('[data-interrupted="true"]', []);
+    const dom = loadDom([assistant]);
+
+    expect(dom.messages()).toEqual([]);
+    expect(dom.errors()).toEqual(['Message delivery timed out. Please try again. Retry']);
+  });
+
   it('records assistant prose from .markdown when ChatGPT supplies no assistant data-message-id', () => {
     const userMessage = new FakeNode(
       { 'data-message-id': 'user-message-1', 'data-message-author-role': 'user' },
@@ -153,6 +171,19 @@ describe('ChatGPT DOM adapter', () => {
         interrupted: false
       }
     ]);
+  });
+
+  it('marks only the observed progress containers so the overlay can make them legible', () => {
+    const firstBox = new FakeNode({ 'data-interrupted': 'true' }, 'Thinking');
+    const secondBox = new FakeNode({ 'data-interrupted': 'true' }, 'Running tests');
+    const a1 = turn('assistant', 'request-progress').with('[data-interrupted]', [firstBox]);
+    const a2 = turn('assistant', 'request-progress').with('[data-interrupted]', [secondBox]);
+    const dom = loadDom([a1, a2]);
+    const logical = dom.turns()[0]!;
+    expect(dom.markProgress(logical)).toBe(2);
+    expect(firstBox.getAttribute('data-clf-progress')).toBe('1');
+    expect(secondBox.getAttribute('data-clf-progress')).toBe('1');
+    expect(dom.markProgress(logical)).toBe(0);
   });
 
   it('reads the newest progress line across every data-interrupted section of a split request', () => {
@@ -222,7 +253,7 @@ function loadWorker(options: {
   const chrome = {
     storage: { local: options.local, session: options.session },
     runtime: {
-      getManifest: () => ({ version: '1.5.0' }),
+      getManifest: () => ({ version: '1.5.1' }),
       onMessage: {
         addListener(fn: typeof listener) {
           listener = fn;
@@ -264,6 +295,52 @@ function journalOf(session: FakeStorageArea): any[] {
 }
 
 describe('extension observation journal', () => {
+  it('releases a stale pending bootstrap even when the fresh tab never collected it', async () => {
+    const local = new FakeStorageArea({ port: 8765, token: 'paired-token' });
+    const session = new FakeStorageArea({
+      bootstrap: {
+        id: 'stale-command',
+        text: 'bootstrap',
+        agent: 'worker-1',
+        leaseMs: 1_000,
+        createdAt: Date.now() - 5_000
+      },
+      settled: []
+    });
+    const paths: string[] = [];
+    const fetch = vi.fn(async (input: string) => {
+      const url = new URL(input);
+      paths.push(url.pathname);
+      if (url.pathname === '/hello') return response(200, { app: 'chatgpt-local-files', paired: true });
+      if (url.pathname === '/commands/ack') return response(200, { ok: true });
+      if (url.pathname === '/commands') return response(200, { commands: [] });
+      return response(404, {});
+    });
+    const worker = loadWorker({ local, session, fetch });
+    const result = await worker.send({ type: 'poll' });
+    expect(result.ok).toBe(true);
+    expect(session.data.bootstrap).toBeNull();
+    expect(paths).toContain('/commands/ack');
+    expect(paths).toContain('/commands');
+  });
+
+  it('does not permanently settle a worker command merely because its bootstrap message was sent', async () => {
+    const local = new FakeStorageArea({ port: 8765, token: 'paired-token' });
+    const session = new FakeStorageArea();
+    const fetch = vi.fn(async (input: string) => {
+      const url = new URL(input);
+      if (url.pathname === '/hello') return response(200, { app: 'chatgpt-local-files', paired: true });
+      if (url.pathname === '/commands/ack') return response(200, { ok: true });
+      return response(404, {});
+    });
+    const worker = loadWorker({ local, session, fetch });
+    await worker.send({ type: 'ack', id: 'worker-command', status: 'sent', agent: 'worker-1' });
+    expect(session.data.settled ?? []).toEqual([]);
+
+    await worker.send({ type: 'ack', id: 'resume-command', status: 'sent' });
+    expect(session.data.settled).toEqual(['resume-command']);
+  });
+
   it('keeps pre-conversation observations across page/service-worker reload and binds them when /c/<id> exists', async () => {
     const local = new FakeStorageArea();
     const session = new FakeStorageArea();

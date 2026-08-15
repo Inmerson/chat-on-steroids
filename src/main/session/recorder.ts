@@ -214,6 +214,16 @@ export function liveConversations(): Array<{ conversationId: string; sessionId: 
   }));
 }
 
+/**
+ * The one conversation demonstrably making a tool call right now, or null if that
+ * cannot be proven. Used only when the first create_agents call establishes the prime:
+ * after that the agent broker has an explicit conversation binding.
+ */
+export function soleGeneratingConversation(): string | null {
+  const live = [...conversations.values()].filter((entry) => entry.turnStartedAt !== null);
+  return live.length === 1 ? live[0]!.conversationId : null;
+}
+
 // ---------------------------------------------------------------- helpers
 
 /**
@@ -392,6 +402,17 @@ function pickTarget(agent: string | null): Target {
   if (agent) {
     const bound = [...conversations.values()].find((entry) => agentConversation(agent) === entry.conversationId);
     if (bound) return { conversationId: bound.conversationId, attribution: 'agent', turnId: bound.turnId };
+    // A restored run can legitimately have the authenticated agent key while its
+    // browser-conversation binding is still missing. Filing that call as unattributed
+    // breaks the extension's one-turn activity matching. If exactly one conversation
+    // is visibly generating, using it for *recording only* is still proof rather than a
+    // guess: the agent identity came from the capability, and the page says only this
+    // one turn can have made a tool call right now. This never authenticates the agent.
+    const generating = [...conversations.values()].filter((entry) => entry.turnStartedAt !== null);
+    if (generating.length === 1) {
+      const only = generating[0]!;
+      return { conversationId: only.conversationId, attribution: 'agent', turnId: only.turnId };
+    }
     return { conversationId: null, attribution: 'agent', turnId: null };
   }
   const generating = [...conversations.values()].filter((entry) => entry.turnStartedAt !== null);
@@ -473,6 +494,18 @@ export async function recordChatObservations(
   if (!sessionId) return { sessionId: null, stored: 0 };
   const live = conversations.get(conversationId);
   let stored = 0;
+  // A cold/reloaded page can discover that a turn finished while the content script
+  // was absent. In that case there is a new final assistant message but no live
+  // `generating -> false` transition for content.js to report. Reconcile only the
+  // newest final assistant observation, and only when this batch has no explicit end
+  // for that turn. Message-id de-duplication below ensures another reload cannot add a
+  // second synthetic completion for the same answer.
+  const explicitEnds = new Set(
+    observations.filter((item) => item.kind === 'turn_end' && item.turnId).map((item) => item.turnId as string)
+  );
+  const recoveredFinal = [...observations]
+    .reverse()
+    .find((item) => item.kind === 'assistant_message' && item.final === true && item.turnId);
 
   for (const item of observations) {
     // A reloaded tab reports the whole visible conversation again. Backfilling an
@@ -506,6 +539,26 @@ export async function recordChatObservations(
           final: item.final === true,
           ...(item.messageId ? { messageId: item.messageId } : {})
         });
+        if (
+          item === recoveredFinal &&
+          item.turnId &&
+          !explicitEnds.has(item.turnId)
+        ) {
+          if (live) {
+            live.turnStartedAt = null;
+            live.turnId = null;
+          }
+          await appendEvent(sessionId, {
+            time: item.time,
+            source: 'extension',
+            kind: 'turn_end',
+            turnId: item.turnId,
+            outcome: 'completed',
+            detail: 'recovered from a final assistant message after the ChatGPT page reloaded',
+            ...(agent ? { agent } : {})
+          });
+          stored++;
+        }
         break;
       case 'progress':
         await appendEvent(sessionId, {
@@ -615,7 +668,16 @@ export async function recordHandoff(
   notifyChanged();
 }
 
-/** Called when a conversation's tab goes away, so an unfinished turn is not left open. */
+/**
+ * Called when a conversation page goes away.
+ *
+ * `pagehide` cannot tell a reload from a real tab close, and ChatGPT may keep a server
+ * generation alive while the page is absent. Calling that "interrupted" was therefore
+ * too strong and made a reload look like a failed turn even when the final answer was
+ * waiting on the page a moment later. Record the lifecycle break as unknown; if the
+ * chat reopens with a new final assistant message, recordChatObservations reconciles it
+ * to a later completed turn_end.
+ */
 export async function closeConversation(conversationId: string): Promise<void> {
   const live = conversations.get(conversationId);
   if (!live) return;
@@ -624,8 +686,8 @@ export async function closeConversation(conversationId: string): Promise<void> {
       time: Date.now(),
       source: 'extension',
       kind: 'turn_end',
-      outcome: 'interrupted',
-      detail: 'the ChatGPT tab was closed or navigated away while generating'
+      outcome: 'unknown',
+      detail: 'the ChatGPT page detached while generating; outcome may be recovered when the chat reopens'
     }).catch(() => undefined);
   }
   conversations.delete(conversationId);

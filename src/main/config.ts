@@ -91,7 +91,10 @@ const configSchema = z.object({
   compaction: z
     .object({
       model: z.string().max(200).optional().default(DEFAULT_COMPACTION.model),
-      reasoning: z.enum(['off', 'low', 'medium', 'high']).optional().default(DEFAULT_COMPACTION.reasoning),
+      reasoning: z
+        .enum(['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'])
+        .optional()
+        .default(DEFAULT_COMPACTION.reasoning),
       showReasoning: z.boolean().optional().default(DEFAULT_COMPACTION.showReasoning)
     })
     .optional()

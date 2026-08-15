@@ -8,7 +8,7 @@
  * key but can never read it back.
  */
 
-import { BrowserWindow, dialog, ipcMain, shell } from 'electron';
+import { BrowserWindow, clipboard, dialog, ipcMain, shell } from 'electron';
 import { z } from 'zod';
 import { CAPABILITIES, type AppState, type Config } from '../shared/types.js';
 import { connect, disconnect, getStatus, onStatusChange } from './connection.js';
@@ -92,7 +92,7 @@ const settingsPatch = z.object({
   }),
   compaction: z.object({
     model: z.string().max(200),
-    reasoning: z.enum(['off', 'low', 'medium', 'high']),
+    reasoning: z.enum(['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max']),
     showReasoning: z.boolean()
   }),
   multiAgent: z.object({
@@ -250,6 +250,11 @@ export function registerIpc(getWindow: () => BrowserWindow | null): void {
   handle('log:get', async () => getLog());
   handle('log:text', async () => formatLogForClipboard());
   handle('log:json', async () => formatLogAsJson());
+  handle('clipboard:write', async (payload) => {
+    const { text } = z.object({ text: z.string().max(1_000_000) }).parse(payload);
+    clipboard.writeText(text);
+    return true;
+  });
 
   handle('link:open', async (payload) => {
     const { url } = z.object({ url: z.string().max(500) }).parse(payload);

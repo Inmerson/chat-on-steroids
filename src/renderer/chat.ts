@@ -136,7 +136,7 @@ function sessionRow(summary: SessionSummary): HTMLElement {
   const share = level && level.limit > 0 ? Math.min(100, (level.estimated / level.limit) * 100) : 0;
   fill.style.width = `${share.toFixed(1)}%`;
   bar.append(fill);
-  bar.title = `~${compactNumber(summary.estimatedTokens)} estimated tokens of recorded text`;
+  bar.title = `~${compactNumber(summary.estimatedTokens)} rough context tokens from messages and tool I/O; transient progress is excluded`;
 
   const remove = document.createElement('button');
   remove.className = 'btn sess-del';
@@ -290,7 +290,7 @@ function eventBody(event: SessionEvent): HTMLElement {
       return box;
     }
     case 'progress':
-      return el('p', 'meta', event.message.text);
+      return el('p', 'meta is-progress', event.message.text);
     case 'turn_start':
       return el('p', 'meta', 'Turn started');
     case 'turn_end': {
@@ -391,7 +391,7 @@ function paintDetail(): void {
     if (agentFilter !== null) {
       facts.push(`filtered to ${agentFilter === UNATTRIBUTED ? 'unattributed' : agentFilter} — ${shown.length} shown`);
     }
-    facts.push(`~${compactNumber(summary.estimatedTokens)} estimated tokens`);
+    facts.push(`~${compactNumber(summary.estimatedTokens)} rough context tokens`);
     const level = pressureOf(summary.id);
     if (level && level.level !== 'ok') {
       facts.push(
@@ -533,7 +533,9 @@ function modelRow(model: OpenRouterModel, chosen: string): HTMLElement {
     top.append(el('span', 'chip', `reasoning: ${model.reasoningLevels.join('/')}`));
   }
   const sub = el('div', 'model-sub');
-  sub.textContent = `${model.id} · ${model.contextLength ? `${compactNumber(model.contextLength)} ctx` : 'context unknown'} · ${priceLabel(model)}`;
+  const context = model.providerContextLength ?? model.contextLength;
+  const output = model.maxCompletionTokens ? ` · ${compactNumber(model.maxCompletionTokens)} max out` : '';
+  sub.textContent = `${model.id} · ${context ? `${compactNumber(context)} ctx` : 'context unknown'}${output} · ${priceLabel(model)}`;
   sub.title = model.id;
   row.append(top, sub);
   return row;
@@ -574,18 +576,30 @@ function paintReasoningHint(): void {
   // Unknown model: leave everything selectable rather than guessing it supports nothing.
   const levels: readonly string[] | null = known ? known.reasoningLevels : null;
   for (const option of select.options) {
-    option.disabled = option.value !== 'off' && levels !== null && !levels.includes(option.value);
+    option.disabled =
+      known !== null &&
+      (option.value === 'off' ? known.reasoningMandatory : levels !== null && !levels.includes(option.value));
   }
-  if (select.selectedOptions[0]?.disabled) select.value = levels && levels.length > 0 ? levels[0]! : 'off';
+  if (select.selectedOptions[0]?.disabled) {
+    const preferred = known?.reasoningDefault;
+    select.value =
+      preferred === 'off' && known?.reasoningMandatory !== true
+        ? 'off'
+        : preferred && levels?.includes(preferred)
+          ? preferred
+          : levels?.[0] ?? 'off';
+  }
 
   $('reasoningHint').textContent =
     chosen === ''
       ? 'No model chosen yet. The first compaction resolves a sensible default from the live catalogue.'
       : known === null
-        ? 'Load the model list to see which reasoning efforts this model accepts.'
-        : levels && levels.length > 0
-          ? `This model accepts ${levels.join(', ')}. Anything else is left out of the request rather than sent and rejected.`
-          : 'This model takes no reasoning parameter, so none is sent.';
+        ? 'Load the model list to see the provider’s exact reasoning and output limits.'
+        : !known.reasoning
+          ? 'This model takes no reasoning parameter, so none is sent.'
+          : `${known.reasoningMandatory ? 'Reasoning is mandatory. ' : 'Off genuinely disables reasoning. '}${
+              levels && levels.length > 0 ? `Advertised efforts: ${levels.join(', ')}.` : 'No selectable effort levels advertised.'
+            }${known.maxCompletionTokens ? ` Provider max output: ${compactNumber(known.maxCompletionTokens)} tokens; compaction caps itself at 64k.` : ''}`;
 }
 
 /**
@@ -787,8 +801,8 @@ export function initChat(next: Deps): void {
 
   $('copyHandoff').addEventListener('click', async () => {
     if (!handoff) return;
-    await navigator.clipboard.writeText(handoff.text);
-    toast('Handoff copied');
+    const copied = await run(api.writeClipboard(handoff.text));
+    if (copied) toast('Handoff copied');
   });
 
   $('orKey').addEventListener('blur', async () => {
