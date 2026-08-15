@@ -97,6 +97,33 @@ describe('runCommand', () => {
     expect(Buffer.byteLength(result.stderr, 'utf8')).toBeLessThanOrEqual(MAX_OUTPUT_BYTES);
   });
 
+  it('passes explicit bounded environment overrides without a shell', async () => {
+    const result = await runCommand(
+      node,
+      ['-e', 'console.log(process.env.CLF_TEST_VALUE ?? "missing")'],
+      cwd,
+      10_000,
+      { TEST_VALUE: 'env-ok' }
+    );
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout.trim()).toBe('missing');
+
+    const explicit = await runCommand(
+      node,
+      ['-e', 'console.log(process.env.TEST_VALUE ?? "missing")'],
+      cwd,
+      10_000,
+      { TEST_VALUE: 'env-ok' }
+    );
+    expect(explicit.stdout.trim()).toBe('env-ok');
+  });
+
+  it('rejects environment names reserved for connector internals', async () => {
+    await expect(
+      runCommand(node, ['-e', 'process.exit(0)'], cwd, 10_000, { CLF_COMMAND: 'nope' })
+    ).rejects.toThrow(/reserved/i);
+  });
+
   it('keeps secret environment variables away from the child', async () => {
     process.env.CONTROL_PLANE_API_KEY = 'sk-should-not-leak';
     process.env.OPENAI_API_KEY = 'sk-should-not-leak-either';
@@ -195,6 +222,16 @@ describe.runIf(IS_WINDOWS)('runPowerShell', () => {
     expect(result.stdout).toContain('hi from ps');
     expect(result.stderr).not.toContain('CLIXML');
     expect(result.stderr).not.toContain('Preparing modules for first use');
+  });
+
+  it('turns non-terminating CLIXML errors into readable plain text', async () => {
+    const result = await runPowerShell('Write-Error "expected-nonterminating"; Write-Output "continued"', cwd, 30_000);
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain('continued');
+    expect(result.stderr).toContain('PowerShell error stream (process exited 0)');
+    expect(result.stderr).toContain('expected-nonterminating');
+    expect(result.stderr).not.toContain('CLIXML');
+    expect(result.stderr).not.toContain('_x000D_');
   });
 
   it('passes shell metacharacters through untouched', async () => {

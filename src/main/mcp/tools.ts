@@ -29,6 +29,7 @@ import {
   editTextFile,
   editTextFiles,
   formatBytes,
+  FsOpError,
   listDirectory,
   readImageFile,
   readTextFile,
@@ -41,7 +42,11 @@ import { SandboxError, resolvePath, toVirtualPath } from '../sandbox.js';
 import { DEFAULT_EXCLUDES, search, searchOneFile } from '../search.js';
 import {
   DEFAULT_TIMEOUT_MS,
+  MAX_ENV_KEY_CHARS,
+  MAX_ENV_VALUE_CHARS,
+  MAX_ENV_VARS,
   MAX_TIMEOUT_MS,
+  ExecError,
   launchCommand,
   normaliseTimeout,
   runCommand,
@@ -50,8 +55,11 @@ import {
 import {
   getManagedProcess,
   listManagedProcesses,
+  MAX_PROCESS_INPUT_CHARS,
+  ProcessError,
   startManagedProcess,
   stopManagedProcess,
+  writeManagedProcess,
   type ManagedProcessStatus
 } from '../process-manager.js';
 import {
@@ -142,7 +150,9 @@ async function guard(name: string, fn: () => Promise<ToolResult>): Promise<ToolR
         .find((item): item is Extract<ToolContent, { type: 'text' }> => item.type === 'text')
         ?.text.split(/\r?\n/, 1)[0]
         ?.slice(0, 500);
-      logWarn(`tool ${name} error in ${elapsed} ms${summary ? `: ${summary}` : ''}`);
+      // A rejected edit, disabled permission, stale cursor, etc. is a normal tool
+      // outcome, not evidence that the connector itself is unhealthy.
+      logInfo(`tool ${name} rejected in ${elapsed} ms${summary ? `: ${summary}` : ''}`);
     } else {
       logInfo(`tool ${name} ok in ${elapsed} ms`);
     }
@@ -150,8 +160,8 @@ async function guard(name: string, fn: () => Promise<ToolResult>): Promise<ToolR
   } catch (err) {
     const message = friendlyError(err);
     const elapsed = Date.now() - started;
-    if (err instanceof SandboxError || err instanceof ComputerError) {
-      logWarn(`tool ${name} denied in ${elapsed} ms: ${message}`);
+    if (err instanceof SandboxError || err instanceof ComputerError || err instanceof FsOpError || err instanceof ExecError || err instanceof ProcessError) {
+      logInfo(`tool ${name} rejected in ${elapsed} ms: ${message}`);
     } else {
       logWarn(`tool ${name} failed in ${elapsed} ms: ${message}`);
     }
@@ -181,6 +191,15 @@ const cropArg = z.object({
   height: z.number().int().min(1).max(100_000)
 });
 const mouseButtonArg = z.enum(['left', 'right', 'middle']);
+const commandEnvArg = z
+  .record(
+    z.string().min(1).max(MAX_ENV_KEY_CHARS).regex(/^[A-Za-z_][A-Za-z0-9_]*$/),
+    z.string().max(MAX_ENV_VALUE_CHARS)
+  )
+  .refine((value) => Object.keys(value).length <= MAX_ENV_VARS, {
+    message: `At most ${MAX_ENV_VARS} environment variables are allowed`
+  })
+  .describe(`Optional environment overrides. At most ${MAX_ENV_VARS}; values are not logged. CLF_* names are reserved.`);
 function enabledToolNames(caps: Capabilities): string[] {
   const names = ['list_roots'];
   if (caps.browse) names.push('list_directory');
@@ -236,7 +255,7 @@ const computerActionArg = z.discriminatedUnion('type', [
 
 export function buildServer(ctx: ToolContext): McpServer {
   const server = new McpServer(
-    { name: 'chatgpt-local-files', version: '1.4.0' },
+    { name: 'chatgpt-local-files', version: '1.4.1' },
     { capabilities: { tools: {} }, instructions: serverInstructions(ctx) }
   );
 
@@ -975,6 +994,7 @@ export function buildServer(ctx: ToolContext): McpServer {
           command: z.string().min(1).max(500).describe('Executable name or path, e.g. git'),
           args: z.array(z.string().max(2000)).max(128).optional().describe('Arguments, one per array item'),
           cwd: pathArg.optional().describe('Approved folder to run in. Defaults to the first root.'),
+          env: commandEnvArg.optional(),
           timeoutMs: z
             .number()
             .int()
@@ -985,11 +1005,11 @@ export function buildServer(ctx: ToolContext): McpServer {
         }),
         annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true }
       },
-      async ({ command, args, cwd, timeoutMs }) =>
+      async ({ command, args, cwd, env, timeoutMs }) =>
         guarded('command', 'run_command', async () => {
           const dir = await resolveCwd(ctx, cwd);
           logInfo(`tool run_command ${command}`);
-          const result = await runCommand(command, args ?? [], dir, normaliseTimeout(timeoutMs));
+          const result = await runCommand(command, args ?? [], dir, normaliseTimeout(timeoutMs), env);
           return result.timedOut ? fail(formatExec(result)) : ok(formatExec(result));
         })
     );
@@ -1020,44 +1040,30 @@ export function buildServer(ctx: ToolContext): McpServer {
       {
         title: 'Manage a background process',
         description:
-          'Start, inspect or stop a managed long-running process such as a dev server, watcher, build or test run. Output is bounded; status returns an opaque cursor you can pass back to receive only newer output. Stop first attempts bounded graceful tree termination, then forces the tree if needed. Managed processes are also stopped when this app quits.',
-        inputSchema: z.discriminatedUnion('action', [
-          z.object({
-            action: z.literal('start'),
-            command: z.string().min(1).max(500).describe('Executable name or path, e.g. npm'),
-            args: z.array(z.string().max(2000)).max(128).optional().describe('Literal arguments, one per array item'),
-            cwd: pathArg.optional().describe('Approved folder to start in. Defaults to the first root.')
-          }),
-          z.object({
-            action: z.literal('status'),
-            id: z.string().min(1).max(32).optional().describe('Managed process id. Omit to list all managed processes.'),
-            lines: z.number().int().min(1).max(200).optional().describe('Lines per stream when id is supplied. Default 80.'),
-            cursor: z
-              .string()
-              .min(1)
-              .max(100)
-              .optional()
-              .describe('Opaque cursor from the previous status/start result. Returns only output since that cursor.')
-          }),
-          z.object({
-            action: z.literal('stop'),
-            id: z.string().min(1).max(32).describe('Managed process id'),
-            lines: z.number().int().min(1).max(200).optional().describe('Lines per stream returned after stopping. Default 80.'),
-            cursor: z
-              .string()
-              .min(1)
-              .max(100)
-              .optional()
-              .describe('Optional previous cursor so the stop result returns only newer output.')
-          })
-        ]),
+          'Start, inspect, write to or stop a managed long-running process such as a dev server, watcher, build or test run. Output is bounded; reuse opaque cursors for delta-only logs. start supports bounded environment overrides; write sends stdin without a shell and can optionally close stdin. Stop has bounded graceful and forced tree termination. Managed processes are also stopped when this app quits.',
+        // Keep this flat rather than a top-level discriminated union: some MCP hosts
+        // collapse union schemas to an unhelpful generic object and hide every action field.
+        inputSchema: z.object({
+          action: z.enum(['start', 'status', 'write', 'stop']).describe('Operation to perform.'),
+          command: z.string().min(1).max(500).optional().describe('start: executable name or path, e.g. npm'),
+          args: z.array(z.string().max(2000)).max(128).optional().describe('start: literal arguments, one per array item'),
+          cwd: pathArg.optional().describe('start: approved folder. Defaults to the first root.'),
+          env: commandEnvArg.optional().describe('start: optional environment overrides; values are never logged.'),
+          id: z.string().min(1).max(32).optional().describe('status/write/stop: managed process id. status may omit it to list all.'),
+          text: z.string().max(MAX_PROCESS_INPUT_CHARS).optional().describe('write: text to send to stdin.'),
+          newline: z.boolean().optional().describe('write: append a newline after text. Default true.'),
+          close: z.boolean().optional().describe('write: close stdin after writing. Default false.'),
+          lines: z.number().int().min(1).max(200).optional().describe('status/write/stop: lines per stream. Default 80.'),
+          cursor: z.string().min(1).max(100).optional().describe('status/write/stop: previous opaque cursor for delta-only output.')
+        }),
         annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true }
       },
       async (input) =>
         guarded('command', 'process', async () => {
           if (input.action === 'start') {
+            if (!input.command) return fail('process start requires command');
             const dir = await resolveCwd(ctx, input.cwd);
-            const result = await startManagedProcess(input.command, input.args ?? [], dir);
+            const result = await startManagedProcess(input.command, input.args ?? [], dir, input.env);
             logInfo(`tool process start ${input.command} -> ${result.id}`);
             return ok(formatManagedProcess(result));
           }
@@ -1068,6 +1074,20 @@ export function buildServer(ctx: ToolContext): McpServer {
               return ok(entries.map((entry) => formatManagedProcess(entry, false)).join('\n'));
             }
             return ok(formatManagedProcess(getManagedProcess(input.id, input.lines ?? 80, input.cursor)));
+          }
+          if (!input.id) return fail(`process ${input.action} requires id`);
+          if (input.action === 'write') {
+            if (input.text === undefined && input.close !== true) return fail('process write requires text or close=true');
+            const result = await writeManagedProcess(
+              input.id,
+              input.text ?? '',
+              input.newline ?? true,
+              input.close ?? false,
+              input.lines ?? 80,
+              input.cursor
+            );
+            logInfo(`tool process write ${input.id} (${input.text?.length ?? 0} chars${input.close ? ', close' : ''})`);
+            return ok(formatManagedProcess(result));
           }
           const result = await stopManagedProcess(input.id, input.lines ?? 80, input.cursor);
           logInfo(`tool process stop ${input.id}`);

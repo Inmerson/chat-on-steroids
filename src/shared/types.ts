@@ -212,9 +212,9 @@ export const CAPABILITY_DETAILS: Record<Capability, string> = {
   powershell:
     'run_powershell — starts in an approved folder, but the script runs as you and is NOT sandboxed to that folder.',
   command:
-    'run_command, launch_app, process, open_url — run things as you; process manages long-running jobs with bounded cursor-based output and lifecycle control. Processes are NOT sandboxed to the approved folder.',
+    'run_command, launch_app, process, open_url — run things as you; process manages long-running jobs with bounded cursor-based output, stdin and lifecycle control. Processes are NOT sandboxed to the approved folder.',
   screen:
-    'screenshot, list_windows, find_ui, wait_for_window — see and crop the screen, find semantic Windows controls, and wait for UI state without blind sleeps.',
+    'screenshot, list_windows, get_active_window, find_ui, wait_for_window — see and crop the screen, inspect focus, find semantic Windows controls, and wait for UI state without blind sleeps.',
   control: 'computer — moves the pointer, clicks, types and presses keys, as you.',
   clipboardRead: 'read_clipboard — read current clipboard text. Separate because clipboard contents may be sensitive.',
   clipboardWrite: 'write_clipboard — replace clipboard text without needing focus, clicks or keystrokes.'

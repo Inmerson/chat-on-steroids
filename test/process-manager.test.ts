@@ -4,9 +4,10 @@ import {
   listManagedProcesses,
   startManagedProcess,
   stopAllManagedProcesses,
-  stopManagedProcess
+  stopManagedProcess,
+  writeManagedProcess
 } from '../src/main/process-manager.js';
-import { makeTempDir, removeTempDir } from './helpers.js';
+import { IS_WINDOWS, makeTempDir, removeTempDir } from './helpers.js';
 
 let cwd: string;
 const node = process.execPath;
@@ -40,6 +41,47 @@ describe('managed processes', () => {
     const stopped = await stopManagedProcess(started.id, 20);
     expect(stopped.running).toBe(false);
   });
+
+  it('writes stdin and applies explicit environment overrides', async () => {
+    const started = await startManagedProcess(
+      node,
+      [
+        '-e',
+        'process.stdin.setEncoding("utf8"); console.log("env="+(process.env.TEST_PROCESS_ENV ?? "missing")); process.stdin.once("data", d => { console.log("input="+d.trim()); process.exit(0); });'
+      ],
+      cwd,
+      { TEST_PROCESS_ENV: 'process-ok' }
+    );
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    const before = getManagedProcess(started.id, 20);
+    expect(before.stdout).toContain('env=process-ok');
+    await writeManagedProcess(started.id, 'hello-process');
+    const deadline = Date.now() + 3000;
+    while (getManagedProcess(started.id).running && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    const after = getManagedProcess(started.id, 20);
+    expect(after.running).toBe(false);
+    expect(after.stdout).toContain('input=hello-process');
+  });
+
+  it.runIf(IS_WINDOWS)(
+    'keeps stop bounded when graceful taskkill waits on a stubborn cmd loop',
+    async () => {
+      const started = await startManagedProcess(
+        'cmd.exe',
+        ['/d', '/s', '/c', 'for /L %i in (1,1,60) do @echo tick%i & @ping 127.0.0.1 -n 2 >nul'],
+        cwd
+      );
+      await new Promise((resolve) => setTimeout(resolve, 150));
+      const before = Date.now();
+      const stopped = await stopManagedProcess(started.id, 10);
+      const elapsed = Date.now() - before;
+      expect(stopped.running).toBe(false);
+      expect(elapsed).toBeLessThan(5_500);
+    },
+    8_000
+  );
 
   it('keeps exited processes inspectable with their exit code', async () => {
     const started = await startManagedProcess(

@@ -1,11 +1,14 @@
 import { spawn, type ChildProcess } from 'node:child_process';
-import { prepareCommand, terminateProcessTree } from './exec.js';
+import { prepareCommand, terminateProcessTree, type CommandEnvironment } from './exec.js';
 
 const MAX_MANAGED_PROCESSES = 16;
 const MAX_PROCESS_HISTORY = 32;
 const MAX_STREAM_BYTES = 100_000;
 const STOP_GRACE_MS = 1_500;
 const FORCE_WAIT_MS = 3_000;
+export const MAX_PROCESS_INPUT_CHARS = 64_000;
+
+export class ProcessError extends Error {}
 
 export interface ManagedProcessStatus {
   id: string;
@@ -90,7 +93,7 @@ class ByteTail {
   view(maxLines: number, sinceOffset?: number): TailView {
     if (maxLines <= 0) return { text: '', cursorLost: false, linesOmitted: 0 };
     if (sinceOffset !== undefined && sinceOffset > this.endOffset) {
-      throw new Error('Output cursor is newer than this process output. Omit cursor to recover.');
+      throw new ProcessError('Output cursor is newer than this process output. Omit cursor to recover.');
     }
     if (this.bytes === 0) {
       return {
@@ -148,12 +151,12 @@ function encodeCursor(entry: ManagedProcess): string {
 
 function parseCursor(entry: ManagedProcess, cursor: string): { stdout: number; stderr: number } {
   const match = /^([A-Za-z0-9_-]+)\.([0-9a-z]+)\.([0-9a-z]+)$/.exec(cursor);
-  if (!match) throw new Error('Invalid output cursor. Omit cursor to recover.');
-  if (match[1] !== entry.id) throw new Error(`Output cursor belongs to ${match[1]}, not ${entry.id}. Omit cursor to recover.`);
+  if (!match) throw new ProcessError('Invalid output cursor. Omit cursor to recover.');
+  if (match[1] !== entry.id) throw new ProcessError(`Output cursor belongs to ${match[1]}, not ${entry.id}. Omit cursor to recover.`);
   const stdout = Number.parseInt(match[2]!, 36);
   const stderr = Number.parseInt(match[3]!, 36);
   if (!Number.isSafeInteger(stdout) || !Number.isSafeInteger(stderr)) {
-    throw new Error('Invalid output cursor. Omit cursor to recover.');
+    throw new ProcessError('Invalid output cursor. Omit cursor to recover.');
   }
   return { stdout, stderr };
 }
@@ -190,20 +193,21 @@ function statusOf(entry: ManagedProcess, maxLines: number, cursor?: string): Man
 export async function startManagedProcess(
   command: string,
   args: readonly string[],
-  cwd: string
+  cwd: string,
+  env?: CommandEnvironment
 ): Promise<ManagedProcessStatus> {
   if (runningCount() >= MAX_MANAGED_PROCESSES) {
-    throw new Error(`Too many managed processes are running (limit ${MAX_MANAGED_PROCESSES})`);
+    throw new ProcessError(`Too many managed processes are running (limit ${MAX_MANAGED_PROCESSES})`);
   }
 
-  const prepared = prepareCommand(command, args, cwd);
+  const prepared = prepareCommand(command, args, cwd, env);
   const child = spawn(prepared.file, prepared.args, {
     cwd,
     env: prepared.env,
     windowsHide: true,
     shell: false,
     detached: false,
-    stdio: ['ignore', 'pipe', 'pipe']
+    stdio: ['pipe', 'pipe', 'pipe']
   });
 
   const id = `p${nextId++}`;
@@ -239,11 +243,11 @@ export async function startManagedProcess(
   });
 
   await new Promise<void>((resolve, reject) => {
-    child.once('error', (error) => reject(new Error(`Failed to start: ${error.message}`)));
+    child.once('error', (error) => reject(new ProcessError(`Failed to start: ${error.message}`)));
     child.once('spawn', () => resolve());
   });
 
-  if (child.pid === undefined) throw new Error('Program started without a process id');
+  if (child.pid === undefined) throw new ProcessError('Program started without a process id');
   entry.pid = child.pid;
   processes.set(id, entry);
   pruneHistory();
@@ -252,12 +256,42 @@ export async function startManagedProcess(
 
 export function getManagedProcess(id: string, maxLines = 80, cursor?: string): ManagedProcessStatus {
   const entry = processes.get(id);
-  if (!entry) throw new Error(`Unknown managed process id: ${id}`);
+  if (!entry) throw new ProcessError(`Unknown managed process id: ${id}`);
   return statusOf(entry, maxLines, cursor);
 }
 
 export function listManagedProcesses(): ManagedProcessStatus[] {
   return [...processes.values()].map((entry) => statusOf(entry, 0));
+}
+
+/** Send input to an already-running managed process without starting a shell. */
+export async function writeManagedProcess(
+  id: string,
+  text: string,
+  newline = true,
+  close = false,
+  maxLines = 80,
+  cursor?: string
+): Promise<ManagedProcessStatus> {
+  const entry = processes.get(id);
+  if (!entry) throw new ProcessError(`Unknown managed process id: ${id}`);
+  if (!entry.running) throw new ProcessError(`Managed process ${id} is not running`);
+  if (cursor !== undefined) parseCursor(entry, cursor);
+  if (typeof text !== 'string') throw new ProcessError('Process input must be text');
+  if (text.length > MAX_PROCESS_INPUT_CHARS) {
+    throw new ProcessError(`Process input is too long (limit ${MAX_PROCESS_INPUT_CHARS} characters)`);
+  }
+  const stdin = entry.child.stdin;
+  if (!stdin || stdin.destroyed || !stdin.writable) throw new ProcessError(`Managed process ${id} is not accepting stdin`);
+  const payload = `${text}${newline ? '\n' : ''}`;
+  await new Promise<void>((resolve, reject) => {
+    stdin.write(payload, 'utf8', (error) => {
+      if (error) reject(new ProcessError(`Could not write to ${id}: ${error.message}`));
+      else resolve();
+    });
+  });
+  if (close) stdin.end();
+  return statusOf(entry, maxLines, cursor);
 }
 
 function delay(ms: number): Promise<void> {
@@ -270,7 +304,7 @@ export async function stopManagedProcess(
   cursor?: string
 ): Promise<ManagedProcessStatus> {
   const entry = processes.get(id);
-  if (!entry) throw new Error(`Unknown managed process id: ${id}`);
+  if (!entry) throw new ProcessError(`Unknown managed process id: ${id}`);
   if (!entry.running) return statusOf(entry, maxLines, cursor);
 
   // Parse before changing anything, so a bad cursor cannot accidentally stop a job.
@@ -280,21 +314,24 @@ export async function stopManagedProcess(
   const closed = new Promise<void>((resolve) => entry.child.once('close', () => resolve()));
 
   // taskkill /T without /F is the least-destructive tree-aware primitive Windows
-  // gives us without creating a native Job Object bridge. It gets one short chance.
-  await terminateProcessTree(entry.pid, false);
-  await Promise.race([closed, delay(STOP_GRACE_MS)]);
+  // gives us without creating a native Job Object bridge. The deadline includes the
+  // taskkill helper itself, so an uncooperative helper cannot secretly add seconds.
+  const gracefulDeadline = Date.now() + STOP_GRACE_MS;
+  await terminateProcessTree(entry.pid, false, Math.min(500, STOP_GRACE_MS));
+  await Promise.race([closed, delay(Math.max(0, gracefulDeadline - Date.now()))]);
 
   if (entry.running) {
     entry.stopMode = 'forced';
-    await terminateProcessTree(entry.pid, true);
-    await Promise.race([closed, delay(FORCE_WAIT_MS)]);
+    const forceDeadline = Date.now() + FORCE_WAIT_MS;
+    await terminateProcessTree(entry.pid, true, Math.min(1_000, FORCE_WAIT_MS));
+    await Promise.race([closed, delay(Math.max(0, forceDeadline - Date.now()))]);
   } else {
     entry.stopMode = 'graceful';
   }
 
   if (entry.running) {
     entry.stopping = false;
-    throw new Error(
+    throw new ProcessError(
       `Process ${id} is still running after graceful and forced tree termination. Retry stop or inspect it manually.`
     );
   }

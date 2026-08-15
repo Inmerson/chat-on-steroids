@@ -28,6 +28,7 @@ export function serverInstructions(ctx: ToolContext): string {
     'Search before reading in bulk, and read large files with startLine/endLine rather than whole.',
     'Output is capped; when a result says it was truncated, narrow the request instead of retrying it.',
     'Use edit_files for coherent cross-file changes. Reuse process cursors so status returns only new logs.',
+    'Prefer the narrow file/process/computer tools over PowerShell or shell workarounds whenever they fit the task.',
     '',
     // This connector often runs long local tasks where silence looks like a stalled MCP.
     // Keep progress unusually visible, but do it in compact phase-level updates rather than

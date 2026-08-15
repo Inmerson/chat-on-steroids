@@ -548,12 +548,21 @@ describe('capability gating', () => {
     expect(toolNames(await legacy('tools/list'))).not.toContain('run_powershell');
 
     ctx.caps = withCaps({ powershell: true, command: true });
-    const names = toolNames(await legacy('tools/list'));
+    const listed = await legacy('tools/list');
+    const names = toolNames(listed);
     expect(names).toContain('run_powershell');
     expect(names).toContain('run_command');
     expect(names).toContain('launch_app');
     expect(names).toContain('process');
     expect(names).toContain('open_url');
+
+    const processTool = (listed.body?.result?.tools as Array<any>).find((tool) => tool.name === 'process');
+    expect(processTool?.inputSchema?.type).toBe('object');
+    expect(processTool?.inputSchema?.properties).toHaveProperty('action');
+    expect(processTool?.inputSchema?.properties).toHaveProperty('command');
+    expect(processTool?.inputSchema?.properties).toHaveProperty('id');
+    expect(processTool?.inputSchema?.properties).toHaveProperty('text');
+    expect(processTool?.inputSchema?.properties).toHaveProperty('env');
   });
 
   it('manages a long-running process through the MCP tool', async () => {
@@ -602,6 +611,43 @@ describe('capability gating', () => {
     expect(stopped.body.result?.isError).not.toBe(true);
     expect(textOf(stopped)).toContain('exited');
     expect(textOf(stopped)).toMatch(/stop: (graceful|forced)/);
+  });
+
+  it('writes to managed process stdin through MCP and preserves cursor deltas', async () => {
+    ctx.readOnly = false;
+    ctx.caps = withCaps({ command: true });
+    const started = await legacy('tools/call', {
+      name: 'process',
+      arguments: {
+        action: 'start',
+        command: process.execPath,
+        args: ['-e', 'process.stdin.setEncoding("utf8"); console.log("env="+(process.env.MCP_TEST_ENV ?? "missing")); process.stdin.once("data", d => { console.log("stdin="+d.trim()); process.exit(0); });'],
+        env: { MCP_TEST_ENV: 'mcp-env-ok' },
+        cwd: '/workspace'
+      }
+    });
+    const id = textOf(started).match(/^(p\d+)\b/m)?.[1];
+    expect(id).toBeTruthy();
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    const first = await legacy('tools/call', {
+      name: 'process',
+      arguments: { action: 'status', id, lines: 20 }
+    });
+    expect(textOf(first)).toContain('env=mcp-env-ok');
+    const cursor = textOf(first).match(/^cursor: (.+)$/m)?.[1];
+
+    const written = await legacy('tools/call', {
+      name: 'process',
+      arguments: { action: 'write', id, text: 'hello-mcp', cursor, lines: 20 }
+    });
+    expect(written.body.result?.isError).not.toBe(true);
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    const delta = await legacy('tools/call', {
+      name: 'process',
+      arguments: { action: 'status', id, lines: 20, cursor }
+    });
+    expect(textOf(delta)).toContain('stdin=hello-mcp');
+    expect(textOf(delta)).not.toContain('env=mcp-env-ok');
   });
 
   it('keeps clipboard read and write as separate permissions', async () => {

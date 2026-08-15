@@ -189,7 +189,9 @@ export async function startMcpServer(getContext: () => ToolContext): Promise<Mcp
       // connection and bury the errors that do matter.
       const optional =
         res.statusCode === 405 && shape === 'mcp' && (method === 'GET' || method === 'DELETE');
+      const expectedTunnelProbe = tunnelProbe && res.statusCode === 415 && shape === 'mcp' && method === 'POST';
       if (optional) logInfo(`request ${line} (stream/session not offered — normal)`);
+      else if (expectedTunnelProbe) logInfo(`request ${line} (probe compatibility check — normal)`);
       else if (res.statusCode >= 400) logWarn(`request ${line}`);
       else logInfo(`request ${line}`);
     });

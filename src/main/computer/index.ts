@@ -106,6 +106,8 @@ interface HelperRuntime {
 let helperRuntime: HelperRuntime | null = null;
 let helperStarting: Promise<HelperRuntime> | null = null;
 let helperQueue: Promise<void> = Promise.resolve();
+let helperGeneration = 0;
+let findUiWarmGeneration = -1;
 
 function readableHelperFailure(stderr: string): string {
   const clean = stderr
@@ -174,6 +176,7 @@ async function startHelper(): Promise<HelperRuntime> {
     child.once('spawn', () => {
       started = true;
       helperRuntime = runtime;
+      helperGeneration += 1;
       resolve(runtime);
     });
     child.once('error', (error) => {
@@ -266,15 +269,28 @@ export async function findUi(opts: {
   role?: string;
   maxResults?: number;
 }): Promise<{ window: number; elements: UiElementInfo[] }> {
-  const reply = await runHelper({
+  const request = {
     op: 'find_ui',
     ...(opts.window === undefined ? {} : { id: opts.window }),
     query: opts.query ?? '',
     role: opts.role ?? '',
     maxResults: Math.min(100, Math.max(1, Math.floor(opts.maxResults ?? 30)))
-  });
+  };
+  let reply = await runHelper(request);
+  const generation = helperGeneration;
+  let raw = Array.isArray(reply['elements']) ? (reply['elements'] as Array<Record<string, any>>) : [];
+  // UI Automation can return an empty tree on the very first query immediately after
+  // the helper starts. Retry that one cold miss internally instead of making the model
+  // spend another MCP round trip. Legitimate later empty queries stay fast.
+  if (raw.length === 0 && findUiWarmGeneration !== generation) {
+    findUiWarmGeneration = generation;
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    reply = await runHelper(request);
+    raw = Array.isArray(reply['elements']) ? (reply['elements'] as Array<Record<string, any>>) : [];
+  } else {
+    findUiWarmGeneration = generation;
+  }
   const frame = lastFrame;
-  const raw = Array.isArray(reply['elements']) ? (reply['elements'] as Array<Record<string, any>>) : [];
   const elements = raw.map((item): UiElementInfo => {
     const bounds = item['bounds'] as Rect;
     let imageBounds: Rect | null = null;

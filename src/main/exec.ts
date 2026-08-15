@@ -18,8 +18,12 @@ export const DEFAULT_TIMEOUT_MS = 30_000;
 export const MAX_TIMEOUT_MS = 300_000;
 export const MAX_OUTPUT_BYTES = 100_000;
 export const MAX_SCRIPT_CHARS = 8_000;
+export const MAX_ENV_VARS = 64;
+export const MAX_ENV_KEY_CHARS = 128;
+export const MAX_ENV_VALUE_CHARS = 8_192;
 
 export class ExecError extends Error {}
+export type CommandEnvironment = Record<string, string>;
 
 export interface ExecResult {
   exitCode: number | null;
@@ -39,9 +43,36 @@ const SECRET_ENV_KEYS = [
   'CLOUDFLARED_TUNNEL_TOKEN'
 ];
 
-function childEnv(): NodeJS.ProcessEnv {
+function validateEnvironment(overrides: CommandEnvironment | undefined): void {
+  if (!overrides) return;
+  const entries = Object.entries(overrides);
+  if (entries.length > MAX_ENV_VARS) throw new ExecError(`Too many environment variables (limit ${MAX_ENV_VARS})`);
+  for (const [key, value] of entries) {
+    if (key.length === 0 || key.length > MAX_ENV_KEY_CHARS || !/^[A-Za-z_][A-Za-z0-9_]*$/.test(key)) {
+      throw new ExecError(`Invalid environment variable name: ${key.slice(0, MAX_ENV_KEY_CHARS) || '(empty)'}`);
+    }
+    if (key.toUpperCase().startsWith('CLF_')) {
+      throw new ExecError('Environment variable names beginning with CLF_ are reserved by ChatGPT Local Files');
+    }
+    if (typeof value !== 'string') throw new ExecError(`Environment variable ${key} must be a string`);
+    if (value.includes('\0')) throw new ExecError(`Environment variable ${key} contains a null byte`);
+    if (value.length > MAX_ENV_VALUE_CHARS) {
+      throw new ExecError(`Environment variable ${key} is too long (limit ${MAX_ENV_VALUE_CHARS} characters)`);
+    }
+  }
+}
+
+function childEnv(overrides?: CommandEnvironment): NodeJS.ProcessEnv {
+  validateEnvironment(overrides);
   const env = { ...process.env };
-  for (const key of SECRET_ENV_KEYS) delete env[key];
+  // Windows environment keys are case-insensitive. Remove every inherited spelling of
+  // connector/control-plane secrets before applying values explicitly supplied by the caller.
+  for (const key of Object.keys(env)) {
+    if (SECRET_ENV_KEYS.some((secret) => secret.toLowerCase() === key.toLowerCase())) delete env[key];
+  }
+  if (overrides) {
+    for (const [key, value] of Object.entries(overrides)) env[key] = value;
+  }
   return env;
 }
 
@@ -91,16 +122,22 @@ function findWindowsCommandShim(command: string, cwd: string): string | null {
   return null;
 }
 
-export async function terminateProcessTree(pid: number, force = true): Promise<void> {
+export async function terminateProcessTree(
+  pid: number,
+  force = true,
+  helperTimeoutMs = force ? 1_000 : 500
+): Promise<void> {
   // child.kill() leaves grandchildren running on Windows; taskkill /T handles the tree.
-  // Without /F Windows gets one bounded chance to terminate normally; callers that
-  // require certainty can retry with force=true.
+  // taskkill itself can block while waiting on an uncooperative console process, so
+  // bound the helper too. The caller owns the larger graceful/forced deadline.
   if (process.platform === 'win32') {
     await new Promise<void>((resolve) => {
       let settled = false;
+      let timer: NodeJS.Timeout | null = null;
       const finish = (): void => {
         if (settled) return;
         settled = true;
+        if (timer) clearTimeout(timer);
         resolve();
       };
       try {
@@ -112,6 +149,14 @@ export async function terminateProcessTree(pid: number, force = true): Promise<v
         });
         killer.once('error', finish);
         killer.once('close', finish);
+        timer = setTimeout(() => {
+          try {
+            killer.kill();
+          } catch {
+            /* already gone */
+          }
+          finish();
+        }, Math.max(50, helperTimeoutMs));
       } catch {
         finish();
       }
@@ -219,6 +264,28 @@ export function normaliseTimeout(input: number | undefined): number {
   return Math.min(MAX_TIMEOUT_MS, Math.max(1000, Math.floor(input)));
 }
 
+function decodePowerShellXmlText(text: string): string {
+  return text
+    .replace(/_x([0-9A-Fa-f]{4})_/g, (_match, hex: string) => String.fromCharCode(Number.parseInt(hex, 16)))
+    .replace(/&quot;/g, '"')
+    .replace(/&apos;/g, "'")
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&amp;/g, '&');
+}
+
+/** Turns Windows PowerShell's serialized error stream into compact plain text. */
+function cleanPowerShellStderr(stderr: string): string {
+  const marker = stderr.indexOf('#< CLIXML');
+  if (marker === -1) return stderr.trim();
+  const plainPrefix = stderr.slice(0, marker).trim();
+  const xml = stderr.slice(marker);
+  const records = [...xml.matchAll(/<S S="(?:Error|Warning)">([\s\S]*?)<\/S>/g)]
+    .map((match) => decodePowerShellXmlText(match[1] ?? '').trim())
+    .filter(Boolean);
+  return [plainPrefix, ...records].filter(Boolean).join('\n').trim();
+}
+
 /** Runs a PowerShell script in an approved working directory. */
 export async function runPowerShell(
   script: string,
@@ -238,12 +305,20 @@ export async function runPowerShell(
   // command line as a place where model-supplied text could be misparsed.
   const cleanScript = `$ProgressPreference='SilentlyContinue'; ${script}`;
   const encoded = Buffer.from(cleanScript, 'utf16le').toString('base64');
-  return run({
+  const result = await run({
     file: shell,
     args: ['-NoProfile', '-NonInteractive', '-NoLogo', '-OutputFormat', 'Text', '-EncodedCommand', encoded],
     cwd,
     timeoutMs
   });
+  const stderr = cleanPowerShellStderr(result.stderr);
+  return {
+    ...result,
+    stderr:
+      stderr && result.exitCode === 0
+        ? `PowerShell error stream (process exited 0):\n${stderr}`
+        : stderr
+  };
 }
 
 function validateCommand(command: string, args: readonly string[]): void {
@@ -263,13 +338,19 @@ function validateCommand(command: string, args: readonly string[]): void {
  * npm cannot be passed to CreateProcess directly, so they use a fixed PowerShell
  * launcher whose command and argv arrive only through environment variables.
  */
-export function prepareCommand(command: string, args: readonly string[], cwd: string): PreparedCommand {
+export function prepareCommand(
+  command: string,
+  args: readonly string[],
+  cwd: string,
+  envOverrides?: CommandEnvironment
+): PreparedCommand {
   validateCommand(command, args);
+  const env = childEnv(envOverrides);
   const shim = findWindowsCommandShim(command, cwd);
-  if (!shim) return { file: command, args: [...args], env: childEnv() };
+  if (!shim) return { file: command, args: [...args], env };
 
   const shell = findPowerShell();
-  if (!shell) return { file: command, args: [...args], env: childEnv() };
+  if (!shell) return { file: command, args: [...args], env };
   const launcher = [
     `$ErrorActionPreference='Stop'`,
     `$ProgressPreference='SilentlyContinue'`,
@@ -279,7 +360,6 @@ export function prepareCommand(command: string, args: readonly string[], cwd: st
     `& $cmd @argv`,
     `if($null -ne $LASTEXITCODE){exit $LASTEXITCODE}`
   ].join('; ');
-  const env = childEnv();
   env['CLF_COMMAND'] = shim;
   env['CLF_ARGUMENTS'] = JSON.stringify(args);
   return {
@@ -331,9 +411,10 @@ export async function runCommand(
   command: string,
   args: readonly string[],
   cwd: string,
-  timeoutMs: number
+  timeoutMs: number,
+  env?: CommandEnvironment
 ): Promise<ExecResult> {
-  const prepared = prepareCommand(command, args, cwd);
+  const prepared = prepareCommand(command, args, cwd, env);
   return run({
     file: prepared.file,
     args: prepared.args,

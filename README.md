@@ -84,7 +84,7 @@ None of this is left to the model to respect. It is enforced before every operat
 | Read clipboard | `read_clipboard` | Text only, capped and separately permissioned |
 | Write clipboard | `write_clipboard` | Replaces clipboard text without synthesizing keystrokes |
 
-Output is bounded everywhere. Reads are capped and report which lines you got and where to continue; listings and searches report when they stopped early; searches have a time budget. Ordinary binary files are refused rather than dumped as mojibake, while `view_image` intentionally returns supported local images as native MCP image content for vision.
+Output is bounded everywhere. Reads are capped and report which lines you got and where to continue; listings and searches report when they stopped early; searches have a time budget. Ordinary binary files are refused rather than dumped as mojibake, while `view_image` validates supported PNG/JPEG/GIF/WebP structure before returning native MCP image content for vision.
 
 `edit_file` is the preferred way to change one file. It replaces exact text and fails if the snippet is ambiguous or missing, rather than guessing — which avoids the accidental whole-file rewrites that line-number edits invite. `edit_files` applies the same exact-snippet semantics across several existing text files: every path and edit is preflighted before targets change, complete replacements are staged beside each target, and commit-time failures trigger a guarded reverse rollback. This deliberately does **not** claim filesystem-wide ACID atomicity across unrelated files; a process/OS crash during the short commit window is still outside what ordinary NTFS file primitives can guarantee.
 
@@ -121,9 +121,10 @@ When enabled:
 - output and runtime are capped for synchronous commands, and the process tree is killed on timeout,
 - PowerShell scripts are passed with `-EncodedCommand`, so the text never reaches a command-line parser,
 - `run_command` starts the executable without interpreting model-supplied shell syntax; Windows `.cmd`/`.bat` shims such as `npm` use a fixed PowerShell launcher with command and argv passed through environment variables,
-- `process` uses that same literal-argument path for long-running jobs, keeps bounded in-memory stdout/stderr, returns an opaque output cursor so later status calls can request only new logs, reports PID/exit status, tries bounded graceful process-tree termination before forcing it, and cleans up managed jobs when this app quits,
+- `run_command` and `process start` accept a small bounded map of explicit environment overrides; values are never logged and `CLF_*` names are reserved for connector internals,
+- `process` uses that same literal-argument path for long-running jobs, keeps bounded in-memory stdout/stderr, returns an opaque output cursor so later status calls can request only new logs, can write bounded text to stdin or close stdin, reports PID/exit status, enforces a real end-to-end graceful/forced stop deadline, and cleans up managed jobs when this app quits,
 - `launch_app` only confirms that Windows accepted the spawn; it deliberately does not claim the program kept running successfully afterward,
-- known credential environment variables are removed from the child process.
+- known credential environment variables are removed from the inherited child environment. A value is present only if the caller explicitly supplies an override for that name.
 
 On Windows, managed-process shutdown uses the built-in process-tree termination path and does not ship a native Job Object binding. A normal app quit therefore cleans managed jobs up, but a hard crash or forced kill of the Electron process can still leave an already-started child alive. Adding `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` would close that gap, but doing it reliably requires native Windows handle/job APIs; this project intentionally avoids adding a native dependency solely for that edge case.
 

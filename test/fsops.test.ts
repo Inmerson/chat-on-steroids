@@ -489,6 +489,16 @@ describe('image and binary helpers', () => {
     await expect(readImageFile(at('binary.bin'))).rejects.toThrow(/unsupported image/i);
   });
 
+  it('rejects a corrupt image that only has a valid PNG signature', async () => {
+    const valid = await fs.readFile(at('pixel.png'));
+    const corrupt = Buffer.from(valid);
+    const corruptIndex = corrupt.length - 5;
+    corrupt[corruptIndex] = corrupt[corruptIndex]! ^ 0xff;
+    const target = at('corrupt.png');
+    await fs.writeFile(target, corrupt);
+    await expect(readImageFile(target)).rejects.toThrow(/invalid or corrupt PNG/i);
+  });
+
   it('decodes standard and URL-safe base64 strictly', () => {
     expect(decodeBase64Data(Buffer.from('hello').toString('base64')).toString()).toBe('hello');
     expect(decodeBase64Data('aGVsbG8')).toEqual(Buffer.from('hello'));

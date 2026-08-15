@@ -42,7 +42,7 @@ const TOOL_COUNT_BY_CAPABILITY: Record<Capability, number> = {
   read: 3,
   metadata: 1,
   create: 2,
-  edit: 3,
+  edit: 4,
   move: 1,
   deleteFile: 1,
   deleteFolder: 1,
