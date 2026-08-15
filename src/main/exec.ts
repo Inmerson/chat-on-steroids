@@ -91,8 +91,10 @@ function findWindowsCommandShim(command: string, cwd: string): string | null {
   return null;
 }
 
-export async function terminateProcessTree(pid: number): Promise<void> {
+export async function terminateProcessTree(pid: number, force = true): Promise<void> {
   // child.kill() leaves grandchildren running on Windows; taskkill /T handles the tree.
+  // Without /F Windows gets one bounded chance to terminate normally; callers that
+  // require certainty can retry with force=true.
   if (process.platform === 'win32') {
     await new Promise<void>((resolve) => {
       let settled = false;
@@ -102,7 +104,9 @@ export async function terminateProcessTree(pid: number): Promise<void> {
         resolve();
       };
       try {
-        const killer = spawn('taskkill', ['/pid', String(pid), '/T', '/F'], {
+        const args = ['/pid', String(pid), '/T'];
+        if (force) args.push('/F');
+        const killer = spawn('taskkill', args, {
           windowsHide: true,
           stdio: 'ignore'
         });
@@ -115,7 +119,7 @@ export async function terminateProcessTree(pid: number): Promise<void> {
     return;
   }
   try {
-    process.kill(pid, 'SIGKILL');
+    process.kill(pid, force ? 'SIGKILL' : 'SIGTERM');
   } catch {
     /* already gone */
   }

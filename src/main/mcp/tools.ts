@@ -19,18 +19,22 @@ import { z } from 'zod';
 import type { Capabilities, Root } from '../../shared/types.js';
 import {
   DEFAULT_READ_BYTES,
+  MAX_BATCH_EDIT_FILES,
+  MAX_BATCH_EDIT_OPS,
   MAX_BINARY_BASE64_CHARS,
   MAX_READ_BYTES,
   appendTextFile,
   assertWritableSize,
   decodeBase64Data,
   editTextFile,
+  editTextFiles,
   formatBytes,
   listDirectory,
   readImageFile,
   readTextFile,
   replaceTextFile,
-  statInfo
+  statInfo,
+  type FileInfo
 } from '../fsops.js';
 import { logInfo, logWarn } from '../logger.js';
 import { SandboxError, resolvePath, toVirtualPath } from '../sandbox.js';
@@ -184,7 +188,7 @@ function enabledToolNames(caps: Capabilities): string[] {
   if (caps.read) names.push('read_file', 'read_files', 'view_image');
   if (caps.metadata) names.push('file_info');
   if (caps.create) names.push('create_file', 'create_directory');
-  if (caps.edit) names.push('edit_file', 'write_file', 'append_file');
+  if (caps.edit) names.push('edit_file', 'edit_files', 'write_file', 'append_file');
   if (caps.create || caps.edit) names.push('write_binary_file');
   if (caps.move) names.push('move_path');
   if (caps.deleteFile) names.push('delete_file');
@@ -232,7 +236,7 @@ const computerActionArg = z.discriminatedUnion('type', [
 
 export function buildServer(ctx: ToolContext): McpServer {
   const server = new McpServer(
-    { name: 'chatgpt-local-files', version: '1.3.0' },
+    { name: 'chatgpt-local-files', version: '1.4.0' },
     { capabilities: { tools: {} }, instructions: serverInstructions(ctx) }
   );
 
@@ -582,30 +586,35 @@ export function buildServer(ctx: ToolContext): McpServer {
       {
         title: 'File metadata',
         description:
-          'Size, timestamps, line count and whether a file is binary. Set hash to also return its SHA-256.',
-        inputSchema: z.object({
-          path: pathArg.describe('Virtual path to a file or folder'),
-          hash: z.boolean().optional().describe('Also compute SHA-256. Default false.')
-        }),
+          'Size, timestamps, line count and binary status for one file/folder or a small batch. Pass path for one item or paths for up to 20. Set hash to also return SHA-256.',
+        inputSchema: z
+          .object({
+            path: pathArg.optional().describe('Virtual path to one file or folder'),
+            paths: z.array(pathArg).min(1).max(20).optional().describe('Virtual paths to inspect in one call'),
+            hash: z.boolean().optional().describe('Also compute SHA-256 for files. Default false.')
+          })
+          .refine((value) => Boolean(value.path) !== Boolean(value.paths), {
+            message: 'Provide exactly one of path or paths'
+          }),
         annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false }
       },
-      async ({ path: p, hash }) =>
+      async ({ path: p, paths, hash }) =>
         guarded('metadata', 'file_info', async () => {
-          const resolved = await resolvePath(ctx.roots, p);
-          const info = await statInfo(resolved.real, resolved.virtual, { hash: hash === true });
-          logInfo(`tool file_info ${resolved.virtual}`);
-          const lines = [
-            `path: ${info.virtualPath}`,
-            `type: ${info.type}`,
-            `size: ${formatBytes(info.bytes)}`,
-            `modified: ${info.modified}`,
-            `created: ${info.created}`
-          ];
-          if (info.readOnly) lines.push('readonly: true');
-          if (info.binary !== null) lines.push(`binary: ${info.binary}`);
-          if (info.lines !== null) lines.push(`lines: ${info.lines}`);
-          if (info.sha256) lines.push(`sha256: ${info.sha256}`);
-          return ok(lines.join('\n'));
+          const requested = paths ?? [p!];
+          const sections: string[] = [];
+          let failures = 0;
+          for (const requestedPath of requested) {
+            try {
+              const resolved = await resolvePath(ctx.roots, requestedPath);
+              const info = await statInfo(resolved.real, resolved.virtual, { hash: hash === true });
+              sections.push(formatFileInfo(info));
+            } catch (err) {
+              failures++;
+              sections.push(`path: ${requestedPath}\nerror: ${friendlyError(err)}`);
+            }
+          }
+          logInfo(`tool file_info (${requested.length} requested, ${failures} failed)`);
+          return ok(sections.join('\n\n---\n\n'));
         })
     );
   }
@@ -684,6 +693,57 @@ export function buildServer(ctx: ToolContext): McpServer {
           logInfo(`tool edit_file ${resolved.virtual} (${result.replacements} replacements)`);
           return ok(
             `Edited ${resolved.virtual} — ${result.replacements} replacement(s), now ${formatBytes(result.bytes)}`
+          );
+        })
+    );
+
+    server.registerTool(
+      'edit_files',
+      {
+        title: 'Edit several files',
+        description:
+          'Apply exact-snippet edits across several existing text files in one call. Every path and edit is preflighted before any target changes; completed replacements are staged first and commit failures trigger safe rollback where possible. Use this for coherent cross-file code changes.',
+        inputSchema: z.object({
+          files: z
+            .array(
+              z.object({
+                path: pathArg.describe('Virtual path of the existing text file'),
+                edits: z
+                  .array(
+                    z.object({
+                      oldText: z.string().min(1).describe('Exact text to find, including indentation'),
+                      newText: z.string().describe('Replacement text'),
+                      replaceAll: z.boolean().optional().describe('Replace every occurrence. Default false.')
+                    })
+                  )
+                  .min(1)
+                  .max(64)
+              })
+            )
+            .min(1)
+            .max(MAX_BATCH_EDIT_FILES)
+            .describe(`Up to ${MAX_BATCH_EDIT_FILES} files; at most ${MAX_BATCH_EDIT_OPS} edits total across the batch.`)
+        }),
+        annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false }
+      },
+      async ({ files }) =>
+        guarded('edit', 'edit_files', async () => {
+          const resolvedFiles = [];
+          for (const file of files) {
+            const resolved = await resolvePath(ctx.roots, file.path);
+            resolvedFiles.push({ realPath: resolved.real, virtualPath: resolved.virtual, edits: file.edits });
+          }
+          const results = await editTextFiles(resolvedFiles);
+          const replacements = results.reduce((sum, result) => sum + result.replacements, 0);
+          logInfo(`tool edit_files (${results.length} files, ${replacements} replacements)`);
+          return ok(
+            `Edited ${results.length} file(s), ${replacements} replacement(s) total\n` +
+              results
+                .map(
+                  (result) =>
+                    `${result.virtualPath} — ${result.replacements} replacement(s), now ${formatBytes(result.bytes)}`
+                )
+                .join('\n')
           );
         })
     );
@@ -960,7 +1020,7 @@ export function buildServer(ctx: ToolContext): McpServer {
       {
         title: 'Manage a background process',
         description:
-          'Start, inspect or stop a managed long-running process such as a dev server, watcher, build or test run. stdout/stderr are kept in bounded in-memory tails and the whole process tree is stopped on request. Managed processes are also stopped when this app quits.',
+          'Start, inspect or stop a managed long-running process such as a dev server, watcher, build or test run. Output is bounded; status returns an opaque cursor you can pass back to receive only newer output. Stop first attempts bounded graceful tree termination, then forces the tree if needed. Managed processes are also stopped when this app quits.',
         inputSchema: z.discriminatedUnion('action', [
           z.object({
             action: z.literal('start'),
@@ -971,12 +1031,24 @@ export function buildServer(ctx: ToolContext): McpServer {
           z.object({
             action: z.literal('status'),
             id: z.string().min(1).max(32).optional().describe('Managed process id. Omit to list all managed processes.'),
-            lines: z.number().int().min(1).max(200).optional().describe('Tail lines per stream when id is supplied. Default 80.')
+            lines: z.number().int().min(1).max(200).optional().describe('Lines per stream when id is supplied. Default 80.'),
+            cursor: z
+              .string()
+              .min(1)
+              .max(100)
+              .optional()
+              .describe('Opaque cursor from the previous status/start result. Returns only output since that cursor.')
           }),
           z.object({
             action: z.literal('stop'),
             id: z.string().min(1).max(32).describe('Managed process id'),
-            lines: z.number().int().min(1).max(200).optional().describe('Tail lines per stream returned after stopping. Default 80.')
+            lines: z.number().int().min(1).max(200).optional().describe('Lines per stream returned after stopping. Default 80.'),
+            cursor: z
+              .string()
+              .min(1)
+              .max(100)
+              .optional()
+              .describe('Optional previous cursor so the stop result returns only newer output.')
           })
         ]),
         annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true }
@@ -995,9 +1067,9 @@ export function buildServer(ctx: ToolContext): McpServer {
               if (entries.length === 0) return ok('No managed processes in this app session.');
               return ok(entries.map((entry) => formatManagedProcess(entry, false)).join('\n'));
             }
-            return ok(formatManagedProcess(getManagedProcess(input.id, input.lines ?? 80)));
+            return ok(formatManagedProcess(getManagedProcess(input.id, input.lines ?? 80, input.cursor)));
           }
-          const result = await stopManagedProcess(input.id, input.lines ?? 80);
+          const result = await stopManagedProcess(input.id, input.lines ?? 80, input.cursor);
           logInfo(`tool process stop ${input.id}`);
           return ok(formatManagedProcess(result));
         })
@@ -1335,6 +1407,21 @@ export function buildServer(ctx: ToolContext): McpServer {
   return server;
 }
 
+function formatFileInfo(info: FileInfo): string {
+  const lines = [
+    `path: ${info.virtualPath}`,
+    `type: ${info.type}`,
+    `size: ${formatBytes(info.bytes)}`,
+    `modified: ${info.modified}`,
+    `created: ${info.created}`
+  ];
+  if (info.readOnly) lines.push('readonly: true');
+  if (info.binary !== null) lines.push(`binary: ${info.binary}`);
+  if (info.lines !== null) lines.push(`lines: ${info.lines}`);
+  if (info.sha256) lines.push(`sha256: ${info.sha256}`);
+  return lines.join('\n');
+}
+
 function formatManagedProcess(result: ManagedProcessStatus, includeOutput = true): string {
   const state = result.running
     ? result.stopping
@@ -1343,11 +1430,21 @@ function formatManagedProcess(result: ManagedProcessStatus, includeOutput = true
     : `exited ${result.exitCode ?? result.signal ?? 'unknown'}`;
   const parts = [`${result.id}  pid ${result.pid}  ${state}  ${result.durationMs} ms  ${result.command}`];
   if (!includeOutput) return parts[0]!;
-  if (result.stdout.trim()) parts.push(`--- stdout tail ---\n${result.stdout.trimEnd()}`);
-  if (result.stderr.trim()) parts.push(`--- stderr tail ---\n${result.stderr.trimEnd()}`);
-  if (result.stdoutTruncated) parts.push('(older stdout discarded from bounded buffer)');
-  if (result.stderrTruncated) parts.push('(older stderr discarded from bounded buffer)');
-  if (!result.stdout.trim() && !result.stderr.trim()) parts.push('(no captured output yet)');
+
+  const label = result.outputMode === 'delta' ? 'delta' : 'tail';
+  if (result.stdout.trim()) parts.push(`--- stdout ${label} ---\n${result.stdout.trimEnd()}`);
+  if (result.stderr.trim()) parts.push(`--- stderr ${label} ---\n${result.stderr.trimEnd()}`);
+  if (result.stdoutCursorLost) parts.push('(stdout cursor fell behind the bounded buffer; oldest unseen stdout was lost)');
+  if (result.stderrCursorLost) parts.push('(stderr cursor fell behind the bounded buffer; oldest unseen stderr was lost)');
+  if (result.stdoutLinesOmitted > 0) parts.push(`(${result.stdoutLinesOmitted} older stdout delta line(s) omitted by the lines cap)`);
+  if (result.stderrLinesOmitted > 0) parts.push(`(${result.stderrLinesOmitted} older stderr delta line(s) omitted by the lines cap)`);
+  if (result.outputMode === 'tail' && result.stdoutTruncated) parts.push('(older stdout discarded from bounded buffer)');
+  if (result.outputMode === 'tail' && result.stderrTruncated) parts.push('(older stderr discarded from bounded buffer)');
+  if (!result.stdout.trim() && !result.stderr.trim()) {
+    parts.push(result.outputMode === 'delta' ? '(no new output since cursor)' : '(no captured output yet)');
+  }
+  if (result.stopMode) parts.push(`stop: ${result.stopMode}`);
+  parts.push(`cursor: ${result.cursor}`);
   return parts.join('\n');
 }
 

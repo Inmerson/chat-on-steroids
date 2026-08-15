@@ -71,9 +71,9 @@ None of this is left to the model to respect. It is enforced before every operat
 | Browse folders | `list_directory` | Optional recursion; skips heavy build folders |
 | Search files | `search_files` | By name or by content, with glob filters |
 | Read files | `read_file`, `read_files`, `view_image` | Bounded text ranges/batches; PNG/JPEG/GIF/WebP can be returned directly to vision |
-| File metadata | `file_info` | Size, timestamps, line count, optional SHA-256 |
+| File metadata | `file_info` | Size, timestamps, line count, optional SHA-256; accepts one path or a small batch |
 | Create files and folders | `create_file`, `create_directory`, `write_binary_file` | Binary writes accept bounded base64; new files require Create permission |
-| Edit files | `edit_file`, `write_file`, `append_file`, `write_binary_file` | `edit_file` replaces exact snippets; binary overwrite requires Edit permission |
+| Edit files | `edit_file`, `edit_files`, `write_file`, `append_file`, `write_binary_file` | Exact-snippet edits for one file or a preflighted cross-file batch; binary overwrite requires Edit permission |
 | Move / rename | `move_path` | Both ends must be inside approved folders |
 | Delete files | `delete_file` | Permanent — no Recycle Bin |
 | Delete folders | `delete_directory` | Refuses to delete an approved root itself |
@@ -86,7 +86,7 @@ None of this is left to the model to respect. It is enforced before every operat
 
 Output is bounded everywhere. Reads are capped and report which lines you got and where to continue; listings and searches report when they stopped early; searches have a time budget. Ordinary binary files are refused rather than dumped as mojibake, while `view_image` intentionally returns supported local images as native MCP image content for vision.
 
-`edit_file` is the preferred way to change a file. It replaces exact text and fails if the snippet is ambiguous or missing, rather than guessing — which avoids the accidental whole-file rewrites that line-number edits invite. There is intentionally no cross-file `edit_files` transaction yet: ordinary filesystem primitives cannot make unrelated file replacements truly atomic, and a fast batch API is not worth leaving a repository half-written after a crash.
+`edit_file` is the preferred way to change one file. It replaces exact text and fails if the snippet is ambiguous or missing, rather than guessing — which avoids the accidental whole-file rewrites that line-number edits invite. `edit_files` applies the same exact-snippet semantics across several existing text files: every path and edit is preflighted before targets change, complete replacements are staged beside each target, and commit-time failures trigger a guarded reverse rollback. This deliberately does **not** claim filesystem-wide ACID atomicity across unrelated files; a process/OS crash during the short commit window is still outside what ordinary NTFS file primitives can guarantee.
 
 `write_binary_file` can save bytes that ChatGPT actually has as base64, but it does **not** bridge ChatGPT's private image-generation environment into Windows by itself. A generated image is only directly writable when the model is given its bytes or another transferable file representation; the connector cannot manufacture access to an image-generation artifact that ChatGPT does not expose to it.
 
@@ -121,9 +121,11 @@ When enabled:
 - output and runtime are capped for synchronous commands, and the process tree is killed on timeout,
 - PowerShell scripts are passed with `-EncodedCommand`, so the text never reaches a command-line parser,
 - `run_command` starts the executable without interpreting model-supplied shell syntax; Windows `.cmd`/`.bat` shims such as `npm` use a fixed PowerShell launcher with command and argv passed through environment variables,
-- `process` uses that same literal-argument path for long-running jobs, keeps bounded in-memory stdout/stderr tails, reports PID/exit status, stops the process tree on request, and cleans up managed jobs when this app quits,
+- `process` uses that same literal-argument path for long-running jobs, keeps bounded in-memory stdout/stderr, returns an opaque output cursor so later status calls can request only new logs, reports PID/exit status, tries bounded graceful process-tree termination before forcing it, and cleans up managed jobs when this app quits,
 - `launch_app` only confirms that Windows accepted the spawn; it deliberately does not claim the program kept running successfully afterward,
 - known credential environment variables are removed from the child process.
+
+On Windows, managed-process shutdown uses the built-in process-tree termination path and does not ship a native Job Object binding. A normal app quit therefore cleans managed jobs up, but a hard crash or forced kill of the Electron process can still leave an already-started child alive. Adding `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` would close that gap, but doing it reliably requires native Windows handle/job APIs; this project intentionally avoids adding a native dependency solely for that edge case.
 
 That is still arbitrary code execution. Treat it as such.
 

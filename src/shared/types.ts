@@ -203,16 +203,16 @@ export const CAPABILITY_DETAILS: Record<Capability, string> = {
   browse: 'list_directory — see what is inside an approved folder, optionally recursively.',
   search: 'search_files — find files by name, or find text inside them.',
   read: 'read_file, read_files, view_image — read text in bounded ranges/batches or load a local PNG/JPEG/GIF/WebP directly into vision.',
-  metadata: 'file_info — size, dates, line count, and an optional SHA-256.',
+  metadata: 'file_info — size, dates, line count, and optional SHA-256 for one path or a small batch.',
   create: 'create_file, create_directory, write_binary_file — make new text/binary files and folders.',
-  edit: 'edit_file, write_file, append_file, write_binary_file — change text or replace a binary file.',
+  edit: 'edit_file, edit_files, write_file, append_file, write_binary_file — exact edits can be applied to one file or preflighted across several files.',
   move: 'move_path — move or rename, both ends inside approved folders.',
   deleteFile: 'delete_file — permanent, with no Recycle Bin.',
   deleteFolder: 'delete_directory — permanent; an approved root itself is refused.',
   powershell:
     'run_powershell — starts in an approved folder, but the script runs as you and is NOT sandboxed to that folder.',
   command:
-    'run_command, launch_app, process, open_url — run things as you; process manages long-running jobs with bounded output and lifecycle control. Processes are NOT sandboxed to the approved folder.',
+    'run_command, launch_app, process, open_url — run things as you; process manages long-running jobs with bounded cursor-based output and lifecycle control. Processes are NOT sandboxed to the approved folder.',
   screen:
     'screenshot, list_windows, find_ui, wait_for_window — see and crop the screen, find semantic Windows controls, and wait for UI state without blind sleeps.',
   control: 'computer — moves the pointer, clicks, types and presses keys, as you.',

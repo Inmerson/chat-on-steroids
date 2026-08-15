@@ -1,6 +1,6 @@
 {
   "name": "chatgpt-local-files",
-  "version": "1.3.0",
+  "version": "1.4.0",
   "description": "Local Windows coding and computer-use bridge for ChatGPT over MCP, limited to folders and capabilities you approve.",
   "license": "MIT",
   "author": "ChatGPT Local Files",

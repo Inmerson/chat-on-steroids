@@ -1,6 +1,6 @@
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import {
   FsOpError,
   MAX_WRITE_BYTES,
@@ -9,6 +9,7 @@ import {
   clamp,
   decodeBase64Data,
   editTextFile,
+  editTextFiles,
   formatBytes,
   listDirectory,
   readImageFile,
@@ -377,6 +378,103 @@ describe('editTextFile', () => {
       ])
     ).rejects.toThrow(/was not found/);
     expect(await fs.readFile(file, 'utf8')).toBe('one\ntwo\n');
+  });
+
+  it('preflights every file before a cross-file batch changes anything', async () => {
+    const first = await scratch('batch-preflight-a.txt', 'alpha\n');
+    const second = await scratch('batch-preflight-b.txt', 'beta\n');
+    await expect(
+      editTextFiles([
+        {
+          realPath: first,
+          virtualPath: '/root/a.txt',
+          edits: [{ oldText: 'alpha', newText: 'ALPHA' }]
+        },
+        {
+          realPath: second,
+          virtualPath: '/root/b.txt',
+          edits: [{ oldText: 'missing', newText: 'BETA' }]
+        }
+      ])
+    ).rejects.toThrow(/was not found/);
+    expect(await fs.readFile(first, 'utf8')).toBe('alpha\n');
+    expect(await fs.readFile(second, 'utf8')).toBe('beta\n');
+  });
+
+  it('edits multiple files and preserves UTF-16 BOM/encoding in the batch', async () => {
+    const utf8 = await scratch('batch-ok-a.txt', 'alpha\n');
+    const utf16 = at('batch-ok-b.txt');
+    await fs.writeFile(
+      utf16,
+      Buffer.concat([Buffer.from([0xff, 0xfe]), Buffer.from('beta\n', 'utf16le')])
+    );
+
+    const result = await editTextFiles([
+      {
+        realPath: utf8,
+        virtualPath: '/root/a.txt',
+        edits: [{ oldText: 'alpha', newText: 'ALPHA' }]
+      },
+      {
+        realPath: utf16,
+        virtualPath: '/root/b.txt',
+        edits: [{ oldText: 'beta', newText: 'BETA' }]
+      }
+    ]);
+
+    expect(result).toHaveLength(2);
+    expect(await fs.readFile(utf8, 'utf8')).toBe('ALPHA\n');
+    const bytes = await fs.readFile(utf16);
+    expect(bytes.subarray(0, 2)).toEqual(Buffer.from([0xff, 0xfe]));
+    expect((await readTextFile(utf16)).text).toBe('BETA');
+  });
+
+  it('rolls back an earlier file when a later staged commit fails', async () => {
+    const first = await scratch('batch-rollback-a.txt', 'alpha\n');
+    const second = await scratch('batch-rollback-b.txt', 'beta\n');
+    const originalRename = fs.rename.bind(fs);
+    const spy = vi.spyOn(fs, 'rename').mockImplementation(async (from, to) => {
+      if (String(from).includes('.clf-stage-') && String(to) === second) {
+        const error = new Error('simulated commit failure') as NodeJS.ErrnoException;
+        error.code = 'EBUSY';
+        throw error;
+      }
+      return originalRename(from, to);
+    });
+
+    try {
+      await expect(
+        editTextFiles([
+          {
+            realPath: first,
+            virtualPath: '/root/a.txt',
+            edits: [{ oldText: 'alpha', newText: 'ALPHA' }]
+          },
+          {
+            realPath: second,
+            virtualPath: '/root/b.txt',
+            edits: [{ oldText: 'beta', newText: 'BETA' }]
+          }
+        ])
+      ).rejects.toThrow(/simulated commit failure/);
+    } finally {
+      spy.mockRestore();
+    }
+
+    expect(await fs.readFile(first, 'utf8')).toBe('alpha\n');
+    expect(await fs.readFile(second, 'utf8')).toBe('beta\n');
+    expect((await fs.readdir(dir)).some((name) => name.startsWith('.clf-'))).toBe(false);
+  });
+
+  it('refuses the same file twice in one batch', async () => {
+    const file = await scratch('batch-duplicate.txt', 'alpha\n');
+    await expect(
+      editTextFiles([
+        { realPath: file, virtualPath: '/root/a.txt', edits: [{ oldText: 'alpha', newText: 'A' }] },
+        { realPath: file, virtualPath: '/root/a.txt', edits: [{ oldText: 'alpha', newText: 'B' }] }
+      ])
+    ).rejects.toThrow(/same file appears more than once/);
+    expect(await fs.readFile(file, 'utf8')).toBe('alpha\n');
   });
 });
 

@@ -504,6 +504,7 @@ describe('capability gating', () => {
     const names = toolNames(await legacy('tools/list'));
     expect(names).toContain('create_file');
     expect(names).toContain('edit_file');
+    expect(names).toContain('edit_files');
     expect(names).toContain('move_path');
     expect(names).toContain('delete_file');
     expect(names).toContain('delete_directory');
@@ -563,7 +564,10 @@ describe('capability gating', () => {
       arguments: {
         action: 'start',
         command: process.execPath,
-        args: ['-e', 'console.log("mcp-ready"); setInterval(() => {}, 1000)'],
+        args: [
+          '-e',
+          'console.log("mcp-ready"); setTimeout(() => console.log("mcp-later"), 250); setInterval(() => {}, 1000)'
+        ],
         cwd: '/workspace'
       }
     });
@@ -578,13 +582,26 @@ describe('capability gating', () => {
     });
     expect(textOf(status)).toContain('mcp-ready');
     expect(textOf(status)).toContain('running');
+    const cursor = textOf(status).match(/^cursor: (.+)$/m)?.[1];
+    expect(cursor).toBeTruthy();
+
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    const delta = await legacy('tools/call', {
+      name: 'process',
+      arguments: { action: 'status', id, lines: 20, cursor }
+    });
+    expect(textOf(delta)).toContain('mcp-later');
+    expect(textOf(delta)).not.toContain('mcp-ready');
+    expect(textOf(delta)).toContain('stdout delta');
+    const nextCursor = textOf(delta).match(/^cursor: (.+)$/m)?.[1];
 
     const stopped = await legacy('tools/call', {
       name: 'process',
-      arguments: { action: 'stop', id, lines: 20 }
+      arguments: { action: 'stop', id, lines: 20, cursor: nextCursor }
     });
     expect(stopped.body.result?.isError).not.toBe(true);
     expect(textOf(stopped)).toContain('exited');
+    expect(textOf(stopped)).toMatch(/stop: (graceful|forced)/);
   });
 
   it('keeps clipboard read and write as separate permissions', async () => {
@@ -891,6 +908,21 @@ describe('bounded output', () => {
     expect(textOf(reply)).toContain('export const helper = 1;');
   });
 
+  it('gets metadata for several files in one call while keeping per-item failures useful', async () => {
+    const reply = await legacy('tools/call', {
+      name: 'file_info',
+      arguments: {
+        paths: ['/workspace/src/app.ts', '/workspace/missing-info.txt', '/workspace/src/lib/util.ts']
+      }
+    });
+    const text = textOf(reply);
+    expect(reply.body.result?.isError).toBeFalsy();
+    expect(text).toContain('path: /workspace/src/app.ts');
+    expect(text).toContain('path: /workspace/missing-info.txt');
+    expect(text).toContain('error: Not found');
+    expect(text).toContain('path: /workspace/src/lib/util.ts');
+  });
+
   it('keeps successful batch reads when another requested file fails', async () => {
     const reply = await legacy('tools/call', {
       name: 'read_files',
@@ -963,6 +995,48 @@ describe('write tools', () => {
       arguments: { path: '/workspace/moved.txt' }
     });
     expect(remove.body.result?.isError).toBeFalsy();
+  });
+
+  it('edits several files atomically enough for a coherent cross-file MCP change', async () => {
+    const a = path.join(approved, 'batch-a.txt');
+    const b = path.join(approved, 'batch-b.txt');
+    await fs.writeFile(a, 'alpha\n', 'utf8');
+    await fs.writeFile(b, 'beta\n', 'utf8');
+
+    const reply = await legacy('tools/call', {
+      name: 'edit_files',
+      arguments: {
+        files: [
+          { path: '/workspace/batch-a.txt', edits: [{ oldText: 'alpha', newText: 'ALPHA' }] },
+          { path: '/workspace/batch-b.txt', edits: [{ oldText: 'beta', newText: 'BETA' }] }
+        ]
+      }
+    });
+    expect(reply.body.result?.isError).toBeFalsy();
+    expect(textOf(reply)).toContain('Edited 2 file(s)');
+    expect(await fs.readFile(a, 'utf8')).toBe('ALPHA\n');
+    expect(await fs.readFile(b, 'utf8')).toBe('BETA\n');
+  });
+
+  it('leaves every target untouched when cross-file edit preflight fails', async () => {
+    const a = path.join(approved, 'batch-fail-a.txt');
+    const b = path.join(approved, 'batch-fail-b.txt');
+    await fs.writeFile(a, 'alpha\n', 'utf8');
+    await fs.writeFile(b, 'beta\n', 'utf8');
+
+    const reply = await legacy('tools/call', {
+      name: 'edit_files',
+      arguments: {
+        files: [
+          { path: '/workspace/batch-fail-a.txt', edits: [{ oldText: 'alpha', newText: 'ALPHA' }] },
+          { path: '/workspace/batch-fail-b.txt', edits: [{ oldText: 'missing', newText: 'BETA' }] }
+        ]
+      }
+    });
+    expect(reply.body.result?.isError).toBe(true);
+    expect(textOf(reply)).toContain('oldText was not found');
+    expect(await fs.readFile(a, 'utf8')).toBe('alpha\n');
+    expect(await fs.readFile(b, 'utf8')).toBe('beta\n');
   });
 
   it('will not overwrite an existing file by accident', async () => {
