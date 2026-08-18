@@ -48,6 +48,7 @@
           <path d="M4.5 7h15M9.5 7V4.5h5V7M6.5 7l1 12.5h9L17.5 7" />
         </g>
         <g id="i-x"><path d="M6 6l12 12M18 6 6 18" /></g>
+        <g id="i-key"><circle cx="8" cy="12" r="3.5" /><path d="M11.5 12H20M17 12v3M20 12v2.5" /></g>
         <g id="i-sun">
           <circle cx="12" cy="12" r="4" />
           <path d="M12 2.5v2M12 19.5v2M2.5 12h2M19.5 12h2M5.2 5.2l1.4 1.4M17.4 17.4l1.4 1.4M18.8 5.2l-1.4 1.4M6.6 17.4l-1.4 1.4" />
@@ -57,6 +58,12 @@
           <path d="M4 5.5h16a1 1 0 0 1 1 1v8.5a1 1 0 0 1-1 1h-8.5L7 19.5V16H4a1 1 0 0 1-1-1V6.5a1 1 0 0 1 1-1Z" />
         </g>
         <g id="i-search"><circle cx="11" cy="11" r="6" /><path d="M15.4 15.4 20 20" /></g>
+        <g id="i-gear">
+          <circle cx="12" cy="12" r="3" />
+          <path
+            d="M12 3.5h0a1 1 0 0 1 1 1v.9a7 7 0 0 1 1.9.8l.6-.6a1 1 0 0 1 1.4 0l.5.5a1 1 0 0 1 0 1.4l-.6.6a7 7 0 0 1 .8 1.9h.9a1 1 0 0 1 1 1v.7a1 1 0 0 1-1 1h-.9a7 7 0 0 1-.8 1.9l.6.6a1 1 0 0 1 0 1.4l-.5.5a1 1 0 0 1-1.4 0l-.6-.6a7 7 0 0 1-1.9.8v.9a1 1 0 0 1-1 1h-.7a1 1 0 0 1-1-1v-.9a7 7 0 0 1-1.9-.8l-.6.6a1 1 0 0 1-1.4 0l-.5-.5a1 1 0 0 1 0-1.4l.6-.6a7 7 0 0 1-.8-1.9h-.9a1 1 0 0 1-1-1v-.7a1 1 0 0 1 1-1h.9a7 7 0 0 1 .8-1.9l-.6-.6a1 1 0 0 1 0-1.4l.5-.5a1 1 0 0 1 1.4 0l.6.6a7 7 0 0 1 1.9-.8v-.9a1 1 0 0 1 1-1Z"
+          />
+        </g>
       </defs>
     </svg>
 
@@ -219,13 +226,30 @@
                     </button>
                   </div>
                   <div class="field">
-                    <label for="tunnelId">Tunnel ID</label>
+                    <label for="tunnelId">Tunnel ID — Core connector</label>
                     <input
                       id="tunnelId"
                       type="text"
                       spellcheck="false"
                       placeholder="tunnel_0123456789abcdef0123456789abcdef"
                     />
+                  </div>
+                  <!-- Desktop is a second connector in ChatGPT, so on this method it needs a
+                       second tunnel of its own. Hidden unless desktop permissions are on, so
+                       nobody is asked to create a tunnel for a feature they never enabled. -->
+                  <div class="field" id="desktopTunnelField" hidden>
+                    <label for="desktopTunnelId">Tunnel ID — Desktop connector <span class="tag">optional</span></label>
+                    <input
+                      id="desktopTunnelId"
+                      type="text"
+                      spellcheck="false"
+                      placeholder="tunnel_0123456789abcdef0123456789abcdef"
+                    />
+                    <p class="hint">
+                      Screen and mouse/keyboard control are a separate connector, so they need a
+                      second tunnel. Create another one and paste its ID here. Leave it empty to
+                      keep desktop control off in ChatGPT.
+                    </p>
                   </div>
                 </div>
               </li>
@@ -291,10 +315,12 @@
                   <p>
                     Turn on <strong>Developer mode</strong> in ChatGPT settings — currently under
                     <em>Security and login</em>, on some accounts under <em>Apps → Advanced</em>.
-                    Then open <strong>Settings → Connectors</strong> and create an app:
+                    Then open <strong>Settings → Connectors</strong> and create one app per card
+                    below — the required one, plus the optional desktop one if you want it. Each
+                    card is a separate app in ChatGPT:
                   </p>
                   <ul class="ticks">
-                    <li>Give it any name, e.g. <code>My PC</code>.</li>
+                    <li>Use the exact name and description from the card — copy them, do not invent your own.</li>
                     <li id="chatgptConn"></li>
                     <li>
                       For authentication, scroll to the very bottom and pick
@@ -302,16 +328,10 @@
                       not by a login.
                     </li>
                   </ul>
-                  <div class="field" id="publicUrlField" hidden>
-                    <label for="publicUrl">URL for ChatGPT</label>
-                    <div class="row-inline">
-                      <input id="publicUrl" type="text" readonly spellcheck="false" />
-                      <button class="btn btn-solid" id="copyUrl" type="button">
-                        <svg class="ico" viewBox="0 0 24 24"><use href="#i-copy" /></svg>Copy
-                      </button>
-                    </div>
-                    <p class="hint">Anyone with this URL can use your enabled tools. Do not share it.</p>
-                  </div>
+                  <!-- One card per connector. The name and description are what ChatGPT matches
+                       on when it decides whether to load a connector's tools at all, so both are
+                       given as copyable text rather than described. -->
+                  <div class="connectors" id="connectorCards"></div>
                   <div class="step-actions">
                     <button class="btn btn-solid" type="button" data-link="https://chatgpt.com/#settings/Connectors">
                       <svg class="ico" viewBox="0 0 24 24"><use href="#i-out" /></svg>Open Connectors
@@ -379,32 +399,48 @@
           </section>
 
           <!-- ------------------------------------------------ session body -->
-          <section class="card">
+          <!--
+            `is-session` is load-bearing, not decoration. This card has four children
+            where every other card has three, and the stylesheet has to know which row
+            gets the flexible track. Getting that wrong is what put the view switcher in
+            the middle of an empty card and painted the timeline over the header.
+          -->
+          <section class="card is-session">
+            <!--
+              Two rows on purpose. All five controls plus the session title used to share
+              one flex row, and at the window's own default size that pushed "Compact &
+              resume" — the primary action of this card — entirely off the right edge. The
+              title ellipsizes; the primary actions never shrink; the view switcher, which
+              is navigation rather than an action, gets its own slim row below.
+            -->
+            <!--
+              A gear and nothing else. Compact & Resume is pressed in the ChatGPT tab, next
+              to the composer, because the chat is what writes the brief — a second button
+              here would be a second way to start the one thing that must happen once.
+              Settings is a property sheet for the whole feature, not a third view of this
+              session, so it hangs off the gear rather than sitting in the switcher.
+            -->
             <h2>
               <span id="chatTitle">No session selected</span>
               <span class="acts">
-                <span class="seg" id="chatView">
-                  <button class="is-sel" data-view="timeline" type="button">Timeline</button>
-                  <button data-view="compact" type="button">Compaction</button>
-                  <button data-view="settings" type="button">Settings</button>
-                </span>
-                <button class="btn" id="cancelCompact" type="button" hidden>
-                  <svg class="ico" viewBox="0 0 24 24"><use href="#i-x" /></svg>Cancel
-                </button>
-                <button class="btn" id="compactBtn" type="button">
-                  <svg class="ico" viewBox="0 0 24 24"><use href="#i-bolt" /></svg>Compact
-                </button>
-                <button class="btn" id="resumeBtn" type="button">
-                  <svg class="ico" viewBox="0 0 24 24"><use href="#i-out" /></svg>Compact &amp; resume
+                <button class="btn btn-icon" id="chatSettingsBtn" type="button" title="Chat settings">
+                  <svg class="ico" viewBox="0 0 24 24"><use href="#i-gear" /></svg>
                 </button>
               </span>
             </h2>
+            <div class="subhead">
+              <span class="seg" id="chatView">
+                <button class="is-sel" data-view="timeline" type="button">Timeline</button>
+                <button data-view="compact" type="button">Handoff</button>
+              </span>
+              <span class="subhead-note" id="chatState"></span>
+            </div>
 
             <div class="scroll" id="chatBody">
               <!-- timeline -->
               <div class="view" data-view="timeline">
                 <!-- Only shown while a multi-agent run has agents in this session. -->
-                <div class="seg" id="agentFilter" hidden></div>
+                <div class="seg" id="chatAgentFilter" hidden></div>
                 <div id="timeline"></div>
                 <p class="empty" id="timelineEmpty">
                   No events for this session yet. Tool calls are recorded here as they happen;
@@ -412,11 +448,9 @@
                 </p>
               </div>
 
-              <!-- compaction -->
+              <!-- the brief the last compaction left behind -->
               <div class="view" data-view="compact" hidden>
                 <div class="pane">
-                  <h3>Compaction</h3>
-                  <div id="compactState"></div>
                   <h3 id="handoffHead" hidden>
                     Latest handoff
                     <button class="btn" id="copyHandoff" type="button" hidden>
@@ -432,10 +466,12 @@
                 <div class="pane">
                   <h3>Recording</h3>
                   <p class="hint">
-                    Off by default. When on, this app writes a full local record of the session —
-                    every message you send, what ChatGPT showed, and the exact tool calls — to
-                    <code>sessions\</code> in its own data folder. Nothing is uploaded. The same
-                    switch starts the loopback bridge the Chrome extension talks to.
+                    On by default, because the timeline, Compact &amp; resume and the agent
+                    features all read from it. This app writes a full local record of the
+                    session — every message you send, what ChatGPT showed, and the exact tool
+                    calls — to <code>sessions\</code> in its own data folder. Nothing is
+                    uploaded. The same switch starts the loopback bridge the Chrome extension
+                    talks to, so turning it off disconnects the extension as well.
                   </p>
                   <div class="field">
                     <label class="inline">
@@ -465,69 +501,33 @@
                   <h3>Chrome extension</h3>
                   <p class="hint" id="bridgeState"></p>
                   <div class="step-actions">
-                    <button class="btn btn-solid" id="bridgePair" type="button">Pair extension</button>
-                    <button class="btn btn-solid" id="bridgeCancel" type="button" hidden>Cancel pairing</button>
-                    <button class="btn" id="bridgeUnpair" type="button">Unpair</button>
-                    <button class="btn" id="bridgeFolder" type="button">
+                    <button class="btn btn-solid" id="bridgeFolder" type="button">
                       <svg class="ico" viewBox="0 0 24 24"><use href="#i-folder" /></svg>Open extension folder
                     </button>
-                    <span class="chosen" id="pairCodeBox" hidden>Code <code id="pairCode"></code></span>
+                    <button class="btn" id="bridgeUnpair" type="button">Disconnect browser</button>
                   </div>
                   <p class="hint">
                     Open <code>chrome://extensions</code>, turn Developer mode on, choose
-                    <b>Load unpacked</b> and pick the folder the button above opens. Then open the
-                    extension's popup and type the code. The code is valid once, for three minutes.
+                    <b>Load unpacked</b> and pick the folder the button above opens. It connects to
+                    this app on its own — there is no code to type.
                   </p>
                   <p class="hint" id="extensionPath"></p>
 
-                  <h3>OpenRouter</h3>
+                  <h3>Automatic compaction</h3>
+                  <p class="hint">
+                    Compacting ends the chat you are working in and opens a fresh one carrying the
+                    brief the old chat wrote about its own work — worth it when the alternative is
+                    hitting the ceiling mid-thought.
+                  </p>
+                  <label class="inline">
+                    <input type="checkbox" id="autoCompact" /> Compact automatically past the
+                    threshold below
+                  </label>
                   <div class="field">
-                    <label for="orKey">API key</label>
-                    <input id="orKey" type="password" spellcheck="false" placeholder="sk-or-…" autocomplete="off" />
-                    <p class="hint" id="orKeyState"></p>
-                    <div class="step-actions">
-                      <button class="btn" id="orRemove" type="button">Remove stored key</button>
-                    </div>
+                    <label for="autoCompactTokens">Compact at (estimated tokens)</label>
+                    <input type="number" id="autoCompactTokens" min="10000" max="4000000" step="10000" />
                   </div>
-                  <div class="field">
-                    <label for="compactModel">Compaction model</label>
-                    <input id="compactModel" type="text" readonly spellcheck="false" placeholder="resolved on first use" />
-                  </div>
-                  <div class="row-inline">
-                    <input id="modelSearch" type="text" spellcheck="false" placeholder="Search models…" />
-                    <button class="btn btn-solid" id="modelRefresh" type="button">
-                      <svg class="ico" viewBox="0 0 24 24"><use href="#i-search" /></svg>Reload
-                    </button>
-                  </div>
-                  <div id="modelList"></div>
-                  <div class="pager">
-                    <button class="btn" id="modelPrev" type="button">Previous</button>
-                    <span id="modelPage"></span>
-                    <button class="btn" id="modelNext" type="button">Next</button>
-                  </div>
-                  <div class="grid2">
-                    <div class="field">
-                      <label for="compactReasoning">Reasoning effort</label>
-                      <!-- Options are enabled from the chosen model's live catalogue
-                           entry; an effort it does not advertise is never sent. -->
-                      <select id="compactReasoning">
-                        <option value="off">Off</option>
-                        <option value="minimal">Minimal</option>
-                        <option value="low">Low</option>
-                        <option value="medium">Medium</option>
-                        <option value="high">High</option>
-                        <option value="xhigh">Extra high</option>
-                        <option value="max">Max</option>
-                      </select>
-                    </div>
-                    <div class="field">
-                      <label class="inline">
-                        <input type="checkbox" id="compactShowReasoning" /> Show the reasoning stream
-                        while it works
-                      </label>
-                    </div>
-                  </div>
-                  <p class="hint" id="reasoningHint"></p>
+                  <p class="hint" id="autoCompactHint"></p>
 
                   <h3>Multi-agent mode (experimental)</h3>
                   <p class="hint">
@@ -563,7 +563,7 @@
             <h2>
               Activity
               <span class="acts">
-                <span class="seg" id="agentFilter" hidden></span>
+                <span class="seg" id="logAgentFilter" hidden></span>
                 <span class="seg" id="logFilter">
                   <button class="is-sel" data-filter="all" type="button">All</button>
                   <button data-filter="bad" type="button">Problems</button>

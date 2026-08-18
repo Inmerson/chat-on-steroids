@@ -24,6 +24,17 @@ const RESERVED_NAMES = new Set([
   'lpt0', 'lpt1', 'lpt2', 'lpt3', 'lpt4', 'lpt5', 'lpt6', 'lpt7', 'lpt8', 'lpt9'
 ]);
 
+/**
+ * Root names this app keeps for itself.
+ *
+ * `/skills` is the virtual namespace the design reserves for progressive-disclosure skill
+ * files reachable through `read` (`docs/tool-surface.md` §5). Reserving it here rather
+ * than inside `read` is the point: once a user has an approved folder called `skills`,
+ * `/skills/x/SKILL.md` is ambiguous between their disk and ours, and no amount of care in
+ * the reader can undo that. Cheap to reserve now, impossible to reclaim later.
+ */
+export const RESERVED_ROOT_NAMES = new Set(['skills']);
+
 export class SandboxError extends Error {}
 
 export interface Resolved {
@@ -48,7 +59,7 @@ export function normaliseRootName(input: string): string {
 /** Picks a root name derived from a folder that does not collide with existing ones. */
 export function uniqueRootName(folderPath: string, existing: readonly Root[]): string {
   const base = normaliseRootName(path.basename(folderPath) || 'folder');
-  const taken = new Set(existing.map((r) => r.name));
+  const taken = new Set([...RESERVED_ROOT_NAMES, ...existing.map((r) => r.name)]);
   if (!taken.has(base)) return base;
   for (let i = 2; i < 1000; i++) {
     const candidate = `${base}-${i}`;
@@ -163,6 +174,60 @@ async function realRoot(root: Root): Promise<string> {
 export interface ResolveOptions {
   /** Allow the final path to not exist yet (for create/write). Defaults to false. */
   allowMissing?: boolean;
+  /**
+   * Virtual folder a path without a leading slash is taken to start from — the calling
+   * chat's workspace. Absent means relative paths have nowhere to start and are refused.
+   *
+   * Applied by textual prefixing *before* any validation, so a relative path is checked by
+   * exactly the same rules as the absolute path it is shorthand for. In particular `..` is
+   * still refused segment by segment: this cannot climb out of the workspace, let alone out
+   * of the root, because there is no point at which a traversal is normalised away first.
+   */
+  base?: string | null;
+}
+
+/** True for a path that names its root, rather than starting from somewhere already known. */
+export function isAbsoluteVirtualPath(input: string): boolean {
+  return typeof input === 'string' && /^[/\\]/.test(input.trim());
+}
+
+/** A drive-letter path or a UNC share — what Windows itself prints and the model copies. */
+const NATIVE_PATH = /^(?:[A-Za-z]:[\\/]|\\\\)/;
+
+/**
+ * Turns down a native Windows path, saying what to write instead.
+ *
+ * Paths here are virtual on purpose: `/root/...` names an approved folder and nothing else
+ * can be addressed. But the model spends its time reading command output, stack traces and
+ * error messages, all of which print `C:\Users\...`, and pasting one back got a single
+ * sentence about a colon — true, unhelpful, and about the wrong thing. It reads as the
+ * sandbox rejecting a path it can plainly see is inside an approved folder.
+ *
+ * So the answer names the path it wants. The refusal is unchanged — nothing is resolved
+ * from a native path, because one canonical form is what makes the rest of this file's
+ * checks mean anything — but a refusal that includes the correction costs a retry instead
+ * of a guessing game.
+ */
+async function rejectNativePath(roots: readonly Root[], input: string): Promise<void> {
+  if (typeof input !== 'string' || !NATIVE_PATH.test(input.trim())) return;
+  const native = path.resolve(input.trim());
+  for (const root of roots) {
+    let rootReal: string;
+    try {
+      rootReal = await fs.realpath(root.path);
+    } catch {
+      continue;
+    }
+    if (!isContained(rootReal, native)) continue;
+    throw new SandboxError(
+      `Paths are virtual, not drive paths. Use "${toVirtualPath(root, rootReal, native)}" instead of "${input.trim()}".`
+    );
+  }
+  const names = roots.map((r) => `/${r.name}`).join(', ') || '(none approved)';
+  throw new SandboxError(
+    `Paths are virtual, not drive paths, and "${input.trim()}" is not inside an approved folder. ` +
+      `Approved roots: ${names} — call list_roots to see what each one maps to.`
+  );
 }
 
 /**
@@ -176,7 +241,25 @@ export async function resolvePath(
   virtualPath: string,
   options: ResolveOptions = {}
 ): Promise<Resolved> {
-  const segments = splitVirtualPath(virtualPath);
+  await rejectNativePath(roots, virtualPath);
+  // A relative path is shorthand for one absolute path, and is turned into that path here,
+  // before anything is validated — so there stays exactly one piece of code deciding what
+  // may be reached. `..` is still refused segment by segment below, because nothing
+  // normalises a traversal away first: shorthand cannot climb out of the workspace, and
+  // certainly not out of the root.
+  const requested =
+    isAbsoluteVirtualPath(virtualPath) || !options.base
+      ? virtualPath
+      : `${options.base.replace(/[/\\]+$/, '')}/${String(virtualPath).replace(/^[/\\]+/, '')}`;
+  if (typeof requested === 'string' && requested.trim() !== '' && !isAbsoluteVirtualPath(requested)) {
+    // Not "Unknown root src": the caller was using shorthand, and being told their first
+    // folder is not a root explains nothing about what to do instead.
+    const names = roots.map((r) => `/${r.name}`).join(', ') || '(none approved)';
+    throw new SandboxError(
+      `"${requested.slice(0, 120)}" is relative and this chat has no active folder yet. Use a full path: ${names}`
+    );
+  }
+  const segments = splitVirtualPath(requested);
   const rootName = segments[0]!.toLowerCase();
   const root = roots.find((r) => r.name.toLowerCase() === rootName);
   if (!root) {

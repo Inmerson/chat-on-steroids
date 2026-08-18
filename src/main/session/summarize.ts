@@ -22,11 +22,6 @@ export function shortPath(virtualPath: string): string {
   return parts.slice(1).join('/');
 }
 
-function baseName(virtualPath: string): string {
-  const parts = String(virtualPath ?? '').split('/').filter(Boolean);
-  return parts[parts.length - 1] ?? virtualPath;
-}
-
 function formatDuration(ms: number): string {
   if (ms < 1000) return `${Math.round(ms)}ms`;
   if (ms < 60_000) return `${(ms / 1000).toFixed(1)}s`;
@@ -63,10 +58,100 @@ function totalDelta(changes: readonly FileChange[]): string | null {
   return changes.some((change) => change.approximate) ? `~${text}` : text;
 }
 
+/**
+ * A command or script as one readable line.
+ *
+ * This used to render as the literal words "PowerShell script", on the reasoning that a
+ * script is multi-line and a title is not. The effect was that every PowerShell call in
+ * a session — and on Windows that is most of them — looked identical, which is the exact
+ * problem this whole file exists to solve. The first real line is nearly always the one
+ * that says what the call was for.
+ *
+ * Bounded and single-line by construction. Live agent keys are scrubbed out of the
+ * summary by the recorder before it is stored or sent anywhere, alongside arguments and
+ * results, so no redaction is repeated here.
+ */
+function scriptLabel(script: string | null): string {
+  if (!script) return 'a command';
+  const lines = script
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0 && !line.startsWith('#'));
+  const first = (lines[0] ?? '').replace(/\s+/g, ' ');
+  if (!first) return 'a command';
+  const shown = first.slice(0, 70);
+  return lines.length > 1 || shown.length < first.length ? `${shown} …` : shown;
+}
+
 function fileTitle(verb: string, changes: readonly FileChange[], fallback: string | null): string {
   if (changes.length === 1) return `${verb} ${shortPath(changes[0]!.path)}`;
   if (changes.length > 1) return `${verb} ${plural(changes.length, 'file')}`;
   return fallback ? `${verb} ${shortPath(fallback)}` : verb;
+}
+
+/**
+ * Past tense → plain infinitive, for the titles of calls that did not happen.
+ *
+ * "Edited src/x.ts" with a red mark next to it still reads, at a glance, as an edit that
+ * happened — and when reading a session back later that is exactly the wrong impression.
+ * The subject has to stay (it is the useful part), so the verb is what changes.
+ */
+const UNDONE: Record<string, string> = {
+  Edited: 'edit',
+  Applied: 'apply',
+  Rewrote: 'rewrite',
+  Appended: 'append',
+  Created: 'create',
+  Saved: 'save',
+  Interrupted: 'interrupt',
+  Filled: 'fill',
+  Wrote: 'write',
+  Moved: 'move',
+  Deleted: 'delete',
+  Read: 'read',
+  Viewed: 'view',
+  Inspected: 'inspect',
+  Listed: 'list',
+  Searched: 'search',
+  Checked: 'check',
+  Ran: 'run',
+  Launched: 'launch',
+  Started: 'start',
+  Stopped: 'stop',
+  Opened: 'open',
+  Looked: 'look',
+  Waited: 'wait',
+  Clicked: 'click',
+  'Double-clicked': 'double-click',
+  Dragged: 'drag',
+  Scrolled: 'scroll',
+  Typed: 'type',
+  Pressed: 'press',
+  Focused: 'focus',
+  Acted: 'act',
+  Replaced: 'replace',
+  Loaded: 'load',
+  Joined: 'join',
+  Messaged: 'message',
+  Reported: 'report'
+};
+
+/** Whole titles that do not begin with a verb. */
+const UNDONE_WHOLE: Record<string, string> = {};
+
+/** Titles that already say they failed, and must not be prefixed twice. */
+const ALREADY_NEGATIVE = /^(Could not|Refused|Failed|Command failed)\b/;
+
+function undoTitle(title: string, refused: boolean): string {
+  if (ALREADY_NEGATIVE.test(title)) return title;
+  const lead = refused ? 'Refused to' : 'Could not';
+  const whole = UNDONE_WHOLE[title];
+  if (whole) return `${lead} ${whole}`;
+  const space = title.indexOf(' ');
+  const first = space === -1 ? title : title.slice(0, space);
+  const verb = UNDONE[first];
+  if (!verb) return `${refused ? 'Refused' : 'Failed'}: ${title}`;
+  return `${lead} ${verb}${space === -1 ? '' : title.slice(space)}`;
 }
 
 export interface SummaryInput {
@@ -93,12 +178,16 @@ export function summarizeToolCall(input: SummaryInput): ActivitySummary {
   const summary = build(input.tool, args, evidence, changes, input);
 
   if (input.outcome === 'ok') return summary;
+  const refused = input.outcome === 'rejected';
   const failed: ActivitySummary = {
     ...summary,
-    tone: input.outcome === 'error' ? 'bad' : 'warn'
+    tone: input.outcome === 'error' ? 'bad' : 'warn',
+    // The verb carries the outcome, not just the colour. Tone and metric are easy to
+    // miss and are gone entirely once a line is quoted or read back as text.
+    title: undoTitle(summary.title, refused)
   };
   const head = (input.resultHead ?? '').trim();
-  if (input.outcome === 'rejected') {
+  if (refused) {
     failed.metric = 'refused';
   } else if (!failed.metric || !failed.metric.startsWith('✕')) {
     failed.metric = '✕ failed';
@@ -118,109 +207,25 @@ function build(
   const path = str(args['path']);
 
   switch (tool) {
-    // ------------------------------------------------------------- files
-    case 'edit_file':
-    case 'edit_files': {
-      const fallback = path ?? (arr(args['files'])[0] ? str(record(arr(args['files'])[0])['path']) : null);
-      return {
-        kind: 'edit',
-        tone: 'good',
-        title: fileTitle('Edited', changes, fallback),
-        ...(delta ? { metric: delta } : {})
-      };
-    }
-    case 'write_file':
-      return {
-        kind: 'edit',
-        tone: 'good',
-        title: fileTitle('Rewrote', changes, path),
-        ...(delta ? { metric: delta } : {})
-      };
-    case 'append_file':
-      return {
-        kind: 'edit',
-        tone: 'good',
-        title: fileTitle('Appended to', changes, path),
-        ...(delta ? { metric: delta } : {})
-      };
-    case 'create_file':
-      return {
-        kind: 'create',
-        tone: 'good',
-        title: fileTitle('Created', changes, path),
-        ...(delta ? { metric: delta } : {})
-      };
-    case 'create_directory':
-      return { kind: 'create', tone: 'good', title: `Created folder ${shortPath(path ?? '')}` };
-    case 'write_binary_file':
-      return {
-        kind: 'create',
-        tone: 'good',
-        title: `Wrote ${shortPath(path ?? '')}`,
-        ...(evidence.detail ? { metric: evidence.detail } : {})
-      };
-    case 'move_path': {
-      const from = str(args['from']);
-      const to = str(args['to']);
-      return {
-        kind: 'move',
-        tone: 'good',
-        title: from && to ? `Moved ${baseName(from)} → ${shortPath(to)}` : 'Moved a file'
-      };
-    }
-    case 'delete_file':
-      return {
-        kind: 'delete',
-        tone: 'warn',
-        title: `Deleted ${shortPath(path ?? '')}`,
-        ...(delta ? { metric: delta } : {})
-      };
-    case 'delete_directory':
-      return { kind: 'delete', tone: 'warn', title: `Deleted folder ${shortPath(path ?? '')}` };
-
     // ------------------------------------------------------------- reads
-    case 'read_file': {
-      const start = num(args['startLine']);
-      const end = num(args['endLine']);
-      const range = evidence.detail ?? (start && end ? `lines ${start}–${end}` : start ? `from line ${start}` : null);
+    case 'read': {
+      const paths = arr(args['paths']).map((p) => String(p));
+      const first = paths[0];
+      const start = num(args['start_line']);
+      const end = num(args['end_line']);
+      // The range only ever applies to a single path, so it is only offered there.
+      const range =
+        paths.length === 1
+          ? (evidence.detail ?? (start && end ? `lines ${start}–${end}` : start ? `from line ${start}` : null))
+          : null;
       return {
         kind: 'read',
         tone: 'neutral',
-        title: `Read ${shortPath(path ?? '')}`,
+        title: paths.length === 1 && first ? `Read ${shortPath(first)}` : `Read ${plural(paths.length, 'path')}`,
         ...(range ? { detail: range } : {})
       };
     }
-    case 'read_files': {
-      const files = arr(args['files']);
-      const first = str(record(files[0])['path']);
-      return {
-        kind: 'read',
-        tone: 'neutral',
-        title: files.length === 1 && first ? `Read ${shortPath(first)}` : `Read ${plural(files.length, 'file')}`
-      };
-    }
-    case 'view_image':
-      return { kind: 'read', tone: 'neutral', title: `Viewed image ${baseName(path ?? '')}` };
-    case 'file_info': {
-      const paths = arr(args['paths']);
-      const target = path ?? str(paths[0]);
-      return {
-        kind: 'read',
-        tone: 'neutral',
-        title:
-          paths.length > 1
-            ? `Inspected ${plural(paths.length, 'path')}`
-            : `Inspected ${shortPath(target ?? '')}`
-      };
-    }
-    case 'list_directory':
-      return {
-        kind: 'browse',
-        tone: 'neutral',
-        title: `Listed ${shortPath(path ?? '')}`,
-        ...(evidence.count !== null ? { detail: plural(evidence.count, 'entry', 'entries') } : {})
-      };
-    case 'search_files': {
+    case 'find': {
       const query = str(args['query']) ?? '';
       const mode = str(args['mode']) ?? 'name';
       return {
@@ -235,107 +240,114 @@ function build(
               : 'by name'
       };
     }
-    case 'list_roots':
-      return { kind: 'browse', tone: 'neutral', title: 'Listed approved folders' };
+
+    // ------------------------------------------------------------ writes
+    //
+    // One tool now covers create, edit, move and delete, so the title comes from what
+    // the patch actually did rather than from which tool was called. The recorded
+    // changes are the authority for that, and they are exact.
+    case 'apply_patch': {
+      // Read off the patch header rather than the recorded changes: the changes carry
+      // line counts, not intent, and "Deleted" versus "Edited" is exactly the distinction
+      // someone reading a timeline back is looking for.
+      const patch = str(args['patch']) ?? '';
+      const adds = /^\*\*\* Add File:/m.test(patch);
+      const deletes = /^\*\*\* Delete File:/m.test(patch);
+      const updates = /^\*\*\* Update File:/m.test(patch);
+      const moves = /^\*\*\* Move to:/m.test(patch);
+      const only =
+        adds && !deletes && !updates
+          ? 'create'
+          : deletes && !adds && !updates
+            ? 'delete'
+            : moves && !adds && !deletes
+              ? 'move'
+              : 'edit';
+      const verb =
+        only === 'create' ? 'Created' : only === 'delete' ? 'Deleted' : only === 'move' ? 'Moved' : 'Edited';
+      return {
+        kind: only,
+        tone: only === 'delete' ? 'warn' : 'good',
+        title: changes.length === 0 ? 'Applied a patch' : fileTitle(verb, changes, null),
+        ...(delta ? { metric: delta } : {})
+      };
+    }
 
     // ---------------------------------------------------------- commands
-    case 'inspect_repo': {
-      const action = str(args['action']) ?? 'status';
-      const count = num(args['count']);
-      const titles: Record<string, string> = {
-        status: 'Checked Git status',
-        head: 'Inspected repository HEAD',
-        diff: args['staged'] === true ? 'Read staged Git diff' : 'Read Git diff',
-        show: `Inspected Git ${str(args['ref']) ?? 'HEAD'}`,
-        log: `Read Git log${count ? ` · ${count} commits` : ''}`
-      };
-      return { kind: 'read', tone: 'neutral', title: titles[action] ?? `Inspected Git ${action}` };
-    }
-    case 'run_command':
-    case 'run_powershell': {
-      const command =
-        tool === 'run_powershell'
-          ? 'PowerShell script'
-          : [str(args['command']) ?? 'command', ...arr(args['args']).map((a) => String(a))].join(' ').slice(0, 70);
+    case 'exec_command': {
+      const command = scriptLabel(str(args['cmd']));
       const failed = evidence.timedOut || (evidence.exitCode !== null && evidence.exitCode !== 0);
+      // `exec_command` deliberately returns after its yield window when the child is still
+      // alive. New callers record that state explicitly. The second branch keeps older
+      // in-memory/test evidence readable, but no new summary needs to infer process state
+      // from a null exit code plus a duration.
+      const running =
+        evidence.running === true ||
+        (evidence.running === null && !evidence.timedOut && evidence.exitCode === null && evidence.durationMs !== null);
       const took = evidence.durationMs ?? input.durationMs;
       return {
         kind: 'run',
-        tone: failed ? 'bad' : 'good',
-        title: failed ? `Command failed  ${command}` : `Ran ${command}`,
-        metric: evidence.timedOut
+        tone: failed ? 'bad' : running ? 'neutral' : 'good',
+        title: failed ? `Command failed  ${command}` : running ? `Started ${command}` : `Ran ${command}`,
+        metric: running
+          ? 'running'
+          : evidence.timedOut
           ? '✕ timed out'
           : failed
             ? `✕ exit ${evidence.exitCode}`
             : `✓ ${formatDuration(took)}`
       };
     }
-    case 'launch_app':
-      return { kind: 'run', tone: 'neutral', title: `Launched ${str(args['command']) ?? 'a program'}` };
-    case 'process_status':
-      return {
-        kind: 'process',
-        tone: 'neutral',
-        title: str(args['id']) ? `Checked process ${str(args['id'])}` : 'Listed processes'
-      };
-    case 'process': {
-      const action = str(args['action']) ?? 'status';
-      const id = str(args['id']);
-      const command = str(args['command']);
-      const titles: Record<string, string> = {
-        start: `Started process ${command ?? ''}`.trim(),
-        status: id ? `Checked process ${id}` : 'Listed processes',
-        write: `Wrote to process ${id ?? ''}`.trim(),
-        stop: `Stopped process ${id ?? ''}`.trim()
-      };
-      return { kind: 'process', tone: 'neutral', title: titles[action] ?? `Process ${action}` };
-    }
-    case 'open_url': {
-      const url = str(args['url']);
-      let shown = url ?? '';
-      try {
-        if (url) shown = new URL(url).host;
-      } catch {
-        // Keep the raw string; the tool itself rejects anything that is not a URL.
-      }
-      return { kind: 'run', tone: 'neutral', title: `Opened ${shown}` };
+    case 'write_stdin': {
+      const id = str(args['session_id']) ?? '';
+      const signal = str(args['signal']);
+      const title =
+        signal === 'kill'
+          ? `Stopped session ${id}`.trim()
+          : signal === 'int'
+            ? `Interrupted session ${id}`.trim()
+            : str(args['chars'])
+              ? `Wrote to session ${id}`.trim()
+              : `Waited on session ${id}`.trim();
+      return { kind: 'process', tone: signal === 'kill' ? 'warn' : 'neutral', title };
     }
 
     // ------------------------------------------------------------ screen
-    case 'screenshot':
+    case 'observe': {
+      const what = str(args['what']) ?? (str(args['wait_for']) ? 'window' : 'active');
+      if (str(args['wait_for'])) {
+        return { kind: 'screen', tone: 'neutral', title: `Waited for ${str(args['wait_for'])}` };
+      }
+      if (what === 'windows') {
+        return {
+          kind: 'screen',
+          tone: 'neutral',
+          title: 'Listed open windows',
+          ...(evidence.count !== null ? { detail: plural(evidence.count, 'window') } : {})
+        };
+      }
+      if (what === 'ui') {
+        return {
+          kind: 'screen',
+          tone: 'neutral',
+          title: `Looked for ${JSON.stringify((str(args['match']) ?? '').slice(0, 40))}`,
+          ...(evidence.count !== null ? { detail: plural(evidence.count, 'match', 'matches') } : {})
+        };
+      }
       return {
         kind: 'screen',
         tone: 'neutral',
-        title: 'Screenshot taken',
-        ...(evidence.detail ? { detail: evidence.detail } : {})
+        title: 'Looked at the screen',
+        ...(evidence.count !== null ? { detail: plural(evidence.count, 'control') } : {})
       };
-    case 'list_windows':
-      return {
-        kind: 'screen',
-        tone: 'neutral',
-        title: 'Listed open windows',
-        ...(evidence.count !== null ? { detail: plural(evidence.count, 'window') } : {})
-      };
-    case 'get_active_window':
-      return { kind: 'screen', tone: 'neutral', title: 'Checked the active window' };
-    case 'find_ui':
-      return {
-        kind: 'screen',
-        tone: 'neutral',
-        title: `Looked for ${JSON.stringify((str(args['query']) ?? str(args['role']) ?? '').slice(0, 40))}`,
-        ...(evidence.count !== null ? { detail: plural(evidence.count, 'match', 'matches') } : {})
-      };
-    case 'wait_for_window':
-      return {
-        kind: 'screen',
-        tone: 'neutral',
-        title: `Waited for ${str(args['title']) ?? str(args['process']) ?? 'a window'}`
-      };
+    }
     case 'computer': {
       const actions = arr(args['actions']).map((a) => str(record(a)['type']) ?? '?');
       const kinds = [...new Set(actions)];
       const label: Record<string, string> = {
         click: 'Clicked',
+        click_ref: 'Clicked',
+        set_value: 'Filled in a field',
         double_click: 'Double-clicked',
         move: 'Moved the pointer',
         drag: 'Dragged',
@@ -343,67 +355,73 @@ function build(
         type: 'Typed',
         keypress: 'Pressed keys',
         focus: 'Focused a window',
-        wait: 'Waited'
+        wait: 'Waited',
+        read_clipboard: 'Read the clipboard',
+        write_clipboard: 'Replaced the clipboard text'
       };
       const title =
         kinds.length === 1
           ? (label[kinds[0]!] ?? 'Acted on the desktop')
           : `${label[kinds[0]!] ?? 'Acted'} and ${kinds.length - 1} more`;
       return {
-        kind: 'input',
+        // Clipboard-only calls are not desktop input and read differently in a timeline.
+        kind: kinds.every((k) => k.endsWith('_clipboard')) ? 'clipboard' : 'input',
         tone: 'neutral',
         title,
         ...(actions.length > 1 ? { detail: plural(actions.length, 'action') } : {})
       };
     }
 
-    // --------------------------------------------------------- clipboard
-    case 'read_clipboard':
-      return { kind: 'clipboard', tone: 'neutral', title: 'Read the clipboard' };
-    case 'write_clipboard':
-      return { kind: 'clipboard', tone: 'neutral', title: 'Replaced the clipboard text' };
-
     // ----------------------------------------------------------- session
-    case 'resume_session':
-      return { kind: 'session', tone: 'good', title: 'Loaded the previous session brief' };
-    case 'session_history': {
+    case 'session': {
+      const action = str(args['action']) ?? 'status';
+      if (action === 'status') {
+        return {
+          kind: 'session',
+          tone: 'neutral',
+          title: 'Checked session size',
+          ...(evidence.detail ? { detail: evidence.detail } : {})
+        };
+      }
       const query = str(args['query']);
-      const callId = str(args['callId']);
-      const title = callId
-        ? 'Opened one recorded tool call'
-        : query
-          ? `Searched session history ${JSON.stringify(query.slice(0, 40))}`
-          : 'Read the session timeline';
+      const callId = str(args['call_id']);
       return {
         kind: 'session',
         tone: 'neutral',
-        title,
+        title: callId
+          ? 'Opened one recorded tool call'
+          : query
+            ? `Searched session history ${JSON.stringify(query.slice(0, 40))}`
+            : 'Read the session timeline',
         ...(evidence.count !== null ? { detail: plural(evidence.count, 'entry', 'entries') } : {})
       };
     }
 
     // ------------------------------------------------------------ agents
-    case 'create_agents':
-      return {
-        kind: 'agent',
-        tone: 'good',
-        title: `Created ${plural(arr(args['workers']).length, 'worker agent')}`
-      };
-    case 'join_agent':
-      return { kind: 'agent', tone: 'good', title: 'Joined the agent swarm' };
-    case 'send_agent_message':
-      return { kind: 'agent', tone: 'neutral', title: `Messaged ${str(args['to']) ?? 'the prime agent'}` };
-    case 'agent_inbox':
-      return {
-        kind: 'agent',
-        tone: 'neutral',
-        title: 'Checked the agent inbox',
-        ...(evidence.count !== null ? { detail: plural(evidence.count, 'message') } : {})
-      };
-    case 'agent_status':
-      return { kind: 'agent', tone: 'neutral', title: 'Checked agent status' };
-    case 'finish_agent':
-      return { kind: 'agent', tone: 'good', title: 'Reported the finished task' };
+    case 'agents': {
+      const action = str(args['action']) ?? 'status';
+      switch (action) {
+        case 'spawn':
+          return {
+            kind: 'agent',
+            tone: 'good',
+            title: `Created ${plural(arr(args['workers']).length, 'worker agent')}`
+          };
+        case 'join':
+          return { kind: 'agent', tone: 'good', title: 'Joined the agent swarm' };
+        case 'message':
+          return { kind: 'agent', tone: 'neutral', title: `Messaged ${str(args['to']) ?? 'the prime agent'}` };
+        case 'finish':
+          return { kind: 'agent', tone: 'good', title: 'Reported the finished task' };
+        default:
+          return {
+            kind: 'agent',
+            tone: 'neutral',
+            title: 'Checked agent status',
+            ...(evidence.count !== null ? { detail: plural(evidence.count, 'message') } : {})
+          };
+      }
+    }
 
     default:
       return { kind: 'other', tone: 'neutral', title: `Ran ${tool}` };

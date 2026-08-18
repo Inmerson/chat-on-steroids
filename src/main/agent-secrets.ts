@@ -2,17 +2,17 @@
  * The registry of live agent credentials, and the scrubber that keeps them out of
  * everything durable.
  *
- * Multi-agent identity rests on secrets the model is told and then repeats back, which
- * means those secrets travel through exactly the channels this app is built to record:
- * tool arguments, tool results, the bootstrap message a worker's chat is opened with,
- * the diagnostics log, and the activity feed the browser extension is sent. Any one of
- * those would turn a capability into a published fact — and a published worker key is
- * how a worker becomes the prime.
+ * There is exactly one credential left in this app: the one-time key that recovers a worker
+ * slot whose binding was lost. Everything else about agent identity is a conversation id,
+ * which is not a secret and is recorded on purpose.
  *
- * So every credential is registered here the moment it is minted, and every path that
- * writes text to disk, to the renderer or to the extension scrubs through this module
- * first. It deliberately does not lean on logger.redact: these keys are shorter than
- * that function's generic opaque-token threshold and would sail straight through it.
+ * That key never goes to a model — it is written where the *user* can find it — but it still
+ * passes through channels this app is built to record if it is ever used: the arguments of the
+ * `agents` call that spends it, the diagnostics log, the activity feed the extension is sent.
+ * So it is registered here as a value and substituted out of every string that goes to disk,
+ * to the renderer or to the extension. This deliberately does not lean on logger.redact: keys
+ * can be shorter than that function's generic opaque-token threshold and would sail straight
+ * through it.
  *
  * Kept dependency-free so the logger, the recorder, the bridge and the broker can all
  * import it without a cycle.

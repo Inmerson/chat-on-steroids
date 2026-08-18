@@ -9,11 +9,10 @@
 import { contextBridge, ipcRenderer } from 'electron';
 import type { AppState, Capabilities, Config, Diagnosis, LogEntry } from '../shared/types.js';
 import type {
-  CompactionState,
   Handoff,
-  OpenRouterModel,
   SessionEvent,
   SessionSummary,
+  ClearAgentResult,
   SwarmState,
   TokenPressure
 } from '../shared/session.js';
@@ -45,12 +44,6 @@ export interface SessionDetail {
   total: number;
 }
 
-export interface ModelPage {
-  total: number;
-  offset: number;
-  models: OpenRouterModel[];
-}
-
 const api = {
   getState: () => call<AppState>('state:get'),
   saveSettings: (patch: SettingsPatch) => call<AppState>('settings:save', patch),
@@ -76,17 +69,6 @@ const api = {
   deleteSession: (id: string) => call<boolean>('sessions:delete', { id }),
   getHandoff: (id: string, handoffId?: string) => call<Handoff | null>('handoff:get', { id, handoffId }),
 
-  getCompaction: () => call<CompactionState>('compaction:state'),
-  compact: (id: string, resume: boolean) => call<Handoff>('compaction:start', { id, resume }),
-  cancelCompaction: () => call<boolean>('compaction:cancel'),
-  clearCompaction: () => call<CompactionState>('compaction:clear'),
-
-  setOpenRouterKey: (value: string) => call<AppState>('openrouter:key', { value }),
-  listModels: (options?: { refresh?: boolean; offset?: number; limit?: number; query?: string }) =>
-    call<ModelPage>('openrouter:models', options ?? {}),
-
-  pairExtension: () => call<AppState>('bridge:pair'),
-  cancelPairing: () => call<AppState>('bridge:cancelPairing'),
   unpairExtension: () => call<AppState>('bridge:unpair'),
   // The renderer can ask where the extension is and ask for it to be opened, but the
   // path it gets back is only ever displayed: the open happens in the main process
@@ -96,6 +78,13 @@ const api = {
 
   getSwarm: () => call<SwarmState>('swarm:get'),
   resetSwarm: () => call<SwarmState>('swarm:reset'),
+  // Clearing the prime ends the run; clearing a worker frees that slot. Which of the two
+  // happened comes back in the result — the renderer does not decide it.
+  clearAgent: (id: string) => call<ClearAgentResult>('swarm:clearAgent', id),
+  // The only place a recovery key is ever produced, and it is produced for the user rather
+  // than for a model. Offered on a worker slot whose chat was never bound, which is the one
+  // situation `agents action=join` exists for.
+  recoveryKey: (id: string) => call<{ key: string | null }>('swarm:recoveryKey', id),
 
   onStateChanged: (listener: (state: AppState) => void): (() => void) => {
     const wrapped = (_event: unknown, state: AppState): void => listener(state);
@@ -111,11 +100,6 @@ const api = {
     const wrapped = (): void => listener();
     ipcRenderer.on('session:changed', wrapped);
     return () => ipcRenderer.removeListener('session:changed', wrapped);
-  },
-  onCompactionChanged: (listener: (state: CompactionState) => void): (() => void) => {
-    const wrapped = (_event: unknown, state: CompactionState): void => listener(state);
-    ipcRenderer.on('compaction:changed', wrapped);
-    return () => ipcRenderer.removeListener('compaction:changed', wrapped);
   },
   onSwarmChanged: (listener: (state: SwarmState) => void): (() => void) => {
     const wrapped = (_event: unknown, state: SwarmState): void => listener(state);

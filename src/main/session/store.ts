@@ -24,10 +24,11 @@ import type {
   Handoff,
   NewSessionEvent,
   SessionEvent,
+  SessionOrigin,
   SessionSummary
 } from '../../shared/session.js';
 import { eventTokens } from '../../shared/session.js';
-import { logError, logWarn } from '../logger.js';
+import { logError, logInfo, logWarn } from '../logger.js';
 
 /**
  * Caps on how much of a value is written *inline*, into the JSONL line itself.
@@ -62,7 +63,24 @@ export function sessionsRoot(): string {
   return root;
 }
 
+/**
+ * Refuses to touch the disk before somebody has said where.
+ *
+ * `root` starts empty, and `path.join('', id)` is a *relative* path — so an uninitialised
+ * store does not fail, it writes real session folders into whatever the process's working
+ * directory happens to be. That stayed invisible for as long as recording was off by
+ * default; the moment it was switched on, a test run began scattering recordings through
+ * the repository. In the app proper this cannot happen — `initSessionStore` is called
+ * during start-up — which is exactly why it needs to be loud rather than left to chance.
+ */
+function assertReady(): void {
+  if (root === '') {
+    throw new Error('The session store was used before initSessionStore() named a directory');
+  }
+}
+
 function sessionDir(id: string): string {
+  assertReady();
   return path.join(root, id);
 }
 
@@ -90,6 +108,7 @@ function emptySummary(id: string, title: string, conversationId: string | null):
     id,
     title,
     conversationId,
+    chatIds: conversationId ? [conversationId] : [],
     startedAt: now,
     updatedAt: now,
     endedAt: null,
@@ -98,20 +117,32 @@ function emptySummary(id: string, title: string, conversationId: string | null):
     toolCalls: 0,
     errors: 0,
     estimatedTokens: 0,
+    contextTokens: 0,
     lastHandoffId: null,
     lastHandoffAt: null,
     lastTurnOutcome: null,
-    agents: []
+    agents: [],
+    origin: null
   };
 }
 
-async function writeMeta(entry: OpenSession): Promise<void> {
-  const dir = sessionDir(entry.summary.id);
+/**
+ * Persists one summary atomically, without any live-entry bookkeeping.
+ *
+ * Split out so a *staged* summary can be written before it is published into memory. That
+ * ordering is what makes the compaction rebind safe to fail: see rebindSession.
+ */
+async function writeSummary(summary: SessionSummary): Promise<void> {
+  const dir = sessionDir(summary.id);
   const target = path.join(dir, 'meta.json');
   const tmp = `${target}.tmp`;
   await fs.mkdir(dir, { recursive: true });
-  await fs.writeFile(tmp, JSON.stringify(entry.summary, null, 2), 'utf8');
+  await fs.writeFile(tmp, JSON.stringify(summary, null, 2), 'utf8');
   await fs.rename(tmp, target);
+}
+
+async function writeMeta(entry: OpenSession): Promise<void> {
+  await writeSummary(entry.summary);
   entry.metaDirty = false;
 }
 
@@ -147,9 +178,11 @@ export async function flushSessions(): Promise<void> {
 export async function createSession(options: {
   title?: string;
   conversationId?: string | null;
+  origin?: SessionOrigin | null;
 }): Promise<SessionSummary> {
   const id = `${new Date().toISOString().slice(0, 10)}-${randomUUID().slice(0, 8)}`;
   const summary = emptySummary(id, options.title?.trim() || 'ChatGPT session', options.conversationId ?? null);
+  summary.origin = options.origin ?? null;
   const entry: OpenSession = { summary, nextSeq: 1, queue: Promise.resolve(), metaDirty: false, metaTimer: null };
   open.set(id, entry);
   await fs.mkdir(sessionDir(id), { recursive: true });
@@ -236,8 +269,15 @@ async function ensureOpen(id: string): Promise<OpenSession> {
 
 function applyToSummary(summary: SessionSummary, event: SessionEvent): void {
   summary.events += 1;
-  summary.updatedAt = event.time;
-  summary.estimatedTokens += eventTokens(event);
+  // Never backwards. A tool call is written once the app knows which chat it belongs to,
+  // which can be after the page has already reported the end of the turn it ran in, and
+  // the call carries the time it started. Taking that literally would age a session back
+  // to before its own last event and drop it down a list sorted by recency.
+  summary.updatedAt = Math.max(summary.updatedAt, event.time);
+  const tokens = eventTokens(event);
+  summary.estimatedTokens += tokens;
+  // What the attached chat is carrying. Reset by a compaction rebind; see rebindSession.
+  summary.contextTokens += tokens;
   if (event.kind === 'user_message') summary.userMessages += 1;
   if (event.kind === 'tool_call') {
     summary.toolCalls += 1;
@@ -334,6 +374,21 @@ export async function readEvents(sessionId: string, options: ReadOptions = {}): 
     if (out.length >= limit) break;
   }
   if (damaged > 0) logWarn(`session ${sessionId}: skipped ${damaged} unreadable event line(s)`);
+  // Stored in append order and handed back in the order things happened, which are no
+  // longer the same thing. A tool call is written once the app has worked out which chat
+  // it belongs to, and that can take a moment longer than the page takes to report the
+  // answer the call fed into — so the file can hold the call after the reply, and reading
+  // it back that way would show, in the timeline and in a compaction, a tool running after
+  // the answer that depended on it. Every source stamps `time` from the same machine's
+  // clock at the moment the thing happened, so that is the order; seq breaks ties and
+  // keeps this stable. Paging is untouched: `from` and `limit` still work in seq, which is
+  // what makes the cursor monotonic.
+  // session_start is a marker rather than an observation, and a session cannot have begun
+  // after its own contents: a batch journalled by the extension while the app was down
+  // creates the session now and carries events from before that, which would otherwise
+  // sort the opening line into the middle.
+  const at = (event: SessionEvent): number => (event.kind === 'session_start' ? -Infinity : event.time);
+  out.sort((left, right) => at(left) - at(right) || left.seq - right.seq);
   return out;
 }
 
@@ -342,8 +397,21 @@ async function readMeta(id: string): Promise<SessionSummary | null> {
     const raw = await fs.readFile(path.join(sessionDir(id), 'meta.json'), 'utf8');
     const parsed = JSON.parse(raw) as SessionSummary;
     if (typeof parsed?.id !== 'string') return null;
-    // A meta.json written before agents existed has no such field.
-    return { ...parsed, agents: Array.isArray(parsed.agents) ? parsed.agents : [] };
+    // A meta.json written before agents, app-opened chats or the session lineage existed
+    // has no such field. A session recorded before the lineage was a single chat by
+    // definition, and everything it holds was in that chat's context, so both defaults are
+    // the truth rather than a placeholder.
+    return {
+      ...parsed,
+      agents: Array.isArray(parsed.agents) ? parsed.agents : [],
+      origin: parsed.origin ?? null,
+      chatIds: Array.isArray(parsed.chatIds)
+        ? parsed.chatIds
+        : parsed.conversationId
+          ? [parsed.conversationId]
+          : [],
+      contextTokens: typeof parsed.contextTokens === 'number' ? parsed.contextTokens : parsed.estimatedTokens
+    };
   } catch {
     return null;
   }
@@ -359,6 +427,7 @@ async function readMeta(id: string): Promise<SessionSummary | null> {
  * wrong folders. Reading a few hundred small meta.json files is cheap next to that.
  */
 async function readAllSummaries(): Promise<SessionSummary[]> {
+  assertReady();
   let names: string[];
   try {
     names = await fs.readdir(root);
@@ -422,6 +491,87 @@ export async function renameSession(id: string, title: string): Promise<void> {
   const entry = await ensureOpen(id);
   entry.summary.title = title.slice(0, 120);
   await writeMeta(entry);
+}
+
+/**
+ * Records that this app opened the chat, and names the session accordingly.
+ *
+ * One write rather than a rename followed by a stamp, because the two are the same
+ * fact: the origin is where the name came from, and a session that carried one without
+ * the other would either show the bootstrap prompt as its name or claim a role the
+ * name contradicts.
+ */
+export async function setSessionOrigin(id: string, origin: SessionOrigin, title: string): Promise<void> {
+  const entry = await ensureOpen(id);
+  entry.summary.origin = origin;
+  entry.summary.title = title.slice(0, 120);
+  await writeMeta(entry);
+}
+
+/**
+ * Attaches this durable session to a different ChatGPT conversation.
+ *
+ * The single canonical session-transfer primitive: Compact & Resume does not create a
+ * second session and copy state into it, it moves the one session's frontend from chat A
+ * to chat B. Everything the session owns — its recorded history, its title, its origin, its
+ * handoffs, and by extension the workspace and swarm binding keyed off it — follows for
+ * free, precisely because none of it was ever keyed on the ChatGPT conversation.
+ *
+ * `contextTokens` is the one figure that resets, and it is not an exception to that rule:
+ * it measures what the *attached chat* is carrying, and chat B is carrying only the
+ * handoff. `estimatedTokens` keeps counting the session's whole life.
+ *
+ * Refuses rather than guesses when the session is not attached where the caller thinks it
+ * is. That check is what makes the commit safe to retry and impossible to apply twice.
+ *
+ * ## Commit on success, never before
+ *
+ * The move is staged on a *clone* and only published into the live summary once the durable
+ * write has actually landed. Mutating the live summary first and writing afterwards looked
+ * equivalent and was not: a failed `writeMeta` returned false while memory already said
+ * chat B, and the next scheduled flush then wrote that state to disk anyway — so a commit
+ * that reported failure completed itself a second later. The requirement is absolute in the
+ * other direction: a failed A→B commit leaves the session attached to A, in memory and on
+ * disk alike. Publishing is a field-by-field copy into the existing object, because callers
+ * hold that reference.
+ */
+export async function rebindSession(
+  id: string,
+  fromConversationId: string,
+  toConversationId: string
+): Promise<boolean> {
+  if (!toConversationId || fromConversationId === toConversationId) return false;
+  const entry = await ensureOpen(id);
+  if (entry.summary.conversationId !== fromConversationId) return false;
+
+  const staged: SessionSummary = {
+    ...entry.summary,
+    conversationId: toConversationId,
+    chatIds: entry.summary.chatIds.includes(toConversationId)
+      ? [...entry.summary.chatIds]
+      : [...entry.summary.chatIds, toConversationId],
+    contextTokens: 0,
+    updatedAt: Date.now(),
+    // A session whose chat was closed during the handover is live again the moment its new
+    // chat is attached; leaving `endedAt` set would draw a visibly growing session as over.
+    endedAt: null
+  };
+
+  // Any queued append must be on disk before the meta that describes it, or a crash between
+  // the two leaves a summary claiming events the log does not have.
+  await entry.queue.catch(() => undefined);
+  try {
+    await writeSummary(staged);
+  } catch (err) {
+    logWarn(`session ${id} could not be moved to ${toConversationId}: ${(err as Error).message}`);
+    return false;
+  }
+
+  // Past this point nothing can fail: the durable record already says chat B.
+  Object.assign(entry.summary, staged);
+  entry.metaDirty = false;
+  logInfo(`session ${id} moved from ChatGPT conversation ${fromConversationId} to ${toConversationId}`);
+  return true;
 }
 
 // ----------------------------------------------------------------- assets
@@ -521,9 +671,9 @@ export async function readHandoff(sessionId: string, handoffId: string): Promise
 /**
  * The newest handoff across every session — what a fresh chat asks for by default.
  *
- * Deliberately over every session rather than the capped UI list: the whole point of
- * resume_session is that it finds the last compaction, and "unless you happen to have
- * more than two hundred sessions" is not a property worth shipping.
+ * Deliberately over every session rather than the capped UI list: the point of "the last
+ * handoff" is that it is the last one, and "unless you happen to have more than two
+ * hundred sessions" is not a property worth shipping.
  */
 export async function latestHandoff(): Promise<Handoff | null> {
   const sessions = await readAllSummaries();
@@ -534,14 +684,6 @@ export async function latestHandoff(): Promise<Handoff | null> {
     if (handoff && (!best || handoff.createdAt > best.createdAt)) best = handoff;
   }
   return best;
-}
-
-export async function findHandoff(handoffId: string): Promise<Handoff | null> {
-  for (const summary of await readAllSummaries()) {
-    const handoff = await readHandoff(summary.id, handoffId);
-    if (handoff) return handoff;
-  }
-  return null;
 }
 
 // ------------------------------------------------------------------ prune
@@ -588,4 +730,9 @@ export async function deleteSession(id: string): Promise<void> {
 export function resetSessionStoreForTests(): void {
   for (const entry of open.values()) if (entry.metaTimer) clearTimeout(entry.metaTimer);
   open.clear();
+}
+
+/** Test seam: puts the store back to never having been told where to write. */
+export function unsetSessionRootForTests(): void {
+  root = '';
 }

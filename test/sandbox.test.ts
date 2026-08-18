@@ -349,3 +349,46 @@ describe('validateNewRoot', () => {
     expect(await validateNewRoot(outside, [{ name: 'project', path: approved }])).toBe(outside);
   });
 });
+
+/**
+ * A drive path is still refused — but the refusal now says what to write.
+ *
+ * Everything the model reads prints native paths: command output, stack traces, error
+ * messages. Pasting one back used to get "Path contains ':', which is not allowed", which
+ * is true, is about the wrong thing, and reads as the sandbox refusing a path it can
+ * plainly see is inside an approved folder. One canonical form is worth keeping; making
+ * the user guess which one is not.
+ */
+describe.runIf(IS_WINDOWS)('a native Windows path', () => {
+  it('is refused with the exact virtual path to use instead', async () => {
+    const error = await expectRefused(path.join(approved, 'sub', 'nested.txt'));
+    expect(error.message).toContain('/project/sub/nested.txt');
+    expect(error.message).not.toContain('Path contains ":"');
+  });
+
+  it('names the root itself when that is what was pasted', async () => {
+    const error = await expectRefused(approved);
+    expect(error.message).toContain('"/project"');
+  });
+
+  it('says it is outside the approved folders when it is, and lists them', async () => {
+    const error = await expectRefused(path.join(outside, 'secret.txt'));
+    expect(error.message).toContain('not inside an approved folder');
+    expect(error.message).toContain('/project');
+    // No correction offered for a path there is no correct form of: the roots are listed
+    // instead, and nothing is invented that would resolve.
+    expect(error.message).not.toContain('/project/');
+    expect(error.message).not.toContain('Use "');
+  });
+
+  it('refuses a UNC path without pretending to know a virtual path for it', async () => {
+    const error = await expectRefused(String.raw`\\server\share\file.txt`);
+    expect(error.message).toContain('not inside an approved folder');
+  });
+
+  it('still resolves a virtual path that merely looks similar', async () => {
+    // "project" is a root name, not a drive letter: the guard must not catch it.
+    const resolved = await resolvePath(roots, '/project/sub/nested.txt');
+    expect(resolved.virtual).toBe('/project/sub/nested.txt');
+  });
+});

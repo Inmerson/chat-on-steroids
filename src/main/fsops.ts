@@ -10,6 +10,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { rawCreateReadStream as createReadStream, rawPromises as fs } from './rawfs.js';
 import path from 'node:path';
 import { lineDelta, type LineDelta } from './diffstat.js';
+import { TextMatchError, applyTextEdit } from './text-match.js';
 
 export const DEFAULT_READ_BYTES = 64 * 1024;
 export const MAX_READ_BYTES = 512 * 1024;
@@ -45,9 +46,15 @@ export interface ReadResult {
 }
 
 export type TextEncoding = 'utf-8' | 'utf-16le' | 'utf-16be';
-interface TextFormat {
+export interface TextFormat {
   encoding: TextEncoding;
   bom: boolean;
+}
+
+export interface EditableTextSnapshot {
+  originalBytes: Buffer;
+  text: string;
+  format: TextFormat;
 }
 
 async function textFormat(realPath: string): Promise<TextFormat> {
@@ -91,6 +98,28 @@ function encodeText(text: string, format: TextFormat, includeBom: boolean): Buff
     format.encoding === 'utf-16le' ? Buffer.from([0xff, 0xfe]) : Buffer.from([0xfe, 0xff]),
     body
   ]);
+}
+
+/** Read one existing text file completely for a transactional edit/patch. */
+export async function readEditableTextFile(realPath: string, label = 'file'): Promise<EditableTextSnapshot> {
+  const stat = await fs.stat(realPath);
+  if (!stat.isFile()) throw new FsOpError(`${label}: not a file`);
+  if (stat.size > MAX_WRITE_BYTES) {
+    throw new FsOpError(`${label}: file is too large to edit (${formatBytes(stat.size)})`);
+  }
+  if (await sniffBinary(realPath)) throw new FsOpError(`${label}: cannot edit a binary file`);
+  const format = await textFormat(realPath);
+  const originalBytes = await fs.readFile(realPath);
+  return { originalBytes, text: decodeText(originalBytes, format), format };
+}
+
+/** Encode edited text using the exact BOM/encoding detected by readEditableTextFile. */
+export function encodeEditableTextFile(text: string, snapshot: Pick<EditableTextSnapshot, 'format'>): Buffer {
+  const encoded = encodeText(text, snapshot.format, true);
+  if (encoded.length > MAX_WRITE_BYTES) {
+    throw new FsOpError(`Edited file would be too large (${formatBytes(encoded.length)})`);
+  }
+  return encoded;
 }
 
 /** Reads the first bytes of a file to decide whether it is binary. */
@@ -667,21 +696,19 @@ async function prepareTextEdit(
     if (typeof edit.newText !== 'string') {
       throw new FsOpError(`${virtualPath}, edit ${index + 1}: newText must be a string`);
     }
-    const occurrences = countOccurrences(content, edit.oldText);
-    if (occurrences === 0) {
-      throw new FsOpError(
-        `${virtualPath}, edit ${index + 1}: oldText was not found. Read the file again — it may have changed.`
-      );
+    // One matching engine for every mutation tool. read_file returns logical LF-separated
+    // lines on every platform, so a snippet copied out of it has to remain a valid edit
+    // input for a CRLF or mixed-ending file; applyTextEdit is where that is guaranteed.
+    try {
+      const applied = applyTextEdit(content, edit);
+      content = applied.text;
+      replacements += applied.replacements;
+    } catch (error) {
+      if (error instanceof TextMatchError) {
+        throw new FsOpError(`${virtualPath}, edit ${index + 1}: ${error.message}`);
+      }
+      throw error;
     }
-    if (occurrences > 1 && !edit.replaceAll) {
-      throw new FsOpError(
-        `${virtualPath}, edit ${index + 1}: oldText appears ${occurrences} times. Include more surrounding text, or set replaceAll.`
-      );
-    }
-    content = edit.replaceAll
-      ? content.split(edit.oldText).join(edit.newText)
-      : content.replace(edit.oldText, edit.newText);
-    replacements += edit.replaceAll ? occurrences : 1;
   }
 
   if (content === original) throw new FsOpError(`${virtualPath}: edits produced no change`);
@@ -818,16 +845,6 @@ export async function editTextFiles(
     bytes: item.nextBytes.length,
     delta: item.delta
   }));
-}
-
-function countOccurrences(haystack: string, needle: string): number {
-  let count = 0;
-  let index = haystack.indexOf(needle);
-  while (index !== -1) {
-    count++;
-    index = haystack.indexOf(needle, index + needle.length);
-  }
-  return count;
 }
 
 export function assertWritableSize(content: string): void {

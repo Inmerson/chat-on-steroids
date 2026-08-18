@@ -18,19 +18,35 @@
  */
 
 import { randomBytes, timingSafeEqual } from 'node:crypto';
+import { requestIdFromHeader, withInboundRequestId } from './inbound.js';
 import http from 'node:http';
 import { createMcpHandler } from '@modelcontextprotocol/server';
 import { localhostHostValidation, localhostOriginValidation, toNodeHandler } from '@modelcontextprotocol/node';
 import { getConfig } from '../config.js';
 import { logError, logInfo, logWarn } from '../logger.js';
 import { buildServer, resetToolClock, type ToolContext } from './tools.js';
+import { SURFACE_IDS, surfaceDefinition, type SurfaceId } from './surfaces.js';
 
 const MAX_BODY_BYTES = 8 * 1024 * 1024;
 
 export interface McpEndpoint {
   port: number;
-  /** Full loopback URL including the secret path segment. */
+  /**
+   * The Core surface's URL, including its secret path segment.
+   *
+   * Kept as a named field because Core is the connector the app cannot work without and
+   * most callers mean exactly it.
+   */
   url: string;
+  /**
+   * One URL per surface, each with its own token.
+   *
+   * Separate paths rather than separate ports: one listener is simpler to start, stop and
+   * firewall, and a public tunnel that publishes the origin publishes both surfaces with no
+   * extra process. What matters for the design is not which socket a request arrived on but
+   * which MCP server answers it, and each path is wired to exactly one (see `buildServer`).
+   */
+  urls: Record<SurfaceId, string>;
   stop: () => Promise<void>;
 }
 
@@ -73,10 +89,10 @@ function jsonError(res: http.ServerResponse, status: number, error: string): voi
  * knows the token, so the `resource` field gives nothing away; serving it at the bare
  * /.well-known root would hand the token to any local process that asked.
  */
-function protectedResourceMetadata(resource: string): string {
+function protectedResourceMetadata(resource: string, resourceName: string): string {
   return JSON.stringify({
     resource,
-    resource_name: 'ChatGPT Local Files',
+    resource_name: resourceName,
     authorization_servers: [],
     scopes_supported: []
   });
@@ -90,9 +106,19 @@ function protectedResourceMetadata(resource: string): string {
  * landing here distinguishes those two.
  */
 let requestSeenAt: number | null = null;
+/**
+ * The same clock per connector.
+ *
+ * With two connectors, "ChatGPT reached this app" no longer means "both connectors were
+ * created and work". A user whose Core connector is healthy and who never added the
+ * optional Desktop one would otherwise be shown a finished setup, so the setup screen
+ * asks each surface for itself.
+ */
+const surfaceRequestAt = new Map<SurfaceId, number>();
 
-export function lastRequestAt(): number | null {
-  return requestSeenAt;
+export function lastRequestAt(surface?: SurfaceId): number | null {
+  if (surface === undefined) return requestSeenAt;
+  return surfaceRequestAt.get(surface) ?? null;
 }
 
 /**
@@ -123,16 +149,60 @@ export function tunnelProbeHeaders(): Record<string, string> {
  * `getContext` is called on every request so that roots and capabilities are read
  * fresh; nothing about the permission state is captured at startup.
  */
+let exposedCaps: ToolContext['caps'] | null = null;
+// The same rule applies to the two whole features — session recording and multi-agent
+// mode. They were derived live, so switching either off mid-conversation deleted `session`
+// or `agents` from under a cached snapshot and reproduced exactly the failure the monotonic
+// design exists to avoid.
+let exposedSessionTools = false;
+let exposedAgentTools = false;
+// `find` and the exec pair are mutually exclusive, so this one cannot follow the "only ever
+// widen" rule the other exposures use — widening in either direction removes the other tool
+// from a cached snapshot. It is frozen instead: decided from the live capabilities the first
+// time a request arrives on this endpoint, and never revisited. A user who changes their
+// mind gets the new shape on the next connection, which is exactly when ChatGPT re-reads the
+// tool list anyway.
+let exposedFind: boolean | null = null;
+
+/**
+ * Forgets what this endpoint has ever exposed, so the next snapshot is built from the
+ * settings as they stand now.
+ *
+ * The monotonic rule above is about not deleting a tool from under a *cached* snapshot, and
+ * that is the right default — but it made switching multi-agent mode off a decision the app
+ * could never carry out: the `agents` tool stayed registered for as long as the app kept
+ * running, so a user who tried the feature once was stuck with it.
+ *
+ * So turning a feature off calls this, and the app tells the user to reconnect the connector
+ * in ChatGPT. That reconnect is what makes it clean: ChatGPT re-reads the tool list, and what
+ * it reads has no trace of the feature. The cost is the one thing the monotonic rule was
+ * buying — a call from the stale snapshot in an already-open chat now fails as an unknown
+ * tool rather than as a tidy refusal — which is why this is only ever called for a
+ * deliberate settings change and never on its own.
+ */
+export function forgetExposedSurface(): void {
+  exposedCaps = null;
+  exposedSessionTools = false;
+  exposedAgentTools = false;
+  exposedFind = null;
+}
+
 export async function startMcpServer(getContext: () => ToolContext): Promise<McpEndpoint> {
   // A per-session token in the path is what authorises callers. It is regenerated on
   // every app start, so a URL that leaks stops working when the app restarts.
   requestSeenAt = null;
+  surfaceRequestAt.clear();
   resetToolClock();
   selfTestToken = randomBytes(16).toString('hex');
   tunnelProbeToken = randomBytes(16).toString('hex');
-  const token = randomBytes(32).toString('base64url');
-  const basePath = `/mcp/${token}`;
-  const prmPath = `${PRM_PREFIX}${basePath}`;
+  // One path per surface, each with its own token. Distinct tokens rather than one shared
+  // secret because the two connectors are configured separately in ChatGPT and may be
+  // shared, revoked or re-pasted at different times; a single token would make "give me
+  // Desktop" and "give me everything" the same act.
+  const surfacePaths = SURFACE_IDS.map((id) => ({
+    id,
+    basePath: `/mcp/${id}/${randomBytes(32).toString('base64url')}`
+  }));
 
   // ChatGPT can keep a cached tools/list snapshot for the lifetime of a connector
   // session. If a permission is disabled after that snapshot was loaded, removing the
@@ -142,15 +212,10 @@ export async function startMcpServer(getContext: () => ToolContext): Promise<Mcp
   // previously exposed tools remain registered, and their handlers return the clear
   // TOOL_DISABLED result while the live capability is off. A fresh app/server start
   // resets the surface to the permissions that are enabled at that point.
-  let exposedCaps: ToolContext['caps'] | null = null;
-  // The same rule applies to the two whole features — session recording and
-  // multi-agent mode. They were derived live, so switching either off mid-conversation
-  // deleted resume_session/session_history or the six agent tools from under a cached
-  // snapshot and reproduced exactly the failure the monotonic design exists to avoid.
-  let exposedSessionTools = false;
-  let exposedAgentTools = false;
+  forgetExposedSurface();
   const stableContext = (): ToolContext => {
     const live = getContext();
+    if (exposedFind === null) exposedFind = !live.caps.command && live.caps.search;
     if (exposedCaps === null) {
       exposedCaps = { ...live.caps };
     } else {
@@ -169,18 +234,27 @@ export async function startMcpServer(getContext: () => ToolContext): Promise<Mcp
       agentTools,
       exposedCaps: { ...exposedCaps },
       exposedSessionTools,
-      exposedAgentTools
+      exposedAgentTools,
+      exposedFind
     };
   };
 
-  const handler = createMcpHandler(() => buildServer(stableContext()));
-  const nodeHandler = toNodeHandler(handler, {
-    onerror: (error) => logError(`MCP handler error: ${error.message}`)
-  });
+  // One handler per surface, and the routing below is the only thing that decides which
+  // one sees a request. This is what makes the discovery boundary real rather than
+  // advertised: the Core handler has no `computer` registered at all, so a call for it
+  // fails as an unknown tool inside the protocol layer, with nothing here to "helpfully"
+  // forward it to the other surface.
+  const routes = surfacePaths.map((surface) => ({
+    ...surface,
+    prmPath: `${PRM_PREFIX}${surface.basePath}`,
+    url: '',
+    handler: toNodeHandler(
+      createMcpHandler(() => buildServer(stableContext(), surface.id)),
+      { onerror: (error) => logError(`MCP handler error (${surface.id}): ${error.message}`) }
+    )
+  }));
   const checkHost = localhostHostValidation();
   const checkOrigin = localhostOriginValidation();
-
-  let listeningUrl = '';
 
   const server = http.createServer((req, res) => {
     const url = req.url ?? '';
@@ -191,12 +265,15 @@ export async function startMcpServer(getContext: () => ToolContext): Promise<Mcp
     // Logged for every request, so the Activity tab shows what actually arrived and
     // what it was answered with. The path is reduced to a shape — it carries the
     // session token — and nothing from the body is logged.
+    const route = routes.find((candidate) => safeEqual(pathOnly, candidate.basePath)) ?? null;
+    const prmRoute = routes.find((candidate) => safeEqual(pathOnly, candidate.prmPath)) ?? null;
+
     const startedAt = Date.now();
     res.on('finish', () => {
-      const shape = safeEqual(pathOnly, basePath)
-        ? 'mcp'
-        : safeEqual(pathOnly, prmPath)
-          ? 'oauth-metadata'
+      const shape = route
+        ? `mcp/${route.id}`
+        : prmRoute
+          ? `oauth-metadata/${prmRoute.id}`
           : pathOnly.slice(0, 40);
       const method = req.method ?? '?';
       const who = selfTest ? ' (self-test)' : tunnelProbe ? ' (tunnel probe)' : '';
@@ -207,18 +284,18 @@ export async function startMcpServer(getContext: () => ToolContext): Promise<Mcp
       // as failures would put a pair of red lines in the log on a healthy
       // connection and bury the errors that do matter.
       const optional =
-        res.statusCode === 405 && shape === 'mcp' && (method === 'GET' || method === 'DELETE');
-      const expectedTunnelProbe = tunnelProbe && res.statusCode === 415 && shape === 'mcp' && method === 'POST';
+        res.statusCode === 405 && route !== null && (method === 'GET' || method === 'DELETE');
+      const expectedTunnelProbe = tunnelProbe && res.statusCode === 415 && route !== null && method === 'POST';
       if (optional) logInfo(`request ${line} (stream/session not offered — normal)`);
       else if (expectedTunnelProbe) logInfo(`request ${line} (probe compatibility check — normal)`);
       else if (res.statusCode >= 400) logWarn(`request ${line}`);
       else logInfo(`request ${line}`);
     });
 
-    if (safeEqual(pathOnly, prmPath)) {
+    if (prmRoute) {
       if (!checkHost(req, res)) return;
       if (!checkOrigin(req, res)) return;
-      const body = protectedResourceMetadata(listeningUrl);
+      const body = protectedResourceMetadata(prmRoute.url, surfaceDefinition(prmRoute.id).connectorName);
       res.writeHead(200, {
         'content-type': 'application/json',
         'cache-control': 'no-store',
@@ -228,7 +305,7 @@ export async function startMcpServer(getContext: () => ToolContext): Promise<Mcp
       return;
     }
 
-    if (!safeEqual(pathOnly, basePath)) {
+    if (!route) {
       jsonError(res, 404, 'not_found');
       return;
     }
@@ -238,7 +315,10 @@ export async function startMcpServer(getContext: () => ToolContext): Promise<Mcp
     // Count only a validated request to the actual MCP endpoint. OAuth metadata,
     // 404s, our own self-test and tunnel-client's startup initialize probe are not
     // evidence that ChatGPT itself reached the connector.
-    if (!selfTest && !tunnelProbe) requestSeenAt = Date.now();
+    if (!selfTest && !tunnelProbe) {
+      requestSeenAt = Date.now();
+      surfaceRequestAt.set(route.id, requestSeenAt);
+    }
 
     const declared = Number(req.headers['content-length'] ?? 0);
     if (Number.isFinite(declared) && declared > MAX_BODY_BYTES) {
@@ -246,7 +326,9 @@ export async function startMcpServer(getContext: () => ToolContext): Promise<Mcp
       return;
     }
 
-    void nodeHandler(req, res);
+    // The tool dispatch reads this back to join the call to the page request that issued
+    // it; see inbound.ts for why it cannot be taken from the MCP call context.
+    withInboundRequestId(requestIdFromHeader(req.headers['x-request-id']), () => void route.handler(req, res));
   });
 
   // Reject slow or oversized bodies rather than holding sockets open indefinitely.
@@ -270,13 +352,15 @@ export async function startMcpServer(getContext: () => ToolContext): Promise<Mcp
   server.on('error', (err) => logError(`Local server error: ${err.message}`));
   logInfo(`server started on 127.0.0.1:${address.port}`);
 
-  // Known only once the OS has handed us a port, and needed by the metadata document
-  // as the canonical resource identifier.
-  listeningUrl = `http://127.0.0.1:${address.port}${basePath}`;
+  // Known only once the OS has handed us a port, and needed by each metadata document as
+  // that surface's canonical resource identifier.
+  for (const surface of routes) surface.url = `http://127.0.0.1:${address.port}${surface.basePath}`;
+  const urls = Object.fromEntries(routes.map((surface) => [surface.id, surface.url])) as Record<SurfaceId, string>;
 
   return {
     port: address.port,
-    url: listeningUrl,
+    url: urls.core,
+    urls,
     stop: () =>
       new Promise<void>((resolve) => {
         server.closeAllConnections();

@@ -20,20 +20,73 @@ import {
   type SessionSettings
 } from '../shared/types.js';
 import { logError } from './logger.js';
+import { RESERVED_ROOT_NAMES } from './sandbox.js';
 
 /**
  * Defaults for the newer sections, in one place so the schema and defaultConfig()
- * cannot drift apart. Recording, compaction and multi-agent all start switched off or
- * unconfigured: none of them should begin writing to disk or opening tabs uninvited.
+ * cannot drift apart.
+ *
+ * Recording starts ON. Everything the app is actually for — the readable timeline, Compact
+ * & resume, and agent attribution — reads the recorded history, so an install that starts
+ * with it off is an install where the main features silently do nothing. It writes only to
+ * this app's own data folder and uploads nothing. Note this changes the default for *new*
+ * configs only: an existing config already carries an explicit `record`, and a user who
+ * turned it off keeps it off.
+ *
+ * Multi-agent still starts off — it opens browser tabs and drives several chats at the
+ * same files, which nobody should get without asking for it.
+ */
+/**
+ * Where the pressure meter turns amber and red.
+ *
+ * These are measured in *this app's* units — `estimateTokens`, four characters to a token,
+ * over the events it kept — and not in whatever ChatGPT counts. The two are not the same
+ * number and never will be: the app cannot see the system prompt, the memory, the file
+ * attachments or the model's own reasoning, and ChatGPT's counter is private.
+ *
+ * So the thresholds are calibrated against observed behaviour rather than a published
+ * context window. The first pair (180k/200k) was set from the published figure, and a real
+ * session then ran past 400k of these units before ChatGPT would take no more — meaning the
+ * meter had been demanding a compaction since roughly the halfway mark, for hours, on a
+ * chat that was fine. A warning that cries wolf at half the real capacity is a warning
+ * people learn to click past, which costs more than having no warning at all.
+ *
+ * 300k/400k puts the amber line where there is still comfortable room to compact and the
+ * red line at the point that has actually been seen to fail. Both remain settings, because
+ * the real ceiling moves with the account, the model and the size of what is attached.
  */
 const DEFAULT_SESSIONS: SessionSettings = {
-  record: false,
+  record: true,
   retainDays: 30,
-  advisoryTokens: 180_000,
-  limitTokens: 200_000
+  advisoryTokens: 300_000,
+  limitTokens: 400_000
 };
-const DEFAULT_COMPACTION: CompactionSettings = { model: '', reasoning: 'medium', showReasoning: true };
-const DEFAULT_MULTI_AGENT: MultiAgentSettings = { enabled: false, maxWorkers: 3 };
+
+/**
+ * The 1.7.1 recalibration, applied once to configs that never chose their own numbers.
+ *
+ * Raising a default only helps a fresh install: every existing config was written with the
+ * old figures spelled out, so it would keep the too-early warning forever. A stored pair
+ * that is *exactly* the old defaults was never a decision — it is what the app wrote for
+ * itself — so it moves. Anything else the user typed, and it stays put.
+ */
+const OLD_TOKEN_DEFAULTS = { advisoryTokens: 180_000, limitTokens: 200_000 };
+const DEFAULT_COMPACTION: CompactionSettings = {
+  // On, at the ceiling.
+  //
+  // This was off by default, on the grounds that compaction ends the chat the user is
+  // working in and that is not something to do to somebody who never asked. Living with it
+  // settled the argument the other way: hitting the ceiling mid-thought is the outcome
+  // people actually get, and it is worse than being moved to a fresh chat carrying a brief.
+  // The threshold is the limit rather than the advisory line, because the advisory line is
+  // where the app starts *mentioning* the size — compacting there ends chats that had
+  // hours of room left.
+  auto: true,
+  autoTokens: DEFAULT_SESSIONS.limitTokens
+};
+// Two workers, not three: three concurrent workers reproducibly trips ChatGPT's rate limit
+// ("too many requests"), which strands the run rather than making it faster.
+const DEFAULT_MULTI_AGENT: MultiAgentSettings = { enabled: false, maxWorkers: 2 };
 
 const rootSchema = z.object({
   name: z
@@ -44,24 +97,57 @@ const rootSchema = z.object({
   path: z.string().min(2).max(4096)
 });
 
+/**
+ * Migrates configs written before the tools were consolidated.
+ *
+ * `powershell` and `command` used to be one tool each and are now the single
+ * `exec_command`, so a user who had granted only PowerShell keeps the ability they
+ * chose. `deleteFolder` is dropped rather than folded into `deleteFile`: they were never
+ * the same permission, and quietly turning one into the other would widen what the user
+ * approved. Both keys are removed afterwards so the file stops carrying dead permissions.
+ */
+function migrateCapabilities(value: unknown): unknown {
+  if (value === null || typeof value !== 'object') return value;
+  const caps = { ...(value as Record<string, unknown>) };
+  if (caps['powershell'] === true) caps['command'] = true;
+  delete caps['powershell'];
+  delete caps['deleteFolder'];
+  return caps;
+}
+
 // Missing capability keys are filled from safe defaults so adding a new optional
 // permission in an update never resets an existing user's folders/tunnel settings.
 const capabilitiesSchema = z
-  .object(
-    Object.fromEntries(CAPABILITIES.map((c) => [c, z.boolean().optional()])) as Record<
-      (typeof CAPABILITIES)[number],
-      z.ZodOptional<z.ZodBoolean>
-    >
+  .preprocess(
+    migrateCapabilities,
+    z.object(
+      Object.fromEntries(CAPABILITIES.map((c) => [c, z.boolean().optional()])) as Record<
+        (typeof CAPABILITIES)[number],
+        z.ZodOptional<z.ZodBoolean>
+      >
+    )
   )
   .transform((caps) => ({ ...DEFAULT_CAPABILITIES, ...caps }) as Capabilities);
 
 const configSchema = z.object({
-  roots: z.array(rootSchema).max(32),
+  // A config written by hand — or by a build before `/skills` was reserved — must not be
+  // able to claim a reserved virtual root. Renamed rather than rejected: a single bad root
+  // name is not a reason to throw away the whole config and every other approved folder.
+  roots: z
+    .array(rootSchema)
+    .max(32)
+    .transform((roots) =>
+      roots.map((root) => (RESERVED_ROOT_NAMES.has(root.name) ? { ...root, name: `${root.name}-folder` } : root))
+    ),
   capabilities: capabilitiesSchema,
   readOnly: z.boolean(),
   tunnel: z.object({
     kind: z.enum(['openai', 'cloudflared', 'manual']),
     tunnelId: z.string().max(128),
+    // Optional with an empty default, so a config written before the connector split
+    // loads unchanged and simply has no Desktop tunnel yet — which is also the correct
+    // state for it, since the user has not created that connector in ChatGPT either.
+    desktopTunnelId: z.string().max(128).optional().default(''),
     binaryPath: z.string().max(4096)
   }),
   ui: z.object({
@@ -90,12 +176,16 @@ const configSchema = z.object({
     .default({ ...DEFAULT_SESSIONS }),
   compaction: z
     .object({
-      model: z.string().max(200).optional().default(DEFAULT_COMPACTION.model),
-      reasoning: z
-        .enum(['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'])
+      auto: z.boolean().optional().default(DEFAULT_COMPACTION.auto),
+      // The floor is high enough that the threshold cannot be set somewhere a fresh chat
+      // is already past, which would compact every conversation the moment it started.
+      autoTokens: z
+        .number()
+        .int()
+        .min(10_000)
+        .max(4_000_000)
         .optional()
-        .default(DEFAULT_COMPACTION.reasoning),
-      showReasoning: z.boolean().optional().default(DEFAULT_COMPACTION.showReasoning)
+        .default(DEFAULT_COMPACTION.autoTokens)
     })
     .optional()
     .default({ ...DEFAULT_COMPACTION }),
@@ -113,7 +203,7 @@ export function defaultConfig(): Config {
     roots: [],
     capabilities: { ...DEFAULT_CAPABILITIES },
     readOnly: true,
-    tunnel: { kind: 'openai', tunnelId: '', binaryPath: '' },
+    tunnel: { kind: 'openai', tunnelId: '', desktopTunnelId: '', binaryPath: '' },
     ui: { minimizeToTray: true, autoConnect: false, privacyScreenshots: false, theme: 'light' },
     sessions: { ...DEFAULT_SESSIONS },
     compaction: { ...DEFAULT_COMPACTION },
@@ -140,7 +230,7 @@ export async function loadConfig(): Promise<Config> {
       logError('Settings file was invalid and has been reset to defaults');
       current = defaultConfig();
     } else {
-      current = parsed.data;
+      current = adoptAutoCompaction(recalibrateTokens(parsed.data));
       // Duplicate root names would make a virtual path ambiguous.
       const seen = new Set<string>();
       current.roots = current.roots.filter((r) => {
@@ -157,6 +247,42 @@ export async function loadConfig(): Promise<Config> {
     current = defaultConfig();
   }
   return current;
+}
+
+/** Applies OLD_TOKEN_DEFAULTS → DEFAULT_SESSIONS, but only to an untouched pair. */
+function recalibrateTokens(config: Config): Config {
+  const { advisoryTokens, limitTokens } = config.sessions;
+  if (advisoryTokens !== OLD_TOKEN_DEFAULTS.advisoryTokens || limitTokens !== OLD_TOKEN_DEFAULTS.limitTokens) {
+    return config;
+  }
+  return {
+    ...config,
+    sessions: {
+      ...config.sessions,
+      advisoryTokens: DEFAULT_SESSIONS.advisoryTokens,
+      limitTokens: DEFAULT_SESSIONS.limitTokens
+    }
+  };
+}
+
+/**
+ * What automatic compaction used to default to, for the same one-time move as above.
+ *
+ * A config written before 1.7.5 spells the old answer out, so raising the default alone
+ * would only ever reach a fresh install. A stored pair that is *exactly* the old default
+ * was never a decision — it is what the app wrote for itself — so it moves. Anything the
+ * user actually chose is left alone, including switching it off on purpose, which is why
+ * `auto: true` with the old threshold is not touched: that is somebody's own setting.
+ */
+const OLD_AUTO_DEFAULTS = { auto: false, autoTokens: 300_000 };
+
+function adoptAutoCompaction(config: Config): Config {
+  const { auto, autoTokens } = config.compaction;
+  if (auto !== OLD_AUTO_DEFAULTS.auto || autoTokens !== OLD_AUTO_DEFAULTS.autoTokens) return config;
+  return {
+    ...config,
+    compaction: { ...config.compaction, auto: DEFAULT_COMPACTION.auto, autoTokens: DEFAULT_COMPACTION.autoTokens }
+  };
 }
 
 export function getConfig(): Config {

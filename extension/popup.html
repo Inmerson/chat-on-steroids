@@ -6,38 +6,58 @@
     <link rel="stylesheet" href="popup.css" />
   </head>
   <body>
-    <h1><img src="icons/icon48.png" alt="" width="20" height="20" />ChatGPT Local Files</h1>
+    <header class="topbar">
+      <div class="brand">
+        <img src="icons/icon48.png" alt="" width="22" height="22" />
+        <div>
+          <h1>ChatGPT Local Files</h1>
+          <div class="status-line">
+            <span class="dot" id="dot"></span>
+            <span id="state">Looking for the app…</span>
+          </div>
+        </div>
+      </div>
+    </header>
 
-    <div class="row">
-      <span class="dot" id="dot"></span>
-      <span id="state">Looking for the app…</span>
-    </div>
+    <main>
+      <section class="card connection-card">
+        <p class="hint" id="hint">
+          The desktop app has to be running. Open it and this connects on its own.
+        </p>
+        <button id="retryBtn" class="secondary full" hidden>Try again</button>
+        <button id="unpairBtn" class="secondary full" hidden>Disconnect this browser</button>
+      </section>
 
-    <p class="hint" id="hint">
-      The desktop app has to be running. Open it, go to <b>Chat → Settings</b> and press
-      <b>Pair extension</b> to get a code.
-    </p>
+      <section class="card overwrite-card">
+        <label class="toggle-row" for="overwriteToggle">
+          <span class="toggle-copy">
+            <strong>Overwrite ChatGPT</strong>
+            <span>Show the Local Files timeline as the complete assistant turn.</span>
+          </span>
+          <span class="switch-wrap">
+            <input id="overwriteToggle" type="checkbox" checked />
+            <span class="switch-track" aria-hidden="true"><span class="switch-thumb"></span></span>
+          </span>
+        </label>
+        <p class="micro" id="overwriteHint">Applies to ChatGPT tabs and stays on after reload.</p>
+      </section>
 
-    <form id="pairForm" hidden>
-      <input
-        id="code"
-        inputmode="numeric"
-        autocomplete="off"
-        maxlength="6"
-        placeholder="000000"
-        aria-label="Six digit pairing code"
-      />
-      <button type="submit" id="pairBtn">Pair</button>
-    </form>
+      <section class="card">
+        <label class="toggle-row" for="timeToggle">
+          <span class="toggle-copy">
+            <strong>Timestamps</strong>
+            <span>Show event times in streamed activity.</span>
+          </span>
+          <span class="switch-wrap">
+            <input id="timeToggle" type="checkbox" />
+            <span class="switch-track" aria-hidden="true"><span class="switch-thumb"></span></span>
+          </span>
+        </label>
+      </section>
 
-    <button id="unpairBtn" class="ghost" hidden>Unpair</button>
-
-    <p class="err" id="err" hidden></p>
-
-    <p class="foot">
-      Observations from chatgpt.com are sent to the app on 127.0.0.1 only. Nothing leaves
-      this machine.
-    </p>
+      <p class="err" id="err" hidden></p>
+      <p class="foot">Local observations stay on 127.0.0.1 and are sent only to the desktop app.</p>
+    </main>
 
     <script src="popup.js"></script>
   </body>

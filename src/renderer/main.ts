@@ -13,7 +13,7 @@
  */
 
 import type { AppApi } from '../preload/index.js';
-import type { AppState, Capability, LogEntry } from '../shared/types.js';
+import type { AppState, Capability, LogEntry, SurfaceStatus } from '../shared/types.js';
 import { CAPABILITY_DETAILS, CAPABILITY_LABELS, WRITE_CAPABILITIES } from '../shared/types.js';
 import type { SwarmState } from '../shared/session.js';
 import { $, ago, el, icon, run, shortAgo, toast } from './dom.js';
@@ -39,25 +39,13 @@ interface Group {
   caps: Capability[];
 }
 
-const TOOL_COUNT_BY_CAPABILITY: Record<Capability, number> = {
-  browse: 1,
-  search: 1,
-  read: 3,
-  metadata: 1,
-  create: 2,
-  edit: 4,
-  move: 1,
-  deleteFile: 1,
-  deleteFolder: 1,
-  powershell: 1,
-  command: 6,
-  screen: 5,
-  control: 1,
-  clipboardRead: 1,
-  clipboardWrite: 1
-};
-const MAX_TOOL_COUNT =
-  1 + Object.values(TOOL_COUNT_BY_CAPABILITY).reduce((sum, count) => sum + count, 0) + 1;
+/**
+ * Every tool both connectors can advertise at once.
+ *
+ * Six on Core and two on Desktop. `find` never coexists with the exec pair — it exists
+ * only when running commands is switched off — so no configuration reaches nine.
+ */
+const MAX_TOOL_COUNT = 8;
 
 const GROUPS: Group[] = [
   {
@@ -72,7 +60,7 @@ const GROUPS: Group[] = [
     title: 'Change files',
     icon: 'i-pencil',
     blurb: 'Create, edit, move and delete, inside those folders only.',
-    caps: ['create', 'edit', 'move', 'deleteFile', 'deleteFolder']
+    caps: ['create', 'edit', 'move', 'deleteFile']
   },
   {
     id: 'desktop',
@@ -86,7 +74,7 @@ const GROUPS: Group[] = [
     title: 'Run programs',
     icon: 'i-terminal',
     blurb: 'Start commands as you. The most powerful setting here.',
-    caps: ['powershell', 'command']
+    caps: ['command']
   }
 ];
 
@@ -125,57 +113,104 @@ $('tabs').addEventListener('click', (event) => {
  * than pushing the cards below it, because the window cannot grow.
  */
 function buildGroups(): void {
-  $('groups').replaceChildren(
-    ...GROUPS.map((group) => {
-      const root = el('div', 'perm');
-      root.dataset.group = group.id;
+  const permissionGroups = GROUPS.map((group) => {
+    const root = el('div', 'perm');
+    root.dataset.group = group.id;
 
-      const main = document.createElement('button');
-      main.className = 'perm-main';
-      main.type = 'button';
-      const text = el('span');
-      text.append(el('b', '', group.title), el('em', 'group-count'));
-      main.append(icon('i-chev', 'ico chev'), icon(group.icon), text);
-      main.addEventListener('click', () => {
-        openGroup = openGroup === group.id ? null : group.id;
-        paintGroups();
-        if (openGroup === group.id) root.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
-      });
+    const main = document.createElement('button');
+    main.className = 'perm-main';
+    main.type = 'button';
+    const text = el('span');
+    text.append(el('b', '', group.title), el('em', 'group-count'));
+    main.append(icon('i-chev', 'ico chev'), icon(group.icon), text);
+    main.addEventListener('click', () => {
+      openGroup = openGroup === group.id ? null : group.id;
+      paintGroups();
+      if (openGroup === group.id) root.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+    });
 
-      const sw = el('span', 'sw');
-      const box = document.createElement('input');
-      box.type = 'checkbox';
-      box.className = 'group-box';
-      box.title = `Turn everything in "${group.title}" on or off`;
-      box.addEventListener('change', () => {
-        for (const cap of group.caps) {
-          const input = capInput(cap);
-          if (!input.disabled) input.checked = box.checked;
-        }
-        void save();
-      });
-      sw.append(box, el('i'));
-
-      const head = el('div', 'perm-head');
-      head.append(main, sw);
-
-      const tools = el('div', 'tools');
+    const sw = el('span', 'sw');
+    const box = document.createElement('input');
+    box.type = 'checkbox';
+    box.className = 'group-box';
+    box.title = `Turn everything in "${group.title}" on or off`;
+    box.addEventListener('change', () => {
       for (const cap of group.caps) {
-        const label = el('label', 'tool');
-        const input = document.createElement('input');
-        input.type = 'checkbox';
-        input.dataset.cap = cap;
-        input.addEventListener('change', () => void save());
-        const body = el('span');
-        body.append(el('strong', '', CAPABILITY_LABELS[cap]), el('em', '', CAPABILITY_DETAILS[cap]));
-        label.append(input, body);
-        tools.append(label);
+        const input = capInput(cap);
+        if (!input.disabled) input.checked = box.checked;
       }
+      void save();
+    });
+    sw.append(box, el('i'));
 
-      root.append(head, tools);
-      return root;
-    })
-  );
+    const head = el('div', 'perm-head');
+    head.append(main, sw);
+
+    const tools = el('div', 'tools');
+    for (const cap of group.caps) {
+      const label = el('label', 'tool');
+      const input = document.createElement('input');
+      input.type = 'checkbox';
+      input.dataset.cap = cap;
+      input.addEventListener('change', () => void save());
+      const body = el('span');
+      body.append(el('strong', '', CAPABILITY_LABELS[cap]), el('em', '', CAPABILITY_DETAILS[cap]));
+      label.append(input, body);
+      tools.append(label);
+    }
+
+    root.append(head, tools);
+    return root;
+  });
+
+  // Multi-agent is a tool surface just like file/desktop permissions, but it used to be
+  // buried three clicks deep in Chat settings. Keep the detailed worker-count knob there;
+  // put the actual expose/hide switch where every other ChatGPT tool switch already lives.
+  const agents = el('div', 'perm');
+  agents.dataset.group = 'agents';
+  const main = document.createElement('button');
+  main.className = 'perm-main';
+  main.type = 'button';
+  const text = el('span');
+  text.append(el('b', '', 'Sub-agents'), el('em', 'group-count'));
+  main.append(icon('i-chev', 'ico chev'), icon('i-bolt'), text);
+  main.addEventListener('click', () => {
+    openGroup = openGroup === 'agents' ? null : 'agents';
+    paintGroups();
+    if (openGroup === 'agents') agents.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+  });
+
+  const sw = el('span', 'sw');
+  const enabled = document.createElement('input');
+  enabled.type = 'checkbox';
+  enabled.id = 'homeMaEnabled';
+  enabled.title = 'Expose or hide the sub-agent tools in ChatGPT';
+  enabled.addEventListener('change', () => {
+    $<HTMLInputElement>('maEnabled').checked = enabled.checked;
+    void save();
+  });
+  sw.append(enabled, el('i'));
+  const head = el('div', 'perm-head');
+  head.append(main, sw);
+
+  const tools = el('div', 'tools');
+  const agentTools: Array<[string, string]> = [
+    ['spawn', 'Open worker ChatGPT conversations for parts of the task.'],
+    ['join', 'Bind a freshly opened worker chat to the slot it was opened for.'],
+    ['message', 'Steer a worker, or report back to prime.'],
+    ['status', 'See every worker, and collect messages not yet delivered on a tool result.'],
+    ['finish', 'Hand the worker result back to prime and close that slot.']
+  ];
+  for (const [name, detail] of agentTools) {
+    const row = el('div', 'tool is-static');
+    const body = el('span');
+    body.append(el('strong', '', name), el('em', '', detail));
+    row.append(body);
+    tools.append(row);
+  }
+  agents.append(head, tools);
+
+  $('groups').replaceChildren(...permissionGroups, agents);
 }
 
 function capInput(cap: Capability): HTMLInputElement {
@@ -213,19 +248,27 @@ function paintGroups(): void {
   }
 
   for (const cap of WRITE_CAPABILITIES) capInput(cap).disabled = readOnly;
+
+  const agents = document.querySelector<HTMLElement>('[data-group="agents"]');
+  if (agents) {
+    const enabled = $<HTMLInputElement>('homeMaEnabled');
+    enabled.checked = state.config.multiAgent.enabled;
+    agents.classList.toggle('is-open', openGroup === 'agents');
+    agents.classList.toggle('is-on', enabled.checked);
+    agents.querySelector<HTMLElement>('.group-count')!.textContent = enabled.checked ? '6 tools exposed' : 'off';
+  }
 }
 
-/** How many MCP tools ChatGPT can currently discover, including list_roots. */
+/**
+ * How many MCP tools ChatGPT can currently discover, across both connectors.
+ *
+ * Taken from the surfaces the main process reports rather than recomputed from the
+ * checkboxes, so this number cannot drift away from what the servers actually register.
+ */
 function toolsOn(next: AppState): number {
-  const { capabilities, readOnly } = next.config;
-  const enabled = (Object.keys(capabilities) as Capability[]).filter(
-    (cap) => capabilities[cap] && !(readOnly && WRITE_CAPABILITIES.includes(cap))
-  );
-  let count = 1;
-  for (const cap of enabled) count += TOOL_COUNT_BY_CAPABILITY[cap];
-  // write_binary_file is shared by Create and Edit, so count it once when either is live.
-  if (enabled.includes('create') || enabled.includes('edit')) count += 1;
-  return count;
+  return next.status.surfaces
+    .filter((surface) => surface.available)
+    .reduce((sum, surface) => sum + surface.tools.length, 0);
 }
 
 // ------------------------------------------------------------------ save
@@ -238,11 +281,14 @@ async function save(over: { readOnly?: boolean; theme?: 'light' | 'dark' } = {})
   }
   const readOnly = over.readOnly ?? state.config.readOnly;
   const previous = state.config;
-  const toolSurfaceChanged = (Object.keys(capabilities) as Capability[]).some((cap) => {
-    const before = previous.capabilities[cap] && !(previous.readOnly && WRITE_CAPABILITIES.includes(cap));
-    const after = capabilities[cap] && !(readOnly && WRITE_CAPABILITIES.includes(cap));
-    return before !== after;
-  });
+  const chatPatch = chatSettingsPatch(state.config);
+  const toolSurfaceChanged =
+    previous.multiAgent.enabled !== chatPatch.multiAgent.enabled ||
+    (Object.keys(capabilities) as Capability[]).some((cap) => {
+      const before = previous.capabilities[cap] && !(previous.readOnly && WRITE_CAPABILITIES.includes(cap));
+      const after = capabilities[cap] && !(readOnly && WRITE_CAPABILITIES.includes(cap));
+      return before !== after;
+    });
   const next = await run(
     api.saveSettings({
       capabilities,
@@ -250,6 +296,7 @@ async function save(over: { readOnly?: boolean; theme?: 'light' | 'dark' } = {})
       tunnel: {
         kind: $<HTMLSelectElement>('tunnelKind').value as 'openai' | 'cloudflared' | 'manual',
         tunnelId: $<HTMLInputElement>('tunnelId').value.trim(),
+        desktopTunnelId: $<HTMLInputElement>('desktopTunnelId').value.trim(),
         binaryPath: $<HTMLInputElement>('binaryPath').value.trim()
       },
       ui: {
@@ -260,12 +307,16 @@ async function save(over: { readOnly?: boolean; theme?: 'light' | 'dark' } = {})
       },
       // Recording, compaction and multi-agent live in the Chat panel but travel in
       // the same patch, so one save can never write a half-updated config.
-      ...chatSettingsPatch(state.config)
+      ...chatPatch
     })
   );
   if (next) {
     apply(next);
-    if (toolSurfaceChanged) {
+    if (previous.multiAgent.enabled && !next.config.multiAgent.enabled) {
+      // A cached snapshot keeps offering the `agents` tool until the connector is
+      // reloaded. Say so plainly rather than letting it look sticky.
+      toast('Multi-agent off. Reconnect the connector in ChatGPT (then start a new chat) to drop the agents tool.');
+    } else if (toolSurfaceChanged) {
       toast('Tools changed. Start a new ChatGPT conversation to guarantee the new tool list is loaded.');
     }
   } else await refresh();
@@ -314,7 +365,11 @@ function isRunning(value: AppState['status']['state']): boolean {
 /** What still has to happen before connecting can work, in the order of the wizard. */
 function missingStep(next: AppState): { step: string; text: string } | null {
   const { config } = next;
-  if (config.roots.length === 0) {
+  // Mirrors the connect gate in connection.ts: a folder is what almost every setup needs,
+  // but a desktop-only setup — screen, control or just the clipboard — is a real
+  // configuration whose tools never touch a folder, and demanding one there is a dead end.
+  const desktopOnly = next.status.surfaces.some((surface) => surface.id === 'desktop' && surface.available);
+  if (config.roots.length === 0 && !desktopOnly) {
     return { step: 'folder', text: 'Choose a folder to share — step 1.' };
   }
   if (config.tunnel.kind === 'openai') {
@@ -380,6 +435,7 @@ function apply(next: AppState): void {
   for (const input of document.querySelectorAll<HTMLInputElement>('[data-cap]')) {
     input.checked = config.capabilities[input.dataset.cap as Capability];
   }
+  $<HTMLInputElement>('homeMaEnabled').checked = config.multiAgent.enabled;
   paintGroups();
 
   // ---- folders
@@ -410,6 +466,7 @@ function apply(next: AppState): void {
   $<HTMLSelectElement>('tunnelKind').value = config.tunnel.kind;
   $('methodHint').textContent = METHOD_HINT[config.tunnel.kind] ?? '';
   $<HTMLInputElement>('tunnelId').value = config.tunnel.tunnelId;
+  $<HTMLInputElement>('desktopTunnelId').value = config.tunnel.desktopTunnelId;
   $<HTMLInputElement>('binaryPath').value = config.tunnel.binaryPath;
   $<HTMLInputElement>('autoConnect').checked = config.ui.autoConnect;
   $<HTMLInputElement>('minimizeToTray').checked = config.ui.minimizeToTray;
@@ -418,6 +475,10 @@ function apply(next: AppState): void {
   const openai = config.tunnel.kind === 'openai';
   step('tunnel').hidden = !openai;
   step('key').hidden = !openai;
+  // Only this method needs a tunnel per connector. Cloudflare and manual publish the
+  // whole address, so both connectors already ride the one tunnel on their own paths.
+  const desktopSurface = status.surfaces.find((surface) => surface.id === 'desktop');
+  $('desktopTunnelField').hidden = !openai || !desktopSurface?.available;
 
   $('wizFolders').textContent =
     config.roots.length === 0 ? 'None yet' : config.roots.map((r) => `/${r.name}`).join('  ');
@@ -442,28 +503,51 @@ function apply(next: AppState): void {
   // FORBIDDEN inside one ChatGPT conversation is not the same as a broken setup.
   // The middle case is the one that costs hours: ChatGPT connects and reads the tool
   // list, but the model is never allowed to call anything — Developer mode is off.
+  // Every connector this app is publishing that ChatGPT has never reached. Computed here
+  // because it decides three things at once: the summary line, whether step 5 counts as
+  // done, and whether the cards stay on screen after the wizard tidies itself away.
+  const unverified = status.surfaces.filter((surface) => surface.available && surface.lastRequestAt === null);
   const chatgptNote = $('wizChatgpt');
-  chatgptNote.classList.toggle('is-warn', status.lastRequestAt !== null && status.lastToolCallAt === null);
+  chatgptNote.classList.toggle(
+    'is-warn',
+    status.lastRequestAt !== null && (status.lastToolCallAt === null || unverified.length > 0)
+  );
   chatgptNote.textContent =
     status.lastRequestAt === null
       ? 'ChatGPT has not called this app yet.'
       : status.lastToolCallAt === null
         ? `ChatGPT connected ${ago(status.lastRequestAt)} but has never run a tool. If it says “does not support developer MCPs”, switch Developer mode back on in ChatGPT → Settings → Apps & Connectors → Advanced.`
-        : `ChatGPT ran a tool ${ago(status.lastToolCallAt)} — the whole chain works.`;
+        : unverified.length > 0
+          ? // One connector working is not the whole setup. Naming the missing one is the
+            // difference between "something is off" and knowing what to go and create.
+            `ChatGPT ran a tool ${ago(status.lastToolCallAt)}, but ${unverified
+              .map((surface) => `“${surface.connectorName}”`)
+              .join(' and ')} has never been called — create it in ChatGPT to use it.`
+          : `ChatGPT ran a tool ${ago(status.lastToolCallAt)} — the whole chain works.`;
 
-  const shownUrl = status.publicUrl ?? (config.tunnel.kind === 'manual' ? status.localUrl : null);
-  $('publicUrlField').hidden = !shownUrl;
-  $<HTMLInputElement>('publicUrl').value = shownUrl ?? '';
+  const cards = $('connectorCards');
+  // A connector the user has switched on but never created in ChatGPT is unfinished setup,
+  // so its card must survive the tidy collapse instead of disappearing behind "Show all
+  // steps" — otherwise a half-done Desktop setup reads as a complete one.
+  cards.classList.toggle('has-unfinished', unverified.length > 0);
+  cards.replaceChildren(...connectorCards(next));
 
   // Step marks: everything before the first unfinished step counts as done.
   const order = ['folder', 'tunnel', 'key', 'connect', 'chatgpt'];
   const done = new Set<string>();
-  if (config.roots.length > 0) done.add('folder');
+  if (config.roots.length > 0 || missingStep(next)?.step !== 'folder') done.add('folder');
   if (!openai || TUNNEL_ID_PATTERN.test(config.tunnel.tunnelId)) done.add('tunnel');
   if (!openai || next.hasApiKey) done.add('key');
   if (connected) done.add('connect');
-  // The only honest proof step 5 is finished: ChatGPT has actually called this app.
-  if (status.lastRequestAt !== null) done.add('chatgpt');
+  // The only honest proof step 5 is finished: ChatGPT has actually called the connectors
+  // this app cannot work without. Judged per surface, because a Core request says nothing
+  // about whether the Desktop connector was ever created. An optional connector never
+  // blocks completion — a user may enable clipboard access and still not want a second
+  // connector — but it is reported separately below rather than quietly counted as done.
+  const requiredUnverified = status.surfaces.some(
+    (surface) => surface.available && !surface.optional && surface.lastRequestAt === null
+  );
+  if (status.lastRequestAt !== null && !requiredUnverified) done.add('chatgpt');
   const current = order.find((name) => !done.has(name)) ?? null;
   for (const name of order) {
     const node = step(name);
@@ -492,6 +576,111 @@ function apply(next: AppState): void {
   chatApply(next);
 
   applying = false;
+}
+
+const SURFACE_STATE_TEXT: Record<SurfaceStatus['state'], string> = {
+  off: 'Not published',
+  starting: 'Connecting…',
+  live: 'Published',
+  error: 'Problem'
+};
+
+/** One copyable value with its own button, so nothing has to be retyped by hand. */
+function copyRow(label: string, value: string, what: string): HTMLElement {
+  const field = el('div', 'field');
+  const input = document.createElement('input');
+  input.type = 'text';
+  input.readOnly = true;
+  input.spellcheck = false;
+  input.value = value;
+  const button = el('button', 'btn btn-solid');
+  (button as HTMLButtonElement).type = 'button';
+  button.append(icon('i-copy'), document.createTextNode('Copy'));
+  button.addEventListener('click', async () => {
+    const copied = await run(api.writeClipboard(value));
+    if (copied) toast(`${what} copied`);
+  });
+  const row = el('div', 'row-inline');
+  row.append(input, button);
+  field.append(el('label', '', label), row);
+  return field;
+}
+
+/**
+ * One card per connector, with the exact strings to paste into ChatGPT.
+ *
+ * The name and the description are offered as copyable text rather than described in
+ * prose, because both are load-bearing: ChatGPT matches on the name to address the
+ * connector and reads the description to decide whether to load its tools at all. A
+ * connector called "my pc" with a description the user invented is one the model may
+ * never reach for, and that failure looks exactly like the app being broken.
+ */
+function connectorCards(next: AppState): HTMLElement[] {
+  const { status, config } = next;
+  return status.surfaces.map((surface) => {
+    const card = el('div', `connector is-${surface.state}`);
+
+    const head = el('div', 'connector-head');
+    head.append(
+      el('h4', '', surface.connectorName),
+      el('span', 'tag', surface.optional ? 'optional' : 'required'),
+      el('span', `pill is-${surface.state}`, SURFACE_STATE_TEXT[surface.state])
+    );
+    card.append(head, el('p', 'hint', surface.cardSummary));
+
+    if (!surface.available) {
+      card.append(el('p', 'hint', surface.detail));
+      return card;
+    }
+
+    card.append(copyRow('Name', surface.connectorName, 'Name'));
+    card.append(copyRow('Description', surface.description, 'Description'));
+
+    // On the OpenAI method the connector is picked from a list of tunnels instead of
+    // pasted as a URL, so showing a loopback address there would only mislead.
+    const url =
+      surface.publicUrl ?? (config.tunnel.kind === 'manual' ? surface.localUrl : null);
+    if (url) {
+      card.append(copyRow('MCP server URL', url, 'URL'));
+      card.append(
+        el('p', 'hint', 'Anyone with this URL can use your enabled tools. Do not share it.')
+      );
+    } else if (config.tunnel.kind === 'openai') {
+      card.append(
+        el(
+          'p',
+          'hint',
+          surface.id === 'desktop' && !config.tunnel.desktopTunnelId
+            ? 'Pick this connector’s own tunnel — paste its ID in step 2 first.'
+            : 'Choose Tunnel, then pick this connector’s tunnel.'
+        )
+      );
+    }
+
+    if (surface.detail && surface.state === 'error') card.append(el('p', 'hint is-warn', surface.detail));
+
+    // Published is only half the story. "Live" says this app is serving the connector;
+    // it says nothing about whether the user ever created it in ChatGPT, and with two
+    // connectors a single app-wide "ChatGPT called us" line cannot tell them apart.
+    if (surface.state === 'live') {
+      card.append(
+        surface.lastRequestAt === null
+          ? el('p', 'hint is-warn', 'Not created in ChatGPT yet — ChatGPT has never called this connector.')
+          : el(
+              'p',
+              'hint',
+              surface.lastToolCallAt === null
+                ? `ChatGPT connected ${ago(surface.lastRequestAt)} but has not run one of its tools yet.`
+                : `ChatGPT ran one of its tools ${ago(surface.lastToolCallAt)}.`
+            )
+      );
+    }
+
+    if (surface.tools.length > 0) {
+      card.append(el('p', 'hint', `Tools: ${surface.tools.join(', ')}`));
+    }
+    return card;
+  });
 }
 
 /**
@@ -590,8 +779,22 @@ function frag(before: string, bold: string, after: string): DocumentFragment {
 
 // ------------------------------------------------------------------- log
 
-/** Anything the user might have to act on. Counted so problems are never buried. */
-let problems = 0;
+/**
+ * Anything the user might have to act on, counted so problems are never buried.
+ *
+ * Counted from the rows the feed still holds, not from everything that ever arrived.
+ * The feed keeps 500 lines and drops the rest, so a running total drifted away from
+ * what the Problems filter could actually show: "4 problems" above an empty list,
+ * which reads as the filter being broken rather than as the rows having aged out.
+ */
+function paintProblems(): void {
+  const problems = $('fullFeed').querySelectorAll('p.bad').length;
+  for (const id of ['homeProblems', 'logProblems']) {
+    const badge = $(id);
+    badge.hidden = problems === 0;
+    badge.textContent = `${problems} problem${problems === 1 ? '' : 's'}`;
+  }
+}
 
 /**
  * Splits a log line into a short subject and the rest, so the eye can scan the left
@@ -616,14 +819,7 @@ function logRow(entry: LogEntry): HTMLElement {
 }
 
 function addLogLine(entry: LogEntry): void {
-  if (entry.level !== 'info') {
-    problems += 1;
-    for (const id of ['homeProblems', 'logProblems']) {
-      const badge = $(id);
-      badge.hidden = false;
-      badge.textContent = `${problems} problem${problems === 1 ? '' : 's'}`;
-    }
-  }
+  let evicted = false;
   for (const id of ['homeFeed', 'fullFeed']) {
     const view = $(id);
     const atBottom = view.scrollTop + view.clientHeight >= view.scrollHeight - 24;
@@ -631,9 +827,16 @@ function addLogLine(entry: LogEntry): void {
     // Home always shows everything; only the Activity panel has the agent filter.
     if (id === 'fullFeed' && agentFilter !== null) row.hidden = entry.agent !== agentFilter;
     view.append(row);
-    while (view.childElementCount > 500) view.firstElementChild?.remove();
+    while (view.childElementCount > 500) {
+      if (id === 'fullFeed' && view.firstElementChild?.classList.contains('bad')) evicted = true;
+      view.firstElementChild?.remove();
+    }
     if (atBottom) view.scrollTop = view.scrollHeight;
   }
+  // After the eviction above, so the badge counts what is there rather than what arrived.
+  // A quiet run of 500 info lines retires old problems just as surely as a new one adds
+  // to them, so both directions have to repaint.
+  if (entry.level !== 'info' || evicted) paintProblems();
 }
 
 $('logFilter').addEventListener('click', (event) => {
@@ -660,7 +863,7 @@ function applyAgentFilter(): void {
 }
 
 function paintAgentFilter(swarm: SwarmState): void {
-  const box = $('agentFilter');
+  const box = $('logAgentFilter');
   if (!swarm.running) {
     box.hidden = true;
     box.replaceChildren();
@@ -770,10 +973,6 @@ $('pickBinary').addEventListener('click', async () => {
   if (next) apply(next);
 });
 
-$('copyUrl').addEventListener('click', async () => {
-  const copied = await run(api.writeClipboard($<HTMLInputElement>('publicUrl').value));
-  if (copied) toast('URL copied');
-});
 
 for (const id of ['copyLog', 'copyLogText']) {
   $(id).addEventListener('click', async () => {
@@ -811,7 +1010,14 @@ $('removeApiKey').addEventListener('click', async () => {
   }
 });
 
-for (const id of ['autoConnect', 'minimizeToTray', 'privacyScreenshots', 'tunnelKind', 'tunnelId']) {
+for (const id of [
+  'autoConnect',
+  'minimizeToTray',
+  'privacyScreenshots',
+  'tunnelKind',
+  'tunnelId',
+  'desktopTunnelId'
+]) {
   $(id).addEventListener('change', () => void save());
 }
 

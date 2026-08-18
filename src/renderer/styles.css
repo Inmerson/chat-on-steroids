@@ -315,12 +315,58 @@ main {
   color: var(--blue);
 }
 
-/* Everything after the title lives in one right-aligned cluster. */
+/* Everything after the title lives in one right-aligned cluster.
+   `flex: none` is what actually keeps a primary action on screen: without it the cluster
+   is allowed to shrink below its content and the last button is clipped away. */
 .acts {
   margin-left: auto;
   display: flex;
   align-items: center;
   gap: 4px;
+  flex: none;
+}
+
+/* The title yields; the actions do not. */
+.card > h2 > span:first-child {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* The slim navigation row under a card header. */
+.subhead {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 0 14px 9px;
+  min-width: 0;
+}
+
+.subhead-note {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0;
+  text-transform: none;
+  color: var(--faint);
+}
+
+.subhead-note.is-live {
+  color: var(--blue);
+}
+
+.subhead-note.is-bad {
+  color: var(--red);
+}
+
+/* The one action in this card a user is most likely to want. */
+.btn.is-primary {
+  border-color: color-mix(in srgb, var(--blue) 55%, var(--edge));
+  color: var(--blue);
 }
 
 /* Vertical only. Nothing in this app may scroll sideways: long values are cut
@@ -574,29 +620,58 @@ main {
   opacity: 0.5;
 }
 
-/* Individual tools, revealed one group at a time so nothing else moves. */
+/* Individual tools, revealed one group at a time so nothing else moves.
+   The left inset lines the rows up under the group's title rather than under its icon; the
+   other three sides match the header's own 14/9, so the block sits square inside the card
+   instead of being pushed against its right edge. */
 .tools {
   display: none;
-  padding: 0 14px 9px 42px;
+  padding: 2px 14px 9px;
 }
 
 .perm.is-open .tools {
   display: grid;
+  gap: 2px;
 }
 
-.tool {
-  display: flex;
-  align-items: flex-start;
-  gap: 9px;
-  padding: 4px 0;
+/* One capability checkbox inside a permission group.
+   Scoped to `.tools` on purpose. This used to be a bare `.tool`, which also matched the
+   expanded tool call in the Chat timeline — a `<details class="tool">` further down this
+   file that never sets `display` of its own. That made the timeline's `<details>` a flex
+   container, so its `<summary>` and its `.raw` body became siblings laid out side by side:
+   the arguments/result panel appeared pinned to the right edge of the card and clipped,
+   instead of opening underneath the row it belongs to. */
+.tools .tool {
+  /* Two columns — the box, then everything else — rather than a flex row. Both are the same
+     picture when a row has a checkbox; the grid is what makes the rows *without* one line up,
+     because the text column starts in the same place whether or not the first cell is filled.
+     The flex version had to reproduce that with a padding of 28 + 14 + 10 worked out by hand,
+     which is the sort of arithmetic that quietly stops matching the moment a number above
+     changes. */
+  display: grid;
+  grid-template-columns: 14px 1fr;
+  /* Centred on the row, not pinned to its first line. These rows are two lines — a name and
+     a sentence explaining it — and a box parked against the top of the taller ones made the
+     column of ticks read as ragged even though every row was the same width. */
+  align-items: center;
+  gap: 10px;
+  padding: 7px 10px 7px 28px;
+  border: 0;
+  border-radius: 8px;
   font-size: 12.5px;
   color: var(--soft);
   cursor: pointer;
 }
 
-.tool input {
+/* The row is the target, so it says so. Replaces the per-row hairline, which drew a box
+   around text that was never a container and left four stacked outlines in a group. */
+.tools .tool:hover {
+  background: var(--hover);
+}
+
+.tools .tool input {
   appearance: none;
-  margin: 2px 0 0;
+  margin: 0;
   width: 14px;
   height: 14px;
   flex: 0 0 auto;
@@ -608,36 +683,55 @@ main {
   cursor: pointer;
 }
 
-.tool input:checked {
+.tools .tool input:checked {
   background: var(--blue);
   border-color: var(--blue);
 }
 
-.tool input:checked::after {
+/* The tick: two borders of an empty box, turned. `place-items: center` on the box above
+   already puts it in the middle, and a rotation is about the element's own centre, so it
+   stays there — the nudge this used to carry only moved it back off again. */
+.tools .tool input:checked::after {
   content: '';
   width: 7px;
   height: 4px;
   border: 1.6px solid #fff;
   border-top: 0;
   border-right: 0;
-  transform: translateY(-1px) rotate(-45deg);
+  transform: rotate(-45deg);
 }
 
-.tool input:disabled {
+.tools .tool input:disabled {
   opacity: 0.45;
   cursor: default;
 }
 
-.tool strong {
+.tools .tool strong {
   font-weight: 550;
   color: var(--ink);
 }
 
-.tool em {
+.tools .tool em {
   display: block;
   font-style: normal;
   font-size: 11.5px;
   color: var(--faint);
+}
+
+/* Informational rows inside the Sub-agents group. The group has one master exposure
+   switch, so drawing six fake per-tool checkboxes would imply controls that do not exist. */
+.tools .tool.is-static {
+  cursor: default;
+}
+
+/* Nothing in the checkbox column, so the text starts in the second one and lands exactly
+   where a ticked row's text does, without a padding computed to match. */
+.tools .tool.is-static span {
+  grid-column: 2;
+}
+
+.tools .tool.is-static:hover {
+  background: none;
 }
 
 /* ----------------------------------------------------------------- folders */
@@ -931,6 +1025,16 @@ main {
   display: flex;
 }
 
+/*
+ * Exception to the collapse: a connector the app is publishing that ChatGPT has never
+ * called is unfinished setup. Hiding its card would let an optional connector the user
+ * switched on but never created look finished, which is the one state tidying must not
+ * invent. The instructions still collapse — only the cards stay.
+ */
+.wizard.is-tidy .step.is-done[data-step='chatgpt'] .step-body > .connectors.has-unfinished {
+  display: grid;
+}
+
 .wizard.is-tidy .step.is-done h3 {
   margin-bottom: 0;
 }
@@ -1098,6 +1202,64 @@ input[readonly] {
   color: var(--faint);
 }
 
+/* ---- connector cards (setup step 5) ------------------------------------ */
+
+.connectors {
+  display: grid;
+  gap: 12px;
+  margin-top: 12px;
+}
+
+.connector {
+  border: 1px solid var(--line);
+  border-radius: 11px;
+  padding: 12px 14px 14px;
+}
+
+.connector-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.connector-head h4 {
+  margin: 0;
+  font-size: 13.5px;
+}
+
+/* Description is long on purpose — it is the model's routing text, not a label. */
+.connector .field > .row-inline input {
+  font-size: 11.5px;
+}
+
+.tag {
+  font-size: 10.5px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--faint);
+}
+
+.pill {
+  font-size: 11px;
+  font-weight: 600;
+  border-radius: 999px;
+  padding: 1px 8px;
+  border: 1px solid var(--line);
+  color: var(--soft);
+  margin-left: auto;
+}
+
+.pill.is-live {
+  color: var(--green);
+  border-color: var(--green);
+}
+
+.pill.is-error {
+  color: var(--red);
+  border-color: var(--red);
+}
+
 .advanced {
   margin-top: 20px;
   border: 1px solid var(--line);
@@ -1151,8 +1313,19 @@ input[readonly] {
   grid-template-rows: minmax(0, 1fr);
 }
 
+/* Header, body, footer. The Sessions card is exactly this shape. */
 [data-panel='chat'] .card {
   grid-template-rows: auto minmax(0, 1fr) auto;
+}
+
+/* The session card also carries a navigation row, so it is header, nav, body, footer.
+   Sharing the three-row template above is what broke this panel: the track list was
+   applied to the wrong children, `.subhead` took the flexible track and centred the view
+   switcher in an empty card, and `.scroll` fell into an implicit auto row sized to its
+   whole content — which is why the timeline painted over the header. Every child gets an
+   explicit track; nothing here may rely on implicit rows. */
+[data-panel='chat'] .card.is-session {
+  grid-template-rows: auto auto minmax(0, 1fr) auto;
 }
 
 #chatTitle {
@@ -1190,6 +1363,9 @@ input[readonly] {
 }
 
 .sess-top {
+  /* `.sess-del` is absolutely positioned at the row's top-right. Reserve its hit target
+     so the age text never sits underneath an invisible delete button. */
+  padding-right: 0;
   display: flex;
   align-items: baseline;
   gap: 8px;
@@ -1216,16 +1392,34 @@ input[readonly] {
 }
 
 .sess-top em {
+  /* Keep the age out from under the hover-only delete hit target. */
+  margin-right: 30px;
   flex: 0 0 auto;
   font-style: normal;
   font-size: 11px;
   color: var(--faint);
 }
 
+/* Role and live-state chips first, then the counts. The counts are what yields when
+   the row is narrow: which run a chat belongs to and whether its worker joined are
+   what the list is for, and "12 tools" is not. */
 .sess-sub {
-  margin-top: 2px;
+  display: flex;
+  align-items: center;
+  margin-top: 3px;
   font-size: 11.5px;
   color: var(--faint);
+}
+
+.sess-sub .chip {
+  flex: none;
+}
+
+.sess-bits {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 /* Estimated tokens against the urgent threshold. Red only past it, because past
@@ -1347,8 +1541,13 @@ input[readonly] {
   font-style: italic;
 }
 
-/* One recorded tool call, closed. Expanding shows exactly what crossed the wire. */
+/* One recorded tool call, closed. Expanding shows exactly what crossed the wire.
+   `display: block` is stated rather than left to the default: a `<details>` whose
+   display is changed lays its summary and its body out as siblings instead of stacking
+   them, which is how the arguments/result panel ended up beside the row and off the
+   right edge. Say it here so a stray rule elsewhere cannot take it away again. */
 .tool {
+  display: block;
   border: 1px solid var(--line);
   border-radius: 8px;
 }
@@ -1563,7 +1762,7 @@ input[readonly] {
 }
 
 /* Per-agent timeline filter. Hidden unless a session has more than one attribution. */
-#agentFilter {
+#chatAgentFilter {
   margin-bottom: 10px;
 }
 
@@ -1620,6 +1819,19 @@ input[readonly] {
 
 .agent {
   border-color: var(--line);
+}
+
+/* Pushed to the far end of the row, quiet until pointed at: it ends a run or a slot,
+   so it should be reachable without being the thing the eye lands on first. */
+.agent-clear {
+  margin-left: auto;
+  flex: none;
+  color: var(--faint);
+}
+
+.agent-clear:hover:not(:disabled) {
+  background: var(--red-wash);
+  color: var(--red);
 }
 
 .model-top {

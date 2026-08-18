@@ -1,18 +1,21 @@
 /**
  * What runs on the ChatGPT page.
  *
- * Two jobs, both read-only as far as the conversation is concerned:
+ * Three jobs. Observation never changes the conversation; presentation may replace the
+ * visible live activity stream when the user has Overwrite enabled:
  *
  *  1. Observe. Messages, turn boundaries, live progress lines and visible errors are
  *     reported to the local app. Nothing is inferred that the page does not show, and
  *     a turn that stops for no visible reason is reported as exactly that.
  *
  *  2. Relabel. The app knows what every MCP tool call actually did, because it ran it.
- *     Where a run of "Called tool" blocks in a turn matches the calls recorded for the
- *     same turn one-for-one, each block's label is replaced with the real thing. If the
- *     counts disagree, or the app could not attribute a call to this turn, nothing is
- *     touched: ChatGPT's own UI is left exactly as it was rather than being decorated
- *     with a guess.
+ *     Each recorded call is matched to one "Called tool" block and given the real thing.
+ *     Matching is per call and incremental: a block that cannot be matched confidently
+ *     keeps ChatGPT's own label, and — this is the part that used to be wrong — it no
+ *     longer suppresses the blocks around it that *can* be matched.
+ *
+ *  3. Offer Compact & resume, as a control beside ChatGPT's own composer buttons that
+ *     says what the job is doing rather than vanishing on the next React render.
  *
  * Every selector lives in chatgpt-dom.js. This file only deals in the shapes that
  * module returns, so a ChatGPT redesign cannot reach past it.
@@ -22,14 +25,63 @@
   'use strict';
 
   const OBSERVE_MS = 1000;
-  const ACTIVITY_MS = 2500;
+  /**
+   * How long the stop button must stay gone before a turn is called finished.
+   *
+   * Measured on the clock and deliberately *not* counted in observations. observe() is not
+   * only the OBSERVE_MS loop: watchTranscript() also runs it from a MutationObserver, via a
+   * microtask, on every relevant transcript mutation. A React rerender that unmounts the
+   * stop button is itself a burst of such mutations, so a counter of quiet observations can
+   * run out inside the same millisecond as the dropout it exists to filter — measuring the
+   * one thing that cannot be inflated by rerender churn is the whole point.
+   *
+   * Four seconds covers the dropouts the live sessions show — 400 ms to 2.7 s, see
+   * `quietSince` — with headroom, while delaying an honest `turn_end` by a few seconds,
+   * which nothing downstream reads as anything but the turn having taken that much longer.
+   */
+  const TURN_SETTLE_MS = 4000;
+  const ACTIVITY_MS = 2000;
   const STATUS_MS = 15_000;
-  const COMMAND_MS = 6000;
   /** Longer than any honest tool call: past this a silent turn is called stalled. */
   const STALL_MS = 10 * 60 * 1000;
+  /** How long the button says "Starting…" before believing something went wrong. */
+  const PRESS_GRACE_MS = 12_000;
+  /** Persistent popup preference. On by default as of 1.7.4; the popup can turn it off. */
+  const RENDER_STREAM_KEY = 'renderStreamEnabled';
+  /** Timestamps are useful for debugging, but too noisy for the normal transcript. */
+  const SHOW_TIMES_KEY = 'showStreamTimes';
+  /**
+   * Production now starts with transcript overwrite enabled. Tests deliberately start off
+   * and opt in case-by-case so renderer regressions do not contaminate unrelated capture
+   * tests. The storage preference is loaded before the first production paint, avoiding a
+   * one-frame flash when somebody has explicitly switched Overwrite off.
+   */
+  const TEST_MODE = typeof globalThis.CLF_TEST_HOOK === 'function';
+  let RENDER_STREAM = TEST_MODE ? false : true;
+  let SHOW_TIMES = false;
+  let renderPreferenceReady = TEST_MODE;
+  const renderStreamAllowed = () => RENDER_STREAM && renderPreferenceReady;
+
+  async function loadRenderPreference() {
+    if (TEST_MODE || !globalThis.chrome || !chrome.storage || !chrome.storage.local) {
+      renderPreferenceReady = true;
+      return;
+    }
+    try {
+      const stored = await chrome.storage.local.get([RENDER_STREAM_KEY, SHOW_TIMES_KEY]);
+      if (typeof stored[RENDER_STREAM_KEY] === 'boolean') RENDER_STREAM = stored[RENDER_STREAM_KEY];
+      SHOW_TIMES = stored[SHOW_TIMES_KEY] === true;
+    } catch {
+      // A storage failure must not leave the renderer permanently waiting. The explicit
+      // production default is ON; the popup can write the preference again on its next use.
+    }
+    renderPreferenceReady = true;
+  }
+  /** Whether any tool row currently wears a label from this app. See unpaint(). */
+  let painted = false;
 
   let alive = true;
-  let status = { connected: false, paired: false };
+  let status = { connected: false, paired: false, disconnected: false };
 
   let conversationId = null;
   let agent = null;
@@ -37,25 +89,326 @@
   const queue = [];
   let flushing = false;
 
-  /** Message ids already reported from this page load. */
+  /**
+   * Which conversation this tab is on, counted rather than named.
+   *
+   * Every asynchronous thing this script starts belongs to the conversation that was
+   * current when it started. ChatGPT is a single-page app, so `location.pathname` can
+   * name a different chat before that work comes back, and a reply applied afterwards is
+   * applied to the wrong chat. Comparing ids is not enough on its own — A → B → A returns
+   * to the same id — so the counter is what makes "still the same conversation" exact.
+   */
+  let epoch = 0;
+
+  /**
+   * Messages already reported from this page load — each as an id *and what it said*.
+   *
+   * Not the id alone, and this is the producer half of a bug whose consumer half the app
+   * already fixes. ChatGPT gives streaming assistant prose no id of its own, so an id is
+   * derived from the section's turn id — and the page reuses those. Worse, the mapping
+   * that would make the derived id unique (`settledGenerations`) lives in memory and is
+   * empty after this content script reloads, which is exactly when the whole visible
+   * transcript is offered again. Several genuinely different historical answers then
+   * arrive under one id, and an id-only filter emitted the first and silently dropped the
+   * rest *here*, before the recorder had anything to de-duplicate.
+   *
+   * Bounded, because a tab left open for days keeps reporting the same transcript.
+   */
   const seenMessages = new Set();
-  const seenErrors = new Set();
+  const MAX_SEEN_MESSAGES = 2000;
+
+  /**
+   * One reported occurrence: this id having said this.
+   *
+   * Four independent lanes, so the identity is 128 bits wide rather than 32. That is not
+   * cryptographic and does not need to be — nobody is choosing these strings adversarially
+   * — but the width matters, because of what a collision costs here. Two different answers
+   * that hashed alike would make the second one look like the first already reported, and
+   * this filter runs *before* the app sees anything: the message would not be de-duplicated,
+   * it would be destroyed, and the log would be silently missing an answer with nothing to
+   * say one was lost. A 32-bit hash reaches even odds of that at a few tens of thousands of
+   * messages, which a long-lived tab genuinely produces. Length is kept alongside, so a
+   * collision has to survive that too.
+   */
+  const HASH_LANES = [
+    [0x811c9dc5, 0x01000193],
+    [0x01234567, 0x01000197],
+    [0xdeadbeef, 0x0100019d],
+    [0x9e3779b9, 0x010001a5]
+  ];
+
+  function occurrenceKey(id, value) {
+    const body = String(value || '');
+    const lanes = [];
+    for (const [offset, prime] of HASH_LANES) {
+      let hash = offset;
+      for (let i = 0; i < body.length; i++) {
+        hash ^= body.charCodeAt(i);
+        hash = Math.imul(hash, prime) >>> 0;
+      }
+      lanes.push(hash.toString(36));
+    }
+    return `${id} :: ${body.length}.${lanes.join('.')}`;
+  }
+
+  /**
+   * The assistant prose already reported for a given rendered node.
+   *
+   * The message id is *derived*, and which spelling is derivable changes during a turn: the
+   * generation a section settled under is preferred, and until that is known the fallback is
+   * ChatGPT's own reused `data-turn-id`. `reportMessages()` runs on both sides of that
+   * moment, so one answer went out twice under two different ids — live session
+   * `2026-08-17-7365eb08`, events 20 and 21: identical text, identical digest, 19 ms apart,
+   * one spelled `assistant:request-WEB:…-0` and one `assistant:g-…-0-1`. Neither the
+   * producer's id filter nor the recorder's could see them as the same thing, because by
+   * their own identity rules they were not.
+   *
+   * So "have I already reported this?" hangs off the node, which does not change when our
+   * naming of it does. Weak, so it costs nothing once ChatGPT drops the section.
+   */
+  const reportedAssistant = new WeakMap();
+
+  /** Records an occurrence as reported, oldest evicted first. */
+  function markSeen(key) {
+    seenMessages.add(key);
+    if (seenMessages.size > MAX_SEEN_MESSAGES) {
+      seenMessages.delete(seenMessages.values().next().value);
+    }
+  }
+  /**
+   * Turn ids observed while on the current conversation.
+   *
+   * Kept so that, at the moment the URL changes, this script can tell which of the
+   * sections still on screen were rendered by the chat it is leaving. See retireVisible().
+   */
+  const seenTurns = new Set();
+  /**
+   * Nodes proven to belong to a conversation this tab has already left.
+   *
+   * A WeakSet, so holding onto them cannot keep detached DOM alive: once ChatGPT drops a
+   * section, the entry goes with it.
+   */
+  const staleNodes = new WeakSet();
+  /** Message ids of those nodes, bounded, for messages whose section is replaced but id reused. */
+  const retiredMessages = new Set();
+  /**
+   * Error occurrences already emitted: which texts have been reported for which node.
+   *
+   * Per node rather than per text, because that is what an occurrence is. Weak, so a
+   * dismissed banner stops being tracked when the page drops it.
+   */
+  const seenErrors = new WeakMap();
+  /** The generation an error node was first seen in, so an old banner cannot fail a later turn. */
+  const errorFirstSeen = new WeakMap();
+  /**
+   * Connector rows already reported, per turn, so a re-observation is not new evidence.
+   *
+   * Cumulative counts rather than a set of rows: the rows have no identity of their own,
+   * and only the increase is ever sent. Bounded, because a long-lived tab would otherwise
+   * keep one entry per turn forever.
+   */
+  const blocksReported = new Map();
+  /** The last label sent for each identified ChatGPT-native tool row of this generation. */
+  const pageToolsReported = new Map();
 
   let generating = false;
+  /**
+   * When the stop button was first found missing while a turn was open. 0 while it is there.
+   *
+   * The stop button is the only signal ChatGPT gives for "a turn is running", and it is not
+   * continuous: the page tears it down and remounts it across tool phases, streaming
+   * reconnects and plain rerenders. Ending the turn on the first sample that misses it is
+   * what session `2026-08-17-d1354db2` records again and again — `turn_start` at seq 342 and
+   * `turn_end` at 343 four hundred milliseconds later with `outcome: "unknown"`, then the
+   * same run reopened at 347 under a fresh generation id; the same shape at 357/358/360 with
+   * a 2.7 s gap, and at 249/251. `unknown` is the signature: endOutcome() found no answer, no
+   * error and no stall, because nothing had actually ended.
+   *
+   * The cost is not just a split log. The app clears `turnStartedAt`, the pending sightings
+   * and the named-call evidence at `turn_end` (recorder.ts), so every connector call made in
+   * the gap grades as `inferred` and is filed into "Unattributed activity" — 54 of that
+   * session's own calls, the first of them 194 ms after a `turn_end` that closed a turn still
+   * in flight.
+   *
+   * So a missing stop button opens a settle window instead of ending the turn, and the button
+   * coming back closes the window with the generation intact. Anything stronger — the user
+   * pressing stop — still ends the turn at once.
+   */
+  let quietSince = 0;
+  /**
+   * How the turn looked when its stop button first went missing, and the turn it described.
+   *
+   * The outcome is read on the first quiet observation rather than at the close, because the
+   * evidence endOutcome() reads is perishable: an error banner dismissed during the settle
+   * window would turn a failed turn into an `unknown` one, and the assistant section can be
+   * replaced under the turn entirely. Held here, the recorded outcome is exactly the one the
+   * unsettled code would have recorded — only published later, and only if the turn really
+   * did end.
+   */
+  let quietTurn = null;
+  let quietOutcome = null;
+  /**
+   * A reloaded page rediscovers historical user messages on its first observation because
+   * the in-memory seen set is new. Those are baseline, not proof that a new turn began.
+   * Cleared after that one observation; every later genuinely new user message while a
+   * generation is still locally open is a definitive turn boundary.
+   */
+  let resumedFirstObservation = false;
+  /**
+   * The identity every event of the turn in flight carries.
+   *
+   * This is a *local* key — `g-<run>-<epoch>-<n>` — and not ChatGPT's `data-turn-id`, which is
+   * what it used to be. The live page settled that question: `data-turn-id` on a streaming
+   * turn has the form `request-<conversation>-<n>`, and the page reuses `…-0` for turn after
+   * turn as it virtualises earlier ones out of the DOM. One recorded session has a
+   * `turn_start` for `…-0` after the turns numbered 1 through 4 had all finished, tool rows
+   * from three turns filed under `…-0`, and commentary from four turns folded into one row
+   * because they all carried the same derived id. Nothing downstream could put that back in
+   * order, because the information had already been destroyed at the point of observation.
+   *
+   * A counter minted here cannot go backwards and does not depend on the page agreeing with
+   * itself. ChatGPT's own id is still read — as `pageTurnId`, a hint for later
+   * reconciliation — but nothing is identified by it.
+   *
+   * The counter alone is not enough to make the key unique, which is the trap a first
+   * version fell into. Both counters live in this document, so reinjecting the content
+   * script into the same conversation — a reload, an extension update — restarts them at
+   * zero and mints `gen-0-1` a second time for a different turn, recreating the reused-id
+   * collision under a new name. `RUN_ID` is a random per-document namespace, so two
+   * injections of the same page can never name the same generation.
+   */
+  const RUN_ID = (() => {
+    try {
+      const bits = new Uint32Array(2);
+      (globalThis.crypto || window.crypto).getRandomValues(bits);
+      return `${bits[0].toString(36)}${bits[1].toString(36)}`;
+    } catch {
+      return `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 10)}`;
+    }
+  })();
   let turnId = null;
+  let genCount = 0;
+  /**
+   * What the last activity pull said this chat has open in the app.
+   *
+   * Read once, at boot, by resumeOpenTurn(). Reloading a ChatGPT page in the middle of an
+   * assistant turn kills this script and every piece of state in it, `RUN_ID` included — and
+   * `RUN_ID` is the random per-document namespace that makes a generation id unique, so the
+   * new document cannot reconstruct the id the old one was using. Left alone it sees a stop
+   * button, finds no generation of its own, and opens a second one: one assistant run
+   * recorded as two, its progress and prose ids keyed off a name the first half never used,
+   * and the app's live-turn evidence reset underneath the calls still in flight. Session
+   * `2026-08-17-d1354db2` has that at seq 367/368.
+   *
+   * The app holds the durable half of that identity, so the new document asks for it before
+   * it observes anything.
+   */
+  let appActiveTurnId = null;
+  /**
+   * The assistant section this generation is writing into, held as a node.
+   *
+   * A node, not an id, for the reason above: the node is the thing with a lifecycle. React
+   * reparenting it keeps it; React replacing it is exactly the event that should force a
+   * rebind, and an id that is reused across turns can signal neither.
+   */
+  let genNode = null;
+  /**
+   * Assistant sections already on screen when this generation began.
+   *
+   * Sampled from the *previous* observation, never from the DOM at the moment the stop
+   * button is first seen. By then ChatGPT has usually already mounted the new turn's
+   * section, so enumerating the page here files the generation's own section under "was
+   * already there" and the generation can then never bind to anything. That is not a
+   * theoretical ordering: it is the common one, and it costs exactly the fast tool turns
+   * whose activity this is all here to place.
+   */
+  let priorSections = new WeakSet();
+  /**
+   * What each of those sections said at that moment, as [node, mark] pairs.
+   *
+   * The evidence for the one case freshness cannot decide: ChatGPT writing a new turn into
+   * a section that already existed. A prior section whose text has changed since the
+   * generation began is demonstrably being written into now, which is a fact about the page
+   * rather than a timer expiring, and a timer is what this replaced — the old fallback took
+   * the newest assistant section after four seconds whether or not it had moved, which is
+   * false attribution with a delay on it.
+   */
+  let priorMarks = [];
+  /** Assistant sections present at the end of the last observation. See priorSections. */
+  let baselineSections = [];
+  /** What the newest of those said then, so a reused section can prove it has moved. */
+  let baselineMarks = [];
+  /** Assistant markdown nodes/text present at the previous observation. */
+  let baselineProseMarks = [];
+  /** The markdown baseline frozen at the moment the current generation began. */
+  let priorProseMarks = [];
+  /**
+   * Assistant section node → the local generation that finished writing into it.
+   *
+   * How a settled turn's prose gets the same identity as the rest of that turn, without
+   * asking the page for an id it does not keep stable. Weak, so a section ChatGPT drops
+   * takes its entry with it.
+   */
+  const settledGenerations = new WeakMap();
+  /**
+   * Local generation key → ChatGPT's own turn id for it, when the page had one.
+   *
+   * A hint, never an identity. Kept so a later reconciliation pass has something to line
+   * the two models up by; bounded, because a tab left open all day would otherwise grow it.
+   */
+  const pageTurnIds = new Map();
   let turnStartedAt = 0;
-  let lastProgress = '';
+  /** The last text sent for each visible commentary item of the turn being generated. */
+  const progressSeen = new Map();
   let lastChangeAt = 0;
   let stallReported = false;
   let userStopped = false;
 
-  /** Progress lines captured live, per turn, for the injected chronological view. */
-  const progressByTurn = new Map();
-
+  /**
+   * Recorded tool calls, keyed by the app's sequence number.
+   *
+   * A map rather than a list because /activity is asked for everything *from* `since`,
+   * and `since` used to be set to the last sequence number seen rather than the one after
+   * it. Every poll therefore re-delivered the final entry, the turn ended up with more
+   * recorded calls than it had blocks, and the old one-block-per-call check then refused
+   * to relabel anything at all. That off-by-one is why relabelling never appeared. The
+   * fix is the `+ 1` below; the map is the belt to its braces, because a feed that ever
+   * repeats itself again must not be able to break the page a second time.
+   */
+  const bySeq = new Map();
+  /** App-owned render events, including calls ChatGPT never gave a native row. */
+  const streamBySeq = new Map();
   let since = 0;
   let entries = [];
-  let bootstrapTried = false;
-  let compactBusy = false;
+  let streamEntries = [];
+  let pulling = false;
+
+  /**
+   * `'resume' | 'worker' | null` — whether this chat was opened by the app, and how.
+   *
+   * From the session record, so it survives a reload of a chat opened days ago.
+   */
+  let bootstrap = null;
+
+  /** The live state of this chat's Compact & resume job, straight from the app. */
+  let job = null;
+  /** Local tool calls the app still has running. Only ever a hint from /activity. */
+  let pendingTools = 0;
+  let pressedAt = 0;
+  let localError = '';
+
+  /**
+   * How full this conversation is, and what the app intends to do about it.
+   *
+   * `tokens` is the recorder's estimate of what has been said and returned so far;
+   * `context` carries the lines it is measured against — the two the app already draws in
+   * its own session view, and the automatic threshold with the provider that would write
+   * the brief. All of them come from /activity rather than being decided here, so the bar
+   * the user is watching and the number that acts are the same number.
+   */
+  let tokens = 0;
+  let context = null;
+
 
   const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -142,6 +495,81 @@
   }
 
   /**
+   * Picks up a turn this conversation already had open, before anything is observed.
+   *
+   * The one thing a reloaded document cannot work out for itself. See `adoptTurnId` for why
+   * the id has to come from the app, and note the ordering this depends on: the conversation
+   * is adopted and *bound* here, ahead of the first observation, so nothing this page load
+   * emits is journalled without an id and then filed as unattributed while the binding
+   * catches up.
+   *
+   * What it deliberately does *not* do is decide, from this one moment, whether the turn is
+   * still running. A reload lands mid-rerender as often as not, so a stop button missing at
+   * the instant the script starts is the same unreliable sample the settle window exists to
+   * discount — and here it would be worse than unreliable, because publishing the section
+   * being written as the answer is what closes the turn on the app side. Against that, "the
+   * app has this turn open" is real, durable evidence.
+   *
+   * So the generation is restored either way, with no `turn_start` — the app already has one
+   * — and the ordinary lifecycle in observe() decides the rest from there. If the page is
+   * still generating, work carries on under the same id. If it is not, the restored turn
+   * enters the same quiet window as any other, its section stays live for the duration, and
+   * only continuous silence closes it: one final answer under the resumed id, one `turn_end`.
+   * A stop button that comes back inside the window simply cancels it.
+   */
+  async function resumeOpenTurn() {
+    const id = CLF_DOM.conversationId();
+    // A chat with no id yet has no app-side record to resume: ChatGPT assigns the id when it
+    // accepts the first message, so this is a fresh composer, not a reload into a live turn.
+    if (!id) return;
+    conversationId = id;
+    await bindConversation(id);
+    // The boot pull, brought forward rather than added to: it is the request the start-up
+    // sequence was going to make anyway, and it carries the answer.
+    await pullActivity();
+    const open = appActiveTurnId;
+    if (!open) return;
+    seedResumeBaseline();
+    generating = true;
+    resumedFirstObservation = true;
+    turnId = open;
+    genNode = null;
+    priorSections = new WeakSet(baselineSections);
+    priorMarks = baselineMarks;
+    priorProseMarks = baselineProseMarks;
+    turnStartedAt = Date.now();
+    lastChangeAt = Date.now();
+    quietSince = 0;
+    quietTurn = null;
+    quietOutcome = null;
+    userStopped = false;
+    stallReported = false;
+  }
+
+  /**
+   * Tells a resumed turn which of the sections on screen it did not write.
+   *
+   * `priorSections` is normally sampled from the previous observation, and on the first
+   * observation of a page load there is no previous one — so every section on screen looks
+   * new and the whole visible transcript would be treated as this generation's output.
+   * Seeding it from the DOM here fixes that, with the live turn's own sections deliberately
+   * left out: those are the ones still being written, and calling them history would publish
+   * a half-written answer as the answer.
+   */
+  function seedResumeBaseline() {
+    const liveTurn = currentAssistantTurn();
+    const liveNodes = liveTurn ? liveTurn.nodes || [liveTurn.node] : [];
+    baselineSections = assistantSections().filter((node) => liveNodes.indexOf(node) < 0);
+    baselineMarks = baselineSections.slice(-3).map((node) => ({ node, mark: sectionMark(node) }));
+    baselineProseMarks = [];
+    if (typeof CLF_DOM.assistantProseSnapshot !== 'function') return;
+    for (const assistant of CLF_DOM.turns()) {
+      if (assistant.role !== 'assistant' || assistant === liveTurn) continue;
+      baselineProseMarks.push(...CLF_DOM.assistantProseSnapshot(assistant));
+    }
+  }
+
+  /**
    * Forgets what belongs to the chat we just left.
    *
    * The observation queue is deliberately *not* cleared: every entry in it already
@@ -149,17 +577,88 @@
    * is delivered to the right session rather than being thrown away because the tab
    * moved on.
    */
+  /**
+   * Marks what is on screen right now as belonging to the chat this tab is leaving.
+   *
+   * Called on a genuine move from chat A to chat B, before anything is attributed to B.
+   * ChatGPT changes `/c/<id>` and replaces the transcript as two separate steps, and the
+   * URL can win. In that window `resetConversation()` had cleared `seenMessages` while A's
+   * messages were still rendered, so the very next pass through observe() — the same one,
+   * in fact — saw them as unseen and emitted every one of them under B's id. A whole
+   * conversation could be copied into the session of the chat the user opened next.
+   *
+   * The proof used here is neither a timeout nor an assumption about which step wins: a
+   * section still on screen whose turn id this script already observed under A was, as a
+   * matter of record, rendered by A. Those exact nodes are retired, and nothing else is.
+   *
+   * That also settles the opposite ordering safely. If ChatGPT had already replaced the
+   * transcript before the URL changed, none of the visible turn ids would have been seen
+   * under A, so nothing is retired and B's opening messages are recorded normally — which
+   * is the behaviour that must not regress, since the first message of a fresh chat is the
+   * one this whole pipeline exists to keep.
+   */
+  function retireVisible() {
+    for (const turn of CLF_DOM.turns()) {
+      if (!turn.id || !seenTurns.has(turn.id)) continue;
+      for (const node of turn.nodes || [turn.node]) {
+        if (node) staleNodes.add(node);
+      }
+      for (const message of CLF_DOM.messagesIn(turn)) {
+        if (message.id) retiredMessages.add(message.id);
+      }
+    }
+    // A tab that lives all day moving between chats must not grow without limit. Only the
+    // ids matter here; the nodes themselves are held weakly.
+    while (retiredMessages.size > 2000) retiredMessages.delete(retiredMessages.values().next().value);
+  }
+
+  /** True for anything rendered by a conversation this tab has already left. */
+  function isStale(node) {
+    for (let current = node; current; current = current.parentElement) {
+      if (staleNodes.has(current)) return true;
+    }
+    return false;
+  }
+
   function resetConversation() {
     seenMessages.clear();
-    seenErrors.clear();
-    progressByTurn.clear();
+    seenTurns.clear();
+    bootstrap = null;
+    bySeq.clear();
+    streamBySeq.clear();
     entries = [];
+    streamEntries = [];
     since = 0;
+    job = null;
+    pendingTools = 0;
+    // A native compaction belongs to the conversation it was started in. Navigating away
+    // abandons this tab's half of it; the app's request expires on its own.
+    nativeBusy = false;
+    nativePhase = '';
+    pressedAt = 0;
+    localError = '';
     generating = false;
+    quietSince = 0;
+    quietTurn = null;
+    quietOutcome = null;
+    resumedFirstObservation = false;
     turnId = null;
-    lastProgress = '';
+    genNode = null;
+    priorSections = new WeakSet();
+    priorMarks = [];
+    baselineSections = [];
+    baselineMarks = [];
+    baselineProseMarks = [];
+    priorProseMarks = [];
+    progressSeen.clear();
     userStopped = false;
     stallReported = false;
+    // The new chat's rows are its own history until proven otherwise. seedToolBlocks
+    // refills this from what is on the page, so nothing already drawn counts as evidence.
+    blocksReported.clear();
+    pageToolsReported.clear();
+    callsReported.clear();
+    seedToolBlocks();
   }
 
   function currentAssistantTurn() {
@@ -170,12 +669,143 @@
     return null;
   }
 
-  function lastAssistantText() {
-    const messages = CLF_DOM.messages();
-    for (let index = messages.length - 1; index >= 0; index--) {
-      if (messages[index].role === 'assistant') return messages[index].text;
+  /** The logical turn a given section node currently belongs to, or null once it is gone. */
+  function turnForNode(node) {
+    if (!node) return null;
+    for (const turn of CLF_DOM.turns()) {
+      for (const section of turn.nodes || [turn.node]) {
+        if (section === node) return turn;
+      }
+    }
+    return null;
+  }
+
+  /** Every assistant section on the page right now, in document order. */
+  function assistantSections() {
+    const out = [];
+    for (const turn of CLF_DOM.turns()) {
+      if (turn.role !== 'assistant') continue;
+      for (const section of turn.nodes || [turn.node]) if (section) out.push(section);
+    }
+    return out;
+  }
+
+  /**
+   * A cheap statement of what ChatGPT has put in a section.
+   *
+   * Compared, never stored or sent, and the only question it answers is "has *the page*
+   * written into this section since the generation began". Which is why it cannot be the
+   * section's raw text: this script rewrites tool-row labels inside assistant sections as
+   * steps land, so a mark built from raw text let our own relabel of an old row look like
+   * ChatGPT writing a new answer into it, and bound the new generation to a finished
+   * section. See CLF_DOM.sectionSignature for what it is built from instead.
+   */
+  function sectionMark(node) {
+    return CLF_DOM.sectionSignature(node);
+  }
+
+  /**
+   * The assistant section this generation is writing into, or null while that is unknown.
+   *
+   * Two kinds of evidence, and nothing else. A section that was not on the page before the
+   * generation began is this generation's — that is the ordinary case, and the reason the
+   * baseline has to come from the previous observation rather than from the DOM as it
+   * stands now. Otherwise, a section that *was* there but whose text has changed since is
+   * also this generation's, which covers ChatGPT continuing to write into an existing
+   * section.
+   *
+   * Null is a real answer. The version this replaced took the newest assistant section
+   * after four seconds regardless, and a turn whose section genuinely had not appeared yet
+   * then had the previous turn's commentary and tool rows recorded as its own. Recording
+   * nothing for a turn is a gap; recording another turn's work under it is a lie, and the
+   * whole point of this batch is that the local session log stops containing those.
+   */
+  function generationTurn() {
+    if (genNode) {
+      const held = turnForNode(genNode);
+      if (held) return held;
+      genNode = null;
+    }
+    const latest = currentAssistantTurn();
+    if (!latest) return null;
+    // Any node of the logical turn, not just the first. ChatGPT splits one answer across
+    // sibling sections, and a new sibling appended to a section that was already there is
+    // still this generation writing.
+    for (const node of latest.nodes || [latest.node]) {
+      if (!node || priorSections.has(node)) continue;
+      genNode = node;
+      return latest;
+    }
+    for (const held of priorMarks) {
+      if (!latest.nodes && held.node !== latest.node) continue;
+      if (latest.nodes && latest.nodes.indexOf(held.node) < 0) continue;
+      if (sectionMark(held.node) === held.mark) continue;
+      genNode = held.node;
+      return latest;
+    }
+    return null;
+  }
+
+  /**
+   * What one turn actually answered.
+   *
+   * Scoped to the turn on purpose. This used to scan the whole conversation for the last
+   * assistant message, which meant that once *any* answer existed anywhere above, every
+   * later turn had evidence of completion whether or not it produced anything — a turn
+   * that failed silently, or was cut off before it wrote a word, was recorded as
+   * `completed`. That outcome is not cosmetic: it is what compaction and the resume
+   * handoff read to decide whether the last turn's work needs redoing.
+   */
+  /**
+   * The settled *final* answer of one turn — the last assistant prose it authored.
+   *
+   * Deliberately not `answerText`, which returns the first and only ever answers "did this
+   * turn say anything at all". One logical turn routinely exposes several assistant-authored
+   * messages: interim commentary while it works, then the answer. For an outcome those are
+   * interchangeable; for a compaction they are not, and taking the first would hand the next
+   * chat a line of "let me go through this" in place of the brief.
+   */
+  function finalAnswerText(turn) {
+    if (!turn) return '';
+    let last = '';
+    for (const message of CLF_DOM.messagesIn(turn)) {
+      if (message.role === 'assistant' && message.text) last = message.text;
+    }
+    return last;
+  }
+
+  function answerText(turn) {
+    if (!turn) return '';
+    for (const message of CLF_DOM.messagesIn(turn)) {
+      if (message.role === 'assistant' && message.text) return message.text;
     }
     return '';
+  }
+
+  /** Whether an error rendered inside a turn belongs to the given one. */
+  function sameTurn(error, turn) {
+    if (error.turnId && turn.id) return error.turnId === turn.id;
+    // Id-less sections cannot be compared by id without merging all of them, so fall back
+    // to the only other thing that is actually true: the error is inside this turn's DOM.
+    for (const node of turn.nodes || [turn.node]) {
+      if (node && node.contains && node.contains(error.node)) return true;
+    }
+    return false;
+  }
+
+  /** An error occurrence this script has not already emitted for this node and turn. */
+  function unreportedError(error, turnKey) {
+    const reported = seenErrors.get(error.node);
+    return !reported || !reported.has(`${turnKey}\u0000${error.text}`);
+  }
+
+  function markErrorReported(error, turnKey) {
+    let reported = seenErrors.get(error.node);
+    if (!reported) {
+      reported = new Set();
+      seenErrors.set(error.node, reported);
+    }
+    reported.add(`${turnKey}\u0000${error.text}`);
   }
 
   /**
@@ -189,21 +819,233 @@
     if (turn && CLF_DOM.interrupted(turn)) {
       return { outcome: 'interrupted', detail: 'ChatGPT marked the turn interrupted' };
     }
-    const errors = CLF_DOM.errors().filter((text) => !seenErrors.has(text));
-    if (errors.length > 0) return { outcome: 'failed', detail: errors[0] };
-    if (lastAssistantText().length > 0) return { outcome: 'completed' };
+    // Only this turn's failures. An error inside another turn's section is that turn's,
+    // and a toast still on screen from an earlier failure was already on screen when this
+    // turn began — neither says anything about how this one ended.
+    const failures = CLF_DOM.errors().filter((error) => {
+      if (isStale(error.node)) return false;
+      if (error.turnId || error.turn) return turn ? sameTurn(error, turn) : false;
+      // A node nothing has recorded yet can only have arrived on this tick, which is this
+      // turn's — the same default the clock version had, without the tie.
+      return (errorFirstSeen.get(error.node) ?? turnId) === turnId;
+    });
+    if (failures.length > 0) return { outcome: 'failed', detail: failures[0].text };
+    if (answerText(turn).length > 0) return { outcome: 'completed' };
     if (turnStartedAt > 0 && Date.now() - lastChangeAt > STALL_MS) {
       return { outcome: 'stalled', detail: 'no visible output and no progress for ten minutes' };
     }
     return { outcome: 'unknown' };
   }
 
+  /**
+   * Reports each visible commentary item's whole current text, under its own identity.
+   *
+   * This replaces a diff. The old sampler read the reasoning area as one string and tried
+   * to work out what was new by comparing it with the previous read, which only works while
+   * the page grows that text monotonically. It does not: ChatGPT re-lays-out the block
+   * mid-turn, reparents it, shrinks it and grows it again, and every rewrite that was not a
+   * prefix of the last read was — correctly, given the information available — reported as
+   * brand-new text. Each of those became another stored event and another row, so one
+   * sentence appeared as a prefix, then the same prefix again, then its suffix, then a
+   * concatenation of all three.
+   *
+   * There is nothing to guess once each item has a name. Send the item's text as it stands;
+   * the recorder holds one record per name and grows it. A snapshot identical to the one
+   * already sent for that name is not sent again, because the observe tick runs every
+   * second whether or not the page has moved.
+   */
+  function progressUpdates(turn) {
+    const out = [];
+    const baselineFor = (node) => priorProseMarks.find((held) => held.node === node) || null;
+    const prose =
+      typeof CLF_DOM.assistantProseItems === 'function'
+        ? CLF_DOM.assistantProseItems(turn, turnId).filter((item) => {
+            const held = baselineFor(item.node);
+            return !held || held.text !== item.text;
+          })
+        : [];
+    const items = [...CLF_DOM.progressItems(turn, turnId), ...prose];
+    for (const item of items) {
+      if (!item || !item.id || !item.text) continue;
+      if (progressSeen.get(item.id) === item.text) continue;
+      progressSeen.set(item.id, item.text);
+      out.push(item);
+    }
+    // Bounded: one turn cannot grow this without limit, and a turn's items are gone from
+    // the visible window long before the count gets anywhere near this.
+    if (progressSeen.size > 2000) progressSeen.clear();
+    return out;
+  }
+  /** The turn section a node is rendered in, or null. */
+  function sectionOf(node) {
+    try {
+      return node && node.closest ? node.closest(TURN_SECTION) : null;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Whether this node is part of the answer currently being written.
+   *
+   * Per section, which is the whole point. The rule this replaced was the global
+   * `!nowGenerating`: while any turn was in flight, *no* assistant message could be
+   * recorded — including the settled answers of turns that finished minutes or days
+   * earlier, which is why a reload during a live turn appended the conversation's history
+   * after the live turn had already started, in the wrong order and much later.
+   */
+  function isLiveSection(node, nowGenerating) {
+    if (!nowGenerating || !node) return false;
+    if (genNode && (node === genNode || (genNode.contains && genNode.contains(node)))) return true;
+    const section = sectionOf(node);
+    if (!section) return true;
+    if (!priorSections.has(section)) return true;
+    for (const held of priorMarks) {
+      if (held.node === section) return sectionMark(section) !== held.mark;
+    }
+    return false;
+  }
+
+  /**
+   * The local generation a rendered assistant turn belongs to, by node identity.
+   *
+   * Deliberately not a reverse lookup through `pageTurnIds`. That map runs generation →
+   * page id, and ChatGPT reuses `data-turn-id` across turns, so inverting it is ambiguous
+   * by construction: several generations can claim one page id and the newest entry is not
+   * reliably the one on screen. The node is unambiguous — the live turn is whichever holds
+   * `genNode`, and a settled section carries the generation that finished writing into it,
+   * seeded for every node of the turn at `turn_end`. The page id stays a hint.
+   */
+  function localGenerationOf(turn) {
+    if (!turn) return null;
+    const nodes = turn.nodes || (turn.node ? [turn.node] : []);
+    if (generating && genNode) {
+      for (const node of nodes) {
+        if (node === genNode || (node && node.contains && node.contains(genNode))) return turnId;
+      }
+    }
+    for (const node of nodes) {
+      const settled = node ? settledGenerations.get(node) : null;
+      if (settled) return settled;
+    }
+    return null;
+  }
+
+  /**
+   * Records the messages on screen that are not still being written.
+   *
+   * Called before the generation transition, so what the page already had is journalled
+   * ahead of anything this tick opens, and again the moment a turn settles, so its answer
+   * lands before its `turn_end` rather than a tick later.
+   */
+  function reportMessages(nowGenerating) {
+    let newUserMessage = false;
+    for (const message of CLF_DOM.messages()) {
+      if (!message.id || !message.text) continue;
+      // Left over from a chat this tab has already navigated away from. Not "probably
+      // old" — the section it is in was one this script watched under the previous
+      // conversation, so filing it here would be filing chat A's transcript into chat B.
+      if (retiredMessages.has(message.id) || isStale(message.node)) continue;
+      if (message.role === 'user') {
+        const key = occurrenceKey(message.id, message.text);
+        if (seenMessages.has(key)) continue;
+        markSeen(key);
+        newUserMessage = true;
+        emit({
+          kind: 'user_message',
+          text: message.text,
+          messageId: message.id,
+          turnId: message.turnId || undefined
+        });
+      } else if (message.role === 'assistant') {
+        // Held only while *this* answer is being written, so a half-written one is never
+        // stored as the answer. The app keeps user messages whole; assistant text it caps.
+        //
+        // The id is rewritten when ChatGPT gave the prose none of its own. `messagesIn()`
+        // then names it after the section's `data-turn-id`, and that id repeats — so under
+        // the previous code the second turn's answer looked like the first one already
+        // recorded and was dropped, and so was every answer after it. One live session
+        // stored three assistant messages for twelve completed turns. The generation this
+        // section settled under is unique by construction.
+        if (isLiveSection(message.node, nowGenerating)) continue;
+        // The stop button is not a reliable statement that the answer is finished. ChatGPT
+        // unmounts it between phases and across rerenders, so `nowGenerating` goes false in
+        // the middle of a turn that is still being written — which is the whole reason a
+        // turn is not closed until the button has stayed gone for TURN_SETTLE_MS.
+        //
+        // While that window is open, nothing from the turn being written may be published.
+        // `finishGeneration` stamps the section with the local generation id and calls
+        // `reportMessages(false)` itself, so the settled prose is published a moment later,
+        // once, under the correct g-... identity — waiting costs only that moment.
+        if (generating && !nowGenerating && isLiveSection(message.node, true)) continue;
+        const settled = settledGenerations.get(sectionOf(message.node) || message.node);
+        const id = settled && message.id.indexOf('assistant:') === 0 ? `assistant:${settled}` : message.id;
+        // By what it said as well as by its id. After a reload there is no settled
+        // generation to make the derived id unique, so several different historical
+        // answers arrive under one id and dropping on the id alone loses all but the first.
+        const key = occurrenceKey(id, message.text);
+        // Node first: this exact rendered message having said this exact thing, whatever
+        // id the current tick can derive for it. See reportedAssistant.
+        const said = occurrenceKey('node', message.text);
+        if (reportedAssistant.get(message.node) === said) continue;
+        if (seenMessages.has(key)) continue;
+        reportedAssistant.set(message.node, said);
+        markSeen(key);
+        emit({
+          kind: 'assistant_message',
+          text: message.text,
+          messageId: id,
+          turnId: settled || message.turnId || undefined,
+          final: true
+        });
+      }
+    }
+    return newUserMessage;
+  }
+
+  /**
+   * Closes the local generation exactly once.
+   *
+   * `publishFinal` is false only when a new user message proves an otherwise-unknown quiet
+   * turn is over while the next assistant turn may already be mounting. In that case a
+   * whole-page `reportMessages(false)` could promote the next turn's half-written prose to a
+   * final answer. The normal quiet-completion path still publishes the settled answer before
+   * `turn_end` as before.
+   */
+  function finishGeneration(ended, result, publishFinal = true) {
+    generating = false;
+    quietSince = 0;
+    quietTurn = null;
+    quietOutcome = null;
+    if (ended) reportToolBlocks(ended.node);
+    if (ended) {
+      for (const item of reportPageTools(ended)) {
+        emit({ kind: 'page_tool', text: item.label, messageId: item.id, turnId });
+      }
+      for (const node of ended.nodes || [ended.node]) if (node) settledGenerations.set(node, turnId);
+    }
+    if (publishFinal) reportMessages(false);
+    emit({ kind: 'turn_end', turnId, ...result });
+    // The compaction turn settling is the moment the brief exists. Read here, from this
+    // generation's own section, while `ended` still names it — a tick later the page is just
+    // a transcript again and this answer is indistinguishable from any other.
+    if (compactCapture && compactCapture.generation === turnId) {
+      void deliverBrief(finalAnswerText(ended), result.outcome);
+    }
+    turnStartedAt = 0;
+    genNode = null;
+  }
+
   function observe() {
     const id = CLF_DOM.conversationId();
     if (id !== conversationId) {
       if (conversationId) {
-        // A genuine move to another chat: close the old one out and start clean.
+        // A genuine move to another chat: close the old one out and start clean. The order
+        // matters — what the old chat left on screen is retired *before* the new id is
+        // adopted, because from the next line onwards everything emitted carries that id.
         void ask({ type: 'closed', conversationId });
+        retireVisible();
+        epoch++;
         conversationId = id;
         resetConversation();
       } else {
@@ -215,18 +1057,106 @@
       }
     }
 
-    const turn = currentAssistantTurn();
+    // Every section on screen, not just the assistant's: this is the record of what this
+    // script watched while on this conversation, and it is the whole basis on which
+    // retireVisible() later decides which sections the tab is leaving behind.
+    for (const seen of CLF_DOM.turns()) {
+      if (seen.id) seenTurns.add(seen.id);
+    }
+    if (seenTurns.size > 2000) seenTurns.delete(seenTurns.values().next().value);
+
     const nowGenerating = CLF_DOM.generating();
+
+    // The transcript that is already settled goes in first — before this tick can open a
+    // new generation. The recorded order used to be the other way round: `turn_start` for
+    // the live turn at sequence 2, the user message that asked for it at 3, and the
+    // conversation's earlier history at 4 and 5. A log whose first assistant turn precedes
+    // the question that caused it cannot be read back as a session, however complete it is.
+    const newUserMessage = reportMessages(nowGenerating);
+
+    // A new user message after the stop control went quiet is definitive evidence that the
+    // quiet generation is over, even if it never produced final prose or an error. This is
+    // the interruption/follow-up shape that previously merged two user turns because the
+    // stop button for the new generation came back before the old four-second window closed.
+    if (generating && newUserMessage && !resumedFirstObservation) {
+      const ended = quietTurn || generationTurn();
+      const fresh = endOutcome(ended);
+      const result = quietOutcome && quietOutcome.outcome !== 'unknown' ? quietOutcome : fresh;
+      finishGeneration(ended, result.outcome === 'unknown' ? { outcome: 'unknown' } : result, false);
+    }
 
     if (nowGenerating && !generating) {
       generating = true;
+      quietSince = 0;
+      quietTurn = null;
+      quietOutcome = null;
       userStopped = false;
       stallReported = false;
-      turnId = turn ? turn.id : null;
+      genCount++;
+      turnId = `g-${RUN_ID}-${epoch}-${genCount}`;
+      genNode = null;
+      // What was already there is what this generation must not adopt — as it stood at the
+      // *previous* observation. Reading the DOM here instead is what the first version of
+      // this did, and by this point ChatGPT has usually already mounted the section it is
+      // about to write into, so the generation disowned its own section.
+      priorSections = new WeakSet(baselineSections);
+      priorMarks = baselineMarks;
+      priorProseMarks = baselineProseMarks;
       turnStartedAt = Date.now();
       lastChangeAt = Date.now();
-      lastProgress = '';
-      emit({ kind: 'turn_start', turnId: turnId || undefined });
+      progressSeen.clear();
+      pageToolsReported.clear();
+      // "Wait for this turn to finish" was about a turn that has now been replaced. Keeping
+      // it would make the composer explain, after the fact, a refusal that no longer applies.
+      localError = '';
+      pressedAt = 0;
+      // Unconditional, unlike before. The old code only announced a turn once it had a
+      // ChatGPT turn id to name it by, so a generation whose section had not mounted yet
+      // was never reported at all — and the app, which places a tool call by asking which
+      // conversation is mid-turn, therefore could not place the calls of exactly the turns
+      // that call tools fastest.
+      //
+      // A turn resumed at boot never reaches this branch: resumeOpenTurn() restores
+      // `generating` before the first observation, so there is no transition to open. That is
+      // what keeps the app's `turn_start` the only one — repeating it would clear the very
+      // state the resume exists to keep, since recorder.ts empties `progress`, `pageTools`
+      // and the pending sightings on every turn_start.
+      emit({ kind: 'turn_start', turnId });
+
+      // The compaction binding is made here and only here: the first generation to open
+      // after the handoff prompt was submitted is the one that is answering it. Everything
+      // afterwards compares against this id, so a later turn — the user carrying on in this
+      // chat, a retry, anything at all — can never satisfy the continuation.
+      if (compactCapture && compactCapture.generation === null && compactCapture.conversationId === conversationId) {
+        compactCapture.generation = turnId;
+        rememberCapture();
+      }
+    }
+
+    // An arming that no generation ever claimed. ChatGPT accepted the message and then did
+    // not answer it; there is nothing to watch and nothing to wait for, so the transaction
+    // is withdrawn rather than left open for whatever the user types next.
+    if (compactCapture && compactCapture.generation === null && Date.now() - compactCapture.armedAt > COMPACT_ARM_MS) {
+      void abandonCapture('ChatGPT never started answering the compaction request. Nothing was compacted.');
+    }
+
+    // Which generation an error first came into view during, recorded before anything reads
+    // it and after this tick has opened its generation, so a banner arriving with a turn is
+    // that turn's and one already on screen belongs to whatever was running when it
+    // appeared. By generation and not by clock: the previous version stored `Date.now()`
+    // and endOutcome compared it against `turnStartedAt`, two stamps taken microseconds
+    // apart in the same tick. At millisecond resolution they tie, and a tie read as "this
+    // turn's" — so an undismissed banner from an earlier failure could fail the next turn,
+    // which is the exact thing that comparison exists to prevent.
+    const visibleErrors = CLF_DOM.errors();
+    for (const error of visibleErrors) {
+      if (!errorFirstSeen.has(error.node)) errorFirstSeen.set(error.node, turnId);
+    }
+
+    const turn = generating ? generationTurn() : currentAssistantTurn();
+    if (generating && turn && turn.id) {
+      pageTurnIds.set(turnId, turn.id);
+      if (pageTurnIds.size > 500) pageTurnIds.delete(pageTurnIds.keys().next().value);
     }
 
     // Progress lines are only meaningful while they are moving. Captured live they
@@ -234,91 +1164,452 @@
     // order things happened in.
     if (turn) CLF_DOM.markProgress(turn);
 
-    if (nowGenerating && turn) {
-      const line = CLF_DOM.progressLine(turn);
-      if (line && line !== lastProgress) {
-        lastProgress = line;
-        lastChangeAt = Date.now();
-        emit({ kind: 'progress', text: line, turnId: turn.id || undefined });
-        const key = turn.id || 'current';
-        const list = progressByTurn.get(key) || [];
-        list.push({ time: Date.now(), text: line });
-        if (list.length > 300) list.shift();
-        progressByTurn.set(key, list);
+    if (generating && turn) {
+      // Stay on the generation we opened. ChatGPT can reorder/replace assistant sections
+      // while a turn is running; re-reading the newest DOM turn here has reproduced
+      // progress from request -7 being filed under the older request -5.
+      const updates = progressUpdates(turn);
+      if (updates.length > 0) lastChangeAt = Date.now();
+      for (const item of updates) {
+        emit({ kind: 'progress', text: item.text, progressId: item.id, turnId });
+      }
+      // Only the live generation's rows. Reporting every section on screen every tick is
+      // what filed native activity from finished turns as if it had just happened: the
+      // labels keep changing, so old turns kept producing "new" rows minutes later, under
+      // the wrong turn and at the wrong time.
+      for (const item of reportPageTools(turn)) {
+        emit({ kind: 'page_tool', text: item.label, messageId: item.id, turnId });
       }
       if (!stallReported && Date.now() - lastChangeAt > STALL_MS) {
         stallReported = true;
         emit({
           kind: 'progress',
           text: 'No visible progress for ten minutes. The turn is still marked as generating.',
-          turnId: turn.id || undefined
+          turnId
         });
       }
     }
 
-    if (!nowGenerating && generating) {
-      generating = false;
-      const result = endOutcome(turn);
-      emit({ kind: 'turn_end', turnId: turnId || undefined, ...result });
-      turnStartedAt = 0;
+    if (generating && nowGenerating && quietSince > 0) {
+      // The stop button came back, so it never went away in the sense that matters: this is
+      // one turn that flickered, not two turns. Everything the generation holds — its id,
+      // its baselines, its reported-progress map — is still the right state to carry on
+      // with, so the settle window is simply abandoned.
+      quietSince = 0;
+      quietTurn = null;
+      quietOutcome = null;
+      emit({ kind: 'turn_state', turnId, active: true });
     }
 
-    for (const message of CLF_DOM.messages()) {
-      if (!message.id || !message.text) continue;
-      if (seenMessages.has(message.id)) continue;
-      if (message.role === 'user') {
-        seenMessages.add(message.id);
-        emit({
-          kind: 'user_message',
-          text: message.text,
-          messageId: message.id,
-          turnId: message.turnId || undefined
-        });
-      } else if (message.role === 'assistant' && !nowGenerating) {
-        // Held until the turn is over so a half-written answer is never stored as
-        // the answer. The app keeps user messages whole; assistant text it caps.
-        seenMessages.add(message.id);
-        emit({
-          kind: 'assistant_message',
-          text: message.text,
-          messageId: message.id,
-          turnId: message.turnId || undefined,
-          final: true
-        });
+    if (generating && !nowGenerating) {
+      // The turn as it stood on the first quiet observation, read once. See quietOutcome.
+      if (quietSince === 0) {
+        quietSince = Date.now();
+        quietTurn = turn || null;
+        quietOutcome = endOutcome(turn);
+        // Do not end the durable turn merely because ChatGPT hid its stop control, but do
+        // withdraw the *weak* sole-generation attribution grade until direct liveness comes
+        // back. Named Fiber requests and visible connector rows remain valid evidence.
+        emit({ kind: 'turn_state', turnId, active: false });
+      }
+      const freshOutcome = endOutcome(quietTurn || turn);
+      // Preserve a failure/interruption captured before its banner disappears, while still
+      // allowing the common opposite transition: the stop control vanishes first and the
+      // final answer appears a beat later. Freezing `unknown` at the first sample is what made
+      // ordinary completed turns end as unknown.
+      if (
+        freshOutcome.outcome !== 'unknown' &&
+        (!quietOutcome || quietOutcome.outcome === 'unknown' ||
+          (quietOutcome.outcome === 'completed' && freshOutcome.outcome !== 'completed'))
+      ) {
+        quietOutcome = freshOutcome;
+      }
+      const quietFor = Date.now() - quietSince;
+      // Explicit stop closes now: the user pressed the button, so there is nothing to wait
+      // for and a composer that stays disabled for another four seconds is a bug of its own.
+      // A user stop also overrides the outcome captured on the first quiet observation.
+      if (userStopped) quietOutcome = { outcome: 'stopped' };
+      const result = quietOutcome || endOutcome(quietTurn || turn);
+      // `unknown` means exactly "nothing proves the turn ended". Keeping an unknown quiet
+      // turn open is safe because turn_state above disables weak generation fallback; strong
+      // per-call evidence can still attach the connector work that proves this is the same
+      // run. A real answer/error/interrupt closes after the settle window, and ten minutes of
+      // genuine silence upgrades itself to `stalled` through endOutcome().
+      if (userStopped || (result.outcome !== 'unknown' && quietFor >= TURN_SETTLE_MS)) {
+        // The turn the end is about is the one that was on screen when it went quiet.
+        // Re-reading it here would pick up whatever ChatGPT has rendered since, which during
+        // a settle window can be a different section entirely.
+        const ended = quietTurn || turn;
+        finishGeneration(ended, result);
       }
     }
 
-    for (const error of CLF_DOM.errors()) {
-      if (seenErrors.has(error)) continue;
-      seenErrors.add(error);
-      emit({ kind: 'chat_error', text: error });
+    /**
+     * One rendered occurrence, one record.
+     *
+     * The identity is the node the error is rendered in plus its text — never the text on
+     * its own, which was the bug: the same wording failing on turn nine was taken for the
+     * banner already recorded on turn three and dropped, so a repeated failure left no
+     * trace and, because endOutcome() consulted the same filter, was written down as a
+     * completed turn instead.
+     *
+     * Deliberately not scoped by turn for a toast. A banner ChatGPT leaves on screen keeps
+     * its node, and scoping by turn would republish that one banner on every turn that
+     * followed it. A banner that is dismissed and shown again is a new node, which is
+     * exactly the difference between the same failure still being displayed and the same
+     * failure happening a second time. Errors rendered inside a turn carry that turn's id
+     * as well, so two turns failing identically stay distinct even in the markdown case.
+     */
+    const recordedTurn = turnId || (turn && turn.id) || '';
+    for (const error of visibleErrors) {
+      if (isStale(error.node)) continue;
+      const scope = error.turnId || '';
+      if (!unreportedError(error, scope)) continue;
+      markErrorReported(error, scope);
+      emit({ kind: 'chat_error', text: error.text, turnId: error.turnId || recordedTurn || undefined });
     }
+
+    if (generating && turn) reportToolBlocks(turn.node);
+
+    // Last, so the next generation's idea of "what was already on the page" is this tick's
+    // page rather than the one it is about to change. Marks are kept only for the newest
+    // few sections: they exist to answer "has ChatGPT written into this since", and no
+    // generation ever binds to a section further back than that.
+    baselineSections = assistantSections();
+    baselineMarks = baselineSections.slice(-3).map((node) => ({ node, mark: sectionMark(node) }));
+    baselineProseMarks = [];
+    if (typeof CLF_DOM.assistantProseSnapshot === 'function') {
+      for (const assistant of CLF_DOM.turns()) {
+        if (assistant.role !== 'assistant') continue;
+        baselineProseMarks.push(...CLF_DOM.assistantProseSnapshot(assistant));
+      }
+    }
+    resumedFirstObservation = false;
 
     void flush();
   }
 
+  /**
+   * Tells the app how many of this turn's tool blocks could be a connector call.
+   *
+   * This is the app's only evidence of *where a tool call came from*. The connector
+   * belongs to a ChatGPT account rather than to this browser, so a call can just as
+   * easily have been made from the phone; a block rendered here is the one thing that
+   * shows this conversation made a call, because ChatGPT renders it in the conversation
+   * that made it and nowhere else.
+   *
+   * Which is exactly why the count must not be `toolBlocks(turn).length`. That includes
+   * the rows ChatGPT names itself — "Searched the web" and friends — and a turn that only
+   * used a built-in would then vouch for a call it never made, letting a call from
+   * another device be filed into this chat. Only connector rows are counted, recognised
+   * by the control ChatGPT puts in them; see isConnectorBlock.
+   *
+   * What that leaves is a connector row, not *this* connector's row: another connector on
+   * the same account renders the same shape, and the collapsed markup names neither. So
+   * this is a narrowing rather than an identification, and the app treats it as one — it
+   * is what makes page-matched attribution a lower grade of evidence than an agent key.
+   * The alternative on offer was inferring the generic label by frequency, which is worse
+   * than it looks: two "Searched the web" rows in one turn are enough to teach it that
+   * built-in label globally, and a turn with three web rows and two connector rows would
+   * teach it the wrong one outright.
+   *
+   * Reported cumulatively per turn, so a retried batch and a re-render add nothing.
+   *
+   * The turn is addressed by its section rather than by CLF_DOM.turns(), and its rows are
+   * counted by CLF_DOM.connectorRows() rather than by filtering toolBlocks(). Both are
+   * lessons from the live page: everything the relabeller needs — data-turn, the
+   * display-contents row shape, the short-header heuristic — is a way for a renderer change
+   * to make this silently report nothing, and reporting nothing is indistinguishable from
+   * "this call came from another device". Evidence now rests on one anchor only, the
+   * control CONNECTOR names, and on a section being a section.
+   */
+  /**
+   * Tool activity ChatGPT itself rendered but this MCP server did not execute.
+   *
+   * Only the visible row label crosses the extension boundary. Web search, image/canvas
+   * helpers and similar page-native tools therefore join the chronological stream without
+   * copying hidden request payloads, private reasoning or arbitrary React props.
+   *
+   * Returns what has changed rather than emitting it, so the caller decides which
+   * generation the rows belong to. A row whose label has been rewritten comes back again
+   * under the same id — the recorder supersedes it, which is the whole reason the id is
+   * stamped on the row rather than derived from its text and its position. Deriving it is
+   * what turned "Inspecting project files" and "Inspected project files" into two rows, and
+   * a re-layout that shifted the index into a third.
+   */
+  function reportPageTools(turn) {
+    const out = [];
+    if (!turn || turn.role !== 'assistant') return out;
+    // Classify first, from the page's own message model, and let the classification stick to
+    // the row. Only what this app can see is *not* its own becomes page-native activity.
+    for (const block of CLF_DOM.toolBlocks(turn)) {
+      const seen = fiberFor(block);
+      if (ourConnectorSeen(seen)) CLF_DOM.markLocalBlock(block);
+    }
+    for (const item of CLF_DOM.pageToolItems(turn, turnId)) {
+      if (!item || !item.id || !item.label) continue;
+      if (pageToolsReported.get(item.id) === item.label) continue;
+      pageToolsReported.set(item.id, item.label);
+      out.push(item);
+    }
+    while (pageToolsReported.size > 500) pageToolsReported.delete(pageToolsReported.keys().next().value);
+    return out;
+  }
+
+  function reportToolBlocks(section) {
+    const key = blockKey(section);
+    const count = connectorBlockCount(section);
+    if (count <= (blocksReported.get(key) || 0)) return;
+    blocksReported.set(key, count);
+    if (blocksReported.size > 50) blocksReported.delete(blocksReported.keys().next().value);
+    const id = turnIdOf(section);
+    emit({ kind: 'tool_block', turnId: id || undefined, count });
+  }
+
+  const turnIdOf = (section) =>
+    section && section.getAttribute ? section.getAttribute('data-turn-id') : null;
+
+  const blockKey = (section) => turnIdOf(section) || 'current';
+
+  /**
+   * Every section of one logical turn. ChatGPT can split a single assistant request across
+   * sibling sections that share a data-turn-id, and counting only the one a row landed in
+   * would make each split look like a fresh turn with a lower count.
+   */
+  function turnSections(section) {
+    if (!section) return [];
+    const id = turnIdOf(section);
+    if (!id || typeof CSS === 'undefined' || typeof CSS.escape !== 'function') return [section];
+    try {
+      return [...document.querySelectorAll(`${TURN_SECTION}[data-turn-id="${CSS.escape(id)}"]`)];
+    } catch {
+      return [section];
+    }
+  }
+
+  /**
+   * How many connector calls this turn has shown.
+   *
+   * Rows this extension has already matched to one of the app's own calls count too, and
+   * are counted only when they are not one of the rows above: relabelling rewrites the
+   * inside of a row, so a renderer where that removes ChatGPT's own control would otherwise
+   * make the count fall as the app labels its work, and the next real row would only bring
+   * it back to a number already reported.
+   */
+  function connectorBlockCount(section) {
+    const roots = section ? turnSections(section) : [document];
+    let count = 0;
+    let exact = null;
+    for (const root of roots) {
+      const rows = CLF_DOM.connectorRows(root);
+      for (const row of rows) {
+        const seen = fiberFor(row);
+        if (seen && Number.isInteger(seen.localCount)) {
+          exact = exact === null ? seen.localCount : Math.max(exact, seen.localCount);
+        }
+        const ours = ourConnectorSeen(seen);
+        // Remembered on the row, because this proof outlives the control it was read from.
+        // See isConnectorBlock: a row that loses its marker is otherwise recorded a second
+        // time as an anonymous ChatGPT-native caption.
+        if (ours) CLF_DOM.markLocalBlock(row);
+        const knownOther =
+          seen &&
+          !ours &&
+          (Boolean(seen.app) || (typeof seen.path === 'string' && seen.path.startsWith('/')));
+        // Fallback for a helper that cannot read the turn-level message list: one visible
+        // unknown/local connector row is one piece of evidence. Never spend hidden here;
+        // that count also includes api_tool metadata calls the desktop MCP never executed.
+        if (!knownOther) count += 1;
+      }
+      for (const own of root.querySelectorAll('[data-clf-call]')) {
+        if (!rows.some((row) => row === own || row.contains(own) || own.contains(row))) count++;
+      }
+    }
+    return exact === null ? count : exact;
+  }
+
+  /**
+   * Watches for connector rows as ChatGPT inserts them, rather than waiting for a tick.
+   *
+   * The poll cannot carry this on its own. A tool call the app answers immediately can be
+   * consumed, answered and the whole turn finished inside one observe interval, and the
+   * next tick then sees a page that is no longer generating and reports nothing — so the
+   * chat's own call is filed as if it came from another device. Insertion is the moment
+   * the evidence exists, so that is when it is taken.
+   *
+   * Rows that are merely *drawn* are not evidence, and this is where that line is held.
+   * Opening an old chat, reloading one, or scrolling back through history all insert
+   * connector rows that were rendered days ago, and reporting those would let yesterday's
+   * work vouch for a call happening right now. The two are told apart by where the row
+   * arrived: ChatGPT creates a turn's section when the turn starts and appends rows into it
+   * as they happen, so a row appended into a section that was already on the page is this
+   * chat working, while a whole section arriving with its rows inside it is history being
+   * drawn. Only that second case has to ask whether the page is generating, and it is the
+   * uncommon one — which matters, because the stop button that answers it is a selector
+   * like any other and a page that stops matching it must not take attribution with it.
+   */
+  function watchToolRows() {
+    if (typeof MutationObserver !== 'function' || !document.body) return;
+    seedToolBlocks();
+    new MutationObserver((records) => {
+      // A different chat: everything about to arrive is its history, not its activity.
+      if (!sameChat()) {
+        seedToolBlocks();
+        return;
+      }
+      const live = new Set();
+      const drawn = [];
+      for (const record of records) {
+        for (const node of record.addedNodes) {
+          if (!node || node.nodeType !== 1) continue;
+          if (!CLF_DOM.hasConnectorRow(node)) continue;
+          if (node.matches(TURN_SECTION) || node.querySelector(TURN_SECTION)) drawn.push(node);
+          else live.add(node.closest ? node.closest(TURN_SECTION) : null);
+        }
+      }
+      if (live.size === 0 && drawn.length === 0) return;
+      // A turn rendered whole while the page is generating is this chat's work arriving in
+      // one piece, not history: report it. Otherwise it is history, and is banked as seen.
+      for (const node of drawn) {
+        if (CLF_DOM.generating()) for (const section of sectionsIn(node)) live.add(section);
+        else seedSections(sectionsIn(node));
+      }
+      if (live.size === 0) return;
+      for (const section of live) reportToolBlocks(section);
+      void flush();
+      void refreshFiber().then(() => {
+        if (!alive || !sameChat()) return;
+        for (const section of live) reportToolBlocks(section);
+        void flush();
+      });
+    }).observe(document.body, { childList: true, subtree: true });
+  }
+
+  /**
+   * React also changes visible commentary without inserting a connector row. Observe those
+   * turn-local mutations immediately so the recorder sees short-lived updates instead of
+   * waiting up to a second for the polling tick. Mutations caused by our own stream are
+   * ignored to avoid feeding the renderer back into itself.
+   */
+  function watchTranscript() {
+    if (typeof MutationObserver !== 'function' || !document.body) return;
+    let queued = false;
+    new MutationObserver((records) => {
+      if (!alive || queued || !sameChat()) return;
+      const relevant = records.some((record) => {
+        const target = record.target && record.target.nodeType === 1 ? record.target : record.target.parentElement;
+        if (!target || (target.closest && target.closest('.clf-stream'))) return false;
+        if (target.closest && target.closest(TURN_SECTION)) return true;
+        for (const node of record.addedNodes || []) {
+          if (!node || node.nodeType !== 1) continue;
+          if (node.matches(TURN_SECTION) || node.querySelector(TURN_SECTION)) return true;
+        }
+        return false;
+      });
+      if (!relevant) return;
+      queued = true;
+      queueMicrotask(() => {
+        queued = false;
+        if (!alive) return;
+        observe();
+        renderStreams();
+      });
+    }).observe(document.body, { childList: true, subtree: true, characterData: true });
+  }
+
+  const TURN_SECTION = 'section[data-testid^="conversation-turn"]';
+  let seededPath = null;
+
+  /**
+   * Whether the page is still on the chat these counts were taken from.
+   *
+   * A brand-new chat being given its id — `/` to `/c/<id>` — is the same chat, not another
+   * one. ChatGPT assigns the id only once the first turn is under way, so treating that as
+   * a navigation banked the rows of the turn in flight as history and lost the evidence for
+   * the first call a fresh chat makes. In an agent chat that call is the one that says who
+   * the chat is, so this cost every worker its identity.
+   */
+  function sameChat() {
+    try {
+      const path = location.pathname;
+      if (path === seededPath) return true;
+      const named = /^\/c\//.test(path) && !/^\/c\//.test(seededPath || '');
+      seededPath = path;
+      return named;
+    } catch {
+      // The document can disappear while an async Fiber refresh is settling. That is not
+      // a navigation to attribute; it is simply a dead observer callback.
+      return false;
+    }
+  }
+
+  const sectionsIn = (node) => (node.matches(TURN_SECTION) ? [node] : [...node.querySelectorAll(TURN_SECTION)]);
+
+  function seedSections(sections) {
+    for (const section of sections) {
+      const key = blockKey(section);
+      const count = connectorBlockCount(section);
+      if (count > (blocksReported.get(key) || 0)) blocksReported.set(key, count);
+    }
+  }
+
+  /** Marks every connector row now on the page as already reported. */
+  function seedToolBlocks() {
+    try {
+      seededPath = location.pathname;
+      seedSections([...document.querySelectorAll(TURN_SECTION)]);
+      const loose = connectorBlockCount(null);
+      if (loose > (blocksReported.get('current') || 0)) blocksReported.set('current', loose);
+    } catch {
+      // The JSDOM harness and a real closing tab can tear the document down before a
+      // queued MutationObserver callback runs. A dead document has nothing left to seed.
+    }
+  }
+
   // ------------------------------------------------------------ relabelling
 
-  const TOOL_GLYPHS = {
-    edit: '✎',
-    create: '+',
-    delete: '×',
-    move: '↗',
-    read: '◉',
-    search: '⌕',
-    browse: '▱',
-    run: '›_',
-    process: '›_',
-    screen: '▣',
-    input: '↖',
-    clipboard: '▤',
-    session: '◷',
-    agent: '◆',
-    other: '◇'
+  const TOOL_ICON_PATHS = {
+    edit: ['M4 20h4l11-11-4-4L4 16v4', 'M13.5 6.5l4 4'],
+    create: ['M12 5v14', 'M5 12h14'],
+    delete: ['M5 7h14', 'M9 7V5h6v2', 'M8 7l1 12h6l1-12'],
+    move: ['M7 17 17 7', 'M10 7h7v7'],
+    read: ['M5 4h14v16H5z', 'M8 8h8', 'M8 12h8', 'M8 16h5'],
+    search: ['M11 18a7 7 0 1 1 0-14 7 7 0 0 1 0 14', 'M16 16l4 4'],
+    browse: ['M4 6h16v12H4z', 'M4 9h16'],
+    run: ['M4 5h16v14H4z', 'M7 9l3 3-3 3', 'M12 15h5'],
+    process: ['M4 5h16v14H4z', 'M7 9l3 3-3 3', 'M12 15h5'],
+    screen: ['M3 5h18v12H3z', 'M8 21h8', 'M12 17v4'],
+    input: ['M6 3l11 9-6 1 3 6-2 1-3-6-4 4z'],
+    clipboard: ['M7 5h10v16H7z', 'M9 5V3h6v2', 'M10 10h4', 'M10 14h4'],
+    session: ['M20 11a8 8 0 1 1-2.3-5.7', 'M20 4v7h-7'],
+    agent: ['M12 3l7 4v10l-7 4-7-4V7z', 'M9 12h6'],
+    other: ['M5 5h14v14H5z']
   };
 
-  function glyph(kind) {
-    return TOOL_GLYPHS[kind] || TOOL_GLYPHS.other;
+  function toolIconKey(kind) {
+    return TOOL_ICON_PATHS[kind] ? kind : 'other';
+  }
+
+  function setToolIcon(node, kind) {
+    const key = toolIconKey(kind);
+    if (node.dataset.clfIcon === key && node.firstElementChild) return;
+    node.dataset.clfIcon = key;
+    node.replaceChildren();
+    const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+    svg.setAttribute('viewBox', '0 0 24 24');
+    svg.setAttribute('width', '14');
+    svg.setAttribute('height', '14');
+    svg.setAttribute('fill', 'none');
+    svg.setAttribute('stroke', 'currentColor');
+    svg.setAttribute('stroke-width', '1.8');
+    svg.setAttribute('stroke-linecap', 'round');
+    svg.setAttribute('stroke-linejoin', 'round');
+    for (const d of TOOL_ICON_PATHS[key]) {
+      const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+      path.setAttribute('d', d);
+      svg.append(path);
+    }
+    node.append(svg);
   }
 
   function labelText(entry) {
@@ -326,45 +1617,504 @@
   }
 
   /**
+   * Metrics worth showing in the compact browser transcript.
+   *
+   * A successful exec can return while its child is still running. In that case the
+   * recorder's `✓ 10.0s` is the duration of the initial wait/tool response, not the duration
+   * of the command the user thinks the row represents. That number is useful forensic data
+   * and stays in the session record, but presenting it as a completion badge is misleading.
+   * Keep concrete output metrics (line deltas, hit counts, exit failures) and suppress only
+   * the green success-duration shape in the extension. See TODO T-129.
+   */
+  function displayMetric(summary) {
+    const metric = summary && typeof summary.metric === 'string' ? summary.metric.trim() : '';
+    if (!metric) return '';
+    if (summary.kind === 'run' && /^✓\s+\d+(?:\.\d+)?(?:ms|s|m)$/.test(metric)) return '';
+    return metric;
+  }
+
+  // ----------------------------------------------------------- fiber evidence
+
+  /**
+   * What ChatGPT's own client state says about the connector rows on this page.
+   *
+   * Supplied by extension/fiber.js, which is the only code we run in the page's own
+   * JavaScript context. Two things come from here that the DOM simply does not carry:
+   * the tool a collapsed row actually ran, and how many further calls that one row is
+   * standing in for.
+   *
+   * **This is untrusted input.** The page can post exactly these messages itself, so a
+   * descriptor is never proof that a call happened — it may only change how a row that is
+   * *already on the page* is labelled. It must never reach the app: nothing here writes a
+   * recorded event, decides an agent's identity, or counts as evidence that a tool call in
+   * the app belongs to this chat. `connectorRows()` remains the only thing that vouches
+   * for that, and it reads the DOM. Everything below therefore re-validates shape, type
+   * and length rather than trusting that our own helper is what replied.
+   */
+  const FIBER_ASK = 'clf-fiber-ask';
+  const FIBER_REPLY = 'clf-fiber-reply';
+  // 3: adds an exact turn-wide TobisComputer call count so folded api_tool metadata calls
+  // are not mistaken for local MCP calls. Older descriptors are refused rather than mixed.
+  // 4: adds a turn-level array naming each TobisComputer request the page holds, so a call
+  // ChatGPT folded into a shared row — or drew no row for at all — still has page evidence.
+  const FIBER_VERSION = 4;
+  const FIBER_TIMEOUT_MS = 1500;
+  const FIBER_MAX_ROWS = 400;
+  /** Assistant turns whose per-call evidence is accepted from one scan. */
+  const FIBER_MAX_TURNS = 6;
+  /** Connector requests accepted for one turn. */
+  const FIBER_MAX_CALLS = 200;
+  const TOOL_NAME = /^[a-z0-9_.-]{1,64}$/i;
+
+  /** Descriptors from the last successful scan, keyed by the stamp on their row. */
+  let fiberRows = new Map();
+  let fiberAsking = null;
+  /** Off until the helper answers once, so a browser without it behaves exactly as before. */
+  let fiberPresent = false;
+  /**
+   * Message ids whose per-call evidence has already been reported. Every scan re-reads the
+   * whole turn, so without this the same request would be re-sent on every poll.
+   */
+  const callsReported = new Set();
+
+  const cap = (value, max) => (typeof value === 'string' && value.length > 0 ? value.slice(0, max) : null);
+
+  /** One descriptor, rebuilt field by field. Anything unexpected makes the row null. */
+  function readDescriptor(raw) {
+    if (!raw || typeof raw !== 'object' || raw.v !== FIBER_VERSION) return null;
+    const index = raw.index;
+    if (!Number.isInteger(index) || index < 0 || index >= FIBER_MAX_ROWS) return null;
+    // Checked, never capped. Everything else here is display text where a truncation is
+    // harmless, but the tool name is an identity: shortening an over-long one until it
+    // fits would turn a value that failed validation into one that passes it.
+    const tool = typeof raw.tool === 'string' && raw.tool.length > 0 ? raw.tool : null;
+    if (tool !== null && !TOOL_NAME.test(tool)) return null;
+    const hidden = Number.isInteger(raw.hidden) ? Math.max(0, Math.min(999, raw.hidden)) : 0;
+    const localCount = Number.isInteger(raw.localCount) ? Math.max(0, Math.min(999, raw.localCount)) : null;
+    return {
+      index,
+      tool,
+      path: cap(raw.path, 200),
+      app: cap(raw.app, 200),
+      resource: cap(raw.resource, 200),
+      messageId: cap(raw.messageId, 200),
+      turnId: cap(raw.turnId, 200),
+      conversationId: cap(raw.conversationId, 200),
+      createTime: typeof raw.createTime === 'number' && Number.isFinite(raw.createTime) ? raw.createTime : null,
+      hidden,
+      localCount,
+      answered: raw.answered === true
+    };
+  }
+
+  /**
+   * One turn's per-call evidence, rebuilt field by field.
+   *
+   * Same trust posture as readDescriptor, and it matters more here: this evidence decides
+   * which *session* a recorded call is written into, so a page that could forge it could
+   * pull another chat's work into this one. Nothing is copied through — the tool name is
+   * checked against its pattern and never trimmed to fit, every other field is rebuilt with
+   * its own bound, and a message id reported twice is dropped rather than resolved, because
+   * two calls sharing one identity is a contradiction and picking one would spend the same
+   * evidence twice.
+   *
+   * What this may do is still bounded on the far side: it can say which conversation a call
+   * this app already ran belongs to. It never writes an event, never names an agent, and
+   * carries no argument value.
+   */
+  function readTurnCalls(raw) {
+    if (!raw || typeof raw !== 'object') return null;
+    const turnId = cap(raw.turnId, 200);
+    if (!turnId || !Array.isArray(raw.calls)) return null;
+    const calls = [];
+    const seen = new Set();
+    const duplicated = new Set();
+    for (const entry of raw.calls.slice(0, FIBER_MAX_CALLS)) {
+      if (!entry || typeof entry !== 'object') continue;
+      const tool = typeof entry.tool === 'string' && entry.tool.length > 0 ? entry.tool : null;
+      if (!tool || !TOOL_NAME.test(tool)) continue;
+      const messageId = cap(entry.messageId, 200);
+      if (!messageId) continue;
+      if (seen.has(messageId)) {
+        duplicated.add(messageId);
+        continue;
+      }
+      seen.add(messageId);
+      calls.push({
+        messageId,
+        tool,
+        order: Number.isInteger(entry.order) ? Math.max(0, Math.min(FIBER_MAX_CALLS, entry.order)) : calls.length,
+        answered: entry.answered === true,
+        // ChatGPT's own id for the request, and its own creation time. The id is what lets
+        // the app place the call in the chat that issued it; this script's own stamp is a
+        // poll tick and cannot.
+        requestId: cap(entry.requestId, 100) || null,
+        createTime: typeof entry.createTime === 'number' && isFinite(entry.createTime) ? entry.createTime : null
+      });
+    }
+    const kept = calls.filter((call) => !duplicated.has(call.messageId));
+    return kept.length > 0 ? { turnId, calls: kept } : null;
+  }
+
+  /**
+   * Asks the page-context helper what it can see, and waits a moment for an answer.
+   *
+   * One request in flight at a time, and a timeout that resolves rather than rejects: a
+   * browser where the MAIN-world script never ran must degrade to the old behaviour, not
+   * stall the paint loop.
+   */
+  function askFiber() {
+    if (fiberAsking) return fiberAsking;
+    const nonce = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+    fiberAsking = new Promise((resolve) => {
+      let done = false;
+      const finish = (rows) => {
+        if (done) return;
+        done = true;
+        window.removeEventListener('message', onMessage);
+        fiberAsking = null;
+        resolve(rows);
+      };
+      const onMessage = (event) => {
+        if (event.source !== window) return;
+        const data = event.data;
+        if (!data || typeof data !== 'object') return;
+        if (data.source !== FIBER_REPLY || data.nonce !== nonce || data.v !== FIBER_VERSION) return;
+        const turns = [];
+        if (Array.isArray(data.turns)) {
+          for (const raw of data.turns.slice(0, FIBER_MAX_TURNS)) {
+            const turn = readTurnCalls(raw);
+            if (turn) turns.push(turn);
+          }
+        }
+        if (!Array.isArray(data.rows)) return finish({ rows: new Map(), turns });
+        const rows = new Map();
+        for (const raw of data.rows.slice(0, FIBER_MAX_ROWS)) {
+          const row = readDescriptor(raw);
+          // A duplicated index is a contradiction; keep neither rather than pick one.
+          if (!row) continue;
+          if (rows.has(row.index)) rows.set(row.index, null);
+          else rows.set(row.index, row);
+        }
+        for (const [index, row] of rows) if (row === null) rows.delete(index);
+        finish({ rows, turns });
+      };
+      window.addEventListener('message', onMessage);
+      setTimeout(() => finish(null), FIBER_TIMEOUT_MS);
+      try {
+        window.postMessage({ source: FIBER_ASK, nonce }, location.origin);
+      } catch {
+        finish(null);
+      }
+    });
+    return fiberAsking;
+  }
+
+  /**
+   * Refreshes the cache. `null` means no answer — keep whatever was last known.
+   *
+   * The per-call evidence is reported onwards from here rather than being kept for the
+   * renderer's own use. It is the only thing that can tell the app a call it just ran
+   * belongs to this chat when ChatGPT drew no row for it, and reporting is cumulative and
+   * idempotent by message id, so repeating a turn's evidence on every scan costs nothing.
+   */
+  async function refreshFiber() {
+    const answer = await askFiber();
+    if (answer === null) return;
+    fiberPresent = true;
+    fiberRows = answer.rows;
+    // Fiber names turns with ChatGPT's page `data-turn-id`, which the live page reuses. The
+    // recorder, deliberately, names the live generation with our durable local `g-...` id.
+    // Never write the recycled page id into recorder evidence as though it were that durable
+    // identity. Only the *newest* Fiber turn matching the assistant section this local
+    // generation is currently bound to may inherit `turnId`; historical/reused matches still
+    // prove the conversation made the call, but carry no durable turn id.
+    const activePageTurnId = generating ? generationTurn()?.id || null : null;
+    let activeTurnIndex = -1;
+    if (activePageTurnId && turnId) {
+      for (let index = answer.turns.length - 1; index >= 0; index--) {
+        if (answer.turns[index].turnId === activePageTurnId) {
+          activeTurnIndex = index;
+          break;
+        }
+      }
+    }
+    for (let index = 0; index < answer.turns.length; index++) {
+      const turn = answer.turns[index];
+      const fresh = turn.calls.filter((call) => !callsReported.has(call.messageId));
+      if (fresh.length === 0) continue;
+      for (const call of fresh) callsReported.add(call.messageId);
+      emit({ kind: 'tool_evidence', ...(index === activeTurnIndex ? { turnId } : {}), calls: fresh });
+    }
+    if (callsReported.size > 4000) callsReported.clear();
+  }
+
+  /** What the page says about this block, or null. */
+  function fiberFor(block) {
+    if (!fiberPresent) return null;
+    const index = CLF_DOM.fiberIndex(block);
+    return index < 0 ? null : fiberRows.get(index) || null;
+  }
+
+  /**
+   * Decides which recorded call belongs to which block. Pure, so it can be tested.
+   *
+   * `blocks` is one `{ callId, original, hidden }` per rendered tool block, in DOM order;
+   * `calls` is the app's recorded calls for the same turn, in the order they ran.
+   * Returns `[blockIndex, call, hiddenCalls]` triples to apply.
+   *
+   * **A row is a group, not a call.** ChatGPT folds a run of calls into one row — observed
+   * live as `4 earlier tool calls hidden` over a `collapsedSameToolCallCount: 4`, so five
+   * calls behind one row. `hidden` is that count, from the page's own client state (see
+   * fiberFor). It defaults to 0, which is the ordinary row and the behaviour everything had
+   * before. The prop is named for a run of calls to the *same* tool and that name is not
+   * reliable: the live page folded a `list_resources` call under an `agents` row. So
+   * it is a count of what the row stands for and never evidence of which tools those were.
+   *
+   * That the row *represents* the last call of its group, not the first, is what the
+   * "earlier … hidden" wording means, and it decides which call's label goes on the row.
+   *
+   * The rules, in the order they are tried:
+   *
+   *  · A block already bound to a call keeps that call, along with the `hidden` calls
+   *    immediately before it — groups are contiguous in run order by construction, since
+   *    ChatGPT only folds *consecutive* calls to the same tool. Labels must not move
+   *    around between repaints, and a block whose call has scrolled out of the feed keeps
+   *    what it has rather than being handed somebody else's.
+   *  · If the unbound blocks and the unmatched calls come out even — counting each block
+   *    as the `1 + hidden` calls it stands for — they pair up in order. This is the strong
+   *    signal and it is what the old code required, except that the old code counted every
+   *    block as one call and so fired on mismatched sets whenever anything was collapsed.
+   *    That produced confidently wrong labels, which is worse than the wall of "Called
+   *    tool" it replaced.
+   *  · Otherwise only the blocks ChatGPT renders *identically* are matched, in order,
+   *    as far as they go, and the run stops at the first folded row. That is the "wall of
+   *    Called tool" case, where the page is saying nothing that could be overwritten, and
+   *    where nothing has reconciled — so a fold count cannot be spent as if the calls it
+   *    counts were the ones waiting in front of it. Blocks ChatGPT has named itself are
+   *    left alone — and, crucially, no longer stop the rest of the turn being matched.
+   *    A tie between two equally large groups is genuinely ambiguous, so nothing moves.
+   *
+   * Over all three, one veto: **a row never takes a call the page says it did not make.**
+   * `block.tool` is the tool named by that row's own Fiber descriptor, and it is evidence
+   * about that row and no other — it needs no counting, no ordering and no reconciliation
+   * to be true. Every rule here is ultimately an argument from position, and position is
+   * exactly what goes wrong when the recorder's view of a turn and the page's view of it
+   * are not the same set of calls. Observed live on two separate chats: a row whose
+   * descriptor said `screenshot` wearing a recorded `list_windows`, and a row whose
+   * descriptor said `run_powershell` wearing a recorded `computer`, each one the single
+   * bound row on its page and each one arrived at by a rule that "fit". A blank row is a
+   * missing label; a wrong row is a lie about what this machine did.
+   */
+  function planLabels(blocks, calls) {
+    /** How many calls this row folded away behind the one it shows. */
+    const hiddenOf = (block) => {
+      const raw = block && block.hidden;
+      return Number.isInteger(raw) && raw > 0 ? Math.min(raw, 999) : 0;
+    };
+    /** `[representative, hidden]` for a run of calls, which the row shows last-first. */
+    const group = (run) => [run[run.length - 1], run.slice(0, -1)];
+    /**
+     * Whether the page's own name for this row rules this call out.
+     *
+     * Only when both are known and they differ. An absent descriptor — no helper, an
+     * unreadable row, a truncated payload with no result yet — says nothing either way,
+     * and must leave every rule exactly as it behaved before the helper existed.
+     */
+    const contradicts = (block, call) =>
+      Boolean(block && block.tool && call && call.tool && block.tool !== call.tool);
+
+    const order = new Map();
+    calls.forEach((call, at) => order.set(call.callId, at));
+
+    const plan = [];
+    const consumed = new Set();
+    const free = [];
+    blocks.forEach((block, index) => {
+      if (!block.callId) {
+        free.push(index);
+        return;
+      }
+      const at = order.get(block.callId);
+      // Its call has scrolled out of the feed. Leave the block alone and, since the call
+      // is not in `calls` either, let the rest of the turn match around it.
+      if (at === undefined) return;
+      if (contradicts(block, calls[at])) {
+        // This row is already wearing a call the page says it did not make — matched in an
+        // earlier paint, before the descriptor for it had arrived. "Never move a label"
+        // exists so labels do not shuffle between repaints, not so a wrong one can outlive
+        // the evidence against it. A null call is the plan's instruction to take it back
+        // off; the call itself stays unconsumed, so it is free to land where it belongs.
+        plan.push([index, null, []]);
+        free.push(index);
+        return;
+      }
+      const from = Math.max(0, at - hiddenOf(block));
+      for (let position = from; position <= at; position++) consumed.add(position);
+      plan.push([index, calls[at], calls.slice(from, at)]);
+    });
+
+    const pending = calls.filter((_call, at) => !consumed.has(at));
+    if (pending.length === 0 || free.length === 0) return plan;
+
+    const spans = free.map((index) => 1 + hiddenOf(blocks[index]));
+    if (spans.reduce((total, span) => total + span, 0) === pending.length) {
+      let at = 0;
+      const runs = free.map((_index, which) => {
+        const run = pending.slice(at, at + spans[which]);
+        at += spans[which];
+        return run;
+      });
+      // The counts coming out even is the strong signal, but it is still only arithmetic,
+      // and one row whose descriptor names a different tool than the call this pairing
+      // would hand it is proof that the two sequences are not the same sequence. The rest
+      // of the pairing rests on the same assumption, so none of it is applied.
+      if (!free.some((index, which) => contradicts(blocks[index], group(runs[which])[0]))) {
+        free.forEach((index, which) => plan.push([index, ...group(runs[which])]));
+        return plan;
+      }
+    }
+
+    const groups = new Map();
+    for (const index of free) {
+      const key = blocks[index].original;
+      groups.set(key, (groups.get(key) || []).concat(index));
+    }
+    const sorted = [...groups.values()].sort((a, b) => b.length - a.length);
+    const generic = sorted[0];
+    if (!generic || (sorted.length > 1 && sorted[1].length === generic.length)) return plan;
+    let at = 0;
+    for (const index of generic) {
+      // Reaching this branch means the two sets did not reconcile, and a folded row is
+      // exactly where that stops being survivable: `hidden` says how many calls the page
+      // shows this row in place of, and nothing here proves those calls are the entries
+      // sitting in front of it in `pending` — the recorder may never have seen them at
+      // all. Consuming them on that assumption shifts this row's label and every later
+      // one. So stop at the first folded row instead. It does not go generic: it keeps
+      // the name the page's own descriptor gave it, which is evidence about that row
+      // alone and needs no reconciliation to be true.
+      if (hiddenOf(blocks[index]) > 0) break;
+      if (at >= pending.length) break;
+      // Same reasoning one row at a time: this is the weakest rule in the file, so the
+      // page naming a different tool ends the run rather than skipping an entry — every
+      // row after this one would be walking at an offset nothing here can measure.
+      if (contradicts(blocks[index], pending[at])) break;
+      plan.push([index, pending[at], []]);
+      at += 1;
+    }
+    return plan;
+  }
+
+  /**
+   * The label ChatGPT gives *this* connector's tool rows, or '' when unknowable.
+   *
+   * The connector's rows carry no name ChatGPT can show, so it renders them all
+   * identically; a built-in has its own name and stands alone. The largest group of
+   * identically-labelled unmatched rows is therefore this connector's — and a group of
+   * one proves nothing, since a lone built-in looks exactly the same from here. A tie is
+   * genuinely ambiguous. Pure, so it can be tested.
+   */
+  function genericLabel(shapes) {
+    const groups = new Map();
+    for (const shape of shapes) {
+      if (shape.callId) continue;
+      groups.set(shape.original, (groups.get(shape.original) || 0) + 1);
+    }
+    const sorted = [...groups.entries()].sort((a, b) => b[1] - a[1]);
+    const top = sorted[0];
+    if (!top || top[1] < 2) return '';
+    if (sorted.length > 1 && sorted[1][1] === top[1]) return '';
+    return top[0];
+  }
+
+  /** How many of these rows are plausibly this connector's calls. Pure. */
+  function localBlockCount(shapes, learned) {
+    return shapes.filter((shape) => shape.callId || (learned && shape.original === learned)).length;
+  }
+
+  /** What ChatGPT itself called this block, before we touched it. */
+  function originalLabel(block) {
+    if (block.dataset.clfOriginal) return block.dataset.clfOriginal;
+    const label = CLF_DOM.toolLabel(block);
+    return label ? (label.textContent || '').replace(/\s+/g, ' ').trim() : '';
+  }
+
+  /**
    * Turns ChatGPT's generic tool header into the same semantic shape as the app:
    * icon + strong title + secondary input/detail + result metric. The app remains the
    * source of truth for the words; this page code only lays out the summary it receives.
    */
-  function applyLabel(block, entry) {
+  function applyLabel(block, entry, hidden) {
     const label = CLF_DOM.toolLabel(block);
     if (!label) return;
+    const folded = Array.isArray(hidden) ? hidden : [];
     const metric = block.querySelector('.clf-metric');
     const detail = block.querySelector('.clf-tool-detail');
     const icon = block.querySelector('.clf-tool-icon');
+    const more = block.querySelector('.clf-folded');
+    const when = block.querySelector('.clf-when');
+    const who = block.querySelector('.clf-agent');
     const wantedDetail = entry.summary.detail || '';
-    const metricOk = Boolean(entry.summary.metric) === Boolean(metric) &&
-      (!entry.summary.metric || metric.textContent === entry.summary.metric);
+    const wantedMore = folded.length > 0 ? `+${folded.length}` : '';
+    const wantedWhen = SHOW_TIMES ? clockText(entry.time) : '';
+    const wantedWho = agentText(entry);
+    const wantedMetric = displayMetric(entry.summary);
+    const metricOk = Boolean(wantedMetric) === Boolean(metric) && (!wantedMetric || metric.textContent === wantedMetric);
     const detailOk = Boolean(wantedDetail) === Boolean(detail) && (!wantedDetail || detail.textContent === wantedDetail);
-    const iconOk = icon && icon.textContent === glyph(entry.summary.kind);
+    const moreOk = Boolean(wantedMore) === Boolean(more) && (!wantedMore || more.textContent === wantedMore);
+    const whenOk = Boolean(wantedWhen) === Boolean(when) && (!wantedWhen || when.textContent === wantedWhen);
+    const whoOk = Boolean(wantedWho) === Boolean(who) && (!wantedWho || who.textContent === wantedWho);
+    const iconOk = icon && icon.dataset.clfIcon === toolIconKey(entry.summary.kind);
     if (
       block.dataset.clfCall === entry.callId &&
       label.textContent === entry.summary.title &&
       metricOk &&
       detailOk &&
+      moreOk &&
+      whenOk &&
+      whoOk &&
       iconOk
     ) return;
 
     if (!block.dataset.clfOriginal) block.dataset.clfOriginal = label.textContent || '';
     block.dataset.clfCall = entry.callId;
     block.dataset.clfKind = entry.summary.kind || 'other';
+    // The outcome is an attribute as well as a colour, so a failed call can be made to
+    // look failed without depending on a tone class that also means other things.
+    block.dataset.clfOutcome = entry.outcome || 'ok';
     label.textContent = entry.summary.title;
     label.classList.add('clf-tool-title');
-    label.title = `${entry.tool} — ${entry.outcome}${
-      entry.durationMs ? ` in ${Math.round(entry.durationMs)} ms` : ''
-    }\nOriginally: ${block.dataset.clfOriginal}`;
+    label.setAttribute(
+      'data-clf-tip',
+      `${entry.tool} — ${entry.outcome}${entry.durationMs ? ` in ${Math.round(entry.durationMs)} ms` : ''}` +
+        `\nOriginally: ${block.dataset.clfOriginal}`
+    );
     block.classList.remove('clf-good', 'clf-bad', 'clf-warn', 'clf-neutral');
     block.classList.add('clf-tool', `clf-${entry.summary.tone}`);
 
     const glyphNode = icon || document.createElement('span');
     glyphNode.className = 'clf-tool-icon';
     glyphNode.setAttribute('aria-hidden', 'true');
-    glyphNode.textContent = glyph(entry.summary.kind);
+    setToolIcon(glyphNode, entry.summary.kind);
     if (!icon && label.parentElement) label.parentElement.insertBefore(glyphNode, label);
+
+    // Which agent ran it. A run with a prime and two workers puts three streams of calls
+    // into one chat, and until now the transcript said three tools ran and nothing about
+    // who ran them — so a worker's mistake read as the prime's. Absent on an ordinary
+    // chat, where there is only one possible answer and a tag saying so is noise.
+    let whoNode = who;
+    if (wantedWho) {
+      whoNode = whoNode || document.createElement('span');
+      whoNode.className = 'clf-agent';
+      whoNode.textContent = wantedWho;
+      whoNode.setAttribute('data-clf-tip', `Run by ${wantedWho}, not by the chat you are reading.`);
+      block.dataset.clfAgent = wantedWho;
+      if (!who) label.insertAdjacentElement('beforebegin', whoNode);
+    } else if (whoNode) {
+      whoNode.remove();
+      whoNode = null;
+      delete block.dataset.clfAgent;
+    }
 
     let detailNode = detail;
     if (wantedDetail) {
@@ -377,245 +2127,1864 @@
       detailNode = null;
     }
 
-    if (entry.summary.metric) {
-      const chip = metric || document.createElement('span');
-      chip.className = 'clf-metric';
-      chip.textContent = entry.summary.metric;
-      if (!metric) (detailNode || label).insertAdjacentElement('afterend', chip);
-    } else if (metric) {
-      metric.remove();
+    let metricNode = metric;
+    if (wantedMetric) {
+      metricNode = metricNode || document.createElement('span');
+      metricNode.className = 'clf-metric';
+      metricNode.textContent = wantedMetric;
+      if (!metric) (detailNode || label).insertAdjacentElement('afterend', metricNode);
+    } else if (metricNode) {
+      metricNode.remove();
+      metricNode = null;
     }
-  }
 
-  function timelineRows(turn, calls) {
-    const progress = progressByTurn.get(turn.id || 'current') || [];
-    const rows = [
-      ...progress.map((item) => ({
-        time: item.time,
-        text: item.text,
-        metric: '',
-        tone: 'progress',
-        kind: 'progress',
-        type: 'progress'
-      })),
-      ...calls.map((call) => ({
-        time: call.time,
-        text: labelText(call),
-        metric: call.summary.metric || '',
-        tone: call.summary.tone,
-        kind: call.summary.kind || 'other',
-        type: 'tool'
-      }))
-    ];
-    rows.sort((a, b) => a.time - b.time);
-    return rows;
+    // The time the app ran the call, on this machine's clock — the one thing the appended
+    // "Local timeline" block carried that the rows themselves did not. Now that it is here,
+    // the rows are the transcript and the block is not needed (T-16).
+    let whenNode = when;
+    if (wantedWhen) {
+      whenNode = whenNode || document.createElement('span');
+      whenNode.className = 'clf-when';
+      whenNode.textContent = wantedWhen;
+      whenNode.setAttribute('data-clf-tip', new Date(entry.time).toLocaleString());
+      if (!when) (metricNode || detailNode || label).insertAdjacentElement('afterend', whenNode);
+    } else if (whenNode) {
+      whenNode.remove();
+      whenNode = null;
+    }
+
+    // ChatGPT draws one row for a run of calls to the same tool, so this row is the last
+    // of several. The other four are not a footnote about this row, they are calls that
+    // happened, so the chip opens them underneath it.
+    setFolded(block, whenNode || metricNode || detailNode || label, folded, wantedMore);
   }
 
   /**
-   * Our own chronological view of the turn, folded away under the tool blocks.
+   * The agent to name on a row, or '' when there is only one possible answer.
    *
-   * ChatGPT renders every tool block after the whole reasoning stack, so its own order
-   * cannot show what happened between two tool calls. This can — but only for a turn
-   * this tab watched live, which is why it is an addition rather than a replacement.
+   * The app attributes this itself, having run the call, so unlike anything from the page
+   * it is authoritative. It is still bounded before going on screen: an id long enough to
+   * push the tool's own name out of the row would hide the thing the row is for.
    */
-  function injectTimeline(turn, calls) {
-    const blocks = CLF_DOM.toolBlocks(turn);
-    const holder = blocks.length > 0 ? blocks[blocks.length - 1].parentElement : null;
-    if (!holder) return;
-    const rows = timelineRows(turn, calls);
-    const signature = `${rows.length}:${rows.length > 0 ? rows[rows.length - 1].time : 0}`;
+  function agentText(entry) {
+    const value = typeof entry.agent === 'string' ? entry.agent.trim() : '';
+    return value.length > 0 && value.length <= 40 ? value : '';
+  }
 
-    let box = holder.querySelector(':scope > .clf-timeline');
-    if (box && box.dataset.clfSignature === signature) return;
-    if (!box) {
-      box = document.createElement('details');
-      box.className = 'clf-timeline';
-      box.open = true;
-      const head = document.createElement('summary');
-      head.textContent = 'Local timeline';
-      box.append(head);
-      const body = document.createElement('div');
-      body.className = 'clf-timeline-body';
-      box.append(body);
-      holder.append(box);
+  /** `HH:MM:SS` for a recorder timestamp, or '' if there isn't a usable one. */
+  function clockText(time) {
+    if (!Number.isFinite(time) || time <= 0) return '';
+    try {
+      return new Date(time).toLocaleTimeString();
+    } catch {
+      return '';
     }
-    box.dataset.clfSignature = signature;
-    box.querySelector('summary').textContent = `Local timeline — ${rows.length} step${
-      rows.length === 1 ? '' : 's'
-    }`;
+  }
 
-    const body = box.querySelector('.clf-timeline-body');
-    body.replaceChildren(
-      ...rows.map((row) => {
-        const line = document.createElement('div');
-        line.className = `clf-row clf-${row.tone} clf-${row.type}`;
-        const time = document.createElement('span');
-        time.className = 'clf-time';
-        time.textContent = new Date(row.time).toLocaleTimeString();
-        const rowIcon = document.createElement('span');
-        rowIcon.className = 'clf-row-icon';
-        rowIcon.setAttribute('aria-hidden', 'true');
-        rowIcon.textContent = row.type === 'progress' ? '·' : glyph(row.kind);
-        const label = document.createElement('span');
-        label.className = 'clf-label';
-        label.textContent = row.text;
-        line.append(time, rowIcon, label);
-        if (row.metric) {
-          const metric = document.createElement('span');
-          metric.className = 'clf-metric';
-          metric.textContent = row.metric;
-          line.append(metric);
-        }
-        return line;
-      })
+  /**
+   * Puts the calls a row folded away underneath that row, opened in place.
+   *
+   * This is what is left of the appended "Local timeline". That block sat at the bottom of
+   * the turn restating rows which were already on the page a few pixels above it, so it was
+   * a second and worse transcript rather than more of the first one — and ChatGPT's own
+   * progress captions, which made up its other half, are read straight out of the reasoning
+   * box the page is already showing. Copying either back onto the page was duplication.
+   *
+   * The calls that genuinely had nowhere to appear are these ones: the calls ChatGPT
+   * collapsed into a neighbour, which exist in the app's record and in no visible row. They
+   * belong inside the row that swallowed them, so that is where they go.
+   */
+  function setFolded(block, anchor, folded, text) {
+    const chip = block.querySelector('.clf-folded');
+    const list = block.querySelector('.clf-fold-list');
+    if (folded.length === 0) {
+      if (chip) chip.remove();
+      if (list) list.remove();
+      return;
+    }
+
+    const open = chip ? chip.getAttribute('aria-expanded') === 'true' : false;
+    const node = chip || document.createElement('span');
+    node.className = 'clf-folded';
+    node.textContent = text;
+    node.setAttribute(
+      'data-clf-tip',
+      `${folded.length} earlier call${folded.length === 1 ? '' : 's'} folded into this row by ChatGPT. Show them.`
     );
+    if (!chip) {
+      // The chip sits inside ChatGPT's own header button, so its click would also open the
+      // row's card. Ours is a separate control with a separate meaning, so it takes the
+      // event: the alternative is a chip that cannot be clicked without doing something else.
+      node.setAttribute('role', 'button');
+      node.setAttribute('tabindex', '0');
+      node.setAttribute('aria-expanded', 'false');
+      const toggle = (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        const showing = node.getAttribute('aria-expanded') === 'true';
+        node.setAttribute('aria-expanded', showing ? 'false' : 'true');
+        const body = block.querySelector('.clf-fold-list');
+        if (body) body.hidden = showing;
+      };
+      node.addEventListener('click', toggle);
+      node.addEventListener('keydown', (event) => {
+        if (event.key === 'Enter' || event.key === ' ') toggle(event);
+      });
+      anchor.insertAdjacentElement('afterend', node);
+    }
+
+    const body = list || document.createElement('div');
+    body.className = 'clf-fold-list';
+    body.hidden = !open;
+    body.replaceChildren(...folded.map((call) => foldedRow(call)));
+    if (!list) {
+      // Outside the header button, so the list is not inside a control that toggles the
+      // row's own card, and a click on a line of it does nothing at all.
+      const header = block.querySelector('button');
+      if (header && header.parentElement) header.insertAdjacentElement('afterend', body);
+      else block.append(body);
+    }
+  }
+
+  /** One folded call, in the same shape as the row it is folded into. */
+  function foldedRow(call) {
+    const line = document.createElement('div');
+    line.className = `clf-row clf-${call.summary.tone}`;
+    const icon = document.createElement('span');
+    icon.className = 'clf-row-icon';
+    icon.setAttribute('aria-hidden', 'true');
+    setToolIcon(icon, call.summary.kind);
+    const label = document.createElement('span');
+    label.className = 'clf-label';
+    label.textContent = labelText(call);
+    if (SHOW_TIMES) {
+      const time = document.createElement('span');
+      time.className = 'clf-time';
+      time.textContent = clockText(call.time);
+      line.append(time);
+    }
+    line.append(icon);
+    // A folded run is where agents get mixed up most easily: ChatGPT collapses by tool
+    // name, which says nothing about who called it, so one row can hide two agents' work.
+    const who = agentText(call);
+    if (who) {
+      const tag = document.createElement('span');
+      tag.className = 'clf-agent';
+      tag.textContent = who;
+      line.append(tag);
+    }
+    line.append(label);
+    const wantedMetric = displayMetric(call.summary);
+    if (wantedMetric) {
+      const metric = document.createElement('span');
+      metric.className = 'clf-metric';
+      metric.textContent = wantedMetric;
+      line.append(metric);
+    }
+    return line;
+  }
+
+  /**
+   * Names a row from ChatGPT's own record of the chat, when the app has nothing to say.
+   *
+   * This is the case that made relabelling look broken in every chat but one: the local
+   * recorder only ever holds the slice of a conversation it observed live, so a chat that
+   * has been going for days shows connector rows for calls that were never recorded here.
+   * No matching rule can fix that — there is nothing to match against.
+   *
+   * What it deliberately does *not* do is dress the result up as the app's own. There is
+   * no result, no duration, no outcome and no summary, because the app did not run this
+   * call; it gets the tool's name, a quieter treatment than a matched row, and a tooltip
+   * that says where the name came from. If a recorded call turns up for this block later,
+   * applyLabel replaces all of this — the recorder is authoritative wherever it has an
+   * entry, and this block stays unbound precisely so that can happen.
+   */
+  function applyPageLabel(block, seen) {
+    if (!seen || !seen.tool) return;
+    const label = CLF_DOM.toolLabel(block);
+    if (!label) return;
+    if (block.dataset.clfPage === seen.tool) return;
+    if (!block.dataset.clfOriginal) block.dataset.clfOriginal = label.textContent || '';
+    block.dataset.clfPage = seen.tool;
+    label.textContent = seen.tool;
+    label.classList.add('clf-tool-title');
+    label.title =
+      `${seen.path || seen.tool}${seen.app ? ` — ${seen.app}` : ''}\n` +
+      'Named from this chat’s own record. This app did not run the call, so it has no ' +
+      'result or duration here.\n' +
+      `Originally: ${block.dataset.clfOriginal}`;
+    block.classList.add('clf-tool', 'clf-page');
+  }
+
+  /**
+   * Takes a recorded call's label back off a row, leaving what ChatGPT drew.
+   *
+   * The one caller is a row whose own descriptor names a different tool than the call it
+   * is wearing, so the label is known to be wrong rather than merely unproven. Leaving it
+   * would be the single outcome worse than "Called tool": another call's name, in this
+   * app's own styling, with a duration and an outcome, over work it did not describe.
+   *
+   * `clfOriginal` is deliberately kept. It is what ChatGPT said before anything here
+   * touched the row, applyPageLabel wants it for the tooltip, and re-reading it from a
+   * label this code has already overwritten would preserve the wrong name forever.
+   */
+  function releaseLabel(block) {
+    const label = CLF_DOM.toolLabel(block);
+    if (label) {
+      if (block.dataset.clfOriginal) label.textContent = block.dataset.clfOriginal;
+      label.classList.remove('clf-tool-title');
+      label.removeAttribute('title');
+    }
+    for (const selector of [
+      '.clf-tool-icon',
+      '.clf-agent',
+      '.clf-tool-detail',
+      '.clf-metric',
+      '.clf-when',
+      '.clf-folded',
+      '.clf-fold-list'
+    ]) {
+      const node = block.querySelector(selector);
+      if (node) node.remove();
+    }
+    block.classList.remove('clf-tool', 'clf-page', 'clf-good', 'clf-bad', 'clf-warn', 'clf-neutral');
+    delete block.dataset.clfCall;
+    delete block.dataset.clfKind;
+    delete block.dataset.clfOutcome;
+    delete block.dataset.clfAgent;
+    // Cleared too, so applyPageLabel treats this as a row it has never named and puts the
+    // page's own tool name on it in this same pass.
+    delete block.dataset.clfPage;
+  }
+
+  /**
+   * Gives every row this app has named back to ChatGPT.
+   *
+   * The disabled half of paint(), and it runs the restore rather than merely skipping the
+   * loop for the same reason renderStreams() does: a switch flipped off mid-session has to
+   * undo what it did, or our labels stay frozen on the page for the life of the tab.
+   */
+  function unpaint() {
+    for (const turn of CLF_DOM.turns()) {
+      if (turn.role !== 'assistant') continue;
+      for (const block of CLF_DOM.toolBlocks(turn)) {
+        if (!block.dataset.clfCall && !block.dataset.clfPage) continue;
+        releaseLabel(block);
+      }
+    }
+    painted = false;
   }
 
   function paint() {
-    if (entries.length === 0) return;
+    // Presentation, all of it. applyLabel and applyPageLabel overwrite ChatGPT's own tool
+    // name, add this app's classes, title and block styling — so they belong behind the
+    // same user-controlled switch as the stream renderer, not merely alongside it. A
+    // relabelled row is a visible claim about that record, so Overwrite OFF must release it
+    // too. Capture is untouched: the identity stamps reportPageTools writes are
+    // invisible and keep flowing with the renderer off.
+    if (!(renderStreamAllowed() && status.connected === true && status.paired === true)) {
+      if (painted) unpaint();
+      return;
+    }
+    // With no recorded calls and no page evidence there is nothing any of this could say.
+    if (entries.length === 0 && !fiberPresent) return;
     const byTurn = new Map();
     for (const entry of entries) {
-      // No turn, or a call the app itself could not attribute confidently: leave it
-      // out entirely rather than guessing which block it belongs to.
-      if (!entry.turnId || entry.attribution === 'inferred') continue;
+      // A call the app could not tie to a turn it can see. Attribution 'inferred' never
+      // carries a turn id, so this one test covers both.
+      if (!entry.turnId) continue;
       const list = byTurn.get(entry.turnId) || [];
       list.push(entry);
       byTurn.set(entry.turnId, list);
     }
     for (const turn of CLF_DOM.turns()) {
       if (turn.role !== 'assistant' || !turn.id) continue;
-      const calls = byTurn.get(turn.id);
-      if (!calls || calls.length === 0) continue;
+      const calls = byTurn.get(turn.id) || [];
       const blocks = CLF_DOM.toolBlocks(turn);
-      // One block per recorded call, or no relabelling at all. A partial match would
-      // put the wrong summary on a real tool call, which is worse than showing none.
-      if (blocks.length !== calls.length) continue;
-      blocks.forEach((block, index) => applyLabel(block, calls[index]));
-      try {
-        injectTimeline(turn, calls);
-      } catch {
-        // The page owns this DOM; if it will not take our node, do without it.
+      const named = new Set();
+      if (blocks.length > 0 && calls.length > 0) {
+        const shapes = blocks.map((block) => {
+          const seen = fiberFor(block);
+          return {
+            callId: block.dataset.clfCall || null,
+            original: originalLabel(block),
+            // How many calls this row folded away. Only the page's own client state knows,
+            // and only when the MAIN-world helper is there; 0 is the honest default and
+            // is exactly the behaviour this had before that helper existed.
+            hidden: seen ? seen.hidden : 0,
+            // The tool this row's own descriptor names, which lets a match be refused on
+            // evidence about the row rather than on where it sits. null whenever the page
+            // did not say, which is the same as not asking.
+            tool: seen ? seen.tool : null
+          };
+        });
+        for (const [index, call, folded] of planLabels(shapes, calls)) {
+          if (call === null) {
+            releaseLabel(blocks[index]);
+            continue;
+          }
+          applyLabel(blocks[index], call, folded);
+          named.add(index);
+          painted = true;
+        }
       }
+      // Rows the app cannot account for. In a chat older than this app's record of it —
+      // which is most of a long-running chat — that is nearly all of them.
+      blocks.forEach((block, index) => {
+        if (named.has(index) || block.dataset.clfCall) return;
+        applyPageLabel(block, fiberFor(block));
+        if (block.dataset.clfPage) painted = true;
+      });
     }
   }
 
-  async function pullActivity() {
-    if (!conversationId || !status.paired) return;
-    const reply = await ask({ type: 'activity', conversationId, since });
-    if (!reply || reply.ok !== true || !reply.data) return;
-    const fresh = Array.isArray(reply.data.entries) ? reply.data.entries : [];
-    if (fresh.length > 0) {
-      entries = entries.concat(fresh);
-      if (entries.length > 2000) entries.splice(0, entries.length - 2000);
-      since = fresh[fresh.length - 1].seq;
+  /** Keeps the newest recorded calls and forgets the rest, feed and index together. */
+  function trimEntries() {
+    entries = [...bySeq.values()].sort((a, b) => a.seq - b.seq);
+    if (entries.length <= 2000) return;
+    const drop = entries.splice(0, entries.length - 2000);
+    for (const entry of drop) bySeq.delete(entry.seq);
+  }
+
+  /**
+   * Pulls this chat's recorded activity from the app and paints it onto the page.
+   *
+   * Everything below the first `await` belongs to the conversation that was current when
+   * the request went out, and to nothing else. Without that check a reply requested for
+   * chat A could come back after the tab had moved to chat B and repopulate `entries`,
+   * `job` and `bootstrap` from A, then fold what it took to be the bootstrap
+   * instruction — which in chat B is the user's own first message — and paint A's tool
+   * labels onto B's rows. `resetConversation()` cannot prevent this: it clears state, but
+   * a request already in flight is not state, and it lands afterwards.
+   *
+   * Both the id and the epoch are checked. The id alone would pass for A → B → A, which is
+   * one back button away and would apply a reply from a genuinely different visit.
+   */
+  /**
+   * Reading order for one window of the app feed. Mirrors `src/shared/chronology.ts`; the
+   * two must stay identical, because this stream and the desktop transcript are the same
+   * record and may not disagree about its order. See that file for why the reordering is
+   * turn-local and why sorting the whole feed by time would corrupt reloaded history.
+   */
+  function chronological(entries) {
+    const bySeq = [...entries].sort((a, b) => a.seq - b.seq);
+    const anchors = new Map();
+    for (const entry of bySeq) {
+      if (entry.kind === 'turn_start' && entry.turnId && !anchors.has(entry.turnId)) {
+        anchors.set(entry.turnId, entry.seq);
+      }
     }
-    paint();
+    const rank = (entry) => (entry.kind === 'turn_start' ? -1 : entry.kind === 'turn_end' ? 1 : 0);
+    const byTime = (a, b) => {
+      const apart = a.time - b.time;
+      return Number.isFinite(apart) && apart !== 0 ? apart : a.seq - b.seq;
+    };
+    const groups = new Map();
+    for (const entry of bySeq) {
+      const anchor = (entry.turnId ? anchors.get(entry.turnId) : undefined) ?? entry.seq;
+      const held = groups.get(anchor);
+      if (held) held.push(entry);
+      else groups.set(anchor, [entry]);
+    }
+    const out = [];
+    for (const anchor of [...groups.keys()].sort((a, b) => a - b)) {
+      const group = groups.get(anchor);
+      group.sort((a, b) => rank(a) - rank(b) || byTime(a, b));
+      out.push(...group);
+    }
+    return out;
+  }
+
+  /** Keeps the app-owned render feed bounded while preserving reading order. */
+  function trimStream() {
+    const bySequence = [...streamBySeq.values()].sort((a, b) => a.seq - b.seq);
+    if (bySequence.length > 4000) {
+      for (const entry of bySequence.slice(0, bySequence.length - 4000)) streamBySeq.delete(entry.seq);
+    }
+    streamEntries = chronological(bySequence.slice(-4000));
+  }
+
+  /**
+   * Groups the app feed by its own turn lifecycle, ignoring ChatGPT's reusable DOM ids.
+   *
+   * This is what makes a reload survivable: `settledGenerations` is a WeakMap owned by one
+   * page lifetime, while the app's `turn_start` / `turn_end` events are durable. Visible
+   * assistant turns and recorded app turns are both chronological lists, so the renderer can
+   * align their newest tails even when no in-memory node→generation mapping survived.
+   *
+   * Turns are indexed by their durable id, not tracked with a pointer at the newest one. A
+   * tool call is appended only once attribution has resolved, and the grace window for that
+   * is 5 s — long enough for the user to have sent the next message already. A pointer at the
+   * newest open turn would hand that call to the turn after the one that made it.
+   */
+  function streamTurnGroups(entries) {
+    const groups = [];
+    const byTurn = new Map();
+    const orphanTools = [];
+    for (const entry of entries) {
+      if (entry.kind === 'turn_start') {
+        const group = { id: entry.turnId || `seq:${entry.seq}`, entries: [entry], startedAt: Number(entry.time) || 0 };
+        groups.push(group);
+        if (entry.turnId) byTurn.set(entry.turnId, group);
+        continue;
+      }
+      // Membership is by durable id and nothing else. An event naming a turn this feed
+      // opened belongs to that turn however late it lands and whatever has started since;
+      // an event this feed cannot name belongs to no group at all.
+      //
+      // The alternative — dropping an unowned event into whichever turn is open where it was
+      // observed — is a guess, and it is the guess that made reloads swirl: backfill re-reports
+      // historical answers under ChatGPT's own recycled request ids, and by position those land
+      // in the live turn. An unattributed tool call has the same shape with no id at all. The
+      // renderer falls back to ChatGPT's native rendering for a turn it has no group for, so
+      // the cost of refusing is a row rendered natively; the cost of guessing is a wrong
+      // transcript.
+      const owner = entry.turnId ? byTurn.get(entry.turnId) : null;
+      if (owner) owner.entries.push(entry);
+      else if (entry.kind === 'tool_call' && !entry.turnId) orphanTools.push(entry);
+    }
+
+    // Rendering-only recovery. The app can have a successful tool call in this conversation
+    // without a turn id when the page lifecycle closed the generation too early. Do not
+    // rewrite or reattribute the event; place it visually into the recorded turn whose start
+    // time precedes the tool's real startedAt. This keeps the page useful while the recorder
+    // attribution/lifecycle repair is intentionally deferred (TODO T-127).
+    for (const entry of orphanTools) {
+      const at = Number(entry.time) || 0;
+      let owner = null;
+      for (const group of groups) {
+        if (group.startedAt > at) break;
+        owner = group;
+      }
+      if (!owner && groups.length > 0 && entry.seq > groups[0].entries[0].seq) owner = groups[0];
+      if (owner) owner.entries.push(entry);
+    }
+
+    const rank = (entry) => (entry.kind === 'turn_start' ? -1 : entry.kind === 'turn_end' ? 1 : 0);
+    const order = (a, b) => rank(a) - rank(b) || (Number(a.time) || 0) - (Number(b.time) || 0) || a.seq - b.seq;
+    for (const group of groups) group.entries.sort(order);
+    return groups;
+  }
+
+  /** A streaming commentary node grows in place; show its newest prefix, not every partial. */
+  function visibleStream(entries, groupId = null) {
+    const out = [];
+    for (const original of entries) {
+      // Compatibility repair for sessions recorded before the live-markdown fix: interim
+      // assistant messages could be stamped `final:true` under a recycled request id while
+      // physically occurring inside a newer local turn. Preserve the visible line, but do
+      // not present it as that turn's final answer. New recordings use #a progress ids and
+      // never enter this branch.
+      const entry =
+        groupId &&
+        original.kind === 'assistant_message' &&
+        original.final === true &&
+        original.turnId &&
+        original.turnId !== groupId
+          ? { ...original, kind: 'progress', progressId: `legacy-assistant:${original.seq}` }
+          : original;
+      const previous = out[out.length - 1];
+      // Only for commentary the app could not name. A caption that has a progressId is
+      // already one row by construction — the app folded its snapshots before sending it —
+      // and merging two named captions here because one happens to begin with the other
+      // would throw away a real second caption.
+      if (
+        entry.kind === 'progress' &&
+        !entry.progressId &&
+        previous &&
+        previous.kind === 'progress' &&
+        !previous.progressId &&
+        entry.text &&
+        previous.text &&
+        entry.text.startsWith(previous.text)
+      ) {
+        out[out.length - 1] = entry;
+      } else {
+        out.push(entry);
+      }
+    }
+    return out;
+  }
+
+  function streamRow(entry) {
+    const row = document.createElement('div');
+    row.className = `clf-stream-row clf-stream-${entry.kind}`;
+    row.dataset.clfSeq = String(entry.seq);
+
+    const icon = document.createElement('span');
+    icon.className = 'clf-stream-icon';
+    icon.setAttribute('aria-hidden', 'true');
+    if (entry.kind === 'tool_call') setToolIcon(icon, entry.summary && entry.summary.kind);
+    else if (entry.kind === 'page_tool') setToolIcon(icon, 'search');
+    else icon.textContent = entry.kind === 'chat_error' ? '!' : entry.kind === 'agent_message' ? '↔' : '';
+    row.append(icon);
+
+    if (entry.agent) {
+      const who = document.createElement('span');
+      who.className = 'clf-agent';
+      who.textContent = String(entry.agent).slice(0, 40);
+      row.append(who);
+    }
+
+    const body = document.createElement('span');
+    body.className = 'clf-stream-text';
+    if (entry.kind === 'tool_call') {
+      body.textContent = entry.summary && entry.summary.title ? entry.summary.title : `Ran ${entry.tool || 'tool'}`;
+      if (entry.summary && entry.summary.detail) {
+        const detail = document.createElement('span');
+        detail.className = 'clf-tool-detail';
+        detail.textContent = entry.summary.detail;
+        body.append(' ', detail);
+      }
+    } else if (entry.kind === 'agent_message') {
+      body.textContent = `${entry.from || 'agent'} → ${entry.to || 'agent'}: ${entry.text || ''}`;
+    } else if (entry.kind === 'page_tool') {
+      body.textContent = entry.label || 'ChatGPT tool';
+    } else if (entry.kind === 'turn_start') {
+      body.textContent = 'Turn started';
+    } else if (entry.kind === 'turn_end') {
+      const outcome = entry.outcome ? String(entry.outcome).replace(/_/g, ' ') : 'completed';
+      body.textContent = `Turn ${outcome}${entry.detail ? ` · ${entry.detail}` : ''}`;
+    } else {
+      body.textContent = entry.text || '';
+    }
+    row.append(body);
+
+    const wantedMetric = entry.kind === 'tool_call' ? displayMetric(entry.summary) : '';
+    if (wantedMetric) {
+      const metric = document.createElement('span');
+      metric.className = 'clf-metric';
+      metric.textContent = wantedMetric;
+      row.append(metric);
+    }
+    if (SHOW_TIMES && !entry.dom) {
+      const when = document.createElement('span');
+      when.className = 'clf-when';
+      when.textContent = clockText(entry.time);
+      row.append(when);
+    }
+    return row;
+  }
+
+  /**
+   * Whether a Fiber descriptor names one of *this* app's connectors.
+   *
+   * Kept in one place because getting it wrong is silent and total: 1.7.1 split the model
+   * surface into a Core and a Desktop connector, and while this test still spelled the
+   * single pre-1.7.1 name, no descriptor on any page matched it. Every call then looked
+   * like a stranger's — so it produced no attribution evidence and, worse, local rows were
+   * classified as ChatGPT-native activity and re-recorded as the assistant's own captions.
+   * `app_name` comes from the protected-resource metadata this app serves, not from what
+   * the user typed into ChatGPT, so these are this app naming itself.
+   *
+   * Exact names, never a prefix: `ChatGPT Local Files Backup` would be somebody else's
+   * connector, and a prefix test would have this app vouch for its traffic.
+   */
+  const OUR_CONNECTORS = ['ChatGPT Local Files Core', 'ChatGPT Local Files Desktop', 'TobisComputer'];
+
+  function ourConnectorApp(name) {
+    return typeof name === 'string' && OUR_CONNECTORS.includes(name);
+  }
+
+  function ourConnectorSeen(seen) {
+    if (!seen) return false;
+    if (ourConnectorApp(seen.app)) return true;
+    if (typeof seen.path !== 'string' || !seen.path.startsWith('/')) return false;
+    const end = seen.path.indexOf('/', 1);
+    return end > 1 && ourConnectorApp(seen.path.slice(1, end));
+  }
+
+  function localConnector(block, localTools) {
+    if (block.dataset.clfCall) return true;
+    const seen = fiberFor(block);
+    if (!seen) return false;
+    if (ourConnectorSeen(seen)) return true;
+    return Boolean(seen.tool && localTools.has(seen.tool) && ourConnectorApp(seen.app));
+  }
+
+  function renderStreams() {
+    // The app owns presentation while Overwrite is on. ChatGPT's DOM stays alive underneath
+    // as the recorder's observation source, but it contributes zero visible ordering or
+    // prose: the local event stream is rendered exactly in the order the app returns it.
+    const enabled = renderStreamAllowed() && status.connected === true && status.paired === true;
+    const sourceTurns = typeof CLF_DOM.presentationTurns === 'function' ? CLF_DOM.presentationTurns() : CLF_DOM.turns();
+    const assistantTurns = sourceTurns.filter((turn) => turn.role === 'assistant' && turn.id);
+    const groups = streamTurnGroups(streamEntries);
+    /**
+     * Whether the DOM has run ahead of the feed, which makes tail alignment a lie.
+     *
+     * Aligning groups to visible turns by position exists for one real case: after a reload
+     * the app's durable turn ids and the page's DOM ids have nothing in common, and matching
+     * the tail of one list to the tail of the other is how a reloaded transcript gets its
+     * recorded content back. That case is sound because the two lists genuinely correspond.
+     *
+     * They stop corresponding the instant the user sends a message. ChatGPT renders the new
+     * assistant turn immediately, and the app's `turn_start` for it is a round trip away, so
+     * for that poll the DOM holds one more assistant turn than the feed holds groups. The
+     * tail offset slips by one and *every* turn is aligned to its predecessor — the whole of
+     * the last answer, prose and tool rows and all, drawn underneath the message just sent.
+     * That is the "entire history copied after my second message" report, and it is the same
+     * positional guessing that was taken out of streamTurnGroups().
+     *
+     * The two cases are told apart by whether this document minted the newest turn itself. A
+     * turn this script watched begin has a local generation id; if the feed has no group for
+     * it, the app simply has not caught up, the lists do not correspond, and nothing may be
+     * aligned by position. A reloaded turn has no local id at all — this document never saw
+     * it start — and that is exactly when the tail is the only correspondence there is.
+     */
+    const newest = assistantTurns[assistantTurns.length - 1] || null;
+    const newestLocal = newest ? localGenerationOf(newest) : null;
+    const domAhead =
+      newestLocal !== null && !groups.some((group) => group.id === newestLocal || group.id === newest.id);
+    const tailOffset = groups.length - assistantTurns.length;
+    for (let turnIndex = 0; turnIndex < assistantTurns.length; turnIndex++) {
+      const turn = assistantTurns[turnIndex];
+      if (turn.role !== 'assistant' || !turn.id) continue;
+      const nodes = turn.nodes || (turn.node ? [turn.node] : []);
+      const existing = nodes.map((node) => node && node.querySelector ? node.querySelector('.clf-stream') : null).find(Boolean) || null;
+      // Through the generation key, not the page's turn id. Everything this script reports
+      // is now filed under a locally minted key, because ChatGPT reuses `data-turn-id` from
+      // one turn to the next; comparing the DOM id against that key matches nothing, so the
+      // live turn was never recognised as live and the reconstruction it is for — the page
+      // ordering, the commentary in its own place — never ran at all.
+      const localId = localGenerationOf(turn);
+      const direct = groups.find((group) => group.id === localId || group.id === turn.id) || null;
+      const alignedIndex = tailOffset + turnIndex;
+      const aligned =
+        !domAhead && alignedIndex >= 0 && alignedIndex < groups.length ? groups[alignedIndex] : null;
+      const group = direct || aligned;
+      // Fallback for old/unit feeds that predate turn_start/turn_end in /activity.
+      const raw = group
+        ? group.entries
+        : streamEntries.filter(
+            (entry) => entry.turnId === turn.id || (localId !== null && entry.turnId === localId)
+          );
+      const rendered = visibleStream(raw, group ? group.id : localId || turn.id);
+
+      if (!enabled || rendered.length === 0) {
+        if (existing) existing.remove();
+        CLF_DOM.replaceTurn(turn, null, false);
+        CLF_DOM.hideProgress(turn, false);
+        for (const block of CLF_DOM.toolBlocks(turn)) block.removeAttribute('data-clf-native-hidden');
+        continue;
+      }
+
+      const root = existing || document.createElement('div');
+      root.className = 'clf-stream';
+      root.dataset.clfTurn = turn.id;
+      // Commentary text is part of the signature: one caption grows in place under the same
+      // seq, so a signature made of seq and kind alone would never notice it had changed.
+      const signature = `${SHOW_TIMES ? 'times:1' : 'times:0'}|` + rendered
+        .map((entry) =>
+          [
+            entry.seq,
+            entry.kind,
+            entry.text || '',
+            entry.label || '',
+            entry.outcome || '',
+            entry.detail || '',
+            entry.summary && entry.summary.title ? entry.summary.title : '',
+            entry.summary && entry.summary.detail ? entry.summary.detail : '',
+            entry.summary ? displayMetric(entry.summary) : '',
+            entry.agent || ''
+          ].join(':')
+        )
+        .join('|');
+      if (root.dataset.clfSignature !== signature) {
+        root.dataset.clfSignature = signature;
+        root.replaceChildren(...rendered.map(streamRow));
+      }
+      // Clear the old selective-hiding state from pre-1.7.4 renderers. The section marker
+      // below now owns visibility wholesale.
+      CLF_DOM.hideProgress(turn, false);
+      for (const block of CLF_DOM.toolBlocks(turn)) block.removeAttribute('data-clf-native-hidden');
+      CLF_DOM.replaceTurn(turn, root, true);
+    }
+  }
+
+  /**
+   * Stream kinds whose later snapshots replace the one already held at that sequence.
+   *
+   * Only these two. Everything else in the stream is a thing that happened once, and a
+   * second delivery of it under the same sequence is a repeat to be ignored, not an update.
+   */
+  const UPSERT_KINDS = new Set(['progress', 'page_tool']);
+
+  /** What a stream entry currently says, whichever field its kind keeps it in. */
+  const snapshotText = (entry) => (entry ? (entry.kind === 'page_tool' ? entry.label : entry.text) : undefined);
+
+  async function pullActivity() {
+    if (pulling || !conversationId) return;
+    pulling = true;
+    const forId = conversationId;
+    const forEpoch = epoch;
+    const current = () => alive && conversationId === forId && epoch === forEpoch;
+    try {
+      const reply = await ask({ type: 'activity', conversationId, since });
+      if (!reply || reply.ok !== true || !reply.data) return;
+      if (!current()) return;
+      const data = reply.data;
+      const freshStream = Array.isArray(data.stream) ? data.stream : [];
+      let streamAdded = 0;
+      for (const entry of freshStream) {
+        const seq = Number(entry && entry.seq);
+        if (!Number.isFinite(seq)) continue;
+        if (seq >= since) since = seq + 1;
+        // Commentary and native tool rows arrive again as they change, under the seq they
+        // first appeared at — that is what keeps one caption one row instead of a new row
+        // per redraw, and one tool row instead of one per relabel. So a repeat of a seq we
+        // hold replaces it rather than being discarded as already seen.
+        //
+        // Both kinds, not just progress. `page_tool` supersession was added on the app side
+        // and then dropped here, because a held entry of any other kind fell straight
+        // through this guard: `Inspecting files` could never become `Inspected files`.
+        const held = streamBySeq.get(seq);
+        if (held) {
+          if (!entry || entry.kind !== held.kind || !UPSERT_KINDS.has(held.kind)) continue;
+          if (snapshotText(held) === snapshotText(entry)) continue;
+        }
+        streamBySeq.set(seq, entry);
+        streamAdded++;
+      }
+      if (streamAdded > 0) trimStream();
+
+      const fresh = Array.isArray(data.entries) ? data.entries : [];
+      let added = 0;
+      for (const entry of fresh) {
+        const seq = Number(entry && entry.seq);
+        if (!Number.isFinite(seq)) continue;
+        // Ask for what comes *after* this one next time. Asking from `seq` itself is the
+        // bug that made the feed repeat its last entry forever.
+        if (seq >= since) since = seq + 1;
+        if (bySeq.has(seq)) continue;
+        bySeq.set(seq, entry);
+        added++;
+      }
+      if (added > 0) trimEntries();
+      const nextSince = Number(data.nextSince);
+      if (Number.isFinite(nextSince) && nextSince > since) since = nextSince;
+      job = data.job || null;
+      pendingTools = Number.isFinite(Number(data.pendingTools)) ? Number(data.pendingTools) : 0;
+      // The generation this chat has open in the app, if any. Only ever *read* by
+      // resumeOpenTurn(), on the boot pull, and only to work out whether this document is
+      // standing in the middle of a turn a previous one opened. See adoptTurnId.
+      appActiveTurnId = typeof data.activeTurnId === 'string' && data.activeTurnId ? data.activeTurnId : null;
+      tokens = Number.isFinite(Number(data.tokens)) ? Number(data.tokens) : 0;
+      context = readContext(data.context);
+      bootstrap = data.bootstrap === 'resume' || data.bootstrap === 'worker' ? data.bootstrap : null;
+      if (job && job.busy) pressedAt = 0;
+      // The local phase describes this tab's part of a native compaction, which is over
+      // the moment the app's job has moved past waiting for the handoff. Leaving it set
+      // would make the button go on saying "ChatGPT is writing…" over a finished job.
+      if (!job || job.stage !== 'handoff-pending') {
+        nativePhase = '';
+        if (!job || !job.busy) nativeBusy = false;
+      }
+      // Before painting, not after: a row's fold count decides which call goes on it, and
+      // painting first would label from a stale count and then have to move it.
+      await refreshFiber();
+      if (generating) {
+        const liveTurn = generationTurn();
+        if (liveTurn) {
+          reportToolBlocks(liveTurn.node);
+          void flush();
+        }
+      }
+      // Checked again: refreshFiber() talks to the page context, so the tab can move
+      // between the check above and the painting below.
+      if (!current()) return;
+      paint();
+      renderStreams();
+      foldBootstrap();
+      renderControl();
+      injectStage();
+    } finally {
+      pulling = false;
+    }
+    // Outside the guard, and last: startCompact runs for tens of seconds and polls this
+    // same endpoint while it works, so firing it with `pulling` still set would deadlock
+    // the run against the poll that started it.
+    await maybeAutoCompact();
+  }
+
+  // ------------------------------------------------------- composer control
+
+  /**
+   * What the Compact & resume control should say right now. Pure, so it can be tested.
+   *
+   * The app is the authority on all of it: `job` is this chat's own resume job. The local
+   * fields cover only the seconds before the app has answered at all, so the button never
+   * sits there looking idle immediately after being pressed.
+   */
+  function controlState(input) {
+    const { job, connected, disconnected, conversationId, pressedAt, error, now, phase } = input;
+
+    if (job && job.busy) {
+      if (job.stage === 'opening') {
+        return { mode: 'busy', label: 'Opening fresh chat…', hint: 'Handoff saved', action: 'cancel' };
+      }
+      if (job.stage === 'waiting-for-browser') {
+        return {
+          mode: 'waiting',
+          label: 'Waiting for Chrome…',
+          hint: job.error || 'The app is trying to open the fresh chat.',
+          action: 'cancel'
+        };
+      }
+      // The progress of this is local — interrupting, waiting for tools, typing — and only
+      // the last stretch is something the app can report. `phase` is what this tab is doing
+      // right now; `handoff-pending` is the app saying it has asked and is waiting.
+      return {
+        mode: 'busy',
+        label: NATIVE_PHASE_LABELS[phase] || 'Asking ChatGPT…',
+        hint: 'ChatGPT is writing the handoff',
+        action: 'cancel'
+      };
+    }
+    /**
+     * A live turn is not a reason to hide.
+     *
+     * This *interrupts* the turn on purpose: the case somebody actually presses it in is a
+     * long turn they no longer want to wait out, and a button that disappears exactly then
+     * is a button that is missing whenever it is wanted.
+     */
+    if (job && job.stage === 'done') {
+      return { mode: 'done', label: 'Fresh chat opened', hint: '', action: 'start' };
+    }
+    if (job && job.stage === 'failed') {
+      if (job.error === 'cancelled') {
+        return { mode: 'idle', label: 'Compact & resume', hint: 'Resume cancelled', action: 'start' };
+      }
+      return { mode: 'error', label: 'Compaction failed', hint: job.error || '', action: 'start' };
+    }
+    if (pressedAt > 0 && now - pressedAt < PRESS_GRACE_MS) {
+      return { mode: 'busy', label: 'Starting…', hint: '', action: 'none' };
+    }
+    if (error) return { mode: 'error', label: 'Could not start', hint: error, action: 'start' };
+    if (disconnected) {
+      return {
+        mode: 'off',
+        label: 'Compact & resume',
+        hint: 'Browser connection is disconnected in ChatGPT Local Files.',
+        action: 'none'
+      };
+    }
+    if (!connected) {
+      return {
+        mode: 'off',
+        label: 'Compact & resume',
+        hint: 'ChatGPT Local Files is not running on this PC.',
+        action: 'none'
+      };
+    }
+    if (!conversationId) {
+      return { mode: 'off', label: 'Compact & resume', hint: 'Send a message first.', action: 'none' };
+    }
+    return { mode: 'idle', label: 'Compact & resume', hint: '', action: 'start' };
+  }
+
+  /**
+   * Tells our stylesheet which way ChatGPT is currently painted.
+   *
+   * Our hover bubble copies colours the page has no variable for, so it carries a light
+   * and a dark set of its own and one of the two has to be chosen. The choice is the
+   * page's: ChatGPT's appearance setting is independent of the operating system's, so a
+   * `prefers-color-scheme` rule put the bubble on the opposite surface from the page for
+   * anyone whose two settings disagree — a white pill on a dark conversation.
+   *
+   * Re-read on the observe tick rather than once at startup, because the setting can be
+   * changed while the tab is open, and written only on a change so the common case costs
+   * one string comparison.
+   */
+  let themeNow = null;
+
+  function syncTheme() {
+    const theme = CLF_DOM.pageTheme();
+    if (theme === themeNow) return;
+    themeNow = theme;
+    // On the root, so it reaches both the control in the composer and the bubble and menu,
+    // which live in the body's top layer rather than inside the control.
+    document.documentElement.setAttribute('data-clf-theme', theme);
+  }
+
+  /**
+   * ChatGPT's hover bubble, for this extension's own controls.
+   *
+   * Everything here used the `title` attribute, which the operating system draws: a pale
+   * rectangle in the platform's font, on the platform's delay, looking nothing like the page
+   * around it. This is the same text on the same trigger, drawn the way the page draws its
+   * own — see `.clf-tip` for the measurements, which are the composer's.
+   *
+   * One bubble for the document, and the listeners are delegated, because the controls that
+   * use it are rebuilt every time ChatGPT replaces the composer and per-control listeners
+   * would accumulate one set per re-render for as long as the tab is open.
+   */
+  const TIP_DELAY_MS = 350;
+  let tipNode = null;
+  let tipTimer = null;
+  let tipFor = null;
+
+  function tipElement() {
+    if (tipNode && tipNode.isConnected) return tipNode;
+    tipNode = document.createElement('div');
+    tipNode.className = 'clf-tip';
+    tipNode.setAttribute('role', 'tooltip');
+    tipNode.hidden = true;
+    (document.body || document.documentElement).append(tipNode);
+    return tipNode;
+  }
+
+  function hideTip() {
+    if (tipTimer !== null) clearTimeout(tipTimer);
+    tipTimer = null;
+    tipFor = null;
+    if (tipNode) tipNode.hidden = true;
+  }
+
+  /** Above the control and centred on it, clamped so a control near an edge still reads. */
+  function placeTip(anchor) {
+    const tip = tipElement();
+    const at = anchor.getBoundingClientRect();
+    const width = tip.offsetWidth;
+    const height = tip.offsetHeight;
+    const left = Math.max(8, Math.min(at.left + at.width / 2 - width / 2, window.innerWidth - width - 8));
+    const above = at.top - height - 8;
+    tip.style.left = `${Math.round(left)}px`;
+    tip.style.top = `${Math.round(above < 8 ? at.bottom + 8 : above)}px`;
+  }
+
+  function showTip(anchor) {
+    const text = anchor.getAttribute('data-clf-tip');
+    if (!text) return;
+    const tip = tipElement();
+    tip.textContent = text;
+    // A name sits on one line; a sentence wraps. Deciding by length rather than by caller
+    // keeps every call site to the one attribute.
+    tip.dataset.clfTipWrap = text.length > 44 ? '1' : '0';
+    tip.hidden = false;
+    tipFor = anchor;
+    placeTip(anchor);
+  }
+
+  function wireTips() {
+    const open = (event) => {
+      const at = event.target;
+      const anchor = at && at.nodeType === 1 && at.closest ? at.closest('[data-clf-tip]') : null;
+      if (!anchor || anchor === tipFor) return;
+      hideTip();
+      tipTimer = setTimeout(() => {
+        if (anchor.isConnected) showTip(anchor);
+      }, event.type === 'focusin' ? 0 : TIP_DELAY_MS);
+    };
+    const close = (event) => {
+      const at = event.target;
+      const anchor = at && at.nodeType === 1 && at.closest ? at.closest('[data-clf-tip]') : null;
+      if (anchor && anchor !== tipFor && tipTimer === null) return;
+      hideTip();
+    };
+    document.addEventListener('pointerover', open, true);
+    document.addEventListener('focusin', open, true);
+    document.addEventListener('pointerout', close, true);
+    document.addEventListener('focusout', close, true);
+    document.addEventListener('pointerdown', hideTip, true);
+    window.addEventListener('scroll', hideTip, true);
+  }
+
+  /** The context settings out of /activity, or null if the app sent none. */
+  function readContext(raw) {
+    if (!raw || typeof raw !== 'object') return null;
+    const number = (value) => (Number.isFinite(Number(value)) ? Number(value) : 0);
+    const warn = number(raw.warn);
+    const limit = number(raw.limit);
+    const threshold = number(raw.threshold);
+    if (limit <= 0) return null;
+    return { auto: raw.auto === true, threshold, warn, limit };
+  }
+
+  /**
+   * What the meter shows: how full this conversation is, and of what.
+   *
+   * Two different questions depending on the settings, which is why the ceiling is not a
+   * constant. With automatic compaction on, the number that matters is the threshold,
+   * because that is where something will actually happen — a bar that filled towards a
+   * limit while the chat was compacted at half of it would be measuring the wrong thing.
+   * With it off, nothing acts, so the bar fills towards the limit the app already warns
+   * about and turns amber at the advisory line on the way.
+   *
+   * Returns null when there is nothing honest to draw.
+   */
+  function meterView() {
+    if (!context || tokens <= 0) return null;
+    const auto = context.auto && context.threshold > 0;
+    const ceiling = auto ? context.threshold : context.limit;
+    if (ceiling <= 0) return null;
+    const filled = Math.max(0, Math.min(1, tokens / ceiling));
+    const level = auto
+      ? filled >= 1
+        ? 'full'
+        : filled >= 0.8
+          ? 'near'
+          : 'ok'
+      : tokens >= context.limit
+        ? 'full'
+        : context.warn > 0 && tokens >= context.warn
+          ? 'near'
+          : 'ok';
+    // One compact line is enough in the composer. The meter itself already conveys the rest.
+    const status = `${roundK(tokens)}/${roundK(ceiling)} · autocompact ${context.auto ? 'on' : 'off'}`;
+    return { filled, level, status, tip: status };
+  }
+
+  /** A token count as a person would say it: 12k, 340k, 1.2M. */
+  function roundK(count) {
+    if (count >= 1_000_000) return `${Math.round(count / 100_000) / 10}M`;
+    if (count >= 1_000) return `${Math.round(count / 1_000)}k`;
+    return String(count);
+  }
+
+  /**
+   * Compaction this tab starts on its own, once the conversation is past the threshold.
+   *
+   * Off unless the user turned it on, with their threshold and their provider — see
+   * CompactionSettings. What this function is careful about is *how often*: it must run
+   * once for a conversation, not once per poll.
+   *
+   * The cycle is meant to repeat for as long as the work does: a chat fills up, is
+   * compacted, resumes into a fresh chat, and that chat fills up in its turn. So the guard
+   * cannot be a session-wide latch — it is keyed on the conversation being compacted. The
+   * source chat stays above the threshold forever afterwards (compacting does not shorten
+   * it; it opens a different one), so without that key an old tab left open would ask
+   * again every two seconds for as long as it was open.
+   *
+   * A failed or cancelled attempt does not clear the key either. Something that could not
+   * write a brief a moment ago is unlikely to manage it on the next poll, and a retry loop
+   * against a failing provider is exactly the shape of a run that spends money all night.
+   * The button is right there, and pressing it clears the key by starting a run the user
+   * asked for.
+   */
+  const autoTried = new Set();
+
+  async function maybeAutoCompact() {
+    if (!conversationId || !context || !context.auto) return;
+    if (context.threshold <= 0 || tokens < context.threshold) return;
+    // Anything already running owns this chat, including a run started by hand.
+    if (nativeBusy || pressedAt > 0) return;
+    if (job && job.busy) return;
+    // Not while ChatGPT is mid-answer: the barrier would stop the turn, and stopping a
+    // turn the user is reading because a counter crossed a line is not something to do
+    // unasked. It will still be over the threshold when the turn ends.
+    if (CLF_DOM.generating()) return;
+    if (autoTried.has(conversationId)) return;
+    autoTried.add(conversationId);
+    // Through the same door as the button, so the stop-and-settle barrier, the one-run
+    // guard and the error reporting are the ones that have been tested.
+    await startCompact();
+  }
+
+  /** Local phases of a ChatGPT-native compaction, as the button says them. */
+  const NATIVE_PHASE_LABELS = {
+    requested: 'Starting…',
+    interrupting: 'Stopping this turn…',
+    settling: 'Finishing local tools…',
+    prompting: 'Asking ChatGPT…',
+    waiting: 'ChatGPT is writing…'
+  };
+
+  const ICON =
+    '<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" ' +
+    'stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' +
+    '<path d="M4 12h16"/><path d="M12 3v5.5"/><path d="M9 5.5 12 8.5 15 5.5"/>' +
+    '<path d="M12 21v-5.5"/><path d="M15 18.5 12 15.5 9 18.5"/></svg>';
+
+  let control = null;
+  /** Local phase of a ChatGPT-native compaction this tab is driving. '' when idle. */
+  let nativePhase = '';
+  /** Guards the whole native run: one press, one interrupt, one injected prompt. */
+  let nativeBusy = false;
+
+  function buildControl() {
+    const root = document.createElement('div');
+    root.className = 'clf-composer';
+    root.dataset.clfComposer = '1';
+
+    const pill = document.createElement('span');
+    pill.className = 'clf-pill';
+    const spinner = document.createElement('span');
+    spinner.className = 'clf-spinner';
+    spinner.setAttribute('aria-hidden', 'true');
+    const text = document.createElement('span');
+    text.className = 'clf-pill-text';
+    const cancel = document.createElement('button');
+    cancel.type = 'button';
+    cancel.className = 'clf-cancel';
+    cancel.textContent = '×';
+    cancel.setAttribute('aria-label', 'Cancel Compact & resume');
+    pill.append(spinner, text, cancel);
+
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.className = 'clf-compact-btn';
+    button.innerHTML = ICON;
+
+    /**
+     * The context meter: a bar around the button that fills as the conversation does.
+     *
+     * On the control rather than beside it, because it is the same subject — how full the
+     * chat is, and the thing that does something about it. Composer width is scarce, and a
+     * separate widget would have to earn its own space and then explain its relationship
+     * to the button next to it.
+     */
+    const meter = document.createElement('span');
+    meter.className = 'clf-meter';
+    meter.setAttribute('aria-hidden', 'true');
+    const meterFill = document.createElement('span');
+    meterFill.className = 'clf-meter-fill';
+    meter.append(meterFill);
+    button.append(meter);
+
+    // Every handler stops the event: the composer's own container turns a stray click into
+    // "focus the textarea", and inside a form an unstopped click would try to submit.
+    button.addEventListener('click', (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      const state = currentState();
+      if (state.action === 'start') void startCompact();
+      else if (state.action === 'cancel') void cancelCompact();
+    });
+    cancel.addEventListener('click', (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      void cancelCompact();
+    });
+
+    root.append(pill, button);
+    return { root, pill, text, button, cancel, meter, meterFill };
+  }
+
+  function currentState() {
+    return controlState({
+      job,
+      connected: status.connected && status.paired,
+      disconnected: status.disconnected === true,
+      conversationId,
+      pressedAt,
+      phase: nativePhase,
+      error: localError,
+      now: Date.now()
+    });
+  }
+
+  /**
+   * Puts the control in the composer and keeps it there.
+   *
+   * ChatGPT replaces the composer's subtree on its own schedule — switching chats, going
+   * from empty to non-empty, finishing a turn — and the previous attempt at this lived in
+   * the + menu precisely to avoid that fight. It also meant nobody ever found it. So the
+   * node is re-attached whenever it has been detached, from both a MutationObserver and
+   * the one-second tick, and it is never rebuilt while it is still connected so pressing
+   * it cannot be interrupted by a repaint.
+   */
+  function injectControl() {
+    // A brand-new ChatGPT tab has nothing to compact yet. Do not burn half the composer
+    // on a disabled "send a message first" control: wait until ChatGPT has assigned the
+    // conversation id, which happens with the first sent turn. If navigation returns to a
+    // fresh chat, remove the old control immediately instead of leaving stale UI behind.
+    if (!CLF_DOM.conversationId()) {
+      if (control && control.root.isConnected) control.root.remove();
+      return;
+    }
+    const spot = CLF_DOM.composerActions();
+    if (!spot || !spot.host) return;
+    if (!control || !control.root.isConnected) {
+      if (!control) control = buildControl();
+      // A host that already holds one of ours (a stale node from a previous subtree)
+      // gets cleaned up rather than accumulating copies.
+      for (const stale of spot.host.querySelectorAll('[data-clf-composer]')) {
+        if (stale !== control.root) stale.remove();
+      }
+      if (spot.before && spot.before.parentElement === spot.host) spot.host.insertBefore(control.root, spot.before);
+      else spot.host.append(control.root);
+    } else if (control.root.parentElement !== spot.host) {
+      if (spot.before && spot.before.parentElement === spot.host) spot.host.insertBefore(control.root, spot.before);
+      else spot.host.append(control.root);
+    }
+    renderControl();
+  }
+
+  function renderControl() {
+    if (!control || !control.root.isConnected) return;
+    const state = currentState();
+    const busy = state.mode === 'busy' || state.mode === 'waiting';
+    control.root.hidden = state.mode === 'hidden';
+    control.root.dataset.clfMode = state.mode;
+    control.button.disabled = state.action === 'none';
+    control.button.setAttribute('aria-label', state.label);
+    // The meter only while the button is a button. During a run the control is saying what
+    // it is doing, and a fill level is neither the question nor the answer any more.
+    const meter = state.action === 'start' ? meterView() : null;
+    control.meter.hidden = meter === null;
+    if (meter) {
+      control.meterFill.style.width = `${Math.round(meter.filled * 100)}%`;
+      control.meter.dataset.clfLevel = meter.level;
+    }
+    const tip = state.hint ? `${state.label} — ${state.hint}` : state.label;
+    control.button.setAttribute('data-clf-tip', meter ? `${tip}\n${meter.tip}` : tip);
+    control.pill.hidden = state.mode === 'idle' && !state.hint;
+    control.cancel.hidden = state.action !== 'cancel';
+    const shown = state.hint && !busy ? `${state.label} · ${state.hint}` : state.label;
+    if (control.text.textContent !== shown) control.text.textContent = shown;
+  }
+
+  /**
+   * Folds away the instruction this app typed to start the chat.
+   *
+   * A resumed chat opens with the whole handoff brief and a worker chat with "You are
+   * worker agent worker-n …", and both of them arrive as an ordinary user message — a
+   * screenful of machinery at the top of the transcript, sitting where the thing the user
+   * actually asked for belongs. It has to be sent: ChatGPT needs it. It does not have to
+   * be the first thing anybody reads.
+   *
+   * Folded, never removed. It is a real message that a real model was given, and a
+   * transcript that quietly hides part of its own input is worse than a long one. The
+   * summary says what it is and opens it in place.
+   *
+   * `bootstrap` comes from the session record rather than from this tab's memory of having
+   * typed it, so it still holds when the chat is reopened days later.
+   */
+  function foldBootstrap() {
+    if (!bootstrap) return;
+    const node = CLF_DOM.firstUserMessage();
+    if (!node) return;
+    // Asks the DOM, not a flag. If React re-rendered this message and took our fold with
+    // it, a remembered "already done" would leave the wall of text back on screen forever.
+    if (node.querySelector(':scope > .clf-boot')) return;
+    // Only ever the first user message of a chat the app opened. `runCommand` refuses to
+    // run at all once a conversation exists, so by construction that message is ours.
+    const box = document.createElement('details');
+    box.className = 'clf-boot';
+    const head = document.createElement('summary');
+    head.className = 'clf-boot-head';
+    head.textContent =
+      bootstrap === 'worker'
+        ? 'The instruction this app gave the worker — not something you typed'
+        : 'The handoff brief this app carried over — not something you typed';
+    box.append(head);
+
+    node.dataset.clfBootstrap = bootstrap;
+    // Moved into the fold rather than copied: two copies of a several-thousand-character
+    // brief in one page is the problem again, one of them merely hidden.
+    while (node.firstChild) box.append(node.firstChild);
+    node.append(box);
+  }
+
+  /**
+   * What the panel above the composer should show, or null for "not there at all".
+   *
+   * Pure, so the decision can be tested without a DOM. Deliberately narrow: the panel
+   * answers "what is it doing right now", and the moment there is no answer it leaves
+   * rather than sitting above the input as an empty box.
+   *
+   * Only ever this chat's own work: `job` is reported per conversation, so a tab sitting
+   * idle beside a chat that is compacting shows nothing.
+   */
+  function stageView(input) {
+    const { job } = input;
+    if (!job || !job.busy) return null;
+    const stage =
+      job.stage === 'opening'
+        ? 'Opening a fresh chat'
+        : job.stage === 'waiting-for-browser'
+          ? 'Waiting for Chrome'
+          : 'ChatGPT is writing the handoff';
+    return { stage, detail: '', body: '', kind: 'none' };
+  }
+
+  let stagePanel = null;
+
+  function buildStage() {
+    const root = document.createElement('div');
+    root.className = 'clf-stage';
+    root.dataset.clfStage = '1';
+    root.setAttribute('role', 'status');
+    root.setAttribute('aria-live', 'polite');
+
+    const head = document.createElement('div');
+    head.className = 'clf-stage-head';
+    const title = document.createElement('span');
+    title.className = 'clf-stage-title';
+    const detail = document.createElement('span');
+    detail.className = 'clf-stage-detail';
+    head.append(title, detail);
+
+    const body = document.createElement('div');
+    body.className = 'clf-stage-body';
+
+    root.append(head, body);
+    return { root, title, detail, body };
+  }
+
+  /**
+   * Puts the panel above the composer and keeps it there, on the same terms as the
+   * control beside it: ChatGPT replaces this subtree whenever it feels like it.
+   */
+  function injectStage() {
+    const view = stageView({ job });
+    if (!view) {
+      if (stagePanel) {
+        stagePanel.root.remove();
+        stagePanel = null;
+      }
+      return;
+    }
+    const spot = CLF_DOM.composerStack();
+    if (!spot || !spot.host) return;
+    if (!stagePanel) stagePanel = buildStage();
+    if (stagePanel.root.parentElement !== spot.host) {
+      for (const old of spot.host.querySelectorAll('[data-clf-stage]')) {
+        if (old !== stagePanel.root) old.remove();
+      }
+      if (spot.before && spot.before.parentElement === spot.host) spot.host.insertBefore(stagePanel.root, spot.before);
+      else spot.host.append(stagePanel.root);
+    }
+
+    // The panel is meant to read as a second composer standing behind the real one, which
+    // only works if it is exactly as wide. Measured rather than assumed: ChatGPT's composer
+    // width follows the window and the sidebar, and the parent centres its children instead
+    // of stretching them, so a fixed `max-width` left this sized to its own caption.
+    const box = spot.before && spot.before.getBoundingClientRect ? spot.before.getBoundingClientRect() : null;
+    const width = box && box.width > 0 ? `${Math.round(box.width)}px` : '';
+    if (width && stagePanel.root.style.width !== width) {
+      stagePanel.root.style.width = width;
+      stagePanel.root.style.maxWidth = 'none';
+    }
+
+    if (stagePanel.title.textContent !== view.stage) stagePanel.title.textContent = view.stage;
+    if (stagePanel.detail.textContent !== view.detail) stagePanel.detail.textContent = view.detail;
+    stagePanel.root.dataset.clfStageKind = view.kind;
+    if (stagePanel.body.textContent !== view.body) {
+      // Measured before the text is replaced, not after: afterwards `scrollHeight` is
+      // already the new content's, so the test would answer a question about the old
+      // scroll position using the new document and follow even when the reader had
+      // scrolled up to read something.
+      const atEnd = stagePanel.body.scrollHeight - stagePanel.body.scrollTop - stagePanel.body.clientHeight < 40;
+      stagePanel.body.textContent = view.body;
+      if (atEnd) stagePanel.body.scrollTop = stagePanel.body.scrollHeight;
+    }
+    stagePanel.body.hidden = view.body === '';
+  }
+
+  async function startCompact() {
+    if (!conversationId) return;
+    // One press, one run. The native path spends tens of seconds interrupting and typing,
+    // and a second press inside that window would submit the instruction twice — which is
+    // the one thing the app cannot fix afterwards, because the second prompt is a second
+    // request the model will try to answer — and then two turns each claim to be the brief.
+    if (nativeBusy) return;
+    localError = '';
+    pressedAt = Date.now();
+    job = null;
+    nativeBusy = true;
+    nativePhase = 'requested';
+    renderControl();
+
+    // The barrier, before the request rather than after it.
+    //
+    // What is being summarised is this conversation plus the local recording of the work
+    // done in it, and the app takes its copy of that the moment it accepts this request.
+    // Asking first and stopping afterwards would cut the brief from a conversation whose
+    // last turn was still being written and whose tool calls were still running — a
+    // summary of a machine state that had already moved on.
+    const barrier = await stopAndSettle();
+    if (barrier) {
+      pressedAt = 0;
+      nativeBusy = false;
+      nativePhase = '';
+      localError = barrier;
+      renderControl();
+      void pullActivity();
+      return;
+    }
+
+    const reply = await ask({ type: 'compact', conversationId, resume: true });
+    if (!reply || reply.ok !== true) {
+      pressedAt = 0;
+      nativeBusy = false;
+      nativePhase = '';
+      localError = replyError(reply) || 'The app did not answer.';
+      renderControl();
+      void pullActivity();
+      return;
+    }
+    const data = reply.data || {};
+    if (data.job) job = data.job;
+    // No prompt means the app has already handed one out for this transaction — this tab
+    // pressed twice, or reloaded, or its first request's answer was lost. There is nothing
+    // to submit: submitting a second instruction would start a second turn, and then two
+    // answers would each have a claim on being the brief. Whichever page armed it is
+    // watching it; this one just reports what is already happening.
+    if (!data.prompt) {
+      nativeBusy = false;
+      nativePhase = compactCapture ? 'waiting' : '';
+      if (!compactCapture) {
+        pressedAt = 0;
+        localError = 'A compaction is already under way in this chat. Wait for it, or cancel it.';
+      }
+      renderControl();
+      void pullActivity();
+      return;
+    }
+    await runNativeCompaction(String(data.prompt), String(data.token || ''));
+  }
+
+  /**
+   * Brings the conversation to a standstill so its recording can be copied.
+   *
+   * Returns an empty string when it is standing still, or the reason it would not — which
+   * the caller reports and treats as a refusal to compact at all, because a brief cut from
+   * a moving conversation is worse than no brief.
+   *
+   * Two halves, and the second is the one that is easy to forget: stopping ChatGPT stops
+   * ChatGPT. A local call the app is already running — an edit half-written to disk — does
+   * not hear about it, and the handoff would describe a machine that no longer exists by
+   * the time the fresh chat reads it.
+   */
+  async function stopAndSettle() {
+    // INTERRUPTING — stop the turn rather than wait it out. That is the whole request: the
+    // user presses this because the turn is long, not because it is nearly done.
+    if (CLF_DOM.generating()) {
+      nativePhase = 'interrupting';
+      renderControl();
+      const stop = CLF_DOM.stopButton();
+      if (stop) stop.click();
+      userStopped = true;
+      const stopped = await waitUntil(() => !CLF_DOM.generating(), INTERRUPT_WAIT_MS);
+      if (!stopped) return 'ChatGPT would not stop the current turn. Nothing was compacted.';
+    }
+
+    // SETTLING — bounded, and deliberately not fatal when the budget runs out: a call that
+    // is simply slow should delay the brief, not cancel it.
+    nativePhase = 'settling';
+    renderControl();
+    // An app that will not say how many calls are running is a different situation from a
+    // busy one, and waiting the full budget for it buys nothing: the budget ends by going
+    // ahead regardless, so the only thing the silence costs is twenty seconds of a control
+    // that says "Finishing local tools…" about an app that is not listening. A couple of
+    // retries covers a dropped answer; past that, get on with it.
+    let unanswered = 0;
+    await waitUntil(async () => {
+      const count = await peekPendingTools();
+      if (count === null) return ++unanswered >= SETTLE_UNKNOWN_TRIES;
+      unanswered = 0;
+      pendingTools = count;
+      return count === 0;
+    }, TOOL_SETTLE_MS);
+    return '';
+  }
+
+  /**
+   * ChatGPT-native compaction, from the press to the point the app takes over.
+   *
+   * IDLE → REQUESTED → INTERRUPTING → SETTLING → PROMPTING → WAITING. The first four are
+   * startCompact's, because the two before the request are what makes the app's copy of
+   * the recording a still picture; this function is PROMPTING onward. Every exit that is
+   * not WAITING cancels the app-side request. That symmetry is the important part: a
+   * request left open would let a much later turn — the model finally getting round to an
+   * instruction it read minutes ago — hand over a brief and open a fresh chat for a
+   * compaction the user has long since given up on.
+   *
+   * Nothing here opens a chat. Submitting the instruction is the last thing this function
+   * does; what happens next is that the turn it started opens, is watched by generation id,
+   * and — when that exact generation settles — hands its own answer to the app as the brief.
+   * See `compactCapture`.
+   */
+  async function runNativeCompaction(prompt, token) {
+    const abandon = async (why) => {
+      nativeBusy = false;
+      nativePhase = '';
+      pressedAt = 0;
+      localError = why;
+      job = null;
+      // Withdraw the app-side request so nothing can complete behind our back.
+      await ask({ type: 'compact', conversationId, cancel: true }).catch(() => undefined);
+      renderControl();
+      void pullActivity();
+    };
+
+    if (!prompt) return void (await abandon('The app did not send the handoff instruction.'));
+    if (!token) return void (await abandon('The app did not send a compaction token, so nothing could be tracked.'));
+
+    try {
+      // INTERRUPTING and SETTLING already happened, before the request that produced this
+      // prompt — see stopAndSettle, which both providers go through.
+
+      // PROMPTING — into this same conversation. `insertPrompt` refuses a composer that
+      // already holds text, so a draft the user was writing is never overwritten or sent.
+      nativePhase = 'prompting';
+      renderControl();
+      if (!CLF_DOM.insertPrompt(prompt)) {
+        return void (await abandon(
+          'ChatGPT would not accept the handoff instruction — clear the message box and try again.'
+        ));
+      }
+      await sleep(400);
+      // Armed before the send rather than after it, because the turn can open between the
+      // click and the next line of this function. An arming that is never claimed by a
+      // generation expires on its own — see the observe() branch that binds it.
+      compactCapture = { token, conversationId, generation: null, priorGeneration: turnId || null, armedAt: Date.now() };
+      rememberCapture();
+      if (!CLF_DOM.send()) {
+        releaseCapture();
+        return void (await abandon('ChatGPT would not send the handoff instruction. Nothing was compacted.'));
+      }
+
+      // WAITING — for one generation, the one this send starts, and for nothing else.
+      nativePhase = 'waiting';
+      renderControl();
+      void pullActivity();
+    } catch (err) {
+      await abandon(`Could not ask ChatGPT for a handoff: ${(err && err.message) || 'unknown error'}`);
+    } finally {
+      // The guard is released either way; `nativePhase` is cleared by the app's job
+      // reaching a terminal stage, or by abandon() above.
+      nativeBusy = false;
+    }
+  }
+
+  /**
+   * The compaction turn this tab is watching, and the transaction it belongs to.
+   *
+   * `{ token, conversationId, generation }`, or null when nothing is being watched. This is
+   * the load-bearing part of Compact & Resume: the brief is whatever the model wrote as its
+   * answer, and this is what makes "its answer" a fact rather than a guess.
+   *
+   * The binding is to one *local* generation id — the ids this script mints when it sees a
+   * turn open, which are unique per page load and never reused. Not to "the newest assistant
+   * message", not to "the next thing that appears", not to the longest block on screen: a
+   * conversation that is being compacted is one the user has been talking to for hours, and
+   * every one of those rules can be satisfied by something the model wrote about something
+   * else. Only the generation that this tab started by submitting the handoff prompt may
+   * ever hand a brief to the app, and it may do so once.
+   *
+   * `generation` is null between submitting the prompt and seeing the turn open. That window
+   * is the only place the binding is made, it is bounded by COMPACT_ARM_MS, and the first
+   * generation to open in it is ours by construction: the turn was stopped and the machine
+   * settled before the prompt was submitted, so nothing else is starting one.
+   *
+   * `priorGeneration` is the generation this tab had open when it armed — normally none, and
+   * otherwise the turn that was just stopped to make room for the compaction. It exists for
+   * one case: a reload inside that same unbound window. See `restoreCapture`.
+   */
+  let compactCapture = null;
+
+  /** Where the binding is kept so it survives a reload of this tab. */
+  const COMPACT_CAPTURE_KEY = 'clf-compact-capture';
+  /** How long to wait for the submitted prompt to actually open a turn. */
+  const COMPACT_ARM_MS = 60_000;
+
+  function rememberCapture() {
+    try {
+      if (compactCapture) sessionStorage.setItem(COMPACT_CAPTURE_KEY, JSON.stringify(compactCapture));
+      else sessionStorage.removeItem(COMPACT_CAPTURE_KEY);
+    } catch {
+      // A tab with no session storage simply loses the binding on reload, which the reload
+      // path already treats as "cannot prove it, so do not claim it".
+    }
+  }
+
+  /**
+   * Forgets the binding, so nothing can be delivered against it twice.
+   *
+   * Always before the delivery, never after: a POST that is retried by the browser, an
+   * observation that runs twice, a second `turn_end` for the same generation — all of them
+   * find nothing here and do nothing.
+   */
+  function releaseCapture() {
+    const held = compactCapture;
+    compactCapture = null;
+    rememberCapture();
+    return held;
+  }
+
+  /**
+   * Restores the binding after a reload, or gives up on it honestly.
+   *
+   * Called after `resumeOpenTurn`, so `turnId` is already whatever the app says this
+   * conversation still has open. If that is the generation the binding names, the watch
+   * continues exactly as before — the reload cost nothing. If it is not, the compaction turn
+   * ended while this tab was not there to see which output was its own, and there is no
+   * honest way to recover that afterwards: the answer is on screen next to a dozen others
+   * and nothing distinguishes it but a guess. So the transaction is cancelled and the
+   * session stays in this chat, which is the failure the user can act on.
+   */
+  async function restoreCapture() {
+    let stored = null;
+    try {
+      stored = JSON.parse(sessionStorage.getItem(COMPACT_CAPTURE_KEY) || 'null');
+    } catch {
+      stored = null;
+    }
+    if (!stored || !stored.token || stored.conversationId !== conversationId) {
+      compactCapture = null;
+      rememberCapture();
+      return;
+    }
+    compactCapture = stored;
+    if (stored.generation) {
+      if (stored.generation === turnId && generating) {
+        nativePhase = 'waiting';
+        renderControl();
+        return;
+      }
+      return void (await abandonCapture(
+        'This tab reloaded while ChatGPT was writing the brief, so the app can no longer tell which answer was it. Nothing was compacted — press Compact & Resume again.'
+      ));
+    }
+
+    // Reloaded between submitting the prompt and seeing the turn open, so the binding was
+    // never made in the old document. The app still holds the open turn for this
+    // conversation, and `resumeOpenTurn` has already adopted it — so the id is available,
+    // it is just not yet claimed.
+    //
+    // It may be claimed only when it is provably not the turn that was stopped to make room
+    // for the compaction: that one can still be the app's open turn, because stopping a turn
+    // and *closing* it are a settle window apart, and adopting it would make some earlier
+    // answer the brief. `priorGeneration` is exactly that id, recorded before the send, so
+    // an open turn that is not it is the one the prompt started.
+    if (generating && turnId && turnId !== stored.priorGeneration) {
+      compactCapture.generation = turnId;
+      rememberCapture();
+      nativePhase = 'waiting';
+      nativeBusy = true;
+      renderControl();
+      return;
+    }
+    await abandonCapture(
+      'This tab reloaded before ChatGPT started answering the compaction request, so the app cannot tell which answer would have been it. Nothing was compacted — press Compact & Resume again.'
+    );
+  }
+
+  /**
+   * Gives up on the watched compaction and withdraws the app-side transaction.
+   *
+   * The session stays in this chat. That is the whole failure mode: every way this can go
+   * wrong ends with the user in the conversation they were already in, told why, with a
+   * button they can press again.
+   */
+  async function abandonCapture(why) {
+    const held = releaseCapture();
+    nativeBusy = false;
+    nativePhase = '';
+    pressedAt = 0;
+    job = null;
+    localError = why;
+    if (held) await ask({ type: 'compact', conversationId, cancel: true }).catch(() => undefined);
+    renderControl();
+    void pullActivity();
+  }
+
+  /**
+   * Hands the app the brief, once, for the generation that was asked for it.
+   *
+   * Called from `finishGeneration` with that generation's own settled answer, already read
+   * off its own section. The token goes with it: the app matches it to the transaction that
+   * asked, so a brief arriving for a continuation that has since been cancelled lands
+   * nowhere rather than opening a chat nobody is waiting for.
+   */
+  async function deliverBrief(text, outcome) {
+    const held = releaseCapture();
+    if (!held) return;
+    const brief = String(text || '').trim();
+    // An interrupted or empty compaction is not a short brief — it is no brief. Half a
+    // handoff reads exactly like a whole one to the chat that receives it, which is why
+    // this is the one place the extension refuses to send something it has.
+    if (!brief || outcome === 'stopped' || outcome === 'interrupted' || outcome === 'failed') {
+      const why =
+        outcome === 'stopped'
+          ? 'The compaction turn was stopped, so nothing was compacted.'
+          : outcome === 'interrupted' || outcome === 'failed'
+            ? 'ChatGPT did not finish writing the brief, so nothing was compacted.'
+            : 'ChatGPT answered the compaction request with nothing, so nothing was compacted.';
+      nativeBusy = false;
+      nativePhase = '';
+      pressedAt = 0;
+      job = null;
+      localError = why;
+      await ask({ type: 'compact', conversationId, cancel: true }).catch(() => undefined);
+      renderControl();
+      void pullActivity();
+      return;
+    }
+    const reply = await ask({ type: 'compact', conversationId, token: held.token, summary: brief });
+    nativeBusy = false;
+    nativePhase = '';
+    if (!reply || reply.ok !== true) {
+      pressedAt = 0;
+      job = null;
+      localError = replyError(reply) || 'The app could not store the brief, so nothing was moved.';
+    } else if (reply.data && reply.data.job) {
+      job = reply.data.job;
+    }
+    renderControl();
+    void pullActivity();
+  }
+
+  /** How long to wait for ChatGPT to actually stop after the stop button is pressed. */
+  const INTERRUPT_WAIT_MS = 15_000;
+  /** How long to wait for local tool calls to finish before prompting anyway. */
+  const TOOL_SETTLE_MS = 20_000;
+  /** How many silent answers about pending calls to sit through before going ahead. */
+  const SETTLE_UNKNOWN_TRIES = 3;
+
+  /**
+   * How many local calls are running right now, asked fresh.
+   *
+   * The stored `pendingTools` is only refreshed by the activity loop, which ticks on its
+   * own schedule — far too coarse to wait on, and stalled entirely while a pull is already
+   * in flight. This asks the same endpoint from the cursor the page already holds, which
+   * returns whatever it would return anyway and advances nothing, and reads one number off
+   * the answer. Null means the app could not be asked, which is not the same as zero.
+   */
+  async function peekPendingTools() {
+    const reply = await ask({ type: 'activity', conversationId, since });
+    if (!reply || reply.ok !== true || !reply.data) return null;
+    const count = Number(reply.data.pendingTools);
+    return Number.isFinite(count) ? count : 0;
+  }
+
+  /** Polls a condition. Resolves true when it holds, false when the budget runs out. */
+  async function waitUntil(test, budgetMs) {
+    const until = Date.now() + budgetMs;
+    for (;;) {
+      let held = false;
+      try {
+        held = (await test()) === true;
+      } catch {
+        held = false;
+      }
+      if (held) return true;
+      if (Date.now() >= until) return false;
+      await sleep(250);
+    }
+  }
+
+  async function cancelCompact() {
+    if (!conversationId) return;
+    pressedAt = 0;
+    nativeBusy = false;
+    nativePhase = '';
+    const reply = await ask({ type: 'compact', conversationId, cancel: true });
+    if (reply && reply.ok === true && reply.data && reply.data.job) job = reply.data.job;
+    renderControl();
+    void pullActivity();
+  }
+
+  function replyError(reply) {
+    if (!reply) return '';
+    const data = reply.data || {};
+    if (data.message) return String(data.message).slice(0, 160);
+    if (data.error === 'session_not_recorded') return 'This chat has no recorded local session yet.';
+    if (data.error === 'compaction_running') return 'Another chat is compacting right now.';
+    if (data.error === 'turn_still_generating') return 'Wait for this ChatGPT turn to finish first.';
+    if (data.error) return String(data.error).slice(0, 160);
+    if (reply.error === 'app_not_found') return 'ChatGPT Local Files is not running on this PC.';
+    return reply.error ? String(reply.error).slice(0, 160) : '';
   }
 
   // -------------------------------------------------------------- commands
 
   async function checkStatus() {
     const reply = await ask({ type: 'status' });
-    if (reply) status = { connected: reply.connected === true, paired: reply.paired === true };
-  }
-
-  async function pollCommands() {
-    if (!status.paired) return;
-    await ask({ type: 'poll' });
+    if (reply) {
+      status = {
+        connected: reply.connected === true,
+        paired: reply.paired === true,
+        disconnected: reply.disconnected === true
+      };
+    }
+    renderStreams();
+    renderControl();
   }
 
   /**
-   * Adds one Local Files action to ChatGPT's own + submenu instead of another floating
-   * control beside the composer. We clone the menu's first row only for its current
-   * spacing/classes; no ChatGPT listener or id is copied, and the action itself is ours.
+   * The command id this page was opened for, from ?clf= or #clf=.
+   *
+   * Both, because ChatGPT's router rewrites the query on its own and the fragment
+   * survives that. It is a correlation id and nothing else: redeeming it needs the bearer
+   * token that only the service worker holds, so a copied link is inert.
    */
-  function injectCompactMenu() {
-    if (!conversationId || !status.paired || compactBusy) return;
-    const plus = document.querySelector('[data-testid="composer-plus-btn"][aria-expanded="true"]');
-    if (!plus) return;
-    const menus = [...document.querySelectorAll('[role="menu"][data-state="open"], [role="menu"]')].filter(
-      (node) => node.querySelector('[role="menuitem"]')
-    );
-    const menu = menus[menus.length - 1];
-    if (!menu || menu.querySelector('[data-clf-compact-menu]')) return;
-    const template = menu.querySelector('[role="menuitem"]');
-    if (!template || !template.parentElement) return;
-
-    const item = template.cloneNode(true);
-    if (!(item instanceof HTMLElement)) return;
-    item.dataset.clfCompactMenu = '1';
-    item.removeAttribute('id');
-    item.removeAttribute('data-testid');
-    item.removeAttribute('data-radix-collection-item');
-    item.setAttribute('role', 'menuitem');
-    item.tabIndex = 0;
-    for (const child of item.querySelectorAll('[id], [data-testid], [data-radix-collection-item]')) {
-      child.removeAttribute('id');
-      child.removeAttribute('data-testid');
-      child.removeAttribute('data-radix-collection-item');
+  function markerId() {
+    try {
+      const fromQuery = new URLSearchParams(location.search).get('clf');
+      if (fromQuery) return fromQuery;
+      const hash = location.hash.startsWith('#') ? location.hash.slice(1) : location.hash;
+      return new URLSearchParams(hash).get('clf');
+    } catch {
+      return null;
     }
-
-    const leaves = [...item.querySelectorAll('*')].filter(
-      (node) => node.children.length === 0 && (node.textContent || '').trim().length > 0
-    );
-    const label = leaves[0] || item;
-    label.textContent = 'Compact & continue';
-    const trailing = [...item.children].find((node) => String(node.className).includes('trailing'));
-    trailing?.remove();
-    const iconBox = item.querySelector('svg')?.parentElement;
-    if (iconBox) {
-      iconBox.replaceChildren(document.createTextNode('↻'));
-      iconBox.classList.add('clf-compact-icon');
-    }
-
-    const activate = async (event) => {
-      event.preventDefault();
-      event.stopPropagation();
-      if (compactBusy) return;
-      compactBusy = true;
-      label.textContent = 'Starting compaction…';
-      const reply = await ask({ type: 'compact', conversationId, resume: true });
-      if (reply && reply.ok === true) {
-        label.textContent = 'Compaction started';
-      } else {
-        label.textContent = 'Compaction failed — open Local Files';
-      }
-      // The bridge only acknowledges that compaction started; the long request runs in
-      // the app. Release the local click guard so a provider failure can be retried by
-      // reopening the menu instead of requiring a page reload. A still-running job is
-      // rejected by /compact with 409, so this cannot start two at once.
-      setTimeout(() => {
-        compactBusy = false;
-      }, 1500);
-    };
-    item.addEventListener('click', activate);
-    item.addEventListener('keydown', (event) => {
-      if (event.key === 'Enter' || event.key === ' ') void activate(event);
-    });
-    template.parentElement.append(item);
   }
 
   /**
-   * Picks up a "continue in a fresh chat" instruction, if this tab is the fresh chat.
+   * Picks up the instruction this tab was opened for. Once per document, and that is all.
    *
-   * Only ever runs on a conversation that does not exist yet and whose composer is
-   * empty, so it cannot overwrite anything the user was writing.
+   * Only ever on a conversation that does not exist yet — a worker's own chat, or the
+   * replacement for a compacted session. Never in an existing chat, and never over a
+   * composer the user has already started typing into.
    *
-   * Every exit reports its outcome. The app holds the command under a lease rather than
-   * deleting it when it is handed out, so a composer that never appears, an insertion
-   * ChatGPT refuses, or a tab the user closes mid-way all end with the command going
-   * back on the queue instead of a worker chat that never opens. Only a message this
-   * tab actually sent is reported as sent — including when the conversation id never
-   * turns up, because retrying then would type the same instruction a second time.
+   * One page, one marker, one attempt, and every exit reports its outcome. This used to be
+   * three in-page attempts driven off the one-second observation tick, with a periodic
+   * `working` ack renewing the app's lease in between; between them those turned one press
+   * into an open-ended background process that could still be typing into a tab minutes
+   * after the user had given up on it. The transaction is now flat: redeem the marker, wait
+   * for the composer, insert, send, report which conversation it became. Anything that goes
+   * wrong is reported as a failure straight away, and the app ends the worker slot or the
+   * continuation rather than arranging for it to happen again somewhere else — which is
+   * what the user can act on, and what nothing else in this file has to know about.
+   *
+   * A message this tab actually sent is reported as sent even if the conversation id never
+   * turns up, because the alternative would be typing the same instruction twice.
    */
-  async function maybeBootstrap() {
-    if (bootstrapTried || CLF_DOM.conversationId()) return;
-    bootstrapTried = true;
-    const reply = await ask({ type: 'bootstrap' });
-    const boot = reply && reply.bootstrap;
-    if (!boot) return;
+  let commandDone = false;
+
+  async function runCommand() {
+    const id = markerId();
+    if (commandDone || !id) return;
+    commandDone = true;
+    await deliverCommand(id);
+  }
+
+  async function deliverCommand(id) {
+    // Every command opens a chat that does not exist yet, so a page that already has a
+    // conversation is not the page this command is for — a stale marker carried into an
+    // existing chat by history, a back button, or a copied URL. Refused before the redeem,
+    // so it neither types into somebody's chat nor claims a command the genuinely fresh tab
+    // is still holding.
+    if (CLF_DOM.conversationId()) return;
+
+    // RUN_ID names this document. It is what makes the command single-owner: a second tab
+    // on the same marker is a different document and is refused, while this one's own
+    // request is answered.
+    const reply = await ask({ type: 'redeem', id, client: RUN_ID });
+    if (!reply || reply.ok !== true) {
+      // The app could not be reached at all, so there is nothing to acknowledge and nothing
+      // to acknowledge it to. Its own deadline ends the command; this page stops here.
+      return;
+    }
+    const boot = reply.command;
+    if (!boot) {
+      // Cancelled, superseded, taken by another page, or from a previous run of the app.
+      // A stale marker types nothing.
+      return;
+    }
 
     const fail = (why) => ask({ type: 'ack', id: boot.id, status: 'failed', error: why });
+
+    // Nothing half-written is ever overwritten. This is a normal failure rather than a
+    // silent skip: the user may keep that draft indefinitely,
+    // and the app has to be told so it can re-offer the work somewhere else.
+    const existing = CLF_DOM.composer();
+    if (existing && (existing.textContent || '').trim()) {
+      return void (await fail('the composer already holds something the user was writing'));
+    }
 
     // ChatGPT paints the composer before the app has fully hydrated. Touching it during
     // that window can look successful for a frame and then React replaces the subtree,
@@ -632,27 +4001,34 @@
     if (!CLF_DOM.insertPrompt(boot.text)) return void (await fail('ChatGPT refused the inserted text'));
     await sleep(500);
     const composer = CLF_DOM.composer();
-    if (!composer || !(composer.textContent || '').includes(boot.text.slice(0, 80))) {
+    // Compared with whitespace squeezed out of both sides. The composer is a rich-text
+    // editor: a blank line in the bootstrap becomes a paragraph break, and `textContent`
+    // stitches the paragraphs back together with no separator at all — so a literal
+    // comparison against the first 80 characters failed for every task short enough that
+    // the wrapper's blank line landed inside them, and reported a healthy insert as
+    // React having replaced the composer. What this check is actually for is proving our
+    // text is still there, and squeezing whitespace proves exactly that.
+    const squeeze = (value) => (value || '').replace(/\s+/g, '');
+    if (!composer || !squeeze(composer.textContent).includes(squeeze(boot.text).slice(0, 80))) {
       return void (await fail('ChatGPT replaced the composer while inserting the bootstrap'));
     }
     if (!CLF_DOM.send()) return void (await fail('the send button never became usable'));
     agent = boot.agent || null;
 
-    // The conversation id only exists once ChatGPT has accepted the message; the app
-    // needs it to tie this chat to the handoff (and to an agent, in multi-agent mode).
-    // The lease is renewed while waiting so a slow first response is not mistaken for a
-    // dead tab, but the message has been sent either way.
+    // The conversation id only exists once ChatGPT has accepted the message, and it is the
+    // whole point of the report: for a worker it is what binds the slot to this chat and
+    // starts it, and for a resume it is what the session is moved onto. Bounded by the same
+    // clock the app is running, so this page never outlives the command it is working on.
     for (let tries = 0; tries < 80; tries++) {
       await sleep(500);
-      const id = CLF_DOM.conversationId();
-      if (id) {
-        await ask({ type: 'ack', id: boot.id, status: 'sent', conversationId: id, agent });
+      const found = CLF_DOM.conversationId();
+      if (found) {
+        await ask({ type: 'ack', id: boot.id, status: 'sent', conversationId: found, agent });
         return;
       }
-      if (tries % 20 === 19) await ask({ type: 'ack', id: boot.id, status: 'working' });
     }
-    // Sent, but this tab never saw an id. The app files this chat's activity by the
-    // agent it reports with its observations instead.
+    // Sent, but this tab never saw an id, so nothing can be bound to it. Reported honestly:
+    // the app ends the slot or the continuation rather than waiting on a chat it cannot name.
     await ask({ type: 'ack', id: boot.id, status: 'sent', agent });
   }
 
@@ -663,19 +4039,21 @@
     (event) => {
       const stop = CLF_DOM.stopButton();
       if (stop && event.target instanceof Node && stop.contains(event.target)) userStopped = true;
-      const plus = document.querySelector('[data-testid="composer-plus-btn"]');
-      if (plus && event.target instanceof Node && plus.contains(event.target)) {
-        setTimeout(injectCompactMenu, 0);
-      }
     },
     true
   );
 
-  window.addEventListener('pagehide', () => {
+  window.addEventListener('pagehide', (event) => {
     // Hand over anything still queued before this script stops existing. The worker
     // outlives the page, so this is the last chance for these observations to survive.
     void flush();
-    if (conversationId) void ask({ type: 'closed', conversationId });
+    // `persisted` means the page went into the back/forward cache: it is frozen, not
+    // gone, and the same script resumes on pageshow. Reporting that as a close ended the
+    // session and the next observation reopened it, which is where the flood of
+    // "session … reopened" came from — several tabs each cycling with nothing changed.
+    if (event.persisted) return;
+    // Conversation lifetime is owned by the service worker's tab tracking. A document
+    // pagehide also happens on reload, so closing here corrupts live turn identity.
   });
 
   function every(ms, fn) {
@@ -693,17 +4071,147 @@
     }, ms);
   }
 
-  void checkStatus().then(() => {
-    void maybeBootstrap();
-    observe();
-    void pullActivity();
-  });
+  // Re-attach immediately when React swaps the composer out, rather than up to a second
+  // later. Cheap because it does nothing unless our node has actually been detached.
+  function watchComposer() {
+    try {
+      const observer = new MutationObserver(() => {
+        if (!alive) return;
+        if (!control || !control.root.isConnected) injectControl();
+        if (stagePanel && !stagePanel.root.isConnected) injectStage();
+      });
+      observer.observe(document.body, { childList: true, subtree: true });
+    } catch {
+      // The one-second tick is the fallback, and it is enough on its own.
+    }
+  }
+
+  /** Apply popup changes immediately in every open ChatGPT tab. */
+  if (globalThis.chrome && chrome.storage && chrome.storage.onChanged) {
+    chrome.storage.onChanged.addListener((changes, areaName) => {
+      if (areaName !== 'local' || !changes) return;
+      let changed = false;
+      if (changes[RENDER_STREAM_KEY]) {
+        const value = changes[RENDER_STREAM_KEY].newValue;
+        RENDER_STREAM = value !== false;
+        changed = true;
+      }
+      if (changes[SHOW_TIMES_KEY]) {
+        SHOW_TIMES = changes[SHOW_TIMES_KEY].newValue === true;
+        changed = true;
+      }
+      if (!changed) return;
+      renderPreferenceReady = true;
+      paint();
+      renderStreams();
+    });
+  }
+
+  /** Popup commands target this tab directly; no bridge credential is involved. */
+  if (globalThis.chrome && chrome.runtime && chrome.runtime.onMessage) {
+    chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
+      if (!message || typeof message.type !== 'string') return false;
+      if (message.type === 'clf-render-stream') {
+        RENDER_STREAM = message.enabled !== false;
+        renderPreferenceReady = true;
+        paint();
+        renderStreams();
+        sendResponse({ ok: true, enabled: RENDER_STREAM });
+        return false;
+      }
+      if (message.type === 'clf-overwrite-now') {
+        if (!renderStreamAllowed()) {
+          sendResponse({ ok: false, error: 'overwrite_disabled' });
+          return false;
+        }
+        void pullActivity()
+          .then(() => {
+            paint();
+            renderStreams();
+            sendResponse({ ok: true, enabled: true });
+          })
+          .catch((err) => sendResponse({ ok: false, error: String(err && err.message ? err.message : err) }));
+        return true;
+      }
+      return false;
+    });
+  }
+
+  // resumeOpenTurn() before the first observe(), and awaited: it is the whole point of the
+  // handshake that this page load learns whether it is standing in the middle of a turn
+  // *before* the observation that would otherwise open a second one. It never throws on its
+  // own, and a failure to reach the app is not a reason to stop starting up.
+  void loadRenderPreference()
+    .then(checkStatus)
+    .then(() => resumeOpenTurn().catch(() => undefined))
+    .then(() => restoreCapture().catch(() => undefined))
+    .then(() => {
+      void runCommand();
+      observe();
+      injectControl();
+      injectStage();
+    });
+
+  syncTheme();
+  wireTips();
+  watchComposer();
+  watchToolRows();
+  watchTranscript();
 
   every(OBSERVE_MS, () => {
     observe();
-    injectCompactMenu();
+    syncTheme();
+    injectControl();
+    injectStage();
+    // Relabelling on the observe tick as well as the activity tick: the calls are
+    // already known here, and ChatGPT rendering a block a second after we heard about
+    // its call used to mean waiting for the next poll to see the real label.
+    paint();
+    renderStreams();
+    foldBootstrap();
   });
   every(ACTIVITY_MS, pullActivity);
   every(STATUS_MS, checkStatus);
-  every(COMMAND_MS, pollCommands);
+
+  /**
+   * Handed to the extension regression tests, which run this file with a real DOM but no
+   * Chrome. Nothing on the live page defines this hook, so nothing on the live page can
+   * reach in through it.
+   */
+  if (typeof globalThis.CLF_TEST_HOOK === 'function') {
+    globalThis.CLF_TEST_HOOK({
+      planLabels,
+      connectorBlockCount,
+      controlState,
+      stageView,
+      observe,
+      syncTheme,
+      meterView,
+      paint,
+      renderStreams,
+      foldBootstrap,
+      injectControl,
+      injectStage,
+      pullActivity,
+      runCommand,
+      startCompact,
+      refreshFiber,
+      fiberFor,
+      readDescriptor,
+      /** Reading order, so a test can pin it against `src/shared/chronology.ts` directly. */
+      chronological,
+      streamTurnGroups,
+      /** So a test settles a turn by the real window rather than a copy of the number. */
+      TURN_SETTLE_MS,
+      /** Test-only: production defaults ON; tests opt into renderer cases explicitly. */
+      setRenderStream: (on) => {
+        RENDER_STREAM = on === true;
+        renderPreferenceReady = true;
+      },
+      renderStreamEnabled: () => RENDER_STREAM,
+      setShowTimes: (on) => {
+        SHOW_TIMES = on === true;
+      }
+    });
+  }
 })();

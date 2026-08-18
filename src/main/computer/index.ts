@@ -18,6 +18,8 @@ import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import { promises as fs } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { ensureUsablePath, normalizeEnvironment, setEnvValue } from '../env.js';
+import { findWindowsPowerShell } from '../exec.js';
 import { logWarn } from '../logger.js';
 import { HELPER_SCRIPT } from './helper.js';
 
@@ -47,6 +49,8 @@ export interface WindowInfo {
 }
 
 export interface UiElementInfo {
+  /** Opaque state-scoped reference accepted by click_ref/set_value. */
+  ref: string;
   name: string;
   role: string;
   automationId: string;
@@ -69,9 +73,22 @@ export interface Screenshot {
   /** The screen region it shows, in the helper's coordinate space. */
   region: Rect;
   scale: number;
+  /**
+   * For a window capture: whether that window was actually in front when the pixels were
+   * taken. Null for whole-screen captures, where the question does not arise.
+   *
+   * A window capture asks Windows to activate the window first, because unoccluded pixels
+   * are better — but it does not *require* it. Looking at a window is not an action on it,
+   * and refusing to photograph a window because something else holds focus made the one
+   * recovery path (focus it) unreachable. False here means the image may show whatever is
+   * covering the window, and the caller is expected to say so.
+   */
+  focused: boolean | null;
 }
 
 export type Action =
+  | { type: 'click_ref'; ref: string }
+  | { type: 'set_value'; ref: string; text: string }
   | { type: 'move'; x: number; y: number }
   | { type: 'click'; x: number; y: number; button?: string }
   | { type: 'double_click'; x: number; y: number; button?: string }
@@ -80,7 +97,13 @@ export type Action =
   | { type: 'type'; text: string }
   | { type: 'keypress'; keys: string[] }
   | { type: 'focus'; window: number }
-  | { type: 'wait'; ms?: number };
+  | { type: 'wait'; ms?: number }
+  // The clipboard is part of driving a desktop — it is how text gets into an app that has
+  // no accessible text field. These two are done in Electron rather than by the helper, but
+  // they run inside the same lock and in the caller's order, so "put this on the clipboard,
+  // then press ctrl+v" is one uninterrupted sequence.
+  | { type: 'read_clipboard' }
+  | { type: 'write_clipboard'; text: string };
 
 /**
  * One long-lived PowerShell helper process.
@@ -124,10 +147,21 @@ async function startHelper(): Promise<HelperRuntime> {
 
   helperStarting = new Promise<HelperRuntime>((resolve, reject) => {
     const bootstrap = Buffer.from('Invoke-Expression $env:CLF_HELPER', 'utf16le').toString('base64');
-    const child = spawn('powershell.exe', ['-NoProfile', '-NonInteractive', '-NoLogo', '-EncodedCommand', bootstrap], {
+    // `powershell.exe` is found through the environment handed to the child, so that
+    // environment has to be sound before the spawn rather than after it: a bare
+    // `{ ...process.env }` is what turned a missing System32 entry into an unexplained
+    // `spawn powershell.exe ENOENT` with no helper and no diagnosis.
+    const env = normalizeEnvironment(process.env);
+    setEnvValue(env, 'CLF_HELPER', HELPER_SCRIPT);
+    ensureUsablePath(env);
+    // By absolute path, so starting the helper does not depend on the very thing it is
+    // often asked to diagnose. The repaired environment above is the second line of
+    // defence, not the first.
+    const host = findWindowsPowerShell() ?? 'powershell.exe';
+    const child = spawn(host, ['-NoProfile', '-NonInteractive', '-NoLogo', '-EncodedCommand', bootstrap], {
       windowsHide: true,
       stdio: ['pipe', 'pipe', 'pipe'],
-      env: { ...process.env, CLF_HELPER: HELPER_SCRIPT }
+      env: env as NodeJS.ProcessEnv
     });
     const runtime: HelperRuntime = {
       child,
@@ -242,8 +276,70 @@ function runHelper(request: Record<string, unknown>): Promise<Record<string, any
  * Actions arrive in the coordinates of the picture the model was looking at, so the
  * conversion back to screen coordinates needs to remember what that picture showed.
  */
+interface Frame {
+  id: number;
+  region: Rect;
+  scale: number;
+  width: number;
+  height: number;
+}
+
 let nextFrameId = 1;
-let lastFrame: { id: number; region: Rect; scale: number; width: number; height: number } | null = null;
+let lastFrame: Frame | null = null;
+let nextUiStateId = 1;
+
+/**
+ * Serialises whole multi-step acquisitions, not just single helper requests.
+ *
+ * `lastFrame` is one global coordinate system shared by every chat and every agent in
+ * this app. get_window_state captures a screenshot and then maps UI element bounds into
+ * it; without this lock another caller's capture can land between those two awaits and
+ * the reply would pair one screenshot with centres computed against a different one.
+ */
+let exclusiveQueue: Promise<unknown> = Promise.resolve();
+
+function exclusive<T>(task: () => Promise<T>): Promise<T> {
+  const result = exclusiveQueue.then(task, task);
+  exclusiveQueue = result.then(
+    () => undefined,
+    () => undefined
+  );
+  return result;
+}
+const uiRefs = new Map<string, { window: number; runtimeKey: string; generation: number }>();
+
+/**
+ * Refs carry the helper generation that minted them. A UI Automation runtime id only
+ * means anything to the helper process that issued it, so once the helper restarts every
+ * outstanding ref is meaningless — and acting on one would click whatever now happens to
+ * hold that id. Stamping the generation makes that detectable instead of silent.
+ */
+function rememberUiRef(window: number, runtimeKey: string, index: number, stateId: number): string {
+  const generation = helperGeneration;
+  const ref = `g${generation}_e${stateId}_${index + 1}`;
+  uiRefs.set(ref, { window, runtimeKey, generation });
+  while (uiRefs.size > 1000) {
+    const oldest = uiRefs.keys().next().value as string | undefined;
+    if (!oldest) break;
+    uiRefs.delete(oldest);
+  }
+  return ref;
+}
+
+function uiTarget(ref: string): { window: number; runtimeKey: string } {
+  const target = uiRefs.get(ref);
+  if (!target) {
+    throw new ComputerError(
+      `UNKNOWN_UI_REF: ${ref}. Call get_window_state or find_ui again and use a ref from that reply.`
+    );
+  }
+  if (target.generation !== helperGeneration) {
+    throw new ComputerError(
+      `STALE_REF: ${ref} was issued before the desktop helper restarted, so it no longer identifies anything. Call get_window_state again and use a ref from that reply.`
+    );
+  }
+  return target;
+}
 
 export async function listWindows(): Promise<{ windows: WindowInfo[]; screen: Rect }> {
   const reply = await runHelper({ op: 'windows' });
@@ -262,13 +358,28 @@ export async function activeWindow(): Promise<{ window: WindowInfo | null; scree
   return { window, screen: reply['screen'] as Rect };
 }
 
-/** Waits inside one MCP call until a matching visible/foreground window appears. */
 export async function findUi(opts: {
   window?: number;
   query?: string;
   role?: string;
   maxResults?: number;
 }): Promise<{ window: number; elements: UiElementInfo[] }> {
+  return exclusive(() => findUiLocked(opts, lastFrame));
+}
+
+/**
+ * Maps elements into `frame` rather than into whatever `lastFrame` happens to be by the
+ * time the helper answers. The caller states which picture the coordinates belong to.
+ */
+async function findUiLocked(
+  opts: {
+    window?: number;
+    query?: string;
+    role?: string;
+    maxResults?: number;
+  },
+  frame: Frame | null
+): Promise<{ window: number; elements: UiElementInfo[] }> {
   const request = {
     op: 'find_ui',
     ...(opts.window === undefined ? {} : { id: opts.window }),
@@ -290,8 +401,9 @@ export async function findUi(opts: {
   } else {
     findUiWarmGeneration = generation;
   }
-  const frame = lastFrame;
-  const elements = raw.map((item): UiElementInfo => {
+  const stateId = nextUiStateId++;
+  const windowId = Number(reply['window']);
+  const elements = raw.map((item, index): UiElementInfo => {
     const bounds = item['bounds'] as Rect;
     let imageBounds: Rect | null = null;
     let imageCenter: { x: number; y: number } | null = null;
@@ -313,7 +425,11 @@ export async function findUi(opts: {
         y: Math.round(imageBounds.y + imageBounds.height / 2)
       };
     }
+    const runtimeKey = String(item['runtimeKey'] ?? '');
     return {
+      ref: runtimeKey
+        ? rememberUiRef(windowId, runtimeKey, index, stateId)
+        : `unavailable-${stateId}-${index + 1}`,
       name: String(item['name'] ?? ''),
       role: String(item['role'] ?? ''),
       automationId: String(item['automationId'] ?? ''),
@@ -324,7 +440,45 @@ export async function findUi(opts: {
       imageCenter
     };
   });
-  return { window: Number(reply['window']), elements };
+  return { window: windowId, elements };
+}
+
+export async function getWindowState(opts: {
+  window?: number;
+  maxWidth?: number;
+  maxElements?: number;
+  includeScreenshot?: boolean;
+  includeUi?: boolean;
+}): Promise<{ window: WindowInfo; screenshot: Screenshot | null; elements: UiElementInfo[] }> {
+  // The whole acquisition is one critical section. Its screenshot and its element
+  // geometry have to describe the same moment, and no other caller may retarget the
+  // shared frame in between.
+  return exclusive(async () => {
+    let window: WindowInfo | null = null;
+    if (opts.window === undefined) {
+      window = (await activeWindow()).window;
+    } else {
+      window = (await listWindows()).windows.find((item) => item.id === opts.window) ?? null;
+    }
+    if (!window) throw new ComputerError('WINDOW_NOT_FOUND: no matching visible window is available');
+
+    const includeScreenshot = opts.includeScreenshot !== false;
+    const includeUi = opts.includeUi !== false;
+    const shot = includeScreenshot
+      ? await screenshotLocked({ window: window.id, maxWidth: opts.maxWidth })
+      : null;
+    // Map against the frame this call just took, never against the global.
+    const frame: Frame | null = shot
+      ? { id: shot.frameId, region: shot.region, scale: shot.scale, width: shot.width, height: shot.height }
+      : null;
+    const found = includeUi
+      ? await findUiLocked({ window: window.id, maxResults: opts.maxElements ?? 60 }, frame)
+      : { window: window.id, elements: [] as UiElementInfo[] };
+    const elements = includeScreenshot
+      ? found.elements
+      : found.elements.map((element) => ({ ...element, imageBounds: null, imageCenter: null }));
+    return { window, screenshot: shot, elements };
+  });
 }
 
 export async function waitForWindow(opts: {
@@ -375,13 +529,30 @@ export async function screenshot(opts: {
   /** Crop in pixels of the most recent returned screenshot. */
   crop?: Rect;
 }): Promise<Screenshot> {
+  return exclusive(() => screenshotLocked(opts));
+}
+
+/**
+ * @param cropFrame Frame a crop is expressed in. Callers that ran something between the
+ * frame the model saw and this capture pass it explicitly; everyone else means the
+ * current one.
+ */
+async function screenshotLocked(
+  opts: {
+    window?: number;
+    full?: boolean;
+    maxWidth?: number;
+    crop?: Rect;
+  },
+  cropFrame?: Frame | null
+): Promise<Screenshot> {
   if (opts.crop && (opts.window !== undefined || opts.full === true)) {
     throw new ComputerError('crop cannot be combined with window or full capture');
   }
 
   let cropRegion: Rect | undefined;
   if (opts.crop) {
-    const frame = lastFrame;
+    const frame = cropFrame === undefined ? lastFrame : cropFrame;
     if (!frame) throw new ComputerError('Take a screenshot first — crop coordinates refer to the most recent frame.');
     const crop = {
       x: Math.floor(opts.crop.x),
@@ -450,7 +621,8 @@ export async function screenshot(opts: {
       width: size.width,
       height: size.height,
       region,
-      scale
+      scale,
+      focused: opts.window === undefined ? null : reply['focused'] === true
     };
   } finally {
     await fs.rm(dir, { recursive: true, force: true }).catch(() => {});
@@ -471,19 +643,87 @@ export interface PointerResult {
   imageSize: { width: number; height: number } | null;
 }
 
-export async function act(actions: Action[]): Promise<{ cursor: PointerResult }> {
+export async function act(
+  actions: Action[],
+  opts: { frameId?: number } = {}
+): Promise<{ cursor: PointerResult; clipboard: string[] }> {
+  return exclusive(() => actLocked(actions, opts));
+}
+
+/**
+ * Acts and then verifies, as one indivisible operation.
+ *
+ * Doing this as act() followed by screenshot() takes the lock twice, and another chat or
+ * agent can focus a window, click, or capture in the gap — so the "after" picture could
+ * show someone else's result. That would defeat the only reason to ask for a capture in
+ * the same call. The crop is resolved against the frame that was current before the
+ * actions ran, which is the one whose coordinates the caller was looking at.
+ */
+export async function actAndCapture(
+  actions: Action[],
+  opts: {
+    frameId?: number;
+    capture?: {
+      window?: number;
+      full?: boolean;
+      maxWidth?: number;
+      crop?: Rect;
+      /** Privacy mode: capture whatever window is in front once the actions have run. */
+      preferActiveWindow?: boolean;
+    };
+  } = {}
+): Promise<{ cursor: PointerResult; screenshot: Screenshot | null; clipboard: string[] }> {
+  return exclusive(async () => {
+    const before = lastFrame;
+    const result = await actLocked(actions, opts);
+    if (!opts.capture) return { cursor: result.cursor, screenshot: null, clipboard: result.clipboard };
+
+    const { preferActiveWindow, ...capture } = opts.capture;
+    // Resolved here rather than by the caller: the actions may have changed which window
+    // is in front, and resolving it outside the lock would reopen the gap this closes.
+    if (preferActiveWindow && capture.window === undefined && capture.full !== true && capture.crop === undefined) {
+      capture.window = (await activeWindow()).window?.id;
+    }
+    return {
+      cursor: result.cursor,
+      screenshot: await screenshotLocked(capture, before),
+      clipboard: result.clipboard
+    };
+  });
+}
+
+async function actLocked(
+  actions: Action[],
+  opts: { frameId?: number }
+): Promise<{ cursor: PointerResult; clipboard: string[] }> {
   const pointing = new Set(['move', 'click', 'double_click', 'scroll', 'drag']);
   const needsFrame = actions.some((a) => pointing.has(a.type));
   if (needsFrame && !lastFrame) {
     throw new ComputerError('Take a screenshot first — pointing needs a picture to point at.');
+  }
+  // The frame is global to this app, so another chat or agent can replace it between the
+  // screenshot a caller saw and the click it sends. Without the id there is no way to
+  // tell that apart from a click on the picture the caller actually looked at.
+  if (needsFrame && opts.frameId !== undefined && opts.frameId !== lastFrame?.id) {
+    throw new ComputerError(
+      `STALE_FRAME: these coordinates are for frame ${opts.frameId}, but the current screen frame is ${lastFrame?.id ?? 'none'}. Take a screenshot or call get_window_state again and point at the new frame.`
+    );
   }
   const frame =
     lastFrame ?? { id: 0, region: { x: 0, y: 0, width: 1, height: 1 }, scale: 1, width: 1, height: 1 };
   const toScreenX = (x: number): number => Math.round(frame.region.x + x / frame.scale);
   const toScreenY = (y: number): number => Math.round(frame.region.y + y / frame.scale);
 
-  const mapped = actions.map((action) => {
+  const mapOne = (action: Action): Record<string, unknown> => {
     switch (action.type) {
+      case 'click_ref': {
+        const target = uiTarget(action.ref);
+        return { type: 'click_ui', window: target.window, runtimeKey: target.runtimeKey };
+      }
+      case 'set_value': {
+        const target = uiTarget(action.ref);
+        return { type: 'set_value_ui', window: target.window, runtimeKey: target.runtimeKey, value: action.text };
+      }
       case 'move':
       case 'click':
       case 'double_click':
@@ -519,9 +759,38 @@ export async function act(actions: Action[]): Promise<{ cursor: PointerResult }>
       default:
         throw new ComputerError(`Unsupported action`);
     }
-  });
+  };
 
-  const reply = await runHelper({ op: 'act', actions: mapped });
+  // Clipboard steps are not desktop input, so the helper never sees them: the pending
+  // batch is flushed at each one instead. That keeps every step in the order it was
+  // asked for — put text on the clipboard, then press ctrl+v — without giving up the
+  // lock in between, which a second call from the tool layer would have done.
+  const clipboard: string[] = [];
+  let batch: ReturnType<typeof mapOne>[] = [];
+  let reply: Record<string, any> = {};
+  const flush = async (): Promise<void> => {
+    if (batch.length === 0) return;
+    reply = await runHelper({ op: 'act', actions: batch });
+    batch = [];
+  };
+  for (const action of actions) {
+    if (action.type === 'read_clipboard') {
+      await flush();
+      clipboard.push((await electronClipboard()).readText());
+      continue;
+    }
+    if (action.type === 'write_clipboard') {
+      await flush();
+      (await electronClipboard()).writeText(action.text);
+      continue;
+    }
+    batch.push(mapOne(action));
+  }
+  // Always ends with the helper, even when the last step was a clipboard one: the cursor
+  // position in the reply is what the caller is told about where things now stand.
+  batch.push({ type: 'wait', ms: 0 });
+  await flush();
+
   const raw = reply['cursor'] as { x?: unknown; y?: unknown } | undefined;
   const sx = Number(raw?.x);
   const sy = Number(raw?.y);
@@ -541,8 +810,26 @@ export async function act(actions: Action[]): Promise<{ cursor: PointerResult }>
       image,
       frameId: current?.id ?? null,
       imageSize: current ? { width: current.width, height: current.height } : null
-    }
+    },
+    clipboard
   };
+}
+
+/**
+ * Electron's clipboard, loaded only if a clipboard action is actually used.
+ *
+ * Imported lazily rather than at the top of the file because everything else here runs
+ * happily outside Electron — the desktop tests drive the helper directly — and a static
+ * import would make that impossible for the sake of two actions.
+ */
+async function electronClipboard(): Promise<{ readText: () => string; writeText: (text: string) => void }> {
+  try {
+    const { clipboard } = await import('electron');
+    if (!clipboard) throw new Error('no clipboard');
+    return clipboard;
+  } catch {
+    throw new ComputerError('The clipboard is only available while the app is running.');
+  }
 }
 
 /** Confirms the helper can run at all, so the UI can say so before ChatGPT tries. */

@@ -17,6 +17,7 @@ import { promises as fs } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import type { ConnectionState, TunnelHealth, TunnelSettings } from '../../shared/types.js';
+import { terminateProcessTree } from '../exec.js';
 import { logError, logInfo, logWarn } from '../logger.js';
 import { ago, POLL_FRESH_MS, readClientStatus, readPollHealth } from './health.js';
 import { locateBinary } from './locate.js';
@@ -51,18 +52,27 @@ export class TunnelError extends Error {}
 
 export const TUNNEL_ID_PATTERN = /^tunnel_[0-9a-f]{32}$/;
 
-/** Kills a child and everything it started. tunnel-client supervises cloudflared. */
+/**
+ * Kills a child and everything it started. tunnel-client supervises cloudflared.
+ *
+ * Through the shared primitive rather than this module's own `spawn('taskkill')`, which
+ * had the same defect the exec runner did and independently of it: the helper was looked
+ * up on PATH, so an inherited path missing System32 meant the kill never started. That
+ * failure arrives asynchronously as an `error` event, which the surrounding try/catch
+ * could not reach and no listener handled — so the tunnel-client (and the cloudflared it
+ * supervises) went on running while `stop()` reported success. terminateProcessTree uses
+ * an absolute taskkill and falls back to signalling the pid directly.
+ */
 function killTree(child: ChildProcess | null): void {
   if (!child || child.pid === undefined || child.exitCode !== null) return;
-  if (process.platform === 'win32') {
+  const pid = child.pid;
+  void terminateProcessTree(pid).catch(() => {
     try {
-      spawn('taskkill', ['/pid', String(child.pid), '/T', '/F'], { windowsHide: true }).unref();
-      return;
+      child.kill('SIGTERM');
     } catch {
-      /* fall through */
+      /* already gone */
     }
-  }
-  child.kill('SIGTERM');
+  });
 }
 
 function lineReader(onLine: (line: string) => void): (chunk: Buffer) => void {

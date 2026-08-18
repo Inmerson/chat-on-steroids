@@ -1,10 +1,11 @@
 /**
- * The Chat panel: recorded sessions, their timeline, compaction, and the settings the
- * two of them need (recording, the browser extension, OpenRouter, multi-agent mode).
+ * The Chat panel: recorded sessions, their timeline, the brief a compaction left behind,
+ * and the settings those need (recording, the browser extension, multi-agent mode).
  *
- * This is a viewer, not a second ChatGPT client. It never talks to ChatGPT, never
- * reads a file and never sees a key: everything arrives through the same fixed IPC
- * channels as the rest of the renderer, and the OpenRouter key travels one way only.
+ * This is a viewer, not a second ChatGPT client, and not a place a compaction is started:
+ * a session is compacted by the chat it lives in, from the button the extension puts beside
+ * ChatGPT's composer. Everything here arrives through the same fixed IPC channels as the
+ * rest of the renderer.
  *
  * The timeline is drawn from what the recorder actually stored. Where a value is a
  * local estimate rather than a fact — token counts above all — the UI says so, because
@@ -13,31 +14,19 @@
 
 import type {
   ActivitySummary,
-  CompactionStage,
-  CompactionState,
+  AgentState,
   Handoff,
-  OpenRouterModel,
   SessionEvent,
   SessionSummary,
   SwarmState,
   TokenPressure
 } from '../shared/session.js';
-import { COMPACTION_STAGE_LABELS, TURN_OUTCOME_LABELS } from '../shared/session.js';
+import { ATTRIBUTION_LABELS, TURN_OUTCOME_LABELS, foldProgress } from '../shared/session.js';
+import { chronological } from '../shared/chronology.js';
 import type { AppState, Config } from '../shared/types.js';
 import { $, ago, clockTime, compactNumber, el, icon, run, toast } from './dom.js';
 
 const api = window.api;
-
-/** Stages in the order they happen. `idle` and `error` are not steps. */
-const STAGES: CompactionStage[] = [
-  'collecting',
-  'preparing',
-  'sending',
-  'thinking',
-  'streaming',
-  'saving',
-  'ready'
-];
 
 /** Sprite id per tool-call family. Deliberately reuses the existing icon set. */
 const KIND_ICON: Record<ActivitySummary['kind'], string> = {
@@ -75,6 +64,8 @@ const MODEL_PAGE = 20;
  */
 const UNATTRIBUTED = '\u0000unattributed';
 let agentFilter: string | null = null;
+/** The session the current filter was chosen in; selecting a different one resets it. */
+let filterFor: string | null = null;
 
 interface Deps {
   /** The renderer's single save path — reads every control, including ours. */
@@ -91,16 +82,14 @@ let activeId: string | null = null;
 let selectedId: string | null = null;
 let events: SessionEvent[] = [];
 let totalEvents = 0;
-let compaction: CompactionState | null = null;
+/** The last swarm the app reported, so the header can summarise it without the log. */
+let swarm: SwarmState | null = null;
+/** Badges the list is currently drawn with. See repaintBadges. */
+let badgeKey = '';
 
 /** Handoff currently shown, and the id it was loaded for. */
 let handoff: Handoff | null = null;
 let handoffFor: string | null = null;
-
-/** Everything we have seen of the OpenRouter catalogue, for honest capability notes. */
-const modelIndex = new Map<string, OpenRouterModel>();
-let modelOffset = 0;
-let modelTotal = 0;
 
 let listTimer: number | undefined;
 
@@ -108,6 +97,58 @@ let listTimer: number | undefined;
 
 function pressureOf(id: string): TokenPressure | null {
   return pressure.get(id) ?? null;
+}
+
+/** A short word about a session, drawn as a chip on its row. */
+interface Badge {
+  text: string;
+  tone: '' | 'is-active' | 'is-finished' | 'is-failed';
+}
+
+/** Live word per worker state, in the user's vocabulary rather than the protocol's. */
+const AGENT_BADGE: Record<AgentState, Badge> = {
+  invited: { text: 'opening', tone: 'is-active' },
+  active: { text: 'joined', tone: 'is-active' },
+  finished: { text: 'finished', tone: 'is-finished' },
+  failed: { text: 'failed', tone: 'is-failed' }
+};
+
+/**
+ * What a row is, and what it is doing right now.
+ *
+ * Once resume and multi-agent mode are in use, most rows in the list are chats this app
+ * opened, and they are all recorded within a minute of each other. A name alone cannot
+ * separate them — which run a chat belonged to, whether its tab ever opened, whether the
+ * worker in it ever joined — and that is how a user loses track of a delayed tab. The
+ * first badge is durable and comes from the session itself; the second is live and comes
+ * from the swarm or the compaction currently reported by the app.
+ */
+function sessionBadges(summary: SessionSummary): Badge[] {
+  const badges: Badge[] = [];
+  const origin = summary.origin;
+  // The one session that is not a chat. Saying so on the row is what stops it reading
+  // as a chat that mysteriously lost its name.
+  if (summary.conversationId === null) return [{ text: 'not a chat', tone: '' }];
+  if (origin?.kind === 'worker') badges.push({ text: origin.agentId ?? 'worker', tone: '' });
+  else if (origin?.kind === 'resume') badges.push({ text: 'resumed', tone: '' });
+  else if (summary.agents.includes('prime')) badges.push({ text: 'prime', tone: '' });
+
+  // Agent ids are reused across runs (`worker-1`, `worker-2`, ...). Matching only by that
+  // short id made old worker sessions inherit the *current* run's live badge, so a worker
+  // chat from 20 minutes ago suddenly said "joined" again when a new worker-2 started.
+  // Conversation id is the durable identity of the actual ChatGPT tab, so only that exact
+  // worker session may borrow the live swarm state.
+  const agent = origin?.agentId
+    ? swarm?.agents.find(
+        (entry) => entry.id === origin.agentId && Boolean(entry.conversationId) && entry.conversationId === summary.conversationId
+      )
+    : undefined;
+  if (agent) {
+    badges.push(AGENT_BADGE[agent.state]);
+    return badges;
+  }
+
+  return badges;
 }
 
 function sessionRow(summary: SessionSummary): HTMLElement {
@@ -128,7 +169,11 @@ function sessionRow(summary: SessionSummary): HTMLElement {
   ];
   if (summary.errors > 0) bits.push(`${summary.errors} error${summary.errors === 1 ? '' : 's'}`);
   if (summary.agents.length > 0) bits.push(`${summary.agents.length} agents`);
-  const sub = el('div', 'sess-sub', bits.join(' · '));
+  const sub = el('div', 'sess-sub');
+  for (const badge of sessionBadges(summary)) {
+    sub.append(el('span', `chip${badge.tone ? ` ${badge.tone}` : ''}`, badge.text));
+  }
+  sub.append(el('span', 'sess-bits', bits.join(' · ')));
 
   const level = pressureOf(summary.id);
   const bar = el('div', `bar${level ? ` is-${level.level}` : ''}`);
@@ -180,6 +225,7 @@ async function loadSessions(): Promise<void> {
 function paintSessions(): void {
   const list = $('sessionList');
   list.replaceChildren(...sessions.map(sessionRow));
+  badgeKey = badgeSignature();
   $('sessionsEmpty').hidden = sessions.length > 0;
 
   const recording = deps.state()?.config.sessions.record === true;
@@ -199,7 +245,12 @@ async function loadDetail(): Promise<void> {
   }
   const detail = await run(api.getSession(selectedId));
   if (!detail) return;
-  events = detail.events;
+  // The log holds one record per commentary snapshot so a live reader can watch a line
+  // being written. A timeline of a finished turn wants the line, once, where it started.
+  // A tool call is appended once it has finished, so `seq` puts it after the commentary it
+  // ran underneath. Ordered once here, on load, rather than per repaint — and with the same
+  // helper the injected page stream uses, so the two views cannot disagree.
+  events = chronological(foldProgress(detail.events));
   totalEvents = detail.total;
   paintDetail();
   void loadHandoff();
@@ -211,14 +262,14 @@ async function loadHandoff(): Promise<void> {
   if (wanted === null) {
     handoff = null;
     handoffFor = null;
-    paintCompaction();
+    paintHandoff();
     return;
   }
   if (handoffFor === wanted) return;
   const loaded = await run(api.getHandoff(summary!.id, wanted));
   handoff = loaded ?? null;
   handoffFor = wanted;
-  paintCompaction();
+  paintHandoff();
 }
 
 // ------------------------------------------------------------------ timeline
@@ -245,7 +296,9 @@ function toolBody(event: Extract<SessionEvent, { kind: 'tool_call' }>): HTMLElem
 
   const raw = el('div', 'raw');
   const facts = el('p', 'raw-facts');
-  facts.textContent = `${call.tool} · ${call.outcome} · ${Math.round(call.durationMs)} ms · attributed by ${call.attribution}`;
+  facts.textContent =
+    `${call.tool} · ${call.outcome} · ${Math.round(call.durationMs)} ms · ` +
+    `placed by ${ATTRIBUTION_LABELS[call.attribution] ?? call.attribution}`;
   raw.append(facts);
 
   if (call.changes && call.changes.length > 0) {
@@ -291,6 +344,8 @@ function eventBody(event: SessionEvent): HTMLElement {
     }
     case 'progress':
       return el('p', 'meta is-progress', event.message.text);
+    case 'page_tool':
+      return el('p', 'meta is-progress', `ChatGPT: ${event.label}`);
     case 'turn_start':
       return el('p', 'meta', 'Turn started');
     case 'turn_end': {
@@ -307,11 +362,30 @@ function eventBody(event: SessionEvent): HTMLElement {
       return toolBody(event);
     case 'note':
       return el('p', 'meta', event.message.text);
+    /**
+     * Rendered rather than left to fall through to "Unknown event".
+     *
+     * The timeline is how the user checks what the agents actually said to each other, and
+     * a run of grey "Unknown event" rows in the middle of a multi-agent session reads as a
+     * broken log — the one impression a session recorder cannot afford to give.
+     */
+    case 'agent_message': {
+      const box = el('div', 'said');
+      // Which end of the message this record is. The same message is written once here and
+      // once in the other agent's session, so without this a pair reads as two messages.
+      box.title =
+        event.delivery === 'sent'
+          ? `Sent by ${event.from}; recorded when the app accepted it`
+          : `Received by ${event.to}; recorded when it acknowledged delivery`;
+      box.append(el('b', '', `${event.from} → ${event.to}`));
+      box.append(textBlock('msg', event.message.text, event.message.truncated, event.message.chars));
+      return box;
+    }
     case 'handoff':
       return el(
         'p',
         'meta is-good',
-        `Handoff saved — ${event.model}, ${compactNumber(event.chars)} characters (${event.reason})`
+        `Handoff saved — ${compactNumber(event.chars)} characters (${event.reason})`
       );
     default:
       return el('p', 'meta', 'Unknown event');
@@ -338,9 +412,19 @@ function eventRow(event: SessionEvent): HTMLElement {
  * keeps exactly the view it had before.
  */
 function paintAgentFilter(): void {
-  const box = $('agentFilter');
+  const box = $('chatAgentFilter');
   const named = [...new Set(events.flatMap((event) => (event.agent ? [event.agent] : [])))].sort();
   const anyUnattributed = events.some((event) => !event.agent);
+  // A filter belongs to the session it was chosen in. Carrying it across a selection
+  // change showed the next session's timeline as empty with no chip lit to explain why —
+  // and agent ids repeat between runs, so it could also silently hide half of one. The
+  // same guard catches an agent that simply is not in this session's events.
+  if (filterFor !== selectedId) {
+    agentFilter = null;
+    filterFor = selectedId;
+  } else if (agentFilter !== null && agentFilter !== UNATTRIBUTED && !named.includes(agentFilter)) {
+    agentFilter = null;
+  }
   if (named.length === 0 || (named.length === 1 && !anyUnattributed)) {
     box.hidden = true;
     box.replaceChildren();
@@ -406,73 +490,23 @@ function paintDetail(): void {
   }
   $('chatFoot').textContent = facts.join(' · ');
   $('chatFoot').classList.toggle('is-warn', pressureOf(selectedId ?? '')?.level === 'huge');
-
-  paintButtons();
 }
 
-// ---------------------------------------------------------------- compaction
+// -------------------------------------------------------------------- handoff
 
-function stageChips(state: CompactionState): HTMLElement {
-  const box = el('div', 'stages');
-  const current = STAGES.indexOf(state.stage);
-  for (const [index, stage] of STAGES.entries()) {
-    const chip = el('span', 'stage', COMPACTION_STAGE_LABELS[stage]);
-    if (state.stage === 'error') {
-      if (index < current) chip.classList.add('is-done');
-    } else if (current >= 0) {
-      if (index < current) chip.classList.add('is-done');
-      if (index === current) chip.classList.add('is-now');
-    }
-    box.append(chip);
-  }
-  return box;
-}
-
-function paintCompaction(): void {
-  const state = compaction;
-  const box = $('compactState');
-
-  if (!state || state.stage === 'idle') {
-    box.replaceChildren(
-      el(
-        'p',
-        'hint',
-        'No compaction has run in this app session. Compacting reads the recorded history and asks the model for a handoff brief — the raw history is never replaced or deleted.'
-      )
-    );
-  } else {
-    const parts: HTMLElement[] = [stageChips(state)];
-    // A history too large for one request is compacted in passes, each carrying the
-    // brief so far. Showing which pass is running is the difference between "this is
-    // taking a while" and "this is stuck".
-    if (state.step) parts.push(el('p', 'hint is-step', state.step));
-    const facts = el('p', 'hint');
-    const bits = [state.model || 'model not chosen yet'];
-    if (state.received > 0) bits.push(`${compactNumber(state.received)} characters received`);
-    if (state.startedAt !== null) {
-      const end = state.finishedAt ?? Date.now();
-      bits.push(`${Math.max(0, Math.round((end - state.startedAt) / 1000))}s`);
-    }
-    facts.textContent = bits.join(' · ');
-    parts.push(facts);
-
-    if (state.error) parts.push(el('p', 'errbox', state.error));
-    if (state.reasoning && deps.state()?.config.compaction.showReasoning) {
-      parts.push(el('h4', '', 'Model reasoning'));
-      parts.push(el('pre', 'pre is-quiet', state.reasoning.slice(-2000)));
-    }
-    if (state.preview && state.stage !== 'ready') {
-      parts.push(el('h4', '', 'Brief so far'));
-      parts.push(el('pre', 'pre', state.preview));
-    }
-    box.replaceChildren(...parts);
-  }
-
+/**
+ * The brief the last compaction of this session left behind.
+ *
+ * A record, not a control. The compaction itself happens in the ChatGPT conversation — the
+ * chat writes its own brief as its final answer — so what is worth showing here is the
+ * document that came out of it, and any warning attached to it.
+ */
+function paintHandoff(): void {
   const hand = $('handoffBox');
   if (handoff) {
     const parts: HTMLElement[] = [];
     const head = el('p', 'hint');
-    head.textContent = `${handoff.model} · ${compactNumber(handoff.text.length)} characters · from ${handoff.sourceEvents} events (~${compactNumber(handoff.sourceTokens)} tokens) · ${ago(handoff.createdAt)}`;
+    head.textContent = `${compactNumber(handoff.text.length)} characters · from ${handoff.sourceEvents} events (~${compactNumber(handoff.sourceTokens)} tokens) · ${ago(handoff.createdAt)}`;
     parts.push(head);
     for (const note of handoff.notes) parts.push(el('p', 'hint is-warn', note));
     parts.push(el('pre', 'pre', handoff.text));
@@ -484,123 +518,70 @@ function paintCompaction(): void {
     $('handoffHead').hidden = true;
     $('copyHandoff').hidden = true;
   }
-
-  paintButtons();
-}
-
-function paintButtons(): void {
-  const state = deps.state();
-  const running =
-    compaction !== null && compaction.stage !== 'idle' && compaction.stage !== 'ready' && compaction.stage !== 'error';
-  const compactBtn = $<HTMLButtonElement>('compactBtn');
-  const resumeBtn = $<HTMLButtonElement>('resumeBtn');
-  const cancelBtn = $<HTMLButtonElement>('cancelCompact');
-
-  const hasKey = state?.hasOpenRouterKey === true;
-  const paired = state?.bridge.paired === true;
-  const blocked = selectedId === null || running || !hasKey;
-
-  compactBtn.disabled = blocked;
-  compactBtn.title = !hasKey
-    ? 'Add an OpenRouter API key in Settings first.'
-    : selectedId === null
-      ? 'Select a session first.'
-      : '';
-
-  resumeBtn.disabled = blocked || !paired;
-  resumeBtn.title = !paired
-    ? 'Pair the Chrome extension first — it is what opens the fresh chat.'
-    : compactBtn.title;
-
-  cancelBtn.hidden = !running;
-}
-
-// ----------------------------------------------------------------- settings
-
-function priceLabel(model: OpenRouterModel): string {
-  if (model.promptPrice === null) return 'price unknown';
-  const perMillion = model.promptPrice * 1_000_000;
-  return `$${perMillion < 1 ? perMillion.toFixed(3) : perMillion.toFixed(2)}/M in`;
-}
-
-function modelRow(model: OpenRouterModel, chosen: string): HTMLElement {
-  const row = el('div', 'model');
-  row.dataset.model = model.id;
-  if (model.id === chosen) row.classList.add('is-sel');
-  const top = el('div', 'model-top');
-  top.append(el('b', '', model.name));
-  if (model.reasoningLevels.length > 0) {
-    top.append(el('span', 'chip', `reasoning: ${model.reasoningLevels.join('/')}`));
-  }
-  const sub = el('div', 'model-sub');
-  const context = model.providerContextLength ?? model.contextLength;
-  const output = model.maxCompletionTokens ? ` · ${compactNumber(model.maxCompletionTokens)} max out` : '';
-  sub.textContent = `${model.id} · ${context ? `${compactNumber(context)} ctx` : 'context unknown'}${output} · ${priceLabel(model)}`;
-  sub.title = model.id;
-  row.append(top, sub);
-  return row;
-}
-
-async function loadModels(refresh = false): Promise<void> {
-  const query = $<HTMLInputElement>('modelSearch').value.trim();
-  const page = await run(
-    api.listModels({ refresh, offset: modelOffset, limit: MODEL_PAGE, query })
-  );
-  if (!page) return;
-  modelTotal = page.total;
-  modelOffset = page.offset;
-  for (const model of page.models) modelIndex.set(model.id, model);
-  const chosen = $<HTMLInputElement>('compactModel').value;
-  $('modelList').replaceChildren(...page.models.map((model) => modelRow(model, chosen)));
-  $('modelPage').textContent =
-    modelTotal === 0
-      ? 'No models matched'
-      : `${modelOffset + 1}–${Math.min(modelOffset + MODEL_PAGE, modelTotal)} of ${modelTotal}`;
-  $<HTMLButtonElement>('modelPrev').disabled = modelOffset === 0;
-  $<HTMLButtonElement>('modelNext').disabled = modelOffset + MODEL_PAGE >= modelTotal;
-  paintReasoningHint();
+  paintStateLine();
 }
 
 /**
- * Offers exactly the reasoning efforts the chosen model advertises.
+ * One line under the header saying what is happening right now.
  *
- * Not cosmetic: an effort a model does not accept is a provider error mid-compaction,
- * not a setting that gets quietly ignored. So an unsupported option is disabled here and
- * omitted from the request in openrouter.ts, and if the current choice is one of them
- * the select falls back to something the model will actually take.
+ * The complaint this answers: the only place a user could find out whether a worker's chat
+ * had opened was the raw Activity log, which is a diagnostics view rather than an answer to
+ * "what is happening".
  */
-function paintReasoningHint(): void {
-  const chosen = $<HTMLInputElement>('compactModel').value;
-  const known = modelIndex.get(chosen) ?? null;
-  const select = $<HTMLSelectElement>('compactReasoning');
-  // Unknown model: leave everything selectable rather than guessing it supports nothing.
-  const levels: readonly string[] | null = known ? known.reasoningLevels : null;
-  for (const option of select.options) {
-    option.disabled =
-      known !== null &&
-      (option.value === 'off' ? known.reasoningMandatory : levels !== null && !levels.includes(option.value));
-  }
-  if (select.selectedOptions[0]?.disabled) {
-    const preferred = known?.reasoningDefault;
-    select.value =
-      preferred === 'off' && known?.reasoningMandatory !== true
-        ? 'off'
-        : preferred && levels?.includes(preferred)
-          ? preferred
-          : levels?.[0] ?? 'off';
+function paintStateLine(): void {
+  const note = $('chatState');
+  const { text, tone } = stateLine();
+  note.textContent = text;
+  note.className = `subhead-note${tone ? ` ${tone}` : ''}`;
+  repaintBadges();
+}
+
+/**
+ * Redraws the list when a row's badges would change, and not otherwise.
+ *
+ * The badges follow live state, which changes as fast as the recorder writes. Rebuilding
+ * every row for each of those would be a list that flickers while it is being read, so the
+ * redraw is keyed on the badges themselves.
+ */
+function repaintBadges(): void {
+  const key = badgeSignature();
+  if (key === badgeKey) return;
+  paintSessions();
+}
+
+function badgeSignature(): string {
+  return sessions.map((entry) => sessionBadges(entry).map((badge) => badge.text).join(',')).join('|');
+}
+
+function stateLine(): { text: string; tone: '' | 'is-live' | 'is-bad' } {
+  // Recording follows the conversation the browser can see. A tool call arrives over the
+  // connector carrying nothing that identifies its caller, so work driven from the phone,
+  // from another browser or from another machine can only be recorded as what it is:
+  // real, complete, and not placeable in any chat this app can observe.
+  const selected = sessions.find((entry) => entry.id === selectedId) ?? null;
+  if (selected && selected.conversationId === null) {
+    return {
+      text: 'Work this app could not place in a chat — driven from another device, or with no ChatGPT tab open',
+      tone: ''
+    };
   }
 
-  $('reasoningHint').textContent =
-    chosen === ''
-      ? 'No model chosen yet. The first compaction resolves a sensible default from the live catalogue.'
-      : known === null
-        ? 'Load the model list to see the provider’s exact reasoning and output limits.'
-        : !known.reasoning
-          ? 'This model takes no reasoning parameter, so none is sent.'
-          : `${known.reasoningMandatory ? 'Reasoning is mandatory. ' : 'Off genuinely disables reasoning. '}${
-              levels && levels.length > 0 ? `Advertised efforts: ${levels.join(', ')}.` : 'No selectable effort levels advertised.'
-            }${known.maxCompletionTokens ? ` Provider max output: ${compactNumber(known.maxCompletionTokens)} tokens; compaction caps itself at 64k.` : ''}`;
+  const workers = swarm?.agents.filter((agent) => agent.role === 'worker') ?? [];
+  if (workers.length === 0) return { text: '', tone: '' };
+  const count = (state: AgentState): number => workers.filter((agent) => agent.state === state).length;
+  const parts: string[] = [];
+  if (count('active') > 0) parts.push(`${count('active')} working`);
+  // "invited" is a worker whose ChatGPT tab has been asked for but has not joined yet.
+  if (count('invited') > 0) parts.push(`${count('invited')} opening`);
+  if (count('finished') > 0) parts.push(`${count('finished')} finished`);
+  if (count('failed') > 0) parts.push(`${count('failed')} failed`);
+  return {
+    text: `${workers.length === 1 ? '1 worker' : `${workers.length} workers`} · ${parts.join(' · ')}`,
+    tone: count('failed') > 0 ? 'is-bad' : count('invited') > 0 || count('active') > 0 ? 'is-live' : ''
+  };
 }
+
+// ----------------------------------------------------------------- settings
 
 /**
  * Shows where the extension actually is on this machine.
@@ -627,9 +608,11 @@ async function showExtensionPath(): Promise<void> {
 }
 
 function paintSwarm(state: SwarmState): void {
+  swarm = state;
+  paintStateLine();
   const list = $('swarmList');
   if (state.agents.length === 0) {
-    list.replaceChildren(el('p', 'hint', 'No agents. The prime agent creates workers with the create_agents tool.'));
+    list.replaceChildren(el('p', 'hint', 'No agents. The prime agent creates workers with the agents tool’s spawn action.'));
   } else {
     list.replaceChildren(
       ...state.agents.map((agent) => {
@@ -638,18 +621,47 @@ function paintSwarm(state: SwarmState): void {
         top.append(el('b', '', agent.label || agent.id));
         top.append(el('span', 'chip', agent.role));
         top.append(el('span', `chip is-${agent.state}`, agent.state));
+        // Clearing is offered where the agent is, not only as one global reset at the
+        // bottom of a settings form. The two rows mean different things and the tooltip
+        // says which: the prime is the run, a worker is one slot.
+        const over = agent.state === 'finished' || agent.state === 'failed';
+        if (!over) {
+          const clear = el('button', 'btn btn-quiet agent-clear');
+          clear.append(icon('i-x'));
+          clear.dataset.clear = agent.id;
+          clear.title =
+            agent.role === 'prime'
+              ? 'Clear session — ends this run and every worker in it'
+              : `Clear session — ends ${agent.id} and frees its slot`;
+          top.append(clear);
+        }
+        // The one place a recovery key can be asked for, and only where it means anything:
+        // a live worker slot whose chat never reported which conversation it is. Everything
+        // else about worker identity happens without anybody pressing anything.
+        if (!over && agent.role === 'worker' && !agent.conversationId) {
+          const recover = el('button', 'btn btn-quiet agent-clear');
+          recover.append(icon('i-key'));
+          recover.dataset.recover = agent.id;
+          recover.title = `Copy a one-time recovery key — paste it into ${agent.id}'s chat if it opened but was never bound`;
+          top.append(recover);
+        }
         const sub = el('div', 'model-sub');
         const bits = [`${agent.pending} pending`, `${agent.delivered} delivered`];
         if (agent.conversationId) bits.push('chat bound');
-        if (agent.claims.length > 0) bits.push(`${agent.claims.length} claimed path(s)`);
         sub.textContent = bits.join(' · ');
         row.append(top, sub);
         if (agent.task) row.append(el('p', 'hint', agent.task));
+        // Why it failed, not just that it did. A worker only reaches this state when its
+        // chat could not be opened, and the reason is the only actionable part.
+        if (agent.state === 'failed' && agent.result) row.append(el('p', 'hint is-warn', agent.result));
         return row;
       })
     );
   }
-  $<HTMLButtonElement>('swarmReset').disabled = !state.running;
+  // Usable whenever there is a run to clear, not only while a worker is still going.
+  // Gating on `running` left finished-but-present swarm state with no way out, which is
+  // exactly the state a user wants to clear before starting the next run.
+  $<HTMLButtonElement>('swarmReset').disabled = state.agents.length === 0;
 }
 
 /** Reads the three config sections this panel owns, for the renderer's save path. */
@@ -671,9 +683,8 @@ export function chatSettingsPatch(current: Config): {
       limitTokens: number('sessLimit', current.sessions.limitTokens, 10_000, 4_000_000)
     },
     compaction: {
-      model: $<HTMLInputElement>('compactModel').value.trim(),
-      reasoning: $<HTMLSelectElement>('compactReasoning').value as Config['compaction']['reasoning'],
-      showReasoning: $<HTMLInputElement>('compactShowReasoning').checked
+      auto: $<HTMLInputElement>('autoCompact').checked,
+      autoTokens: number('autoCompactTokens', current.compaction.autoTokens, 10_000, 4_000_000)
     },
     multiAgent: {
       enabled: $<HTMLInputElement>('maEnabled').checked,
@@ -683,6 +694,21 @@ export function chatSettingsPatch(current: Config): {
 }
 
 /** Writes app state into this panel's controls. Called from the renderer's apply(). */
+/**
+ * Says in words what the automatic switch will actually do, including the parts that are
+ * easy to be surprised by: which chat ends, and that the number it fires on is an estimate
+ * rather than ChatGPT's own accounting.
+ */
+function applyAutoCompactHint(config: Config): void {
+  const { auto, autoTokens } = config.compaction;
+  const tokens = compactNumber(autoTokens);
+  $('autoCompactHint').textContent = !auto
+    ? 'Off. Compaction only happens when you press Compact & resume in the ChatGPT tab.'
+    : `Past roughly ${tokens} recorded tokens, this chat is stopped and asked to write its own ` +
+      'handoff, then a fresh chat opens carrying it. Each chat is compacted once; the fresh one ' +
+      'starts its own count.';
+}
+
 export function chatApply(state: AppState): void {
   const { config, bridge } = state;
 
@@ -691,36 +717,23 @@ export function chatApply(state: AppState): void {
   $<HTMLInputElement>('sessAdvisory').value = String(config.sessions.advisoryTokens);
   $<HTMLInputElement>('sessLimit').value = String(config.sessions.limitTokens);
 
-  $<HTMLInputElement>('compactModel').value = config.compaction.model;
-  $<HTMLSelectElement>('compactReasoning').value = config.compaction.reasoning;
-  $<HTMLInputElement>('compactShowReasoning').checked = config.compaction.showReasoning;
+  $<HTMLInputElement>('autoCompact').checked = config.compaction.auto;
+  $<HTMLInputElement>('autoCompactTokens').value = String(config.compaction.autoTokens);
+  applyAutoCompactHint(config);
 
   $<HTMLInputElement>('maEnabled').checked = config.multiAgent.enabled;
   $<HTMLInputElement>('maWorkers').value = String(config.multiAgent.maxWorkers);
 
-  $<HTMLInputElement>('orKey').placeholder = state.hasOpenRouterKey ? '•••••••• stored' : 'sk-or-…';
-  $('orKeyState').textContent = state.hasOpenRouterKey
-    ? 'A key is stored, encrypted by Windows. Type a new one to replace it.'
-    : 'Stored encrypted by Windows. It never reaches this window, the browser extension or the log.';
-  $<HTMLButtonElement>('orRemove').disabled = !state.hasOpenRouterKey;
-
-  // Extension bridge.
-  const code = bridge.pairingCode;
-  $('pairCode').textContent = code ?? '';
-  $('pairCodeBox').hidden = code === null;
-  $<HTMLButtonElement>('bridgePair').hidden = code !== null;
-  $<HTMLButtonElement>('bridgeCancel').hidden = code === null;
+  // Extension bridge. Connecting is automatic, so this reports rather than asks.
   $<HTMLButtonElement>('bridgeUnpair').disabled = !bridge.paired;
   $('bridgeState').textContent = !bridge.running
     ? 'The local bridge is off. Turn recording or multi-agent mode on to start it.'
     : bridge.paired
-      ? `Paired. Listening on 127.0.0.1:${bridge.port ?? '?'} · last message ${ago(bridge.lastSeenAt)}.`
-      : `Listening on 127.0.0.1:${bridge.port ?? '?'} · no extension paired yet.`;
+      ? `Connected. Listening on 127.0.0.1:${bridge.port ?? '?'} · last message ${ago(bridge.lastSeenAt)}.`
+      : `Listening on 127.0.0.1:${bridge.port ?? '?'} · no browser has connected yet.`;
   $('bridgeState').classList.toggle('is-warn', bridge.running && !bridge.paired);
   void showExtensionPath();
 
-  paintReasoningHint();
-  paintButtons();
   if (sessions.length > 0) paintSessions();
 }
 
@@ -732,11 +745,6 @@ export function chatVisible(next: boolean): void {
 
 async function refreshAll(): Promise<void> {
   await loadSessions();
-  const state = await run(api.getCompaction());
-  if (state) {
-    compaction = state;
-    paintCompaction();
-  }
   const swarmNow = await run(api.getSwarm());
   if (swarmNow) paintSwarm(swarmNow);
 }
@@ -750,6 +758,14 @@ function scheduleReload(): void {
 
 // ------------------------------------------------------------------- wiring
 
+/**
+ * Switches the session card's body.
+ *
+ * Settings is reachable only from the gear, so it is deliberately not one of the switcher
+ * buttons: while it is open no switcher button is selected, and the gear itself carries
+ * the selected state instead. That is what keeps a property sheet from reading as a third
+ * view of this session.
+ */
 function showView(name: string): void {
   for (const button of $('chatView').querySelectorAll<HTMLButtonElement>('[data-view]')) {
     button.classList.toggle('is-sel', button.dataset.view === name);
@@ -757,16 +773,16 @@ function showView(name: string): void {
   for (const view of document.querySelectorAll<HTMLElement>('#chatBody > .view')) {
     view.hidden = view.dataset.view !== name;
   }
-  if (name === 'settings' && modelTotal === 0) void loadModels();
+  $('chatSettingsBtn').classList.toggle('is-on', name === 'settings');
 }
 
-async function startCompaction(resume: boolean): Promise<void> {
-  if (selectedId === null) return;
-  const result = await run(api.compact(selectedId, resume));
-  if (!result) return;
-  handoffFor = null;
-  toast(resume ? 'Handoff saved. Opening a fresh chat…' : 'Handoff saved');
-  await loadSessions();
+/** Timeline or Compaction — whichever the gear was opened over. */
+let lastContentView = 'timeline';
+
+/** The gear toggles: pressing it again returns to the view the user came from. */
+function toggleSettings(): void {
+  const settings = document.querySelector<HTMLElement>('#chatBody > .view[data-view="settings"]');
+  showView(settings && !settings.hidden ? lastContentView : 'settings');
 }
 
 export function initChat(next: Deps): void {
@@ -784,10 +800,14 @@ export function initChat(next: Deps): void {
 
   $('chatView').addEventListener('click', (event) => {
     const button = (event.target as HTMLElement).closest<HTMLButtonElement>('[data-view]');
-    if (button?.dataset.view) showView(button.dataset.view);
+    if (!button?.dataset.view) return;
+    lastContentView = button.dataset.view;
+    showView(button.dataset.view);
   });
 
-  $('agentFilter').addEventListener('click', (event) => {
+  $('chatSettingsBtn').addEventListener('click', () => toggleSettings());
+
+  $('chatAgentFilter').addEventListener('click', (event) => {
     const button = (event.target as HTMLElement).closest<HTMLButtonElement>('[data-agent]');
     if (!button) return;
     agentFilter = button.dataset.agent === '' ? null : (button.dataset.agent ?? null);
@@ -795,63 +815,11 @@ export function initChat(next: Deps): void {
   });
 
   $('chatRefresh').addEventListener('click', () => void refreshAll());
-  $('compactBtn').addEventListener('click', () => void startCompaction(false));
-  $('resumeBtn').addEventListener('click', () => void startCompaction(true));
-  $('cancelCompact').addEventListener('click', () => void run(api.cancelCompaction()));
 
   $('copyHandoff').addEventListener('click', async () => {
     if (!handoff) return;
     const copied = await run(api.writeClipboard(handoff.text));
     if (copied) toast('Handoff copied');
-  });
-
-  $('orKey').addEventListener('blur', async () => {
-    const input = $<HTMLInputElement>('orKey');
-    if (input.value === '') return;
-    const state = await run(api.setOpenRouterKey(input.value));
-    input.value = '';
-    if (state) {
-      toast('OpenRouter key stored');
-      modelIndex.clear();
-      modelOffset = 0;
-      void loadModels(true);
-    }
-  });
-
-  $('orRemove').addEventListener('click', async () => {
-    const state = await run(api.setOpenRouterKey(''));
-    if (state) toast('OpenRouter key removed');
-  });
-
-  $('modelRefresh').addEventListener('click', () => {
-    modelOffset = 0;
-    void loadModels(true);
-  });
-  $('modelPrev').addEventListener('click', () => {
-    modelOffset = Math.max(0, modelOffset - MODEL_PAGE);
-    void loadModels();
-  });
-  $('modelNext').addEventListener('click', () => {
-    modelOffset += MODEL_PAGE;
-    void loadModels();
-  });
-  let searchTimer: number | undefined;
-  $('modelSearch').addEventListener('input', () => {
-    window.clearTimeout(searchTimer);
-    searchTimer = window.setTimeout(() => {
-      modelOffset = 0;
-      void loadModels();
-    }, 250);
-  });
-  $('modelList').addEventListener('click', (event) => {
-    const row = (event.target as HTMLElement).closest<HTMLElement>('[data-model]');
-    if (!row?.dataset.model) return;
-    $<HTMLInputElement>('compactModel').value = row.dataset.model;
-    for (const other of $('modelList').querySelectorAll('[data-model]')) {
-      other.classList.toggle('is-sel', other === row);
-    }
-    paintReasoningHint();
-    void deps.save();
   });
 
   $('swarmReset').addEventListener('click', async () => {
@@ -862,24 +830,58 @@ export function initChat(next: Deps): void {
     }
   });
 
+  // Which of the two things happened is decided in the main process and reported back,
+  // so the toast describes the actual outcome rather than the intent of the click.
+  $('swarmList').addEventListener('click', async (event) => {
+    const target = event.target as HTMLElement;
+    const recoverId = target.closest<HTMLElement>('[data-recover]')?.dataset.recover;
+    if (recoverId) {
+      // Straight to the clipboard, never onto the screen: the user pastes it into the chat
+      // that lost its binding, which is the only thing it can be used for.
+      const minted = await run(api.recoveryKey(recoverId));
+      if (!minted) return;
+      if (!minted.key) {
+        toast(`${recoverId} has nothing to recover`);
+        return;
+      }
+      const copied = await run(api.writeClipboard(minted.key));
+      toast(
+        copied
+          ? `Recovery key copied — in ${recoverId}'s chat, ask it to call agents action=join with that as join_key`
+          : 'Could not copy the recovery key'
+      );
+      return;
+    }
+    const button = target.closest<HTMLElement>('[data-clear]');
+    const id = button?.dataset.clear;
+    if (!id) return;
+    const outcome = await run(api.clearAgent(id));
+    if (!outcome) return;
+    paintSwarm(outcome.swarm);
+    toast(
+      outcome.cleared === 'run'
+        ? 'Run cleared — every worker ended'
+        : outcome.cleared === 'worker'
+          ? `${id} cleared — its slot is free`
+          : outcome.reason
+    );
+  });
+
   for (const id of [
     'sessRecord',
     'sessRetain',
     'sessAdvisory',
     'sessLimit',
-    'compactReasoning',
-    'compactShowReasoning',
+    'autoCompact',
     'maEnabled',
     'maWorkers'
   ]) {
     $(id).addEventListener('change', () => void deps.save());
   }
 
-  $('bridgePair').addEventListener('click', () => void run(api.pairExtension()));
-  $('bridgeCancel').addEventListener('click', () => void run(api.cancelPairing()));
   $('bridgeUnpair').addEventListener('click', async () => {
     const state = await run(api.unpairExtension());
-    if (state) toast('Extension unpaired');
+    if (state) toast('Browser disconnected');
   });
   $('bridgeFolder').addEventListener('click', async () => {
     const dir = await run(api.openExtensionFolder());
@@ -887,11 +889,5 @@ export function initChat(next: Deps): void {
   });
 
   api.onSessionChanged(scheduleReload);
-  api.onCompactionChanged((state) => {
-    compaction = state;
-    if (state.stage === 'ready') handoffFor = null;
-    paintCompaction();
-    if (state.stage === 'ready') void loadSessions();
-  });
   api.onSwarmChanged(paintSwarm);
 }

@@ -23,7 +23,7 @@
 const PORTS = [8765, 8766, 8767, 8768, 8769];
 const HELLO_TIMEOUT_MS = 1200;
 /** Bumped only when the request/response shape changes; the app compares it. */
-const BRIDGE_PROTOCOL = 3;
+const BRIDGE_PROTOCOL = 4;
 
 /**
  * Journal caps. The byte figure is what actually matters — chrome.storage.session has a
@@ -37,6 +37,51 @@ const BATCH = 100;
 let port = null;
 let token = null;
 let loaded = false;
+/**
+ * The one `load()` in flight, shared by everything that has to wait for it.
+ *
+ * `loaded` alone is not a guard, because it is only set after two awaited storage reads.
+ * Chrome stops this worker after seconds of idling, so the cold path is the normal path:
+ * two tabs report at the same moment, both see `loaded === false`, and both walk the whole
+ * of load(). The first finishes, its handler enqueues an observation and persists it — and
+ * then the second finishes and assigns the journal it read *before* that write straight
+ * over the global. The entry the first handler already answered `ok` for is gone, and
+ * nothing anywhere reports a loss, because as far as both halves are concerned each did
+ * its job. Serialising initialisation is the whole fix: after this, the second caller
+ * awaits the same promise and never re-reads.
+ */
+let loading = null;
+
+/**
+ * Set when the user disconnected on purpose, and cleared only when they connect again.
+ *
+ * Without it, "Disconnect" cleared the token and the very next `/hello` handed this
+ * browser a new one — a button whose effect lasted until the next poll, roughly two
+ * seconds. Auto-provisioning is right for a browser that has never connected and wrong
+ * for one that was told to stop, and only this flag can tell those two apart.
+ */
+let disconnected = false;
+
+/**
+ * The `/pair` in flight, shared by everything that wants a token.
+ *
+ * Several tabs coming back at once all find no token and all call `/pair`. Each call
+ * mints a fresh credential and invalidates the one before it, so the tabs rotate each
+ * other's tokens: every request 401s, drops its token, and provisions again. One promise
+ * means one credential no matter how many callers arrive together.
+ */
+let pairing = null;
+
+/**
+ * When the app was last confirmed to be on `port`, and how long that is believed for.
+ *
+ * `discover()` used to run a `/hello` before every authenticated request, which doubled
+ * the bridge traffic of an already-chatty poll and, with several tabs open, could spend
+ * the 900/min budget on nothing but asking whether the app was still there. A failed
+ * request re-checks immediately, so nothing is lost by believing a recent answer.
+ */
+let portCheckedAt = 0;
+const PORT_TRUST_MS = 30_000;
 
 /**
  * Observations accepted from content scripts but not yet accepted by the app.
@@ -49,29 +94,70 @@ let loaded = false;
 let journal = [];
 let flushing = false;
 
-/** The instruction waiting for the next fresh ChatGPT tab to pick up. */
-let pendingBootstrap = null;
-/** Command ids this browser has already delivered, so a re-offer is not typed twice. */
+/**
+ * Which ChatGPT conversation each browser tab currently represents.
+ *
+ * Conversation lifetime is a browser-level fact, not a document-level one. A content
+ * script dies on reload and `pagehide` fires even though the tab and conversation are
+ * still alive; with two tabs on one chat, either document can disappear while the other
+ * remains. Keeping this in the service worker lets a tab reload without closing the
+ * app-side session and lets `/closed` mean the last live tab really left.
+ *
+ * Persisted in storage.session because Chrome routinely stops this worker while tabs stay
+ * open. `chrome.tabs.onRemoved` wakes it again and can then retire the right conversation.
+ */
+let tabConversations = {};
+
+/**
+ * Command ids this browser has already delivered.
+ *
+ * All that is left of the delivery bookkeeping. There used to be an `opened` list beside it,
+ * for a periodic alarm that opened tabs for commands nobody had delivered; the app opens the
+ * chat itself, exactly once, and a command that does not get taken up fails rather than being
+ * arranged for again. This one stays because a marked page that reloads must not type the
+ * same bootstrap into a second conversation.
+ */
 let settled = [];
 
-async function load() {
-  if (loaded) return;
-  const stored = await chrome.storage.local.get(['port', 'token']);
+function load() {
+  if (loaded) return Promise.resolve();
+  if (!loading) {
+    loading = loadOnce().finally(() => {
+      // Only ever cleared after loadOnce() has run to completion or thrown. A throw leaves
+      // `loaded` false, so the next caller genuinely retries rather than proceeding on
+      // half-initialised globals.
+      loading = null;
+    });
+  }
+  return loading;
+}
+
+async function loadOnce() {
+  const stored = await chrome.storage.local.get(['port', 'token', 'disconnected']);
   port = typeof stored.port === 'number' ? stored.port : null;
   token = typeof stored.token === 'string' ? stored.token : null;
-  const live = await chrome.storage.session.get(['bootstrap', 'settled', 'journal']);
-  pendingBootstrap = live.bootstrap || null;
+  // Deliberately in `local` rather than `session`: a choice to disconnect that a browser
+  // restart undoes is not a choice, it is a delay.
+  disconnected = stored.disconnected === true;
+  const live = await chrome.storage.session.get(['settled', 'journal', 'tabConversations']);
   settled = Array.isArray(live.settled) ? live.settled : [];
   journal = Array.isArray(live.journal) ? live.journal : [];
+  tabConversations =
+    live.tabConversations && typeof live.tabConversations === 'object' && !Array.isArray(live.tabConversations)
+      ? { ...live.tabConversations }
+      : {};
   loaded = true;
 }
 
 async function persist() {
-  await chrome.storage.local.set({ port, token });
+  await chrome.storage.local.set({ port, token, disconnected });
 }
 
 async function persistLive() {
-  await chrome.storage.session.set({ bootstrap: pendingBootstrap, settled: settled.slice(-40) });
+  await chrome.storage.session.set({
+    settled: settled.slice(-40),
+    tabConversations
+  });
 }
 
 /**
@@ -361,32 +447,58 @@ function versionHeaders() {
   return { 'x-extension-version': version, 'x-extension-protocol': String(BRIDGE_PROTOCOL) };
 }
 
-/** Finds the app, preferring the port that worked last time. */
+/**
+ * Finds the app, preferring the port that worked last time.
+ *
+ * A recent confirmation is believed rather than re-checked. The alternative was a
+ * `/hello` in front of every authenticated request, which doubled the traffic of a poll
+ * that already runs every two seconds in every open tab. Nothing is lost by it: a request
+ * to a port the app has left fails, and a failure re-checks immediately.
+ */
 async function discover(force = false) {
   await load();
   if (port !== null && !force) {
+    if (Date.now() - portCheckedAt < PORT_TRUST_MS) return { port, paired: token !== null };
     const body = await hello(port);
-    if (body) return { port, paired: body.paired === true };
+    if (body) {
+      portCheckedAt = Date.now();
+      return { port, paired: body.paired === true };
+    }
   }
   for (const candidate of PORTS) {
     const body = await hello(candidate);
     if (body) {
       port = candidate;
+      portCheckedAt = Date.now();
       await persist();
       return { port: candidate, paired: body.paired === true };
     }
   }
   port = null;
+  portCheckedAt = 0;
   await persist();
   return null;
 }
 
+/** Forgets that the app was ever confirmed, so the next call really looks. */
+function forgetPort() {
+  portCheckedAt = 0;
+}
+
 /** One authenticated request. Returns { ok, status, data } and never throws. */
-async function call(path, init = {}) {
+async function call(path, init = {}, retried = false) {
   await load();
   const found = await discover();
   if (!found) return { ok: false, status: 0, error: 'app_not_found' };
-  if (!token) return { ok: false, status: 401, error: 'not_paired' };
+  if (!token) {
+    // Somebody disconnected this browser on purpose. Quietly getting a new token here is
+    // how "Disconnect" came to mean "disconnect until the next poll".
+    if (disconnected) return { ok: false, status: 401, error: 'disconnected' };
+    // First use. Ask the app for a token instead of asking the user for one — see
+    // provision() for why that is not a downgrade.
+    const got = await provision();
+    if (!got.ok) return { ok: false, status: 401, error: got.error || 'not_paired' };
+  }
   try {
     const response = await fetch(`http://127.0.0.1:${found.port}${path}`, {
       ...init,
@@ -398,20 +510,48 @@ async function call(path, init = {}) {
       }
     });
     if (response.status === 401) {
-      // The app was unpaired, or its stored token was replaced. Forget ours rather
-      // than retrying with a credential that will never work again.
+      // Our token no longer matches the app's — it was reset, or the app's storage was
+      // rebuilt. Drop ours and provision a new one once, rather than retrying forever
+      // with a credential that will never work again or making the user do it by hand.
       token = null;
       await persist();
-      return { ok: false, status: 401, error: 'not_paired' };
+      if (retried) return { ok: false, status: 401, error: 'not_paired' };
+      return call(path, init, true);
     }
     const data = await response.json().catch(() => ({}));
     return { ok: response.ok, status: response.status, data };
   } catch (err) {
+    // The request never reached anything, so the belief that the app is on this port is
+    // exactly what has just been disproved. Next call looks properly.
+    forgetPort();
     return { ok: false, status: 0, error: String(err && err.message ? err.message : err) };
   }
 }
 
-async function pair(code) {
+/**
+ * Gets this browser a bearer token, with nothing for the user to type.
+ *
+ * There used to be a six-digit code shown in the app and entered in the extension popup.
+ * It bought nothing: the only callers that can reach the app at all are already on this
+ * machine's loopback interface — the app refuses any web origin outright — so the code
+ * was asking the user to prove something the network had already proved. What it did cost
+ * was the first-run path, which failed until somebody found the popup.
+ *
+ * The token itself stays: it is what keeps a second local program from driving the bridge
+ * by accident, and it is why the marker in a chat URL is harmless on its own.
+ */
+function provision() {
+  // Singleflight. Everything that wants a token waits on the same request: `/pair` mints
+  // a fresh credential and invalidates the one before it, so two concurrent callers do
+  // not get two tokens, they get one working token and one that has already been revoked.
+  if (pairing) return pairing;
+  pairing = pairOnce().finally(() => {
+    pairing = null;
+  });
+  return pairing;
+}
+
+async function pairOnce() {
   const found = await discover(true);
   if (!found) return { ok: false, error: 'app_not_found' };
   try {
@@ -419,13 +559,15 @@ async function pair(code) {
       method: 'POST',
       cache: 'no-store',
       headers: { 'content-type': 'application/json', ...versionHeaders() },
-      body: JSON.stringify({ code })
+      body: JSON.stringify({})
     });
     const data = await response.json().catch(() => ({}));
     if (!response.ok || typeof data.token !== 'string') {
       return { ok: false, error: data.error || `HTTP ${response.status}`, message: data.message };
     }
     token = data.token;
+    // Connecting is the counterpart of disconnecting, and the only thing that clears it.
+    disconnected = false;
     await persist();
     return { ok: true };
   } catch (err) {
@@ -436,80 +578,34 @@ async function pair(code) {
 // -------------------------------------------------------------------- commands
 
 /**
- * Picks up at most one queued "open a fresh chat" command and opens the tab for it.
+ * Fetches the one command a marked page was opened for.
  *
- * Claiming happens here because the worker is a single instance: several ChatGPT tabs
- * poll, but only one of them can win a command. The claim is a lease held by the app —
- * if this browser never manages to type the message, the app hands the command out
- * again rather than losing it.
- */
-async function pollCommands() {
-  await load();
-  if (pendingBootstrap) {
-    const expired = Date.now() - pendingBootstrap.createdAt > pendingBootstrap.leaseMs;
-    if (!expired) return { ok: true, waiting: true };
-    // A tab was opened but never collected the bootstrap. Previously this memory slot
-    // blocked every later worker/resume command forever because only takeBootstrap()
-    // knew how to expire it. Release and report it here too, since polling is what keeps
-    // running even when the fresh tab died before its content script came up.
-    const stale = pendingBootstrap;
-    pendingBootstrap = null;
-    await persistLive();
-    await ackCommand(stale.id, 'failed', 'no fresh ChatGPT tab collected it before the lease expired');
-  }
-  const result = await call('/commands');
-  if (!result.ok) return result;
-  const commands = Array.isArray(result.data.commands) ? result.data.commands : [];
-  const next = commands.find((command) => command && !settled.includes(command.id));
-  if (!next) return { ok: true, waiting: false };
-  pendingBootstrap = {
-    id: next.id,
-    text: String(next.text || '').slice(0, 4000),
-    agent: typeof next.agent === 'string' ? next.agent : null,
-    leaseMs: Number(next.leaseMs) || 90_000,
-    createdAt: Date.now()
-  };
-  await persistLive();
-  try {
-    await chrome.tabs.create({ url: 'https://chatgpt.com/', active: true });
-  } catch (err) {
-    // No tab, no bootstrap. Tell the app now so it can re-offer immediately instead of
-    // waiting out a lease nothing is holding.
-    const failed = pendingBootstrap;
-    pendingBootstrap = null;
-    await persistLive();
-    await ackCommand(failed.id, 'failed', String(err && err.message ? err.message : err));
-    return { ok: false, error: 'tab_failed' };
-  }
-  return { ok: true, opened: true };
-}
-
-/**
- * Handed to the first fresh chat that asks, once.
+ * Redeeming by id is what replaced the single global "pending bootstrap" slot. That slot
+ * was consumed by whichever fresh tab asked first, so a tab that came up before the slot
+ * was filled got nothing and never asked again, while a later unrelated tab could take a
+ * bootstrap meant for something else. An id in the URL cannot be taken by the wrong page,
+ * survives the tab being reloaded, and can be asked for as many times as it takes.
  *
- * A bootstrap nobody collected inside its lease is not typed later: the tab was
- * probably closed, and the app is already free to offer it to a new one. Reporting the
- * failure here is what makes that re-offer immediate.
+ * The app answers 404 for a command that has been cancelled, superseded, or already
+ * sent, so a stale marker types nothing.
  */
-async function takeBootstrap() {
+async function redeemCommand(id, client) {
   await load();
-  if (!pendingBootstrap) return null;
-  const taken = pendingBootstrap;
-  if (Date.now() - taken.createdAt > taken.leaseMs) {
-    pendingBootstrap = null;
-    await persistLive();
-    await ackCommand(taken.id, 'failed', 'no fresh ChatGPT tab collected it in time');
-    return null;
-  }
-  pendingBootstrap = null;
-  await persistLive();
-  return taken;
+  if (!id || settled.includes(id)) return { ok: true, command: null };
+  const result = await call('/commands/redeem', { method: 'POST', body: JSON.stringify({ id, client }) });
+  if (result.status === 404) return { ok: true, command: null, gone: true };
+  // Another page already owns this command. Not an error to report: this page simply is not
+  // the one the app is talking to, and it must type nothing.
+  if (result.status === 409) return { ok: true, command: null, gone: true };
+  if (!result.ok) return { ok: false, error: result.error || `HTTP ${result.status}` };
+  const command = result.data && result.data.command ? result.data.command : null;
+  return { ok: true, command };
 }
 
 async function ackCommand(id, status, error, conversationId, agent) {
   if (status === 'sent' && !agent) {
     // Resume commands are finished once their bootstrap message was sent. Worker
-    // commands are different: the app deliberately keeps them until join_agent really
+    // commands are different: the app deliberately keeps them until the join really
     // succeeds, so do not blacklist their id here or a post-safety-block retry could
     // never be collected by this service worker.
     settled.push(id);
@@ -540,25 +636,122 @@ function tabKey(sender) {
   return id === null ? 'tab-unknown' : `tab-${id}`;
 }
 
+function tabId(sender) {
+  return sender && sender.tab && typeof sender.tab.id === 'number' ? sender.tab.id : null;
+}
+
+function cleanConversationId(value) {
+  const id = typeof value === 'string' ? value.trim() : '';
+  return /^[0-9a-f-]{8,64}$/i.test(id) ? id : null;
+}
+
+/** Records a tab's current conversation without writing storage on every poll. */
+async function noteTabConversation(sender, value) {
+  const id = tabId(sender);
+  const conversationId = cleanConversationId(value);
+  if (id === null || !conversationId) return false;
+  const key = String(id);
+  if (tabConversations[key] === conversationId) return false;
+  tabConversations[key] = conversationId;
+  await persistLive();
+  return true;
+}
+
+function conversationStillOpen(conversationId) {
+  return Object.values(tabConversations).some((value) => value === conversationId);
+}
+
+/**
+ * Removes one tab's ownership and closes the app-side conversation only if it was last.
+ *
+ * `expected` protects an old page's delayed close from deleting a mapping that the same
+ * tab has already replaced with a new conversation.
+ */
+async function releaseTab(tab, expected = null) {
+  await load();
+  if (typeof tab !== 'number') return { ok: true, closed: false };
+  const key = String(tab);
+  const current = cleanConversationId(tabConversations[key]);
+  const wanted = cleanConversationId(expected);
+  if (current && (!wanted || current === wanted)) {
+    delete tabConversations[key];
+    await persistLive();
+  }
+  const conversationId = wanted || current;
+  if (!conversationId || conversationStillOpen(conversationId)) {
+    return { ok: true, closed: false };
+  }
+  // Deliver anything still queued before telling the app the final browser view is gone.
+  await drain();
+  return call('/closed', {
+    method: 'POST',
+    body: JSON.stringify({ conversationId })
+  });
+}
+
+function conversationFromUrl(value) {
+  try {
+    const url = new URL(String(value || ''));
+    if (url.hostname !== 'chatgpt.com') return null;
+    const match = /^\/c\/([0-9a-f-]{8,64})/i.exec(url.pathname);
+    return match ? match[1] : null;
+  } catch {
+    return null;
+  }
+}
+
 const HANDLERS = {
   async status() {
     await load();
     const found = await discover();
+    // Provisioning here as well as in call() is what makes the popup show "Connected"
+    // the first time it is opened, rather than a truthful but useless "not paired".
+    // Not after a deliberate disconnect: opening the popup to check is not a request to
+    // undo the thing the popup was opened to check.
+    if (found && !token && !disconnected) await provision();
     return {
       connected: found !== null,
       port: found ? found.port : null,
       paired: token !== null,
+      disconnected,
       pending: journal.length
     };
   },
-  async pair(message) {
-    return pair(String(message.code || ''));
+  async pair() {
+    await load();
+    return provision();
   },
   async unpair() {
     await load();
     token = null;
+    // Remembered, not just cleared. Otherwise the next request — two seconds away in any
+    // open tab — provisions a new token and the browser is connected again.
+    disconnected = true;
     await persist();
     return { ok: true };
+  },
+  /**
+   * Ask every ChatGPT tab this worker already knows about to rebuild its Local Files
+   * activity stream immediately. `tabConversations` is the same durable tab registry used
+   * for conversation lifetime, so this needs neither broad tab-query permissions nor URL
+   * guessing from the popup.
+   */
+  async overwriteNow() {
+    await load();
+    const tabs = Object.keys(tabConversations)
+      .map((value) => Number(value))
+      .filter((value) => Number.isInteger(value));
+    let applied = 0;
+    for (const id of tabs) {
+      try {
+        const result = await chrome.tabs.sendMessage(id, { type: 'clf-overwrite-now' });
+        if (result && result.ok === true) applied += 1;
+      } catch {
+        // A tab may be between navigations/reloads and temporarily have no receiver. The
+        // registry is tab-lifetime state, so do not retire it merely because one send raced.
+      }
+    }
+    return { ok: true, tabs: applied, attempted: tabs.length };
   },
   /**
    * Takes observations off a content script's hands.
@@ -571,6 +764,7 @@ const HANDLERS = {
    */
   async events(message, sender) {
     await load();
+    await noteTabConversation(sender, message.conversationId);
     const key = tabKey(sender);
     const entries = (Array.isArray(message.entries) ? message.entries : []).map((entry) =>
       entry && !entry.conversationId ? { ...entry, provisional: key } : entry
@@ -591,6 +785,7 @@ const HANDLERS = {
    */
   async bind(message, sender) {
     await load();
+    await noteTabConversation(sender, message.conversationId);
     const bound = bindProvisional(tabKey(sender), String(message.conversationId || ''));
     if (bound > 0) {
       await persistJournal();
@@ -601,35 +796,45 @@ const HANDLERS = {
   async drain() {
     return drain();
   },
-  async activity(message) {
+  async activity(message, sender) {
+    await load();
+    await noteTabConversation(sender, message.conversationId);
     const query = `?conversationId=${encodeURIComponent(message.conversationId)}&since=${Number(message.since) || 0}`;
     return call(`/activity${query}`);
   },
-  async closed(message) {
-    // Deliver anything still queued for this conversation before saying it is over.
-    await drain();
-    return call('/closed', {
-      method: 'POST',
-      body: JSON.stringify({ conversationId: message.conversationId })
-    });
+  async closed(message, sender) {
+    // releaseTab drains the queue and posts /closed itself, and only when this was the
+    // last live tab on the conversation.
+    return releaseTab(tabId(sender), message.conversationId);
   },
-  async compact(message) {
+  async compact(message, sender) {
+    await load();
+    await noteTabConversation(sender, message.conversationId);
     return call('/compact', {
       method: 'POST',
-      body: JSON.stringify({ conversationId: message.conversationId, resume: message.resume !== false })
+      body: JSON.stringify({
+        conversationId: message.conversationId,
+        resume: message.resume !== false,
+        cancel: message.cancel === true,
+        // The capture. `token` names the transaction the page was given when it marked the
+        // compaction turn, and `summary` is that turn's own answer. Both are forwarded
+        // verbatim and only together: the app refuses a brief whose token does not name an
+        // open continuation for this chat, which is what keeps some other tab's text from
+        // ever becoming this session's handoff.
+        ...(typeof message.token === 'string' && typeof message.summary === 'string'
+          ? { token: message.token, summary: message.summary }
+          : {})
+      })
     });
   },
-  async poll() {
-    await drain();
-    return pollCommands();
-  },
-  async bootstrap() {
-    return { ok: true, bootstrap: await takeBootstrap() };
+  /** The marked page asking for the one command it was opened for. */
+  async redeem(message) {
+    return redeemCommand(String(message.id || ''), String(message.client || ''));
   },
   async ack(message) {
     return ackCommand(
       String(message.id || ''),
-      message.status === 'failed' || message.status === 'working' ? message.status : 'sent',
+      message.status === 'failed' ? 'failed' : 'sent',
       message.error,
       message.conversationId,
       message.agent
@@ -648,3 +853,20 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   );
   return true;
 });
+
+// Document unload is not conversation lifetime. A real tab close is: reload keeps the
+// same tab id, while closing it wakes the service worker and retires only that tab's claim.
+chrome.tabs.onRemoved.addListener((id) => {
+  void releaseTab(id).catch(() => undefined);
+});
+
+// -------------------------------------------------------------------- recovery
+
+/**
+ * The only thing that runs without a page.
+ *
+ * A service worker is not a daemon: Chrome stops it after seconds of idling, and nothing
+ * in a stopped worker fires. An alarm is the one wake-up that survives that, which is why
+ * the leftovers — a command restored from a previous run, a tab closed before its content
+ * script came up — are picked up here and not on a timer.
+ */

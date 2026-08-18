@@ -18,10 +18,10 @@ const FILE_NAME = 'secrets.bin';
 let secretsPath = '';
 let cache: Record<string, string> | null = null;
 /**
- * Every mutation is a read-modify-write of one small encrypted blob. Saving the
- * OpenRouter key while the bridge token is being minted would otherwise have both calls
- * clone the same snapshot, and the later write would erase the other's key — as well as
- * racing on secrets.bin.tmp. Same shape as config.ts's queue, for the same reason.
+ * Every mutation is a read-modify-write of one small encrypted blob. Saving the OpenAI key
+ * while the bridge token is being minted would otherwise have both calls clone the same
+ * snapshot, and the later write would erase the other's key — as well as racing on
+ * secrets.bin.tmp. Same shape as config.ts's queue, for the same reason.
  */
 let mutationQueue: Promise<void> = Promise.resolve();
 
@@ -39,7 +39,7 @@ function enqueue<T>(operation: () => Promise<T>): Promise<T> {
  * extension presents. It lives here anyway so it is encrypted at rest and stays out of
  * config.json, the log and the renderer.
  */
-export type SecretKey = 'openaiApiKey' | 'openrouterApiKey' | 'bridgeToken';
+export type SecretKey = 'openaiApiKey' | 'bridgeToken';
 
 export function initSecretsPath(userDataDir: string): void {
   secretsPath = path.join(userDataDir, FILE_NAME);

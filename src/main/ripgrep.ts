@@ -1,0 +1,35 @@
+import { existsSync } from 'node:fs';
+import path from 'node:path';
+import { pathEntries } from './env.js';
+
+/**
+ * Looks for rg on the inherited path.
+ *
+ * Through the shared reader, because environment names are case-insensitive on Windows and
+ * `process.env.PATH` is undefined on a machine whose parent process spelled it `Path` —
+ * which is the ordinary spelling. Reading only the uppercase name silently found nothing.
+ */
+function pathCandidate(): string | null {
+  for (const raw of pathEntries()) {
+    const dir = raw.trim().replace(/^"|"$/g, '');
+    if (!dir) continue;
+    const candidate = path.join(dir, 'rg.exe');
+    if (existsSync(candidate)) return candidate;
+  }
+  return null;
+}
+
+/** Locate the bundled ripgrep first, then an existing user installation as a dev fallback. */
+export function locateRipgrep(): string | null {
+  const packaged = process.resourcesPath ? path.join(process.resourcesPath, 'rg', 'rg.exe') : null;
+  if (packaged && existsSync(packaged)) return packaged;
+
+  const dev = path.resolve(__dirname, '..', '..', 'resources', 'rg', 'rg.exe');
+  if (existsSync(dev)) return dev;
+  return pathCandidate();
+}
+
+export function ripgrepVersionFile(): string | null {
+  const executable = locateRipgrep();
+  return executable ? path.join(path.dirname(executable), 'VERSION') : null;
+}

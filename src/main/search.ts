@@ -8,7 +8,9 @@
  */
 
 import { rawCreateReadStream as createReadStream, rawPromises as fs } from './rawfs.js';
+import { spawn } from 'node:child_process';
 import path from 'node:path';
+import { locateRipgrep } from './ripgrep.js';
 import { detectTextEncoding, isExcludedFolderName, sniffBinary } from './fsops.js';
 
 /**
@@ -97,6 +99,7 @@ export interface SearchRequest {
   include?: string | undefined;
   exclude: readonly string[];
   caseSensitive: boolean;
+  regex?: boolean;
   maxResults: number;
 }
 
@@ -135,7 +138,137 @@ function matchesInclude(relPath: string, pattern: string, caseSensitive: boolean
   return false;
 }
 
+async function searchWithRipgrep(
+  executable: string,
+  req: SearchRequest,
+  realTarget: string,
+  virtualTarget: string,
+  targetIsFile = false
+): Promise<SearchOutcome> {
+  const started = Date.now();
+  const args = [
+    '--json',
+    '--line-number',
+    '--color',
+    'never',
+    '--hidden',
+    '--no-ignore',
+    '--max-filesize',
+    String(MAX_CONTENT_FILE_BYTES)
+  ];
+  if (!req.caseSensitive) args.push('--ignore-case');
+  if (!req.regex) args.push('--fixed-strings');
+  if (req.include) args.push('--glob', req.include);
+  for (const excluded of req.exclude) args.push('--glob', `!**/${excluded}/**`);
+  args.push('--', req.query, targetIsFile ? realTarget : '.');
+
+  return new Promise<SearchOutcome>((resolve, reject) => {
+    const child = spawn(executable, args, {
+      cwd: targetIsFile ? path.dirname(realTarget) : realTarget,
+      windowsHide: true,
+      shell: false,
+      stdio: ['ignore', 'pipe', 'pipe']
+    });
+    const hits: SearchHit[] = [];
+    let filesScanned = 0;
+    let stdout = '';
+    let stderr = '';
+    let stoppedBecause: SearchOutcome['stoppedBecause'] = null;
+    let settled = false;
+
+    const finish = (error?: Error): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (error) {
+        reject(error);
+        return;
+      }
+      resolve({
+        hits,
+        filesScanned,
+        truncated: stoppedBecause !== null,
+        stoppedBecause,
+        elapsedMs: Date.now() - started
+      });
+    };
+
+    const consider = (line: string): void => {
+      if (!line) return;
+      let event: any;
+      try {
+        event = JSON.parse(line);
+      } catch {
+        return;
+      }
+      if (event?.type === 'summary') {
+        // `begin` is emitted once per file that *has* a match, so counting it reported
+        // matches, not coverage. The summary is the only event that knows how many files
+        // were actually searched.
+        const searches = Number(event?.data?.stats?.searches);
+        if (Number.isSafeInteger(searches)) filesScanned = searches;
+        return;
+      }
+      if (event?.type !== 'match') return;
+      // Killing the child does not stop this. The pipe already holds whatever ripgrep
+      // wrote before the signal landed, and every buffered line still arrives here, so
+      // without this guard a maxResults of 3 could return 9.
+      if (stoppedBecause !== null) return;
+      const data = event.data;
+      const lineNo = Number(data?.line_number);
+      // With a target of "." and cwd set, ripgrep reports paths as ".\README.md". Left
+      // alone that becomes "/root/./README.md" and no caller can match it against the
+      // path it asked about.
+      const rawPath = String(data?.path?.text ?? '')
+        .replace(/\\/g, '/')
+        .replace(/^\.\//, '');
+      const rawText = String(data?.lines?.text ?? '').replace(/\r?\n$/, '');
+      const trimmed = rawText.trim();
+      const hitPath = targetIsFile
+        ? virtualTarget
+        : `${virtualTarget}/${rawPath}`.replace(/\/+/g, '/').replace(/\/\.\//g, '/');
+      hits.push({
+        path: hitPath,
+        line: Number.isSafeInteger(lineNo) ? lineNo : undefined,
+        text: trimmed.length > MAX_LINE_CHARS ? `${trimmed.slice(0, MAX_LINE_CHARS)}…` : trimmed
+      });
+      if (hits.length >= req.maxResults && stoppedBecause === null) {
+        stoppedBecause = 'limit';
+        child.kill();
+      }
+    };
+
+    child.stdout.on('data', (chunk: Buffer) => {
+      stdout += chunk.toString('utf8');
+      for (;;) {
+        const newline = stdout.indexOf('\n');
+        if (newline === -1) break;
+        consider(stdout.slice(0, newline).trim());
+        stdout = stdout.slice(newline + 1);
+      }
+    });
+    child.stderr.on('data', (chunk: Buffer) => {
+      stderr = `${stderr}${chunk.toString('utf8')}`.slice(-8000);
+    });
+    child.once('error', (error) => finish(error));
+    child.once('close', (code) => {
+      if (stdout.trim()) consider(stdout.trim());
+      // rg uses 1 for "no matches". A deliberate limit/time kill can return any code.
+      if (stoppedBecause !== null || code === 0 || code === 1) finish();
+      else finish(new Error(`ripgrep failed${code === null ? '' : ` (exit ${code})`}: ${stderr.trim() || 'unknown error'}`));
+    });
+    const timer = setTimeout(() => {
+      if (stoppedBecause === null) stoppedBecause = 'time';
+      child.kill();
+    }, TIME_BUDGET_MS);
+  });
+}
+
 export async function search(req: SearchRequest): Promise<SearchOutcome> {
+  if (req.mode === 'content') {
+    const ripgrep = locateRipgrep();
+    if (ripgrep) return searchWithRipgrep(ripgrep, req, req.realDir, req.virtualDir);
+  }
   const started = Date.now();
   const deadline = started + TIME_BUDGET_MS;
   const hits: SearchHit[] = [];
@@ -255,8 +388,20 @@ async function scanContents(
 export async function searchOneFile(
   realPath: string,
   virtualPath: string,
-  req: Pick<SearchRequest, 'query' | 'mode' | 'include' | 'caseSensitive' | 'maxResults'>
+  req: Pick<SearchRequest, 'query' | 'mode' | 'include' | 'caseSensitive' | 'regex' | 'maxResults'>
 ): Promise<SearchOutcome> {
+  if (req.mode === 'content') {
+    const ripgrep = locateRipgrep();
+    if (ripgrep) {
+      return searchWithRipgrep(
+        ripgrep,
+        { ...req, realDir: path.dirname(realPath), virtualDir: path.dirname(virtualPath).replace(/\\/g, '/'), exclude: [] },
+        realPath,
+        virtualPath,
+        true
+      );
+    }
+  }
   const started = Date.now();
   const rel = path.basename(virtualPath);
   if (req.include && !matchesInclude(rel, req.include, req.caseSensitive)) {
@@ -306,6 +451,14 @@ async function scanOneFile(
   }
 
   const needle = req.caseSensitive ? req.query : req.query.toLowerCase();
+  let regex: RegExp | null = null;
+  if (req.regex) {
+    try {
+      regex = new RegExp(req.query, req.caseSensitive ? '' : 'i');
+    } catch (error) {
+      throw new Error(`Invalid search regex: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
   const results: Array<{ line: number; text: string }> = [];
   let lineNo = 0;
   let carry = '';
@@ -314,7 +467,7 @@ async function scanOneFile(
   const consider = (line: string): void => {
     lineNo++;
     const haystack = req.caseSensitive ? line : line.toLowerCase();
-    if (!haystack.includes(needle)) return;
+    if (regex ? !regex.test(line) : !haystack.includes(needle)) return;
     const trimmed = line.trim();
     results.push({
       line: lineNo,

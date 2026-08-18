@@ -3,18 +3,19 @@
  */
 
 import path from 'node:path';
-import { app, BrowserWindow, Menu, Tray, nativeImage, session } from 'electron';
+import { app, BrowserWindow, Menu, Tray, nativeImage, session, shell } from 'electron';
 import { getConfig, initConfigPath, loadConfig } from './config.js';
 import { connect, disconnect, getStatus, onStatusChange } from './connection.js';
 import { registerIpc } from './ipc.js';
 import { logError, logInfo } from './logger.js';
 import { stopAllManagedProcesses } from './process-manager.js';
 import { initSecretsPath } from './secrets.js';
-import { startBridge, stopBridge } from './bridge.js';
+import { installBridgeLiveness, setBrowserOpener, startBridge, stopBridge } from './bridge.js';
 import { flushSessions, initSessionStore, pruneSessions } from './session/store.js';
-import { setAgentConversationLookup } from './session/recorder.js';
+import { flushRecorder, setAgentBinder, setAgentConversationLookup } from './session/recorder.js';
 import {
   agentConversation,
+  bindConversation,
   onSwarmPersist,
   restoreSwarm,
   snapshotSwarm,
@@ -169,6 +170,22 @@ void app.whenReady().then(async () => {
   initDurableStore(userData);
   await loadConfig();
   setAgentConversationLookup(agentConversation);
+  // The prime's chat is the user's own, so no extension report can name it. It is bound
+  // when the recorder manages to place the prime's first call. See recordToolCall.
+  setAgentBinder(bindConversation);
+  // Before anything can call an agent tool, and before a run is restored: the broker
+  // decides whether a previous run has been abandoned partly from which ChatGPT tabs are
+  // open, and without this it can only answer "I cannot see" — which it treats, on
+  // purpose, as a reason to leave the existing run alone.
+  installBridgeLiveness();
+  // How a fresh chat actually opens. The app asks the OS to open the ChatGPT URL, which
+  // launches the browser if it is closed and creates the tab if there is none — the two
+  // cases the old "wait for a ChatGPT tab to poll us" delivery could never handle. Wired
+  // before any restored command is delivered, so a resume queued yesterday opens as soon
+  // as the bridge starts rather than waiting for the user to visit ChatGPT.
+  setBrowserOpener(async (url) => {
+    await shell.openExternal(url);
+  });
 
   // A multi-agent run outlives this process. Restoring it before the bridge starts
   // means a worker that never joined gets its chat re-requested through the same queue
@@ -235,8 +252,11 @@ app.on('will-quit', (event) => {
   tray.destroy();
   tray = null;
   // flushSessions and flushDurable last, so a summary or a swarm change written during
-  // shutdown still lands on disk instead of dying with the debounce timer.
+  // shutdown still lands on disk instead of dying with the debounce timer. flushRecorder
+  // comes before them: tool calls are filed off the connector's path, so the last one or
+  // two of a session can still be queued at this point.
   void Promise.all([disconnect(), stopAllManagedProcesses(), stopBridge()])
+    .then(() => flushRecorder())
     .then(() => Promise.all([flushSessions(), flushDurable()]))
     .finally(() => app.quit());
 });

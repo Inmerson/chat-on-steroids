@@ -41,18 +41,15 @@ afterEach(async () => {
 describe('secret store', () => {
   it('serializes concurrent writes so one credential cannot erase another', async () => {
     await Promise.all([
-      setSecret('openrouterApiKey', 'or-key-123'),
       setSecret('bridgeToken', 'bridge-token-456'),
       setSecret('openaiApiKey', 'sk-openai-789')
     ]);
 
-    expect(await getSecret('openrouterApiKey')).toBe('or-key-123');
     expect(await getSecret('bridgeToken')).toBe('bridge-token-456');
     expect(await getSecret('openaiApiKey')).toBe('sk-openai-789');
 
     // Force a disk read, not the in-process cache.
     resetSecretsCacheForTests();
-    expect(await getSecret('openrouterApiKey')).toBe('or-key-123');
     expect(await getSecret('bridgeToken')).toBe('bridge-token-456');
     expect(await getSecret('openaiApiKey')).toBe('sk-openai-789');
     expect(await fs.stat(path.join(dir, 'secrets.bin'))).toBeTruthy();

@@ -10,6 +10,14 @@
 
 /** Above this many lines on either side, the LCS pass is skipped as too expensive. */
 const LCS_LINE_LIMIT = 1500;
+/**
+ * Maximum edit distance the sparse Myers pass will chase on a large residual block.
+ *
+ * A pair of tiny edits thousands of lines apart has a tiny D and is cheap even when N is
+ * huge. A true rewrite has a huge D, so this bound stops before the quadratic/worst-case
+ * work becomes interesting and lets the existing approximate fallback take over.
+ */
+const MYERS_EDIT_LIMIT = 512;
 
 export interface LineDelta {
   added: number;
@@ -45,6 +53,45 @@ function lcsLength(a: readonly string[], b: readonly string[]): number {
   return previous[b.length] ?? 0;
 }
 
+/**
+ * Exact shortest insert/delete edit distance for sparse large changes, bounded by D.
+ *
+ * Myers is the right second pass here because its useful complexity is O((N+M)D): the
+ * 4,000-line file with two distant replacements that broke the old counter has D=4, while
+ * a 4,000-line rewrite quickly hits the cap and remains explicitly approximate. We only need
+ * the distance, not an edit script. Together with the length difference it uniquely gives
+ * added and removed line counts.
+ */
+function boundedMyersDistance(a: readonly string[], b: readonly string[]): number | null {
+  const n = a.length;
+  const m = b.length;
+  const maxD = Math.min(MYERS_EDIT_LIMIT, n + m);
+  const offset = maxD + 1;
+  const frontier = new Int32Array(2 * maxD + 3);
+  frontier.fill(-1);
+  frontier[offset + 1] = 0;
+
+  for (let d = 0; d <= maxD; d++) {
+    for (let k = -d; k <= d; k += 2) {
+      const index = offset + k;
+      let x: number;
+      if (k === -d || (k !== d && frontier[index - 1]! < frontier[index + 1]!)) {
+        x = frontier[index + 1]!;
+      } else {
+        x = frontier[index - 1]! + 1;
+      }
+      let y = x - k;
+      while (x < n && y < m && a[x] === b[y]) {
+        x++;
+        y++;
+      }
+      frontier[index] = x;
+      if (x >= n && y >= m) return d;
+    }
+  }
+  return null;
+}
+
 /** Added and removed line counts between two versions of the same text. */
 export function lineDelta(before: string, after: string): LineDelta {
   if (before === after) return { added: 0, removed: 0, approximate: false };
@@ -73,6 +120,13 @@ export function lineDelta(before: string, after: string): LineDelta {
     return { added: newBlock.length, removed: oldBlock.length, approximate: false };
   }
   if (oldBlock.length > LCS_LINE_LIMIT || newBlock.length > LCS_LINE_LIMIT) {
+    const distance = boundedMyersDistance(oldBlock, newBlock);
+    if (distance !== null) {
+      const net = newBlock.length - oldBlock.length;
+      const added = (distance + net) / 2;
+      const removed = distance - added;
+      return { added, removed, approximate: false };
+    }
     return { added: newBlock.length, removed: oldBlock.length, approximate: true };
   }
 

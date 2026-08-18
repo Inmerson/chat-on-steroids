@@ -14,6 +14,60 @@
   opacity: 0.75;
 }
 
+/* A row named from ChatGPT's own record rather than from the app's. The app did not run
+   this call and has no result for it, so it reads as a name and not as a finding: no
+   icon, no outcome colour, and less contrast than a matched row. */
+.clf-page [data-clf-label] {
+  opacity: 0.8;
+  font-style: italic;
+}
+
+/* "+4" on a row that ChatGPT drew for five calls, and the control that opens the other
+   four underneath it. Deliberately quiet and small: it is a count of things folded away,
+   not a result, and it must not compete with the tool name the row now carries. */
+.clf-folded {
+  margin-left: 0.4em;
+  padding: 0 0.35em;
+  border-radius: 0.6em;
+  border: 1px solid currentColor;
+  font-size: 0.8em;
+  font-variant-numeric: tabular-nums;
+  opacity: 0.55;
+  cursor: pointer;
+  user-select: none;
+}
+
+.clf-folded:hover,
+.clf-folded:focus-visible,
+.clf-folded[aria-expanded='true'] {
+  opacity: 1;
+}
+
+/* Which agent ran the call, in front of the name of what it did — the transcript's
+   equivalent of a speaker prefix, and read as one. Only appears in a chat that has agents;
+   a plain chat has one possible answer and does not need to be told it. */
+.clf-agent {
+  margin-right: 0.45em;
+  padding: 0 0.4em;
+  border-radius: 0.6em;
+  background: color-mix(in srgb, currentColor 14%, transparent);
+  font-size: 0.8em;
+  font-weight: 600;
+  letter-spacing: 0.01em;
+  white-space: nowrap;
+  opacity: 0.8;
+}
+
+/* When the app ran the call, on this machine's clock. Quiet and after the result, because
+   almost nobody reads a transcript for the time — but when the question is what happened
+   between two calls, it is the only thing that answers it. */
+.clf-when {
+  margin-left: 0.5em;
+  font-size: 0.85em;
+  font-variant-numeric: tabular-nums;
+  opacity: 0.45;
+}
+
 .clf-good > * .clf-metric,
 .clf-good .clf-metric {
   color: color-mix(in srgb, currentColor 45%, #17a34a);
@@ -32,9 +86,32 @@
   opacity: 1;
 }
 
-/* The relabelled tool row keeps ChatGPT's component but makes its semantics readable. */
+/* The relabelled tool row keeps ChatGPT's component but makes its semantics readable.
+   ChatGPT renders "Called tool" at roughly half opacity, which is right for a row that
+   says nothing and wrong for one that names a file being rewritten. Ours is a real line
+   of the transcript, so it gets full contrast. */
 .clf-tool [data-clf-label] {
   font-variant-numeric: tabular-nums;
+}
+
+.clf-tool {
+  opacity: 1 !important;
+}
+
+.clf-tool .clf-tool-title {
+  opacity: 1;
+  color: inherit;
+}
+
+/* A failed call has to look failed at a glance, not only in its metric chip. */
+.clf-tool[data-clf-outcome='error'] .clf-tool-title,
+.clf-tool[data-clf-outcome='error'] .clf-tool-icon {
+  color: color-mix(in srgb, currentColor 35%, #dc2626);
+}
+
+.clf-tool[data-clf-outcome='rejected'] .clf-tool-title,
+.clf-tool[data-clf-outcome='rejected'] .clf-tool-icon {
+  color: color-mix(in srgb, currentColor 35%, #d97706);
 }
 
 .clf-tool-icon {
@@ -44,6 +121,14 @@
   justify-content: center;
   font-weight: 700;
   opacity: 0.9;
+}
+
+.clf-tool-icon svg,
+.clf-row-icon svg,
+.clf-stream-icon svg {
+  display: block;
+  width: 14px;
+  height: 14px;
 }
 
 .clf-tool-title {
@@ -69,53 +154,552 @@
   font-weight: 550;
 }
 
-.clf-compact-icon {
-  font-size: 1.05em;
-  font-weight: 700;
-}
+/* --- the Compact & resume control in the composer ------------------------- */
 
-/* --- the injected chronological view ------------------------------------- */
+/* Sized and shaped like ChatGPT's own composer buttons rather than styled as a badge:
+   the same square hit target, the same round corners, no colour of its own. Everything
+   here is drawn from `currentColor` so it follows the composer into either theme. */
 
-.clf-timeline {
-  margin: 0.5em 0 0;
-  padding: 0;
-  border-left: 2px solid color-mix(in srgb, currentColor 22%, transparent);
-  font-size: 0.82em;
-  line-height: 1.5;
-  opacity: 0.85;
-}
+/* --- the instruction the app typed to open the chat ----------------------- */
 
-.clf-timeline > summary {
-  margin-left: 0.7em;
+/* A resumed chat opens with the whole handoff brief and a worker chat with "You are
+   worker agent worker-n …", both arriving as an ordinary user message — a screenful of
+   machinery where the thing the user actually asked for belongs. Folded, never removed:
+   it is real input a real model was given, and a transcript that quietly hides part of
+   its own input is worse than a long one. */
+.clf-boot > summary {
   cursor: pointer;
   list-style: none;
-  opacity: 0.7;
+  font-size: 0.82em;
+  font-weight: 600;
+  opacity: 0.55;
   user-select: none;
 }
 
-.clf-timeline > summary::-webkit-details-marker {
+.clf-boot > summary::-webkit-details-marker {
   display: none;
 }
 
-.clf-timeline > summary::before {
+.clf-boot > summary::before {
   content: '▸ ';
   display: inline-block;
   width: 1em;
 }
 
-.clf-timeline[open] > summary::before {
+.clf-boot[open] > summary::before {
   content: '▾ ';
 }
 
-.clf-timeline > summary:hover {
+.clf-boot > summary:hover,
+.clf-boot > summary:focus-visible {
+  opacity: 0.9;
+}
+
+/* --- the field stacked above the composer --------------------------------- */
+
+/* Compact & resume used to say what it was doing in a pill the width of a button, and
+   put its actual output into the composer — the one place on the page that belongs to
+   the user. This is the second field instead: the composer duplicated and set behind it,
+   noticeably taller, joined to it by the hairline along its own bottom edge. The input
+   stays empty and usable while the work happens above it. */
+.clf-stage {
+  /* Visually this is a second ChatGPT composer sitting *behind* the real one. The lower
+     padding and negative margin overlap exactly the native input's footprint; all actual
+     status/reasoning text stays above that padded zone, so nothing is rendered underneath
+     the textarea even though the rounded background continues behind it. */
+  /* The composer's own width, not a guess at it. `max-width` alone left the panel sized to
+     its text — "Opening a fresh chat" came out as a small tab floating over a much wider
+     input — because the composer's parent centres its children rather than stretching
+     them. The exact width is measured from the composer and set inline; these two are the
+     fallback for the tick before that measurement exists. */
+  box-sizing: border-box;
+  align-self: stretch;
+  width: 100%;
+  margin: 0 auto -3.15rem;
+  max-width: 48rem;
+  padding: 0.78rem 1rem 3.75rem;
+  border: 1px solid color-mix(in srgb, currentColor 13%, transparent);
+  border-radius: 1.55rem;
+  background: var(--main-surface-secondary, color-mix(in srgb, currentColor 9%, transparent));
+  box-shadow: 0 1px 2px rgb(0 0 0 / 8%);
+  color: inherit;
+  font-size: 0.9rem;
+  line-height: 1.55;
+}
+
+.clf-stage-head {
+  display: flex;
+  align-items: baseline;
+  gap: 0.5rem;
+  min-width: 0;
+}
+
+.clf-stage-title {
+  flex: none;
+  font-weight: 650;
   opacity: 1;
 }
 
-.clf-timeline-body {
-  margin: 0.35em 0 0.2em 0.7em;
+.clf-stage-detail {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+  opacity: 0.82;
+}
+
+/* Taller than the composer, and scrolling rather than growing: the brief runs to
+   thousands of characters and the page must not reflow every time another chunk lands. */
+.clf-stage-body {
+  margin-top: 0.5rem;
+  max-height: 13rem;
+  overflow-y: auto;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+  font-size: 0.88rem;
+  line-height: 1.55;
+  opacity: 1;
+}
+
+.clf-stage-body[hidden] {
+  display: none;
+}
+
+/* The model thinking out loud is not the brief; it reads as an aside so the two are not
+   mistaken for each other while they take turns in the same box. */
+.clf-stage[data-clf-stage-kind='reasoning'] .clf-stage-body {
+  font-style: italic;
+  opacity: 1;
+}
+
+.clf-composer {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  min-width: 0;
+}
+
+/*
+ * The hover text, built to ChatGPT's own measurements.
+ *
+ * It was drawn to this extension's taste before and read as bolted on. The numbers here are
+ * the page's, read off the live composer rather than guessed: a `#1b1b1b` pill, 5px by
+ * 12px, at 14px/600. The surface variable is the one thing not copied — `--main-surface-*`
+ * has no entry for this — so the colours are written out with a light counterpart.
+ *
+ * Which of the two applies is the *page's* answer, not the operating system's: ChatGPT's
+ * appearance setting is independent of the Windows one, so `prefers-color-scheme` put the
+ * bubble on the opposite surface from the page whenever the two disagreed. `data-clf-theme`
+ * is stamped from the composer's actual paint — see CLF_DOM.pageTheme — and restamped when
+ * the page changes theme under us.
+ */
+.clf-tip {
+  --clf-pop-bg: #353535;
+  --clf-pop-ink: #fff;
+  --clf-tip-bg: #1b1b1b;
+}
+
+[data-clf-theme='light'] .clf-tip {
+  --clf-pop-bg: #fff;
+  --clf-pop-ink: #0d0d0d;
+  --clf-tip-bg: #0d0d0d;
+}
+
+/*
+ * The hover bubble, replacing the `title` attribute this used everywhere.
+ *
+ * `title` is drawn by the operating system: a pale rectangle in the platform's font that
+ * appears after its own delay and looks nothing like the page it is sitting on. Same text,
+ * same trigger, drawn the way ChatGPT draws its own.
+ */
+.clf-tip {
+  position: fixed;
+  z-index: 2147483001;
+  max-width: 22rem;
+  padding: 5px 12px;
+  border-radius: 9999px;
+  background: var(--clf-tip-bg);
+  /* White in both themes on purpose: the bubble itself inverts, so it is a dark pill on a
+     light page and a near-black one on a dark page. */
+  color: #fff;
+  font-size: 14px;
+  font-weight: 600;
+  line-height: 20px;
+  white-space: nowrap;
+  pointer-events: none;
+  animation: clf-pop-in 0.12s cubic-bezier(0.23, 1, 0.32, 1);
+}
+
+/* A sentence rather than a name — the compaction hints, a tool row's origin — wraps instead
+   of running off, and keeps the newline the caller wrote. */
+.clf-tip[data-clf-tip-wrap='1'] {
+  border-radius: 14px;
+  white-space: pre-line;
+  text-wrap: pretty;
+}
+
+.clf-tip[hidden] {
+  display: none;
+}
+
+.clf-compact-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 36px;
+  height: 36px;
+  padding: 0;
+  border: 0;
+  border-radius: 9999px;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+  opacity: 0.7;
+  transition: opacity 0.12s ease, background-color 0.12s ease;
+}
+
+.clf-compact-btn:hover:not(:disabled) {
+  background: color-mix(in srgb, currentColor 12%, transparent);
+  opacity: 1;
+}
+
+.clf-compact-btn:focus-visible {
+  outline: 2px solid color-mix(in srgb, currentColor 45%, transparent);
+  outline-offset: 2px;
+}
+
+.clf-compact-btn:disabled {
+  cursor: default;
+  opacity: 0.38;
+}
+
+.clf-composer[data-clf-mode='busy'] .clf-compact-btn,
+.clf-composer[data-clf-mode='waiting'] .clf-compact-btn {
+  opacity: 1;
+}
+
+.clf-composer[data-clf-mode='error'] .clf-compact-btn {
+  color: color-mix(in srgb, currentColor 35%, #dc2626);
+  opacity: 1;
+}
+
+/*
+ * The context meter: how full this conversation is, drawn on the button that empties it.
+ *
+ * A track under the icon rather than a widget of its own. Composer width is scarce, and a
+ * separate meter would have to earn its own space and then explain what it had to do with
+ * the button beside it. Two pixels, in the button's own colour — a glance tells you where
+ * things stand, and the hover text gives the numbers to anyone who wants them.
+ */
+.clf-meter {
+  position: absolute;
+  right: 8px;
+  bottom: 5px;
+  left: 8px;
+  height: 2px;
+  border-radius: 9999px;
+  background: color-mix(in srgb, currentColor 22%, transparent);
+  overflow: hidden;
+}
+
+.clf-meter[hidden] {
+  display: none;
+}
+
+.clf-compact-btn {
+  position: relative;
+}
+
+.clf-meter-fill {
+  display: block;
+  height: 100%;
+  width: 0;
+  border-radius: inherit;
+  background: currentColor;
+  /* Long enough to read as filling rather than jumping, short enough not to still be
+     animating when the next poll arrives two seconds later. */
+  transition: width 0.4s ease;
+}
+
+/* Amber approaching, red at the line. Written out rather than mixed from `currentColor`,
+   because the whole point of these two is to stop looking like the rest of the control. */
+.clf-meter[data-clf-level='near'] .clf-meter-fill {
+  background: #d97706;
+}
+
+.clf-meter[data-clf-level='full'] .clf-meter-fill {
+  background: #dc2626;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .clf-meter-fill {
+    transition: none;
+  }
+}
+
+.clf-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  max-width: 15rem;
+  padding: 0.15rem 0.5rem;
+  border-radius: 9999px;
+  background: color-mix(in srgb, currentColor 10%, transparent);
+  font-size: 0.78rem;
+  line-height: 1.5;
+  white-space: nowrap;
+}
+
+.clf-pill[hidden] {
+  display: none;
+}
+
+.clf-pill-text {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.clf-composer[data-clf-mode='error'] .clf-pill {
+  background: color-mix(in srgb, #dc2626 18%, transparent);
+}
+
+.clf-composer[data-clf-mode='done'] .clf-pill {
+  background: color-mix(in srgb, #17a34a 18%, transparent);
+}
+
+.clf-cancel {
+  flex: none;
+  padding: 0 0.15rem;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  font-size: 1.05em;
+  line-height: 1;
+  cursor: pointer;
+  opacity: 0.65;
+}
+
+.clf-cancel:hover {
+  opacity: 1;
+}
+
+.clf-cancel[hidden] {
+  display: none;
+}
+
+.clf-spinner {
+  display: none;
+  flex: none;
+  width: 0.75rem;
+  height: 0.75rem;
+  border: 2px solid color-mix(in srgb, currentColor 30%, transparent);
+  border-top-color: currentColor;
+  border-radius: 50%;
+  animation: clf-spin 0.8s linear infinite;
+}
+
+.clf-composer[data-clf-mode='busy'] .clf-spinner,
+.clf-composer[data-clf-mode='waiting'] .clf-spinner {
+  display: inline-block;
+}
+
+@keyframes clf-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .clf-spinner {
+    animation-duration: 3s;
+  }
+}
+
+/* --- app-owned chronological assistant stream ---------------------------- */
+
+/* Native activity is suppressed only after the local replacement exists. This attribute
+   is put on ChatGPT-owned nodes rather than changing their contents, so React is free to
+   replace them and the observer can immediately re-apply the decision to the new node. */
+[data-clf-native-hidden='1'] {
+  display: none !important;
+}
+
+/* Overwrite is whole-turn ownership, not a selective relabel pass. ChatGPT's native
+   assistant subtree remains mounted for observation/React state, but every direct child is
+   visually removed except the app-owned stream we append as a sibling. */
+[data-clf-turn-replaced='1'] > :not(.clf-stream) {
+  display: none !important;
+}
+
+/* The reading column, not the thread.
+ *
+ * `replaceTurn` appends this to the turn's <article>, which is as wide as the whole thread
+ * pane; ChatGPT's own prose sits in a centred column inside it. Inheriting the article's
+ * width made the app's rendering run edge to edge while the native turn above it stayed
+ * narrow — the same conversation in two different measures. So take ChatGPT's own column
+ * variable, and fall back to the 48rem it has meant for a long time when the build in front
+ * of us does not publish one. */
+.clf-stream {
+  display: flex;
+  flex-direction: column;
+  gap: 0.16rem;
+  margin: 0.08rem auto 0.5rem;
+  width: 100%;
+  max-width: var(--thread-content-max-width, 48rem);
+  min-width: 0;
+}
+
+.clf-stream-row {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  min-width: 0;
+  font-size: 0.86rem;
+  line-height: 1.42;
+  color: inherit;
+}
+
+.clf-stream-turn_start,
+.clf-stream-turn_end {
+  display: none;
+}
+
+.clf-stream-icon {
+  display: inline-flex;
+  width: 1.4rem;
+  height: 1.4rem;
+  flex: none;
+  align-items: center;
+  justify-content: center;
+  border-radius: 0.38rem;
+  opacity: 0.72;
+}
+
+.clf-stream-text {
+  min-width: 0;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.clf-stream-progress,
+.clf-stream-assistant_message {
+  opacity: 1;
+}
+
+.clf-stream-progress .clf-stream-icon,
+.clf-stream-assistant_message .clf-stream-icon {
+  display: none;
+}
+
+/* Reasoning/commentary is a real readable block, not ChatGPT's half-opacity status
+   caption. Full snapshots are prefix-collapsed in content.js, so this can preserve the
+   visible paragraphs without turning every streaming update into another row. */
+.clf-stream-progress {
+  align-items: flex-start;
+  margin: 0.2rem 0 0.3rem;
+}
+
+.clf-stream-progress .clf-stream-text {
+  font-size: 0.91rem;
+  line-height: 1.55;
+  font-weight: 450;
+  opacity: 0.86;
+}
+
+.clf-stream-assistant_message {
+  display: block;
+  margin: 0.55rem 0 0.25rem;
+  font-size: 1rem;
+  line-height: 1.7;
+}
+
+.clf-stream-assistant_message .clf-stream-text {
+  display: block;
+  white-space: pre-wrap;
+  font-weight: 400;
+}
+
+.clf-stream-assistant_message .clf-agent,
+.clf-stream-assistant_message .clf-when,
+.clf-stream-progress .clf-when {
+  display: none;
+}
+
+.clf-stream-progress .clf-stream-icon {
+  padding-top: 0.12rem;
+  opacity: 0.58;
+}
+
+.clf-stream-tool_call {
+  width: fit-content;
+  max-width: 100%;
+  min-height: 1.85rem;
+  padding: 0.16rem 0.46rem 0.16rem 0.28rem;
+  border: 1px solid color-mix(in srgb, currentColor 8%, transparent);
+  border-radius: 0.55rem;
+  background: color-mix(in srgb, currentColor 2.5%, transparent);
+  opacity: 0.9;
+}
+
+.clf-stream-tool_call:hover {
+  background: color-mix(in srgb, currentColor 6%, transparent);
+  opacity: 1;
+}
+
+.clf-stream-tool_call .clf-stream-text {
+  font-weight: 580;
+}
+
+.clf-stream-tool_call .clf-stream-icon {
+  background: color-mix(in srgb, currentColor 7%, transparent);
+  opacity: 0.82;
+}
+
+.clf-stream-tool_call .clf-metric {
+  margin-left: 0.15rem;
+  padding: 0.02rem 0.32rem;
+  border-radius: 999px;
+  background: color-mix(in srgb, currentColor 6%, transparent);
+  font-size: 0.76rem;
+  opacity: 0.62;
+}
+
+.clf-stream-page_tool {
+  opacity: 0.65;
+}
+
+.clf-stream-chat_error .clf-stream-text,
+.clf-stream-chat_error .clf-stream-icon {
+  color: color-mix(in srgb, currentColor 35%, #dc2626);
+}
+
+.clf-stream .clf-when {
+  margin-left: auto;
+  flex: none;
+}
+
+/* --- the calls ChatGPT folded into a neighbouring row --------------------- */
+
+/* Indented under the row that swallowed them and stepped down in size, so they read as
+   part of that row rather than as extra rows of the transcript — which is what they are:
+   ChatGPT drew one row, and this is the rest of what that row stands for. */
+.clf-fold-list {
+  margin: 0.25em 0 0.35em 1.9em;
+  padding-left: 0.7em;
+  border-left: 2px solid color-mix(in srgb, currentColor 22%, transparent);
   display: flex;
   flex-direction: column;
   gap: 0.15em;
+  font-size: 0.82em;
+  line-height: 1.5;
+  opacity: 0.85;
+}
+
+.clf-fold-list[hidden] {
+  display: none;
 }
 
 .clf-row {
@@ -144,12 +728,6 @@
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-}
-
-.clf-row.clf-progress .clf-label {
-  opacity: 1;
-  font-style: normal;
-  font-weight: 600;
 }
 
 .clf-row.clf-bad .clf-label {

@@ -50,6 +50,15 @@ export interface StoredText {
   chars: number;
   /** Asset holding the complete redacted text, present only when truncated. */
   assetId?: string;
+  /**
+   * Digest of the complete text, for events whose identity has to survive being cut.
+   *
+   * Written for messages, which are the events a reloaded page reports again and which
+   * must therefore be recognisable as ones already stored. `text` alone cannot do that
+   * once it has been capped, and a length plus a head cannot tell two answers apart that
+   * begin the same way — the exact case ChatGPT's reused turn ids produce.
+   */
+  digest?: string;
 }
 
 /** A screenshot or other binary kept beside the log rather than inside it. */
@@ -103,13 +112,40 @@ export type ToolOutcome = 'ok' | 'error' | 'rejected';
 /**
  * How confident the recorder is that this call belongs to the session it landed in.
  *
- * `turn` means exactly one conversation had a turn in flight, `agent` means the call
- * carried a transport-bound or capability-proven agent identity, and `inferred` means
- * nothing identified the caller — those calls are stored in the unattributed stream
- * rather than guessed into somebody's history. The extension refuses to rewrite
- * ChatGPT's UI for an inferred call.
+ * Four grades, strongest first. `agent` is caller identity. `turn` is per-call evidence
+ * out of the page's own message model, or a connector block it drew. `generation` is the
+ * one ChatGPT chat that was demonstrably mid-turn when the call arrived. `inferred` means
+ * nothing identified the caller — those calls are stored in the unattributed stream rather
+ * than guessed into somebody's history. The extension refuses to rewrite ChatGPT's UI for
+ * an inferred call.
  */
-export type CallAttribution = 'turn' | 'agent' | 'inferred';
+export type CallAttribution = 'turn' | 'agent' | 'generation' | 'inferred';
+
+/**
+ * What each grade of attribution actually rests on, in the words shown to the user.
+ *
+ * Deliberately not interchangeable. `agent` is caller identity: a key only that agent
+ * holds, bound to a chat the app itself opened. `turn` is the page having shown a
+ * connector block — good evidence about which conversation made *a* connector call, but
+ * the collapsed row does not name the connector, so it is a match rather than an identity.
+ *
+ * `generation` is weaker again and is stated as what it is. The connector belongs to a
+ * ChatGPT account rather than to a browser, so a chat being mid-turn here does not prove
+ * this call came from here rather than from the same account on a phone. It is used
+ * because the alternative measured worse in practice by a wide margin: requiring per-call
+ * page evidence sent roughly half of one session's own work into `Unattributed activity`,
+ * and a record that is missing half the work is not more truthful than one that says how
+ * it placed each call.
+ *
+ * `inferred` is on the records in the unattributed stream, which is where everything else
+ * goes rather than being guessed into somebody's history.
+ */
+export const ATTRIBUTION_LABELS: Record<CallAttribution, string> = {
+  agent: 'agent key',
+  turn: 'tool block on the page',
+  generation: 'the only chat generating',
+  inferred: 'not placed in a chat'
+};
 
 export interface ToolCallRecord {
   callId: string;
@@ -141,7 +177,34 @@ export type SessionEvent =
   | (BaseEvent & { kind: 'session_start'; conversationId: string | null; title: string })
   | (BaseEvent & { kind: 'user_message'; message: StoredText; messageId?: string })
   | (BaseEvent & { kind: 'assistant_message'; message: StoredText; messageId?: string; final: boolean })
-  | (BaseEvent & { kind: 'progress'; message: StoredText })
+  /**
+   * One visible ChatGPT commentary item, as it stood when this snapshot was taken.
+   *
+   * `progressId` is the identity of the *logical* item — one caption block the page keeps
+   * growing — not of the snapshot. ChatGPT re-lays-out, reparents, shrinks and redraws that
+   * block many times inside a turn, and treating each redraw as a new event is what put the
+   * same sentence on screen a dozen times, split across duplicate rows. So a later snapshot
+   * of the same item supersedes the earlier one instead of following it: readers keep the
+   * newest text at the *earliest* record's position, which is both where the commentary
+   * belongs chronologically and the only way one caption stays one row.
+   *
+   * `origin` names the seq of that earliest record, so a reader working from a cursor can
+   * still place a supersession whose anchor it has already consumed. Both are optional: an
+   * event written before this model existed, or by a page whose commentary had no readable
+   * identity, is still a plain standalone caption.
+   */
+  | (BaseEvent & { kind: 'progress'; message: StoredText; progressId?: string; origin?: number })
+  /**
+   * Visible ChatGPT-native tool activity that never passed through this MCP server.
+   *
+   * `messageId` is the identity of one rendered activity row, and it supersedes the same
+   * way `progress` does. ChatGPT rewrites a row's label as the work completes — "Inspecting
+   * project files" becomes "Inspected project files" — and treating the rewrite as a second
+   * row is what put the same step on screen three and four times under slightly different
+   * wording. `origin` names the seq of the first record of that row, for readers working
+   * from a cursor that has already consumed it.
+   */
+  | (BaseEvent & { kind: 'page_tool'; messageId: string; label: string; origin?: number })
   | (BaseEvent & { kind: 'turn_start' })
   | (BaseEvent & { kind: 'turn_end'; outcome: TurnOutcome; detail?: string })
   | (BaseEvent & { kind: 'chat_error'; message: StoredText })
@@ -169,7 +232,6 @@ export type SessionEvent =
   | (BaseEvent & {
       kind: 'handoff';
       handoffId: string;
-      model: string;
       chars: number;
       /** What triggered it: manual compaction, resume, or an automatic suggestion. */
       reason: string;
@@ -190,10 +252,71 @@ export type NewSessionEvent = SessionEvent extends infer Event
     : never
   : never;
 
+/**
+ * How a chat came to exist, when this app is the one that opened it.
+ *
+ * Recorded when the extension acknowledges that it typed the bootstrap into a fresh
+ * tab, which is the first and only moment at which the app can connect the command it
+ * queued to the conversation that command became.
+ */
+export interface SessionOrigin {
+  kind: 'resume' | 'worker';
+  /** The session this chat continues. Null when the source session no longer exists. */
+  fromSessionId: string | null;
+  /** Agent id for a worker chat ("worker-1"). Null for a resume. */
+  agentId: string | null;
+  /** The worker's task, verbatim from `agents action=spawn`. Empty for a resume. */
+  task: string;
+}
+
+const RESUMED_PREFIX = 'Resumed · ';
+
+function clip(text: string, max: number): string {
+  const flat = text.replace(/\s+/g, ' ').trim();
+  return flat.length > max ? `${flat.slice(0, max - 1).trimEnd()}…` : flat;
+}
+
+/**
+ * The name to give a chat this app opened, in place of its bootstrap prompt.
+ *
+ * A resumed or worker chat opens with a long instruction this app typed itself, and
+ * the ordinary "name a session after the first thing the user said" rule turned that
+ * instruction into the session's name. The result was a list of near-identical rows
+ * reading `Continue the previous ChatGPT ...` and `You are worker agent "worker-1"...`
+ * with nothing in them to say which run a row belonged to. The command that opened the
+ * chat already knows what the chat is for, so the name comes from there instead.
+ */
+export function originTitle(origin: SessionOrigin, source: string | null): string {
+  if (origin.kind === 'worker') {
+    const who = origin.agentId ?? 'worker';
+    const task = clip(origin.task, 60);
+    return task ? `${who} · ${task}` : who;
+  }
+  // A resumed chat is itself resumable, and often is. Stacking the prefix each time
+  // would bury the part of the name that identifies the work.
+  const from = clip((source ?? '').replace(new RegExp(`^(?:${RESUMED_PREFIX})+`), ''), 80);
+  return from ? `${RESUMED_PREFIX}${from}` : 'Resumed session';
+}
+
 export interface SessionSummary {
   id: string;
   title: string;
+  /**
+   * The ChatGPT conversation this session is attached to *right now*.
+   *
+   * The local session is the durable identity; a ChatGPT chat is only the frontend
+   * currently attached to it. Compact & Resume moves this from chat A to chat B in one
+   * commit, and nothing else ever changes it.
+   */
   conversationId: string | null;
+  /**
+   * Every ChatGPT conversation this session has lived in, oldest first, current last.
+   *
+   * Kept so a recorded history that spans a compaction can still be traced back to the
+   * chats it was written in, and so a stale tab reporting for a superseded conversation
+   * can be recognised rather than silently filed as if nothing had moved.
+   */
+  chatIds: string[];
   startedAt: number;
   updatedAt: number;
   /** Null while the session is still the active one. */
@@ -202,8 +325,19 @@ export interface SessionSummary {
   userMessages: number;
   toolCalls: number;
   errors: number;
-  /** Rough local estimate — never ChatGPT's private counter. See estimateTokens. */
+  /** Rough local estimate for the whole session — never ChatGPT's private counter. */
   estimatedTokens: number;
+  /**
+   * The same estimate, but only for what the *currently attached* ChatGPT chat is carrying.
+   *
+   * This is what the composer meter fills against and what automatic compaction fires on,
+   * and it is why one durable session surviving a compaction does not mean an ever-rising
+   * meter: the rebind into chat B resets this to zero while `estimatedTokens` keeps
+   * counting the session's whole life. Chat B genuinely starts with only the handoff in
+   * its context, so measuring it against the session's lifetime total would re-fire
+   * compaction immediately after every compaction.
+   */
+  contextTokens: number;
   /** Id of the newest stored handoff, or null when the session was never compacted. */
   lastHandoffId: string | null;
   lastHandoffAt: number | null;
@@ -211,14 +345,14 @@ export interface SessionSummary {
   lastTurnOutcome: TurnOutcome | null;
   /** Agents seen in this session, prime first. Empty when no swarm ran. */
   agents: string[];
+  /** Set only for a chat this app opened itself. Null for one the user started. */
+  origin: SessionOrigin | null;
 }
 
 export interface Handoff {
   id: string;
   sessionId: string;
   createdAt: number;
-  model: string;
-  reasoning: string;
   /** The continuation brief itself. */
   text: string;
   /** How the raw session looked when this was made, for honest staleness reporting. */
@@ -227,81 +361,6 @@ export interface Handoff {
   /** Set when the model stopped early or the pack dropped material. */
   notes: string[];
 }
-
-/** One step of a running compaction, mirrored into the UI. */
-export type CompactionStage =
-  | 'idle'
-  | 'collecting'
-  | 'preparing'
-  | 'sending'
-  | 'thinking'
-  | 'streaming'
-  | 'saving'
-  | 'ready'
-  | 'error';
-
-export const COMPACTION_STAGE_LABELS: Record<CompactionStage, string> = {
-  idle: 'Idle',
-  collecting: 'Collecting session',
-  preparing: 'Preparing history',
-  sending: 'Sending to OpenRouter',
-  thinking: 'Model working',
-  streaming: 'Receiving output',
-  saving: 'Saving handoff',
-  ready: 'Ready',
-  error: 'Failed'
-};
-
-export interface CompactionState {
-  stage: CompactionStage;
-  sessionId: string | null;
-  /**
-   * Which pass is running, when a session is too large for one and has to be
-   * compacted in stages, e.g. "part 2 of 4". Empty for the ordinary single pass.
-   */
-  step: string;
-  /** Characters of brief received so far, so the UI can show real movement. */
-  received: number;
-  /** Reasoning text, only when the provider actually streams it. */
-  reasoning: string;
-  /** Tail of the brief as it streams, bounded for the UI. */
-  preview: string;
-  model: string;
-  startedAt: number | null;
-  finishedAt: number | null;
-  handoffId: string | null;
-  error: string | null;
-  /** True when the flow should open a fresh ChatGPT chat once the handoff is saved. */
-  resume: boolean;
-}
-
-export interface OpenRouterModel {
-  id: string;
-  name: string;
-  /** Gateway-advertised context window. */
-  contextLength: number | null;
-  /** Primary provider's context window, when OpenRouter exposes it. */
-  providerContextLength: number | null;
-  /** Primary provider's maximum completion, used to clamp compaction output. */
-  maxCompletionTokens: number | null;
-  /** True when the model advertises reasoning support of any kind. */
-  reasoning: boolean;
-  /** Exact effort levels advertised by OpenRouter, excluding our local `off` choice. */
-  reasoningLevels: ReasoningEffort[];
-  /** A mandatory-reasoning model must not offer the local Off choice. */
-  reasoningMandatory: boolean;
-  /** Provider's preferred effort. `off` represents OpenRouter's wire value `none`. */
-  reasoningDefault: ReasoningEffort | 'off' | null;
-  /** Unix seconds the model was listed, for newest-first ordering. Null if absent. */
-  created: number | null;
-  promptPrice: number | null;
-  completionPrice: number | null;
-}
-
-/** OpenRouter's selectable effort values. `off` is a local UI value mapped to wire `none`. */
-export type ReasoningEffort = 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max';
-
-export const REASONING_EFFORTS: readonly ReasoningEffort[] = ['minimal', 'low', 'medium', 'high', 'xhigh', 'max'];
 
 // ---------------------------------------------------------------- agents
 
@@ -315,7 +374,13 @@ export interface AgentInfo {
   task: string;
   state: AgentState;
   createdAt: number;
-  joinedAt: number | null;
+  /**
+   * When the app bound this agent to its conversation and started it.
+   *
+   * Set by the app, never by the model: a worker is activated by the extension reporting the
+   * chat it opened for the slot, which happens before that chat has said anything.
+   */
+  activatedAt: number | null;
   finishedAt: number | null;
   /** Result text the worker reported when it finished. */
   result: string | null;
@@ -325,13 +390,19 @@ export interface AgentInfo {
   awaitingAck: number;
   /** Messages this agent has demonstrably received. */
   delivered: number;
+  /**
+   * The ChatGPT conversation this agent is running in.
+   *
+   * For the prime this is the run's identity and is set exactly once, by a successful
+   * spawn; it moves only through the app's authenticated Compact & Resume transfer. For a
+   * worker it is reported first-hand by the extension that opened the tab, and is what
+   * lets `join` answer from the conversation the call came from.
+   */
   conversationId: string | null;
-  /** Files the agent declared it is working on, for the overlap warning. */
-  claims: string[];
 }
 
 /**
- * One brokered message, with delivery tracked at-least-once.
+ * One brokered message, with delivery tracked at-least-once — within a stated limit.
  *
  * Marking a message delivered at the moment it is written into a tool result would be
  * a lie the moment the connector drops between the result being built and ChatGPT
@@ -340,6 +411,13 @@ export interface AgentInfo {
  * the recipient proves it got it by making another authenticated call. The cost is
  * that a message can be shown twice; `id` is stable so the model and the recorder can
  * both tell a repeat from a new message, and a repeat is much cheaper than a loss.
+ *
+ * The limit, stated rather than glossed: another authenticated call is *evidence* that
+ * the previous result arrived, not proof of it. The connector supplies no session id and
+ * no request identity (see transportIdentityStatus), so a retry of a call whose result
+ * was lost is indistinguishable from the next call of one that arrived — and retirement
+ * on that call would drop a message the model never saw. `offeredOnFinish` narrows the
+ * one place where that is unrecoverable rather than merely annoying.
  */
 export interface AgentMessage {
   id: string;
@@ -351,6 +429,17 @@ export interface AgentMessage {
   offeredAt: number | null;
   /** How many times it has been offered, so a repeat can be labelled as one. */
   offers: number;
+  /**
+   * Last written into a result for a `finish_agent` call.
+   *
+   * That is the one call an agent repeats verbatim when its result goes missing, and the
+   * one whose next call therefore proves nothing — a finish that never came back is
+   * answered by another finish. Retiring on it would hand the agent's own retry as
+   * evidence that it read something it never saw, and then terminalise it. So a message
+   * carrying this flag is not retired by a finish; it is re-offered, and only an ordinary
+   * tool call — the kind an agent makes because it went back to work — retires it.
+   */
+  offeredOnFinish: boolean;
   /** Set once the recipient has demonstrably received it. */
   ackedAt: number | null;
 }
@@ -360,6 +449,19 @@ export interface SwarmState {
   /** True while at least one worker is invited or active. */
   running: boolean;
   agents: AgentInfo[];
+}
+
+/**
+ * The result of the user clearing one agent row in the app.
+ *
+ * `cleared` is what actually happened, not what was asked for: clearing the prime ends the
+ * whole run, clearing a worker frees that one slot, and clearing a row that had already
+ * ended does nothing at all. The UI reports this rather than assuming the click worked.
+ */
+export interface ClearAgentResult {
+  cleared: 'run' | 'worker' | 'none';
+  reason: string;
+  swarm: SwarmState;
 }
 
 // ---------------------------------------------------------------- helpers
@@ -391,6 +493,12 @@ export function eventTokens(event: SessionEvent): number {
       // assistant message. Counting every transient caption made the advisory meter
       // roughly double what users saw in the actual conversation on tool-heavy turns.
       return 0;
+    case 'agent_message':
+      // Real context, unlike a progress caption: a brokered message is appended to a tool
+      // result the model actually reads, so it occupies the conversation the same way a
+      // tool result does. Leaving it at zero made the meter under-report exactly the runs
+      // most likely to need compacting — the multi-agent ones.
+      return estimateTokens(event.message.text);
     case 'tool_call':
       return (
         estimateTokens(event.call.args.text) +
@@ -402,6 +510,53 @@ export function eventTokens(event: SessionEvent): number {
     default:
       return 0;
   }
+}
+
+/**
+ * Collapses every stored snapshot of one page-observed item back into one event.
+ *
+ * The recorder writes a `progress` or `page_tool` event again whenever the thing it is
+ * watching has changed on screen. That is the honest thing to store — an append-only log
+ * cannot rewrite a line it has already written — but it is not what anything should
+ * *display*: one caption that grew four times is one caption, not four, and one activity
+ * row whose label was rewritten as it finished is one step, not two. Rendering the
+ * snapshots as siblings is exactly the duplicated-and-reordered transcript this fold
+ * exists to undo.
+ *
+ * The surviving event keeps the *first* snapshot's position (seq, time, turn, agent) and
+ * the *last* snapshot's text. Position first, because the thing happened when it first
+ * appeared — placing it at the newest snapshot would drag it below tool calls it actually
+ * preceded, which is the other half of the same bug. Snapshots with no identity are left
+ * exactly as they are: nothing about them says they belong together.
+ *
+ * Identity is namespaced by kind. A `progressId` and a `messageId` are minted by different
+ * code paths and are not required to be disjoint; folding them into one keyspace would let
+ * a caption swallow an activity row that happened to be named the same thing.
+ */
+export function foldProgress(events: readonly SessionEvent[]): SessionEvent[] {
+  const anchor = new Map<string, number>();
+  const out: Array<SessionEvent | null> = [...events];
+  for (let index = 0; index < out.length; index++) {
+    const event = out[index];
+    if (!event) continue;
+    let key: string | null = null;
+    if (event.kind === 'progress' && event.progressId) key = `progress\u0000${event.progressId}`;
+    else if (event.kind === 'page_tool' && event.messageId) key = `page_tool\u0000${event.messageId}`;
+    if (!key) continue;
+    const at = anchor.get(key);
+    if (at === undefined) {
+      anchor.set(key, index);
+      continue;
+    }
+    const held = out[at];
+    if (held && held.kind === 'progress' && event.kind === 'progress') {
+      out[at] = { ...held, message: event.message };
+    } else if (held && held.kind === 'page_tool' && event.kind === 'page_tool') {
+      out[at] = { ...held, label: event.label };
+    }
+    out[index] = null;
+  }
+  return out.filter((event): event is SessionEvent => event !== null);
 }
 
 export interface TokenPressure {

@@ -5,6 +5,21 @@
  * server when their capability is enabled, so a disabled capability is invisible
  * to the model rather than merely refused.
  */
+/*
+ * Two permissions were removed when the tools were consolidated, because no tool could
+ * honour them any more and a checkbox that grants nothing — or worse, less than its
+ * label promises — is a lie about the security boundary:
+ *
+ * - `powershell` and `command` were one tool each. `exec_command` replaced both, and it
+ *   runs PowerShell by default, so leaving the pair in place meant "Run executable" was
+ *   silently also "Run PowerShell" while the PowerShell checkbox granted nothing at all.
+ *   One permission for running commands is what the single tool can actually enforce.
+ * - `deleteFolder` had no implementation left: `apply_patch` deletes files, and the patch
+ *   format has no way to express removing a directory. Deleting a folder now needs
+ *   `exec_command`, which is a permission the user grants deliberately.
+ *
+ * `config.ts` migrates both keys off existing configs; see the note there.
+ */
 export const CAPABILITIES = [
   'browse',
   'search',
@@ -14,8 +29,6 @@ export const CAPABILITIES = [
   'edit',
   'move',
   'deleteFile',
-  'deleteFolder',
-  'powershell',
   'command',
   'screen',
   'control',
@@ -37,8 +50,6 @@ export const WRITE_CAPABILITIES: readonly Capability[] = [
   'edit',
   'move',
   'deleteFile',
-  'deleteFolder',
-  'powershell',
   'command',
   'control',
   'clipboardWrite'
@@ -57,8 +68,23 @@ export type TunnelKind = 'openai' | 'cloudflared' | 'manual';
 
 export interface TunnelSettings {
   kind: TunnelKind;
-  /** OpenAI tunnel id, format tunnel_<32 hex>. Not a secret. */
+  /**
+   * OpenAI tunnel id for the Core connector, format tunnel_<32 hex>. Not a secret.
+   *
+   * Named without a surface prefix because it predates the split and every existing
+   * config on disk carries it; it is migrated to mean Core, which is what it always was.
+   */
   tunnelId: string;
+  /**
+   * OpenAI tunnel id for the optional Desktop connector. Empty when the user has not set
+   * one up, which is the normal case.
+   *
+   * A second id rather than a second channel on the first: `tunnel-client` really does
+   * multiplex channels, but ChatGPT's connector UI addresses a tunnel id and normalises
+   * everything to the `main` channel, so the extra channels are reachable only from Codex
+   * and the API (`docs/tool-surface.md` §6.5). One id per connector is what actually works.
+   */
+  desktopTunnelId: string;
   /** Optional explicit path to tunnel-client.exe / cloudflared.exe. */
   binaryPath: string;
 }
@@ -73,8 +99,11 @@ export interface UiPrefs {
 }
 
 /**
- * Session recording. Off by default, because unlike the diagnostics log this one
- * writes what happened to disk and keeps it.
+ * Session recording. On by default: unlike the diagnostics log this one writes what
+ * happened to disk and keeps it, but the timeline, Compact & resume and the agent
+ * features are all reads of that record, so an app with it off is an app with its
+ * reason for existing switched off. It stays a switch, and an explicit `false` is
+ * never overridden.
  *
  * The same switch starts the local bridge the Chrome extension talks to: recording
  * without the extension only sees our own tool calls, and the extension has nothing
@@ -90,14 +119,23 @@ export interface SessionSettings {
   limitTokens: number;
 }
 
-export type ReasoningLevel = 'off' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max';
-
+/**
+ * Automatic Compact & Resume.
+ *
+ * The whole of it: whether it fires, and at what size. There is no provider to choose and
+ * no model to configure, because there is one way a session is compacted — the chat writes
+ * its own brief and the app moves the session to a fresh chat carrying it.
+ */
 export interface CompactionSettings {
-  /** OpenRouter model id. Empty means "resolve the default at first use". */
-  model: string;
-  reasoning: ReasoningLevel;
-  /** Show the model's reasoning stream separately while it works. */
-  showReasoning: boolean;
+  /**
+   * Compact without being asked, once a conversation grows past `autoTokens`.
+   *
+   * On, at the ceiling. Compaction ends the chat someone is working in and opens a fresh
+   * one; that is the right trade when the alternative is hitting the ceiling mid-thought.
+   */
+  auto: boolean;
+  /** Estimated recorded tokens at which automatic compaction fires. */
+  autoTokens: number;
 }
 
 /**
@@ -170,7 +208,64 @@ export interface ConnectionStatus {
   lastToolCallAt: number | null;
   /** The tunnel's own view of itself, or null when no tunnel is running. */
   health: TunnelHealth | null;
+  /**
+   * One entry per model-facing connector, in setup order.
+   *
+   * This app publishes more than one MCP server — a required coding connector and an
+   * optional desktop one — and the user has to create each in ChatGPT by hand. So the
+   * status carries everything that setup needs as data rather than as prose the user has
+   * to reconstruct: the exact name to type, the exact description to paste, the URL, and
+   * whether that particular connector is currently live.
+   */
+  surfaces: SurfaceStatus[];
 }
+
+/** The identifiers of the connectors this app publishes. Mirrors `mcp/surfaces.ts`. */
+export type SurfaceId = 'core' | 'desktop';
+
+export interface SurfaceStatus {
+  id: SurfaceId;
+  /** Exactly what the user should name the connector in ChatGPT. */
+  connectorName: string;
+  /** Exactly what the user should paste as its description. */
+  description: string;
+  /** One line in the app's own voice, for the setup card. */
+  cardSummary: string;
+  /** False for a connector the app cannot work without. */
+  optional: boolean;
+  /**
+   * Whether this connector can do anything under the current permissions. A Desktop
+   * connector with neither screen nor control access would advertise an empty tool list,
+   * which is worse for the user than not being offered at all.
+   */
+  available: boolean;
+  /** Loopback URL of this surface's MCP endpoint, or null when the server is stopped. */
+  localUrl: string | null;
+  /** Public URL to paste into ChatGPT, when the transport in use produces one. */
+  publicUrl: string | null;
+  /** Tools this connector will advertise right now. */
+  tools: string[];
+  state: SurfaceConnectionState;
+  /** Short human-readable explanation. Never contains secrets. */
+  detail: string;
+  /**
+   * When ChatGPT last reached *this* connector, and last ran one of its tools.
+   *
+   * `state` is only ever our side of the wire — whether we published it. These two are the
+   * other side: proof the user really created this connector in ChatGPT and that the model
+   * is allowed to call it. With an optional second connector the difference matters, since
+   * a healthy Core says nothing about whether Desktop was ever added.
+   */
+  lastRequestAt: number | null;
+  lastToolCallAt: number | null;
+}
+
+export type SurfaceConnectionState =
+  /** Not being published: unavailable, or optional and not configured. */
+  | 'off'
+  | 'starting'
+  | 'live'
+  | 'error';
 
 /** One link in the chain from ChatGPT to this PC, as reported by the self-test. */
 export interface Check {
@@ -198,13 +293,10 @@ export interface LogEntry {
 export interface BridgeStatus {
   running: boolean;
   port: number | null;
-  /** True once a browser extension has paired with this app. */
+  /** True once a browser extension has been issued this app's token. */
   paired: boolean;
   /** Epoch ms of the last message from the extension, or null. */
   lastSeenAt: number | null;
-  /** Pairing code while one is being shown, else null. Short-lived and single-use. */
-  pairingCode: string | null;
-  pairingExpiresAt: number | null;
 }
 
 export interface AppState {
@@ -212,8 +304,6 @@ export interface AppState {
   status: ConnectionStatus;
   /** True when an OpenAI control-plane API key is stored. The key itself never leaves the main process. */
   hasApiKey: boolean;
-  /** True when an OpenRouter key is stored, for compaction. Also never leaves main. */
-  hasOpenRouterKey: boolean;
   /** Resolved path of the tunnel binary we would run, or null if we cannot find one. */
   resolvedBinary: string | null;
   /** Version of the tunnel-client copy shipped inside the app, for diagnostics. */
@@ -230,8 +320,6 @@ export const DEFAULT_CAPABILITIES: Capabilities = {
   edit: false,
   move: false,
   deleteFile: false,
-  deleteFolder: false,
-  powershell: false,
   command: false,
   screen: false,
   control: false,
@@ -244,13 +332,11 @@ export const CAPABILITY_LABELS: Record<Capability, string> = {
   search: 'Search files',
   read: 'Read files',
   metadata: 'File metadata',
-  create: 'Create files and folders',
+  create: 'Create files',
   edit: 'Edit files',
   move: 'Move / rename',
   deleteFile: 'Delete files',
-  deleteFolder: 'Delete folders',
-  powershell: 'Run PowerShell',
-  command: 'Run executable / command',
+  command: 'Run commands',
   screen: 'See the screen',
   control: 'Control mouse and keyboard',
   clipboardRead: 'Read clipboard',
@@ -259,22 +345,19 @@ export const CAPABILITY_LABELS: Record<Capability, string> = {
 
 /** One line per capability, shown under its checkbox when the group is expanded. */
 export const CAPABILITY_DETAILS: Record<Capability, string> = {
-  browse: 'list_directory — see what is inside an approved folder, optionally recursively.',
-  search: 'search_files — find files by name, or find text inside them.',
-  read: 'read_file, read_files, view_image — read text in bounded ranges/batches or load a local PNG/JPEG/GIF/WebP directly into vision.',
-  metadata: 'file_info — size, dates, line count, and optional SHA-256 for one path or a small batch.',
-  create: 'create_file, create_directory, write_binary_file — make new text/binary files and folders.',
-  edit: 'edit_file, edit_files, write_file, append_file, write_binary_file — exact edits can be applied to one file or preflighted across several files.',
-  move: 'move_path — move or rename, both ends inside approved folders.',
-  deleteFile: 'delete_file — permanent, with no Recycle Bin.',
-  deleteFolder: 'delete_directory — permanent; an approved root itself is refused.',
-  powershell:
-    'run_powershell — starts in an approved folder, but the script runs as you and is NOT sandboxed to that folder.',
+  browse: 'read — list what is inside an approved folder.',
+  search: 'read, find — expand globs, and find files by name or text inside them.',
+  read: 'read — read text in bounded ranges, several files at once, and load a local PNG/JPEG/GIF/WebP straight into vision.',
+  metadata: 'read — size, dates and line count for a path, without returning its contents.',
+  create: 'apply_patch — add new files, creating any parent folders they need. An empty folder on its own needs Run commands.',
+  edit: 'apply_patch — exact edits, applied atomically across as many files as one change touches.',
+  move: 'apply_patch — move or rename, both ends inside approved folders.',
+  deleteFile: 'apply_patch — permanent, with no Recycle Bin. Deleting a whole folder needs Run commands.',
   command:
-    'run_command, launch_app, process, open_url — run things as you; process manages long-running jobs with bounded cursor-based output, stdin and lifecycle control. Processes are NOT sandboxed to the approved folder.',
+    'exec_command, write_stdin — PowerShell or cmd: run builds, tests, git and anything else as you, and keep long-running or interactive sessions going. Commands are NOT sandboxed to the approved folder.',
   screen:
-    'screenshot, list_windows, get_active_window, find_ui, wait_for_window — see and crop the screen, inspect focus, find semantic Windows controls, and wait for UI state without blind sleeps.',
-  control: 'computer — moves the pointer, clicks, types and presses keys, as you.',
-  clipboardRead: 'read_clipboard — read current clipboard text. Separate because clipboard contents may be sensitive.',
-  clipboardWrite: 'write_clipboard — replace clipboard text without needing focus, clicks or keystrokes.'
+    'observe — screenshots, the window list, and the buttons, fields and other controls on screen, without needing anything in front.',
+  control: 'computer — moves the pointer, clicks, types, scrolls and presses keys, as you.',
+  clipboardRead: 'computer — read current clipboard text. Separate because clipboard contents may be sensitive.',
+  clipboardWrite: 'computer — replace clipboard text without needing focus, clicks or keystrokes.'
 };

@@ -12,11 +12,15 @@
  * extension does nothing" into a diagnosable mismatch.
  */
 
-export const APP_VERSION = '1.5.1';
+export const APP_VERSION = '1.7.6';
 
 /**
  * 1 — original observations/activity bridge.
  * 2 — leased commands: /commands hands out a claim, /commands/ack reports the outcome.
  * 3 — browser-triggered compaction via /compact and worker bootstrap completion semantics.
+ * 4 — targeted open: the app opens the chat itself with a ?clf=<id> marker and the page
+ *     redeems that one id through /commands/redeem, /commands also reports which ids are
+ *     still active, /activity carries the resume job and compaction progress, and /pair
+ *     provisions silently.
  */
-export const BRIDGE_PROTOCOL = 3;
+export const BRIDGE_PROTOCOL = 4;

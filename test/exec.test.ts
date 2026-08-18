@@ -1,14 +1,18 @@
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { pathEntries } from '../src/main/env.js';
 import {
   DEFAULT_TIMEOUT_MS,
   ExecError,
   MAX_OUTPUT_BYTES,
   MAX_TIMEOUT_MS,
+  childEnv,
   findPowerShell,
   launchCommand,
   normaliseTimeout,
+  prepareCommand,
+  prepareShellCommand,
   runCommand,
   runPowerShell
 } from '../src/main/exec.js';
@@ -197,6 +201,45 @@ describe('runCommand', () => {
   });
 });
 
+/**
+ * What a spawned child is actually handed.
+ *
+ * The unit-level rules live in test/env.test.ts; this is the one that would have caught the
+ * live incident, because it asks the real `childEnv()` about the real inherited path.
+ */
+describe('the environment prepared for a child process', () => {
+  it('hands over one path variable that still contains the inherited directories', () => {
+    const env = childEnv();
+    const keys = Object.keys(env).filter((key) => key.toLowerCase() === 'path');
+    expect(keys).toHaveLength(1);
+
+    const inherited = pathEntries(process.env).map((entry) => entry.toLowerCase());
+    const child = pathEntries(env).map((entry) => entry.toLowerCase());
+    for (const entry of inherited) expect(child).toContain(entry);
+    // The bundled ripgrep is a prefix, so the child is never shorter than what it inherited.
+    expect(child.length).toBeGreaterThanOrEqual(inherited.length);
+  });
+
+  it('resolves a command against the same path the child will search', () => {
+    const prepared = prepareCommand(node, ['-e', 'process.exit(0)'], cwd);
+    const keys = Object.keys(prepared.env ?? {}).filter((key) => key.toLowerCase() === 'path');
+    expect(keys).toHaveLength(1);
+    expect(pathEntries(prepared.env ?? {}).length).toBeGreaterThan(0);
+  });
+
+  it('does not pass connector secrets on, whatever case they arrived in', () => {
+    const held = process.env.OPENAI_API_KEY;
+    process.env.OPENAI_API_KEY = 'sk-should-not-travel';
+    try {
+      const env = childEnv();
+      expect(Object.keys(env).some((key) => key.toLowerCase() === 'openai_api_key')).toBe(false);
+    } finally {
+      if (held === undefined) delete process.env.OPENAI_API_KEY;
+      else process.env.OPENAI_API_KEY = held;
+    }
+  });
+});
+
 describe('normaliseTimeout', () => {
   it('falls back to the default', () => {
     expect(normaliseTimeout(undefined)).toBe(DEFAULT_TIMEOUT_MS);
@@ -266,5 +309,73 @@ describe.runIf(IS_WINDOWS)('runPowerShell', () => {
 
   it('rejects an over-long script', async () => {
     await expect(runPowerShell('a'.repeat(9000), cwd, 5000)).rejects.toThrow(/too long/);
+  });
+
+  /**
+   * Without a console attached, PowerShell encodes what it prints as the machine's OEM code
+   * page — 437 here — while this side reads UTF-8. `ä → — …` came back as `84 1a 2d 2e`:
+   * mojibake with a control character in the middle of it, from a shell that exited 0. The
+   * data was never damaged (the same text in a file or an environment variable arrived
+   * intact, and the same command in a terminal was fine), which is what made it read as
+   * corruption rather than as the encoding mismatch it was.
+   */
+  it('brings non-ASCII output back exactly as the script wrote it', async () => {
+    const result = await runPowerShell("Write-Output 'ä→—…'", cwd, 30_000);
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout.trim()).toBe('ä→—…');
+  });
+
+  it('round-trips the whole repertoire, astral characters included', async () => {
+    // Deliberately past Latin-1 and past the BMP. The emoji is a surrogate pair, so it
+    // exercises both ends at once: the script is handed over as UTF-16LE and comes back as
+    // UTF-8, and a mismatch at either end shows up here as a replacement character rather
+    // than as a plausible-looking substitution nobody notices.
+    const sample = 'äöüß → — … “quotes” 😀';
+    const result = await runPowerShell(`Write-Output '${sample}'`, cwd, 30_000);
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout.trim()).toBe(sample);
+    expect(result.stdout).not.toContain('�');
+  });
+
+  it('round-trips the same characters on the error stream', async () => {
+    // stderr is decoded separately from stdout and cleaned of PowerShell's XML error
+    // records on the way through, so it is its own encoding path and its own regression.
+    const sample = 'äöüß → — … “quotes” 😀';
+    const result = await runPowerShell(`[Console]::Error.WriteLine('${sample}')`, cwd, 30_000);
+    expect(result.stderr).toContain(sample);
+    expect(result.stderr).not.toContain('�');
+  });
+
+  it('starts the captured output with the text, not with a byte-order mark', async () => {
+    const result = await runPowerShell("Write-Output 'plain'", cwd, 30_000);
+    expect(result.stdout.startsWith('﻿')).toBe(false);
+  });
+});
+
+/**
+ * cmd.exe does not read the quoting Node writes.
+ *
+ * Node escapes an inner `"` as `\"`, which is the convention for an ordinary Windows
+ * program; cmd takes the backslashes literally, so `node -e "console.log(123)"` reached it
+ * as something it could not run. The part that makes this a trust bug rather than a bug is
+ * what cmd does then: it exits 0. The call was reported as having succeeded, with no
+ * output and no side effect — a command that silently did not run.
+ *
+ * What that line does once it reaches the shell is covered end to end against a real
+ * cmd.exe in the process manager's tests, which is the path `exec_command` takes.
+ */
+describe.runIf(IS_WINDOWS)('the command line prepared for cmd.exe', () => {
+  it('hands the line to Windows as written rather than letting Node quote it', () => {
+    const prepared = prepareShellCommand('node -e "console.log(1)"', 'cmd');
+    expect(prepared.windowsVerbatimArguments).toBe(true);
+    // Verbatim and the wrapping quotes are one decision: without the quotes there is no
+    // outer pair for `/s` to strip, and a script containing `&` would be split by cmd.
+    expect(prepared.args).toEqual(['/d', '/s', '/c', '"node -e "console.log(1)""']);
+  });
+
+  it('leaves the PowerShell path on its encoded command', () => {
+    const prepared = prepareShellCommand('Write-Output 1', 'powershell');
+    expect(prepared.windowsVerbatimArguments).toBeUndefined();
+    expect(prepared.args).toContain('-EncodedCommand');
   });
 });

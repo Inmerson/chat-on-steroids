@@ -29,9 +29,21 @@ extraResources:
     filter:
       - '**/*'
       - '!**/*.map'
+  - from: resources/rg
+    to: rg
+    filter:
+      - '**/*'
 
-# No native modules, so there is nothing to rebuild.
+# node-pty is the one native module, and it ships Node-API prebuilds — one binary per
+# platform, not per ABI — so it loads in Electron unchanged. Rebuilding would require
+# Visual Studio build tools on every machine that packages this app, for no gain.
 npmRebuild: false
+
+# The ConPTY binaries have to be real files on disk: Windows loads conpty.dll and launches
+# OpenConsole.exe by path, and neither can be read from inside an asar. Without this the
+# packaged app would install cleanly and then fail to open a terminal at runtime.
+asarUnpack:
+  - '**/node_modules/node-pty/**'
 compression: maximum
 
 win:

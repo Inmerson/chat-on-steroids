@@ -209,9 +209,53 @@ describe('content search', () => {
     expect(out.truncated).toBe(true);
   });
 
-  it('reports how many files it looked at', async () => {
+  it('honours the cap exactly, even when the pipe is already full of matches', async () => {
+    // ripgrep is killed the moment the cap is reached, but the kill is asynchronous and
+    // whatever it already wrote is sitting in the pipe. Every one of those buffered lines
+    // still arrives, so the cap has to hold on the reading side too.
+    const flood = await makeTempDir('clf-search-flood-');
+    try {
+      const lines = Array.from({ length: 4000 }, (_, i) => `needle ${i}`).join('\n');
+      await writeTree(flood, { 'a.txt': `${lines}\n`, 'b.txt': `${lines}\n` });
+      const out = await search(
+        req({ realDir: flood, query: 'needle', mode: 'content', maxResults: 3, exclude: [] })
+      );
+      expect(out.hits).toHaveLength(3);
+      expect(out.truncated).toBe(true);
+      expect(out.stoppedBecause).toBe('limit');
+    } finally {
+      await removeTempDir(flood);
+    }
+  });
+
+  it('reports paths without ripgrep relative-directory prefix', async () => {
+    // rg runs with cwd set and "." as the target, so it reports ".\README.md". Left alone
+    // that becomes "/root/./README.md", which matches nothing the caller can name.
     const out = await search(req({ query: 'findme', mode: 'content' }));
-    expect(out.filesScanned).toBeGreaterThan(0);
+    for (const hit of out.hits) {
+      expect(hit.path.startsWith('/root/')).toBe(true);
+      expect(hit.path).not.toContain('/./');
+      expect(hit.path).not.toContain('\\');
+    }
+    expect(out.hits.map((h) => h.path)).toContain('/root/README.md');
+  });
+
+  it('counts files it searched, not files that matched', async () => {
+    const tree = await makeTempDir('clf-search-count-');
+    try {
+      await writeTree(tree, {
+        'hit.txt': 'needle\n',
+        'miss-one.txt': 'nothing here\n',
+        'miss-two.txt': 'nothing here either\n'
+      });
+      const out = await search(
+        req({ realDir: tree, query: 'needle', mode: 'content', exclude: [] })
+      );
+      expect(out.hits).toHaveLength(1);
+      expect(out.filesScanned).toBe(3);
+    } finally {
+      await removeTempDir(tree);
+    }
   });
 });
 

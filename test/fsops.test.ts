@@ -301,10 +301,16 @@ describe('editTextFile', () => {
     expect(await fs.readFile(file, 'utf8')).toBe('1\ntwo\n3\n');
   });
 
+  it('accepts an LF snippet copied from read_file when the real file is CRLF', async () => {
+    const file = await scratch('edit-crlf.txt', 'one\r\ntwo\r\nthree\r\n');
+    await editTextFile(file, [{ oldText: 'one\ntwo', newText: 'ONE\nTWO' }]);
+    expect(await fs.readFile(file, 'utf8')).toBe('ONE\r\nTWO\r\nthree\r\n');
+  });
+
   it('refuses an ambiguous snippet rather than guessing', async () => {
     const file = await scratch('edit3.txt', 'x = 1\ny = 2\nx = 1\n');
     await expect(editTextFile(file, [{ oldText: 'x = 1', newText: 'x = 9' }])).rejects.toThrow(
-      /appears 2 times/
+      /occurs 2 times, at lines 1, 3/
     );
     // The file must be untouched after a refusal.
     expect(await fs.readFile(file, 'utf8')).toBe('x = 1\ny = 2\nx = 1\n');

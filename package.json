@@ -1,6 +1,6 @@
 {
   "name": "chatgpt-local-files",
-  "version": "1.5.1",
+  "version": "1.7.6",
   "description": "Local Windows coding and computer-use bridge for ChatGPT over MCP, limited to folders and capabilities you approve.",
   "license": "MIT",
   "author": "ChatGPT Local Files",
@@ -14,19 +14,23 @@
     "verify": "npm run typecheck && npm run test",
     "icon": "node scripts/make-icon.mjs",
     "tunnel": "node scripts/fetch-tunnel-client.mjs",
-    "dist": "npm run icon && npm run tunnel && electron-vite build && electron-builder --win",
-    "dist:dir": "npm run icon && npm run tunnel && electron-vite build && electron-builder --win --dir"
+    "rg": "node scripts/fetch-ripgrep.mjs",
+    "dist": "npm run icon && npm run tunnel && npm run rg && electron-vite build && electron-builder --win",
+    "dist:dir": "npm run icon && npm run tunnel && npm run rg && electron-vite build && electron-builder --win --dir"
   },
   "dependencies": {
     "@modelcontextprotocol/node": "^2.0.0",
     "@modelcontextprotocol/server": "^2.0.0",
+    "node-pty": "1.2.0-beta.15",
     "zod": "^4.4.3"
   },
   "devDependencies": {
+    "@types/jsdom": "^30.0.0",
     "@types/node": "^22.15.0",
     "electron": "^43.4.0",
     "electron-builder": "^26.15.7",
     "electron-vite": "^5.0.0",
+    "jsdom": "^30.0.1",
     "typescript": "^7.0.2",
     "vite": "^7.3.6",
     "vitest": "^4.1.10"

@@ -11,21 +11,20 @@
 import { BrowserWindow, clipboard, dialog, ipcMain, shell } from 'electron';
 import { z } from 'zod';
 import { CAPABILITIES, type AppState, type Config } from '../shared/types.js';
-import { connect, disconnect, getStatus, onStatusChange } from './connection.js';
+import { applySettings, connect, disconnect, getStatus, onStatusChange } from './connection.js';
 import { getConfig, updateConfig } from './config.js';
+import { forgetExposedSurface } from './mcp/server.js';
 import { runDiagnostics } from './diagnostics.js';
-import { formatLogAsJson, formatLogForClipboard, getLog, logInfo, onLog } from './logger.js';
+import { formatLogAsJson, formatLogForClipboard, getLog, logInfo, logWarn, onLog } from './logger.js';
 import { uniqueRootName, validateNewRoot, SandboxError } from './sandbox.js';
 import { hasSecret, isEncryptionAvailable, setSecret } from './secrets.js';
 import { bundledVersion, locateBinary } from './tunnel/locate.js';
 import { TUNNEL_ID_PATTERN } from './tunnel/index.js';
 import {
   bridgeStatus,
-  cancelPairing,
+  cancelWorkerCommands,
   onBridgeChange,
-  queueResume,
   startBridge,
-  startPairing,
   stopBridge,
   unpair
 } from './bridge.js';
@@ -39,15 +38,7 @@ import {
   latestHandoff
 } from './session/store.js';
 import { activeSessionId, forgetSession, onSessionChange } from './session/recorder.js';
-import {
-  cancelCompaction,
-  clearCompaction,
-  compactSession,
-  compactionState,
-  onCompactionChange
-} from './session/compact.js';
-import { listModels } from './openrouter.js';
-import { onSwarmChange, resetSwarm, swarmState } from './agents.js';
+import { clearAgent, mintWorkerJoinKey, onSwarmChange, resetSwarm, swarmState } from './agents.js';
 import { tokenPressure } from '../shared/session.js';
 
 /** The only URLs the renderer may ask the OS to open. */
@@ -76,6 +67,12 @@ const settingsPatch = z.object({
       .string()
       .max(128)
       .refine((v) => v === '' || TUNNEL_ID_PATTERN.test(v), 'Expected tunnel_ followed by 32 hex characters'),
+    // The Desktop connector's own tunnel. Empty is normal and means "not published":
+    // Desktop is optional, and most users will never create a second Secure Tunnel.
+    desktopTunnelId: z
+      .string()
+      .max(128)
+      .refine((v) => v === '' || TUNNEL_ID_PATTERN.test(v), 'Expected tunnel_ followed by 32 hex characters'),
     binaryPath: z.string().max(4096)
   }),
   ui: z.object({
@@ -91,9 +88,10 @@ const settingsPatch = z.object({
     limitTokens: z.number().int().min(10_000).max(4_000_000)
   }),
   compaction: z.object({
-    model: z.string().max(200),
-    reasoning: z.enum(['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max']),
-    showReasoning: z.boolean()
+    auto: z.boolean(),
+    // Floored well above what a fresh chat holds, so a threshold cannot be set somewhere
+    // every conversation is already past the moment it opens.
+    autoTokens: z.number().int().min(10_000).max(4_000_000)
   }),
   multiAgent: z.object({
     enabled: z.boolean(),
@@ -124,7 +122,6 @@ async function buildState(): Promise<AppState> {
     config,
     status: getStatus(),
     hasApiKey: await hasSecret('openaiApiKey'),
-    hasOpenRouterKey: await hasSecret('openrouterApiKey'),
     resolvedBinary: resolvedBinary(config),
     bundledTunnelVersion: bundledVersion(),
     bridge: await bridgeStatus()
@@ -153,14 +150,31 @@ export function registerIpc(getWindow: () => BrowserWindow | null): void {
 
   handle('settings:save', async (payload) => {
     const patch = settingsPatch.parse(payload);
+    const wasMultiAgent = getConfig().multiAgent.enabled;
     const next = await updateConfig((config) => ({ ...config, ...patch }));
+    // Switching multi-agent mode off has to be able to remove the `agents` tool from the
+    // schemas, and the exposed surface only ever widens by default. So the latch is
+    // released here — the one place that knows the user made the decision
+    // deliberately — and the settings screen tells them to reconnect the connector, which
+    // is what makes ChatGPT read the clean schemas.
+    if (wasMultiAgent && !next.multiAgent.enabled) forgetExposedSurface();
+    // Order matters, and it used to be wrong. Ending the run is what tells the still-open
+    // worker chats to stop, and it does that by queueing commands the bridge delivers — so
+    // stopping the bridge first meant those notices were queued into a server that was
+    // already gone, the tabs kept generating, and the commands sat in the queue until some
+    // later restart opened them. The run ends while the bridge can still act on it.
+    if (!next.multiAgent.enabled) resetSwarm();
     // The extension bridge serves both features: recording needs it to observe the
     // chat, and multi-agent mode needs it to open worker tabs. Either one being on is
     // enough, and this must match the startup rule in index.ts exactly — a bridge that
     // runs at startup but not after a settings save is the worst of both.
     if (next.sessions.record || next.multiAgent.enabled) await startBridge();
     else await stopBridge();
-    if (!next.multiAgent.enabled) resetSwarm();
+    // Permissions and the second tunnel id both decide whether the optional Desktop
+    // connector should be published. Without this, enabling desktop access or pasting its
+    // tunnel id left the connector unpublished until the user happened to reconnect, with
+    // the card still saying "not published" and nothing explaining why.
+    await applySettings();
     logInfo('settings updated');
     return buildState();
   });
@@ -323,78 +337,8 @@ export function registerIpc(getWindow: () => BrowserWindow | null): void {
     return summary?.lastHandoffId ? readHandoff(id, summary.lastHandoffId) : null;
   });
 
-  // ------------------------------------------------------------ compaction
-
-  handle('compaction:state', async () => compactionState());
-  handle('compaction:clear', async () => {
-    clearCompaction();
-    return compactionState();
-  });
-  handle('compaction:cancel', async () => {
-    cancelCompaction();
-    return true;
-  });
-
-  handle('compaction:start', async (payload) => {
-    const { id, resume } = z
-      .object({
-        id: z.string().min(8).max(64).regex(/^[0-9a-z-]+$/i),
-        resume: z.boolean().optional()
-      })
-      .parse(payload);
-    const handoff = await compactSession({
-      sessionId: id,
-      reason: resume ? 'compact and resume' : 'manual compaction',
-      resume: resume === true
-    });
-    // The fresh chat is only opened once the handoff exists on disk. If compaction
-    // had failed, compactSession would have thrown and nothing would navigate.
-    if (resume) {
-      queueResume(handoff.id);
-      logInfo(`compaction: queued a fresh chat for handoff ${handoff.id}`);
-    }
-    return handoff;
-  });
-
-  handle('openrouter:key', async (payload) => {
-    const { value } = z.object({ value: z.string().max(500) }).parse(payload);
-    if (!isEncryptionAvailable()) {
-      throw new Error('Windows credential encryption is unavailable, so the key cannot be stored safely.');
-    }
-    await setSecret('openrouterApiKey', value);
-    logInfo(value.trim() === '' ? 'openrouter key cleared' : 'openrouter key stored');
-    return buildState();
-  });
-
-  handle('openrouter:models', async (payload) => {
-    const { refresh, offset, limit, query } = z
-      .object({
-        refresh: z.boolean().optional(),
-        offset: z.number().int().min(0).max(10_000).optional(),
-        limit: z.number().int().min(1).max(100).optional(),
-        query: z.string().max(100).optional()
-      })
-      .parse(payload ?? {});
-    const all = await listModels(refresh === true);
-    const needle = query?.trim().toLowerCase() ?? '';
-    const filtered = needle
-      ? all.filter((model) => model.id.toLowerCase().includes(needle) || model.name.toLowerCase().includes(needle))
-      : all;
-    const start = offset ?? 0;
-    const size = limit ?? 25;
-    return { total: filtered.length, offset: start, models: filtered.slice(start, start + size) };
-  });
-
   // ---------------------------------------------------------------- bridge
 
-  handle('bridge:pair', async () => {
-    startPairing();
-    return buildState();
-  });
-  handle('bridge:cancelPairing', async () => {
-    cancelPairing();
-    return buildState();
-  });
   handle('bridge:unpair', async () => {
     await unpair();
     return buildState();
@@ -427,6 +371,38 @@ export function registerIpc(getWindow: () => BrowserWindow | null): void {
     resetSwarm();
     return swarmState();
   });
+  /**
+   * Clearing one row in the app: the prime ends the run, a worker frees its own slot.
+   *
+   * The queued bootstrap is withdrawn here rather than from inside the broker. The broker
+   * deliberately knows nothing about HTTP or tabs, and `drop()` reaches `failAgent` from
+   * inside a delivery — cancelling from there would re-enter it. An IPC call never is.
+   * `tidyCommands()` would retire the command on its own at the next poll; doing it now is
+   * what stops a tab opening for a slot the user has just cleared.
+   */
+  handle('swarm:clearAgent', async (payload) => {
+    const id = typeof payload === 'string' ? payload : '';
+    const outcome = clearAgent(id);
+    if (outcome.cleared === 'worker') cancelWorkerCommands(outcome.reason, id);
+    // The prime's report stays in the main process: the renderer needs the outcome, not
+    // the message queued for the prime agent.
+    return { cleared: outcome.cleared, reason: outcome.reason, swarm: swarmState() };
+  });
+
+  /**
+   * Mints the one-time key that recovers a worker slot whose chat was never bound.
+   *
+   * Deliberately here, on an explicit click, and nowhere else. A worker chat this app opened
+   * is bound to its slot by the extension's report before the model in it reads its task, so
+   * the ordinary run never has a key at all; this exists for the one failure that leaves a
+   * chat doing a worker's work with no way to say so. The plaintext is returned to the
+   * renderer for the *user* to paste, and is never in a bootstrap or a tool result.
+   */
+  handle('swarm:recoveryKey', async (payload) => {
+    const id = typeof payload === 'string' ? payload : '';
+    return { key: mintWorkerJoinKey(id) };
+  });
+
 
   // Push updates so the UI reflects tunnel progress without polling.
   const pushState = (): void => {
@@ -436,6 +412,5 @@ export function registerIpc(getWindow: () => BrowserWindow | null): void {
   onBridgeChange(pushState);
   onLog((entry) => getWindow()?.webContents.send('log:entry', entry));
   onSessionChange(() => getWindow()?.webContents.send('session:changed'));
-  onCompactionChange((state) => getWindow()?.webContents.send('compaction:changed', state));
   onSwarmChange(() => getWindow()?.webContents.send('swarm:changed', swarmState()));
 }

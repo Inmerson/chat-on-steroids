@@ -11,8 +11,10 @@
  *     data-message-author-role, data-interrupted, data-testid)
  *   · `.markdown` for assistant prose when the current renderer supplies no assistant
  *     data-message-id; progress markdown under data-interrupted is excluded
- *   · the id #prompt-textarea on the composer
- *   · one structural tool-message class substring
+ *   · the id #prompt-textarea on the composer, and the send/stop/dictation buttons beside
+ *     it, which is where our own composer control is anchored
+ *   · one structural tool-message class substring, plus a display-contents row shape that
+ *     is confirmed structurally (short header line, no prose) before it is believed
  *
  * None of these are a public ChatGPT API. In the live 2026-08-15 page one logical
  * assistant request can also be split into several sections sharing data-turn-id, so
@@ -27,10 +29,34 @@ var CLF_DOM = (() => {
   // Keep both explicit structural anchors; hashed CSS-module names remain off limits.
   const TOOL_LEGACY = 'span[class*="tool-message"]';
   const TOOL = `${TOOL_LEGACY}, div.pointer-events-none.contents`;
+  /**
+   * The control ChatGPT puts inside a *connector* tool row and nowhere else.
+   *
+   * Collapsed, a connector row carries no name, no tool id and no connector attribute —
+   * inspected live it is a `group/tool-message` span wrapping a button whose only
+   * distinguishing mark is this label, above turn-level attributes that say nothing about
+   * what ran. The identity ChatGPT holds (`api_tool`, the connector's name, the request
+   * path) appears only once the row or its side panel is opened, and opening rows behind
+   * the user's back to read it is not something this extension will do.
+   *
+   * So this is the one structural thing that separates a connector row from a built-in
+   * one — "Searched the web" and friends are a different component. It matters because
+   * the app uses these rows as its only evidence of *where a tool call came from*: a row
+   * that is not a connector row must never vouch for a connector call, or a turn that
+   * merely searched the web ends up adopting a call made from another device.
+   */
+  const CONNECTOR = '[aria-label="Open tool call list" i]';
   const STOP =
     'button[data-testid="stop-button"], button[data-testid="composer-stop-button"], ' +
     'button[aria-label="Stop streaming"], button[aria-label="Stop generating"]';
   const SEND = 'button[data-testid="send-button"], form button[aria-label^="Send" i]';
+  /** The composer's own trailing controls, where the send and dictation buttons live. */
+  const TRAILING =
+    '[data-testid="composer-trailing-actions"], [data-testid="composer-footer-actions"], ' +
+    '[grid-area="trailing"]';
+  const SPEECH =
+    'button[data-testid="composer-speech-button"], button[data-testid="composer-dictate-button"], ' +
+    'button[aria-label^="Dictate" i], button[aria-label^="Voice" i]';
 
   const safe = (fn, fallback) => {
     try {
@@ -45,11 +71,148 @@ var CLF_DOM = (() => {
     node ? (node.textContent || '').replace(/ /g, ' ').trim().slice(0, cap) : '';
 
   /**
+   * Visible page text with every CLF-owned surface removed first.
+   *
+   * The synthetic stream is mounted inside an assistant turn. On the live page ChatGPT's
+   * reasoning container can later expand/reparent around that mount, so reading the outer
+   * container's textContent naively feeds our own rendered transcript back into the recorder.
+   * That is the exact loop that produced twenty copies of the same assistant update. Clone
+   * and strip our nodes before extracting page text. Unknown/fake DOMs fall back safely.
+   */
+  const OWN_SURFACES = '.clf-stream, .clf-stage, .clf-composer, .clf-boot';
+
+  /**
+   * Removes this extension's own rendered surfaces from a clone, in place.
+   *
+   * Every read of assistant DOM has to do this, not just pageText: our stream is mounted
+   * inside the turn, so anything that reads the turn and feeds the result back into the
+   * stream compounds on each repaint — one copy, then two, then three.
+   */
+  function stripOwn(clone) {
+    if (!clone || typeof clone.querySelectorAll !== 'function') return clone;
+    for (const own of clone.querySelectorAll(OWN_SURFACES)) own.remove();
+    return clone;
+  }
+
+  function pageText(node, cap = 200_000) {
+    return safe(() => {
+      if (!node) return '';
+      if (typeof node.cloneNode !== 'function') return text(node, cap);
+      return text(stripOwn(node.cloneNode(true)), cap);
+    }, '');
+  }
+  /**
    * ChatGPT sometimes renders transport failures inside the same `.markdown` shape as
    * a final assistant answer. Treating "Message delivery timed out … Retry" as model
    * prose makes a broken/reloaded turn look completed. role=alert remains the primary
    * signal; these are narrow fallbacks for failure copy observed on the live site.
    */
+  /**
+   * Authored message text, without ChatGPT's controls around it.
+   *
+   * Reading the whole `[data-message-id].textContent` also captures UI chrome. The live
+   * page reproduced stored messages ending `Show moreShow less`, which polluted session
+   * history and compaction. Prefer ChatGPT's content subtrees; strip controls only as a
+   * fallback for an unfamiliar renderer shape.
+   */
+  function messageText(node, role) {
+    return safe(() => {
+      if (!node) return '';
+      if (role === 'user') {
+        const parts = [...node.querySelectorAll('.whitespace-pre-wrap')]
+          .map((part) => text(part))
+          .filter(Boolean);
+        if (parts.length > 0) return parts.join('\n');
+      }
+      if (role === 'assistant') {
+        const parts = [...node.querySelectorAll('.markdown')]
+          .filter((part) => !(part.closest && part.closest('[data-interrupted]')))
+          .filter((part) => !(part.closest && part.closest(TOOL)))
+          .map((part) => text(part))
+          .filter(Boolean);
+        if (parts.length > 0) return parts.join('\n\n');
+      }
+      // Structural test fakes and a future partial DOM shim may not implement cloneNode.
+      // The live browser always does, but falling back to the node's own text is safer than
+      // turning an otherwise valid authored message into an empty string. Real ChatGPT
+      // still takes the clone/remove path, which is what strips Show more / Show less.
+      if (typeof node.cloneNode !== 'function') return role === 'assistant' ? '' : text(node);
+      const clone = node.cloneNode(true);
+      // Our own surfaces first, and this is not defensive tidying. A live assistant
+      // container with no authored `.markdown` fell through to here and returned the whole
+      // node — which contains the stream this extension drew into that very turn. The
+      // recorder stored `▣Listed open windows … ›_Ran …` as the assistant's final answer.
+      // Anything that reads a turn and feeds the result back into the stream compounds on
+      // every repaint, so the strip has to happen before any fallback, not only in
+      // pageText().
+      stripOwn(clone);
+      for (const control of clone.querySelectorAll('button, [role="button"], [data-testid*="copy"], [data-testid*="feedback"]')) {
+        control.remove();
+      }
+      // Everything the preferred path above excludes, excluded here too — otherwise the
+      // fallback is not a fallback, it is a different and much laxer rule that fires
+      // exactly when the strict one found nothing.
+      //
+      // Tool rows are ChatGPT's chrome, not its prose, and are reported separately as
+      // page_tool activity; reading them here turned one answer into a transcript of its
+      // own tool labels. Commentary is not the answer either: a turn that narrated its
+      // work and then produced no prose would otherwise have its narration promoted to
+      // `final: true`, which is what closes a turn and what a recovery later trusts.
+      //
+      // Nothing authored left is the honest record. An assistant final is the one thing a
+      // reader takes as "what it said", so absence beats a plausible-looking invention.
+      if (role === 'assistant') {
+        for (const row of clone.querySelectorAll(TOOL)) row.remove();
+        for (const commentary of clone.querySelectorAll('[data-interrupted]')) commentary.remove();
+      }
+      return text(clone);
+    }, '');
+  }
+
+  /**
+   * What ChatGPT itself has put into a section, as a value comparable with a later reading.
+   *
+   * Deliberately not `textContent`. content.js uses "this section's text changed since the
+   * baseline" as evidence that the generation now running is writing into it — and this
+   * extension rewrites the visible label of tool rows *inside assistant sections* as steps
+   * land (`applyLabel`, `applyPageLabel`). Raw text therefore changes in sections ChatGPT
+   * has not touched, and our own relabel of an old row was enough to bind a finished
+   * section to the new generation and file this turn's work under the previous answer.
+   *
+   * So it is built only from signals this extension does not write: authored prose, and how
+   * many tool rows the page is showing. A relabel moves neither. New prose or a new row
+   * moves one, which is precisely the page-authored activity the caller is asking about.
+   */
+  function sectionSignature(node) {
+    return safe(() => {
+      if (!node || typeof node.querySelectorAll !== 'function') return '0|0|';
+      // Structural, so it survives a relabel: this extension rewrites what a row *says*,
+      // never how many there are. A row appearing is page activity; "Inspecting" becoming
+      // "Inspected" is ours.
+      const rows = [...node.querySelectorAll(TOOL)].filter(
+        (row) => !(row.closest && row.closest(OWN_SURFACES))
+      ).length;
+      let authored = '';
+      if (typeof node.cloneNode === 'function') {
+        // Everything ChatGPT put here, with the two things this extension writes taken out:
+        // its own surfaces, and the tool rows whose labels it rewrites. Commentary counts —
+        // it is usually the *first* thing a new generation writes, and a signature made of
+        // final prose and rows alone stayed identical through the whole commentary phase,
+        // so a generation writing into an already-mounted section could not be recognised
+        // and its visible commentary was never recorded at all.
+        const clone = stripOwn(node.cloneNode(true));
+        for (const row of clone.querySelectorAll(TOOL)) row.remove();
+        authored = text(clone);
+      } else {
+        authored = [...node.querySelectorAll('.markdown')]
+          .filter((part) => !(part.closest && (part.closest(TOOL) || part.closest(OWN_SURFACES))))
+          .map((part) => text(part))
+          .join('\n');
+      }
+      return `${rows}|${authored.length}|${authored.slice(-96)}`;
+    }, '0|0|');
+  }
+
   function transportFailure(value) {
     const line = String(value || '').replace(/\s+/g, ' ').trim();
     return /(?:message delivery timed out|unknown error occurred|there was an error generating (?:a|the) response|error in message stream|network error|something went wrong)/i.test(line);
@@ -93,6 +256,38 @@ var CLF_DOM = (() => {
     }, []);
   }
 
+  /**
+   * Logical turns for presentation only.
+   *
+   * Keep this separate from `turns()`: the recorder has a deliberately conservative model
+   * that other code depends on. The renderer needs one extra guarantee the live ChatGPT DOM
+   * no longer gives it: `data-turn-id` can be reused by later requests. Grouping every
+   * section with the same id across the whole page therefore lets one old id swallow several
+   * different assistant turns and the overwrite renderer hides them all as one block.
+   *
+   * Split sections of one response are adjacent, while a later response is separated by a
+   * user turn. So presentation groups only consecutive sections with the same role + id.
+   * This changes no observation, attribution or recording path; it is only the list the
+   * synthetic stream paints into.
+   */
+  function presentationTurns() {
+    return safe(() => {
+      const out = [];
+      let previous = null;
+      for (const node of document.querySelectorAll(TURN)) {
+        const id = node.getAttribute('data-turn-id');
+        const role = node.getAttribute('data-turn');
+        if (previous && id && previous.id === id && previous.role === role) {
+          previous.nodes.push(node);
+          continue;
+        }
+        previous = { node, nodes: [node], id, role };
+        out.push(previous);
+      }
+      return out;
+    }, []);
+  }
+
   const turnNodes = (turn) =>
     turn && Array.isArray(turn.nodes) && turn.nodes.length > 0 ? turn.nodes : turn && turn.node ? [turn.node] : [];
 
@@ -107,54 +302,82 @@ var CLF_DOM = (() => {
     return safe(() => {
       const out = [];
       const seen = new Set();
-      for (const [index, turn] of turns().entries()) {
-        const nodes = turnNodes(turn);
-        let explicit = 0;
+      for (const [index, turn] of turns().entries()) out.push(...messagesIn(turn, index, seen));
+      return out;
+    }, []);
+  }
+
+  /**
+   * The messages of exactly one turn.
+   *
+   * Split out of messages() rather than duplicated because callers that need turn-scoped
+   * evidence — "did *this* turn produce an answer" — must read the page the same way the
+   * whole-conversation scan does, including the no-data-message-id fallback below. Asking
+   * that question by filtering messages() on `turnId` is not the same thing: sections
+   * ChatGPT renders without a turn id all report `turnId: null`, so the filter silently
+   * merges every id-less turn into one.
+   *
+   * `seen` is shared by the whole-conversation scan so a message id rendered in two
+   * sections is reported once. On its own each turn gets a fresh one.
+   */
+  function messagesIn(turn, index = 0, seen = new Set()) {
+    return safe(() => {
+      const out = [];
+      const nodes = turnNodes(turn);
+      let explicit = 0;
+      for (const section of nodes) {
+        for (const node of section.querySelectorAll('[data-message-id]')) {
+          const id = node.getAttribute('data-message-id');
+          if (!id || seen.has(id)) continue;
+          const role = node.getAttribute('data-message-author-role') || turn.role;
+          if (role !== 'user' && role !== 'assistant') continue;
+          seen.add(id);
+          explicit++;
+          out.push({
+            id,
+            role,
+            text: messageText(node, role),
+            turnId: turn.id,
+            node: section,
+            interrupted: interrupted(turn)
+          });
+        }
+      }
+
+      // The current ChatGPT renderer no longer gives streaming assistant prose a
+      // data-message-id. Final prose is still exposed as `.markdown`; live progress
+      // prose is also `.markdown`, but lives under `[data-interrupted]`. Only use the
+      // fallback when there is no explicit assistant message and only collect
+      // markdown outside progress/tool containers. content.js itself waits until the
+      // turn has stopped generating before recording this as the final answer.
+      if (turn.role === 'assistant' && explicit === 0) {
+        const parts = [];
         for (const section of nodes) {
-          for (const node of section.querySelectorAll('[data-message-id]')) {
-            const id = node.getAttribute('data-message-id');
-            if (!id || seen.has(id)) continue;
-            const role = node.getAttribute('data-message-author-role') || turn.role;
-            if (role !== 'user' && role !== 'assistant') continue;
-            seen.add(id);
-            explicit++;
-            out.push({
-              id,
-              role,
-              text: text(node),
-              turnId: turn.id,
-              interrupted: interrupted(turn)
-            });
+          for (const markdown of section.querySelectorAll('.markdown')) {
+            if (markdown.closest && markdown.closest('[data-interrupted]')) continue;
+            if (markdown.closest && markdown.closest(TOOL)) continue;
+            if (markdown.closest && markdown.closest(OWN_SURFACES)) continue;
+            const value = text(markdown);
+            if (value && parts[parts.length - 1] !== value) parts.push(value);
           }
         }
-
-        // The current ChatGPT renderer no longer gives streaming assistant prose a
-        // data-message-id. Final prose is still exposed as `.markdown`; live progress
-        // prose is also `.markdown`, but lives under `[data-interrupted]`. Only use the
-        // fallback when there is no explicit assistant message and only collect
-        // markdown outside progress/tool containers. content.js itself waits until the
-        // turn has stopped generating before recording this as the final answer.
-        if (turn.role === 'assistant' && explicit === 0) {
-          const parts = [];
-          for (const section of nodes) {
-            for (const markdown of section.querySelectorAll('.markdown')) {
-              if (markdown.closest && markdown.closest('[data-interrupted]')) continue;
-              if (markdown.closest && markdown.closest(TOOL)) continue;
-              const value = text(markdown);
-              if (value && parts[parts.length - 1] !== value) parts.push(value);
-            }
-          }
-          if (parts.length > 0) {
-            const value = parts.join('\n\n');
-            if (!transportFailure(value)) {
-              out.push({
-                id: `assistant:${turn.id || index}`,
-                role: 'assistant',
-                text: value,
-                turnId: turn.id,
-                interrupted: interrupted(turn)
-              });
-            }
+        if (parts.length > 0) {
+          // The live renderer can leave several assistant-authored markdown blocks in one
+          // logical turn: interim commentary messages followed by the actual final answer.
+          // Joining them all promoted the whole visible work log to one "final answer" and
+          // later re-recorded those interim messages under an older reused page turn id.
+          // The final answer is the last authored markdown block; interim blocks are captured
+          // live by assistantProseItems() below, with their own stable identities.
+          const value = parts[parts.length - 1];
+          if (!transportFailure(value)) {
+            out.push({
+              id: `assistant:${turn.id || index}`,
+              role: 'assistant',
+              text: value,
+              turnId: turn.id,
+              node: nodes[0] || null,
+              interrupted: interrupted(turn)
+            });
           }
         }
       }
@@ -179,18 +402,443 @@ var CLF_DOM = (() => {
    */
   function progressLine(turn) {
     return safe(() => {
-      let latest = null;
+      const parts = [];
       for (const section of turnNodes(turn)) {
-        for (const box of section.querySelectorAll('[data-interrupted]')) {
-          const lines = (box.innerText || box.textContent || '')
+        // Outermost containers only. These boxes nest, and reading whichever one came last
+        // in document order made this value flip between the whole reasoning block and
+        // whatever inner box was newest. A shrink is not a prefix of what came before, so
+        // the delta below could only report it as brand-new text — which is exactly how the
+        // same commentary line came to be printed two and three times.
+        for (const box of progressRoots(section)) {
+          const lines = pageText(box, 32_000)
             .split('\n')
             .map((line) => line.trim())
             .filter(Boolean);
-          if (lines.length > 0) latest = lines[lines.length - 1].slice(0, 400);
+          if (lines.length > 0) parts.push(lines.join('\n'));
         }
       }
-      return latest;
+      return parts.length > 0 ? parts.join('\n').slice(0, 8000) : null;
     }, null);
+  }
+
+  /**
+   * The outermost commentary containers of one section, in document order.
+   *
+   * Outermost only. These boxes nest, and a scan that returns the inner ones too reports
+   * the same sentence under two identities — which is how one caption came to be recorded,
+   * and drawn, several times over.
+   */
+  /**
+   * The identity a commentary root inherits from the prose block it swallowed, if any.
+   *
+   * The two families of item here are told apart by where the text sits: prose blocks are
+   * `.markdown` *outside* a `[data-interrupted]` container, commentary is what is inside
+   * one. ChatGPT moves text across that line mid-answer — it mounts the markdown first and
+   * wraps it a moment later — and the same visible words were then reported twice, once
+   * under each family's stamp. The commentary chain revises itself correctly, so what the
+   * user saw was a frozen truncated prefix of their answer sitting above the answer:
+   * "Yeah bro, I'll stay on the **current" and then the whole paragraph, in one turn.
+   *
+   * It is one block of text, so it gets one identity: the stamp the prose block already
+   * carries from this same generation. Only when the root has exactly one stamped block —
+   * two would make the inheritance a guess, and a guess here merges two different things
+   * into one row.
+   */
+  function adoptedProseId(box, namespace) {
+    if (!box || !box.querySelectorAll) return '';
+    let found = '';
+    for (const node of box.querySelectorAll('[data-clf-assistant-prose-id]')) {
+      const stamp = node.getAttribute('data-clf-assistant-prose-id') || '';
+      if (stamp.indexOf(`${namespace}#`) !== 0) continue;
+      if (found) return '';
+      found = stamp;
+    }
+    return found;
+  }
+
+  function progressRoots(section) {
+    return [...section.querySelectorAll('[data-interrupted]')].filter(
+      (node) => !(node.parentElement && node.parentElement.closest && node.parentElement.closest('[data-interrupted]'))
+    );
+  }
+
+  /**
+   * Stamps a list of nodes with per-generation identities, reusing a stamp only within the
+   * generation that minted it.
+   *
+   * The namespace is the caller's generation key, and that is the whole point. Stamping
+   * with ChatGPT's `data-turn-id` looked equivalent and was not: live, the page reuses the
+   * id `request-<conversation>-0` for turn after turn, and it reuses the commentary
+   * container node itself across turns as well. So a stamp minted on turn one was still
+   * sitting on the node during turn four, every turn's commentary was recorded under one
+   * identity, and the recorder folded four different captions into one row at the position
+   * of the first. A stamp from another generation is therefore treated as absent.
+   *
+   * Within a generation the stamp is what ties identity to the node's own lifecycle: React
+   * keeping the node — including reparenting it — keeps the id, and a container ChatGPT
+   * genuinely replaces gets a new one. The ordinal is only how an unstamped node is *named*;
+   * two nodes carrying the same stamp (React cloned a subtree) are separated rather than
+   * merged, because merging them would put two different things in one row.
+   */
+  function stampIdentities(nodes, attribute, key, letter) {
+    const namespace = `${key}#`;
+    const taken = new Set();
+    const ids = [];
+    for (const node of nodes) {
+      const stamp = node && node.getAttribute ? node.getAttribute(attribute) : null;
+      if (stamp && stamp.indexOf(namespace) === 0 && !taken.has(stamp)) {
+        taken.add(stamp);
+        ids.push(stamp);
+      } else {
+        ids.push(null);
+      }
+    }
+    let next = 0;
+    for (let at = 0; at < nodes.length; at++) {
+      if (ids[at]) continue;
+      let id = `${namespace}${letter}${next++}`;
+      while (taken.has(id)) id = `${namespace}${letter}${next++}`;
+      taken.add(id);
+      ids[at] = id;
+      try {
+        nodes[at].setAttribute(attribute, id);
+      } catch {
+        // A DOM that will not take the stamp still gets a usable id for this pass; it
+        // simply cannot keep it across a redraw. One row per redraw is the old failure,
+        // so the caller's own per-id state is what actually holds the line here.
+      }
+    }
+    return ids;
+  }
+
+  /**
+   * One commentary container's text, with the streaming double-write collapsed.
+   *
+   * `textContent` of a live commentary container is not the sentence on screen. While
+   * ChatGPT streams, the container holds the raw markdown buffer *and* the parsed render of
+   * the same words at the same time, so reading it naively returns
+   * `…**that screenshot basically confirms` immediately followed by
+   * `…that screenshot basically confirms the gate theory`. That is a real duplication in
+   * what the page exposes, not a bug in how it is read, and every layer downstream that
+   * tried to reconcile snapshots against each other was reconciling text that already said
+   * everything twice.
+   *
+   * Two collapses, because the page produces the duplication in two shapes.
+   *
+   * Within a line, because there is very often no newline between the two copies at all.
+   * The recorded example is a single line reading
+   * `Yep bro, **that screenshot basically confirmsYep bro, that screenshot basically
+   * confirms the gate theory` — the raw buffer runs straight into the rendered copy, and a
+   * deduper that only looks across lines cannot see it. So a line that begins with a long
+   * prefix which then starts again immediately is cut back to the second copy, which is the
+   * complete one: the buffer is always the shorter, earlier half.
+   *
+   * Then across lines, where a block contained in one already kept — or containing one —
+   * collapses to the longer of the two.
+   *
+   * Markdown punctuation is ignored for both comparisons; the text kept is always the
+   * page's own, never a rewritten one. The prefix has to be long to count, because prose
+   * legitimately repeats short openings and this must never eat a real sentence.
+   */
+  const MARKDOWN_CHAR = /[*_`#>~[\]()]/;
+  const SPACE_CHAR = /\s/;
+  const bareText = (value) => value.replace(/[*_`#>~[\]()]/g, '').replace(/\s+/g, ' ').trim();
+
+  /** Shortest repeated opening that is taken as a streaming double-write rather than prose. */
+  const MIN_ECHO_CHARS = 12;
+
+  /**
+   * Where the segment starting at `from` is immediately restated, or -1.
+   *
+   * A restatement has to be exact and back-to-back — `plain.slice(from, cut)` repeated at
+   * `cut` — so this never fires on prose that merely opens the same way twice. The candidate
+   * positions are the places the segment's own opening occurs again, which is a handful of
+   * indices rather than every one; a commentary line can be thousands of characters long and
+   * this runs on every container on every tick. The nearest candidate wins, because the
+   * shortest restated segment is the one that was interrupted earliest.
+   */
+  function echoCut(plain, from) {
+    const probe = plain.slice(from, from + MIN_ECHO_CHARS);
+    if (probe.length < MIN_ECHO_CHARS) return -1;
+    for (let at = plain.indexOf(probe, from + MIN_ECHO_CHARS); at > from; at = plain.indexOf(probe, at + 1)) {
+      const width = at - from;
+      if (at + width > plain.length) break;
+      // Two words at minimum. A repeated single long word is a word, not a double-write.
+      if (plain.slice(from, at).indexOf(' ') < 0) continue;
+      if (plain.slice(from, at) === plain.slice(at, at + width)) return at;
+    }
+    return -1;
+  }
+
+  /**
+   * A line the page wrote over itself while streaming, reduced to its last and fullest pass.
+   *
+   * Measured live: ChatGPT's commentary container briefly holds the paragraph it is replacing
+   * alongside the replacement, and `innerText` runs the two together without a newline. The
+   * result is not `A + A` but a chain of ever-longer prefixes — `**Schritt 3 erled` then
+   * `Schritt 3 erledigt: Die ersten 15 Zeilen` then the same sentence carried further — all on
+   * one line, which is how a single interim message came to be stored reading itself three and
+   * four times over. Only `A + A` was recognised before, so none of that chain was caught.
+   *
+   * Each pass is a prefix of the one after it, so stripping the restated segment repeatedly
+   * peels the chain from the front and leaves the last pass. Markdown punctuation is ignored
+   * for the comparison; the text kept is always the page's own, never a rewritten one, and a
+   * line the page did not double is returned untouched.
+   */
+  function dropEcho(line) {
+    if (line.length < MIN_ECHO_CHARS * 2) return line;
+    const chars = [];
+    const origin = [];
+    for (let at = 0; at < line.length; at++) {
+      const ch = line[at];
+      if (MARKDOWN_CHAR.test(ch)) continue;
+      if (SPACE_CHAR.test(ch)) {
+        if (chars.length === 0 || chars[chars.length - 1] === ' ') continue;
+        chars.push(' ');
+        origin.push(at);
+        continue;
+      }
+      chars.push(ch);
+      origin.push(at);
+    }
+    const plain = chars.join('');
+    let from = 0;
+    for (let cut = echoCut(plain, from); cut > from; cut = echoCut(plain, from)) from = cut;
+    return from === 0 ? line : line.slice(origin[from]).trim();
+  }
+
+  function commentaryText(node) {
+    const blocks = pageText(node, 32_000)
+      .split('\n')
+      .map((line) => dropEcho(line.trim()))
+      .filter(Boolean);
+    const kept = [];
+    for (const block of blocks) {
+      const plain = bareText(block);
+      if (!plain) continue;
+      let merged = false;
+      for (let at = 0; at < kept.length; at++) {
+        const held = bareText(kept[at]);
+        if (held.indexOf(plain) >= 0) {
+          merged = true;
+          break;
+        }
+        if (plain.indexOf(held) >= 0) {
+          kept[at] = block;
+          merged = true;
+          break;
+        }
+      }
+      if (!merged) kept.push(block);
+    }
+    return kept.join('\n').slice(0, 8000);
+  }
+
+  /**
+   * This turn's visible commentary, as identified items rather than as one blob of text.
+   *
+   * `progressLine()` answers "what does the whole reasoning area say right now", which is
+   * the wrong question for recording. ChatGPT grows one caption block in place, reparents
+   * it, shrinks it during a re-layout and grows it again; a caller comparing consecutive
+   * blobs can only see "the text changed" and has to guess whether that is new commentary
+   * or the same commentary redrawn. It guessed wrong, repeatedly, and every wrong guess
+   * became another stored event and another row on screen.
+   *
+   * `key` is the caller's generation key — see stampIdentities for why it may not be
+   * ChatGPT's turn id.
+   */
+  function progressItems(turn, key) {
+    return safe(() => {
+      const namespace = key || (turn && turn.id) || 'turn';
+      const boxes = [];
+      for (const section of turnNodes(turn)) boxes.push(...progressRoots(section));
+      const ids = stampIdentities(boxes, 'data-clf-progress-id', namespace, 'p');
+
+      const out = [];
+      for (let at = 0; at < boxes.length; at++) {
+        const value = commentaryText(boxes[at]);
+        if (value) out.push({ id: adoptedProseId(boxes[at], namespace) || ids[at], text: value });
+      }
+      return out;
+    }, []);
+  }
+
+  /**
+   * Assistant-authored markdown that ChatGPT exposes *outside* its reasoning container
+   * while a turn is still running.
+   *
+   * Newer ChatGPT builds use these blocks for visible interim messages between tool calls.
+   * They are neither `[data-interrupted]` commentary nor the settled final answer yet. If
+   * they are ignored until the turn ends, messages such as "I'll inspect X now" disappear
+   * from the recorded chronology and can later be mistaken for final prose from an older
+   * virtualised section. Stamp the real markdown nodes just like reasoning containers so a
+   * streaming rewrite updates one row instead of creating duplicates.
+   */
+  function assistantProseBlocks(turn) {
+    const blocks = [];
+    for (const section of turnNodes(turn)) {
+      for (const markdown of section.querySelectorAll('.markdown')) {
+        if (markdown.closest && markdown.closest('[data-interrupted]')) continue;
+        if (markdown.closest && markdown.closest(TOOL)) continue;
+        if (markdown.closest && markdown.closest(OWN_SURFACES)) continue;
+        blocks.push(markdown);
+      }
+    }
+    return blocks;
+  }
+
+  function assistantProseSnapshot(turn) {
+    return safe(
+      () =>
+        assistantProseBlocks(turn)
+          .map((node) => ({ node, text: commentaryText(node) }))
+          .filter((item) => item.text && !transportFailure(item.text)),
+      []
+    );
+  }
+
+  function assistantProseItems(turn, key) {
+    return safe(() => {
+      const blocks = assistantProseBlocks(turn);
+      const ids = stampIdentities(blocks, 'data-clf-assistant-prose-id', key || (turn && turn.id) || 'turn', 'a');
+      const out = [];
+      for (let at = 0; at < blocks.length; at++) {
+        const value = commentaryText(blocks[at]);
+        if (!value || transportFailure(value)) continue;
+        out.push({ id: ids[at], text: value, node: blocks[at] });
+      }
+      return out;
+    }, []);
+  }
+
+  /**
+   * This turn's visible ChatGPT-native activity rows, as identified items.
+   *
+   * Connector rows are excluded: those are this app's own calls, and the recorder holds
+   * them first-hand with their arguments, outcome and duration. What is left is the work
+   * only the page knows about — web search, image and canvas helpers, ChatGPT's own
+   * "Thinking" steps — and only the visible label of it ever leaves the page.
+   *
+   * Identity is a stamp on the row, for the same reason commentary needs one: ChatGPT
+   * rewrites a row's label in place as the step finishes. Naming a row by its position in
+   * the turn and a hash of its current label, which is what this did before, made
+   * "Inspecting project files" and "Inspected project files" two rows, and a re-layout that
+   * shifted the index made a third. One live turn produced fifty-four recorded rows for
+   * about a dozen visible steps.
+   */
+  /**
+   * Captions that say only that ChatGPT is busy, and are therefore not steps.
+   *
+   * These arrive through the same row as the real reasoning headlines — live, one node
+   * carried `Thinking`, then `Inspecting Package, Documentation, and Tests`, then the
+   * settled summary — so a filter on the *label* is the only place to tell them apart.
+   * Recording them produced timeline rows reading `ChatGPT: Thinking`, which is a status
+   * indicator wearing an assistant's name.
+   *
+   * Deliberately narrow: matched whole, after normalisation, never as a prefix. A step
+   * genuinely called "Thinking about the release gate" is a step and is kept.
+   */
+  const BUSY_CAPTIONS = new Set(['thinking', 'thinking about it', 'reasoning', 'working', 'loading', 'done', 'called tool']);
+  const TIMER_CAPTION = /^(?:worked|thought|reasoned|thinking)\s+for\s+[\d.,]+\s*(?:s|m|h|sec|secs|seconds?|min|mins|minutes?|hours?)\b/;
+
+  /**
+   * A caption reduced to the step it describes, so tense and punctuation stop mattering.
+   *
+   * ChatGPT rewrites a headline as its step finishes — `Inspecting Package, Documentation,
+   * and Tests` becomes `Inspected package documentation and tests, then counted files` —
+   * and those are one step said twice, not two steps. Stemming the common verb endings and
+   * dropping the joining words leaves two strings where one is a prefix of the other, which
+   * is the test `stepsMatch` uses.
+   */
+  function stepKey(label) {
+    return label
+      .toLowerCase()
+      .replace(/[^a-z0-9\s]/g, ' ')
+      .split(/\s+/)
+      .filter(Boolean)
+      .map((word) => word.replace(/(?:ing|ed|es|s)$/, ''))
+      .filter((word) => word !== 'the' && word !== 'and' && word !== 'then' && word !== 'a')
+      .join(' ');
+  }
+
+  function isBusyCaption(label) {
+    const plain = label.toLowerCase().replace(/[.…\s]+$/, '').trim();
+    return BUSY_CAPTIONS.has(plain) || TIMER_CAPTION.test(plain);
+  }
+
+  /** Whether two already-reduced captions describe the same step, one merely finished. */
+  function keysMatch(a, b) {
+    if (!a || !b) return false;
+    return a === b || a.indexOf(b) === 0 || b.indexOf(a) === 0;
+  }
+
+  /** Whether two captions describe the same step, one of them merely finished. */
+  function stepsMatch(before, after) {
+    if (before === after) return true;
+    return keysMatch(stepKey(before), stepKey(after));
+  }
+
+  /**
+   * The steps each generation has been seen taking, in the order they first appeared.
+   * Bounded, because a long-lived tab walks through many turns.
+   */
+  const stepLogs = new Map();
+
+  /**
+   * The identity a caption should be recorded under — derived from the step, never the row.
+   *
+   * Measured live: ChatGPT gives every reasoning step its own row, which starts as `Thinking`,
+   * becomes `Inspecting Local Files Source Directory`, then settles to `Inspected local source
+   * directory files`. But React *replaces* those rows as they settle, and a replaced node
+   * carries no stamp, so a row-shaped identity broke in both directions at once. It recycled:
+   * the node for step one was destroyed, the node for step two claimed the freed `#t0`, and
+   * a genuinely new step arrived under the previous step's id and overwrote it. And it
+   * duplicated: for one sampling tick the old and new node both existed holding the same
+   * settled caption, so `Read README and provided intermediate updates` was recorded twice,
+   * once as `#t1` and once as `#t2`.
+   *
+   * Nothing about the row survives that, so identity comes from the caption instead. A caption
+   * that is a step already recorded in this generation — matched after stemming, so `Reading
+   * README` and `Read README` are one step — updates that step in place, whichever node it
+   * arrives on. Anything else is appended as the next step. The scan runs newest-first because
+   * the step being rewritten is always the most recent one.
+   */
+  function stepIdentity(generation, label) {
+    let log = stepLogs.get(generation);
+    if (!log) {
+      log = { next: 0, steps: [] };
+      stepLogs.set(generation, log);
+      while (stepLogs.size > 8) stepLogs.delete(stepLogs.keys().next().value);
+    }
+    const key = stepKey(label);
+    for (let at = log.steps.length - 1; at >= 0; at--) {
+      if (!keysMatch(log.steps[at].key, key)) continue;
+      log.steps[at].label = label;
+      return log.steps[at].id;
+    }
+    const id = `${generation}#s${log.next++}`;
+    log.steps.push({ id, key, label });
+    return id;
+  }
+
+  function pageToolItems(turn, key) {
+    return safe(() => {
+      const rows = toolBlocks(turn).filter((block) => !isConnectorBlock(block));
+      const generation = key || (turn && turn.id) || 'turn';
+      const out = [];
+      const seen = new Set();
+      for (const row of rows) {
+        const label = pageText(toolLabel(row), 300).replace(/\s+/g, ' ').trim();
+        if (!label || isBusyCaption(label)) continue;
+        const id = stepIdentity(generation, label);
+        // Both halves of a row React is mid-way through replacing are on screen together.
+        // Reporting the same step twice in one pass would undo the update in place.
+        if (seen.has(id)) continue;
+        seen.add(id);
+        out.push({ id, label });
+      }
+      return out;
+    }, []);
   }
 
   function interrupted(turn) {
@@ -214,16 +862,215 @@ var CLF_DOM = (() => {
     }, 0);
   }
 
+  /**
+   * Is this candidate really one tool row?
+   *
+   * `div.pointer-events-none.contents` is a layout shape, not a semantic one: ChatGPT uses
+   * display-contents wrappers in several places, and matching the class alone once counted
+   * containers that hold a whole answer. A tool row is a short header line — no prose, no
+   * nested tool row — so require that shape rather than trusting the class.
+   *
+   * A block we have already relabelled is always accepted. Expanding one puts its output
+   * inside, which would otherwise make our own row stop looking like a tool row and let
+   * its call be handed to a different block on the next repaint.
+   */
+  function isToolBlock(node) {
+    if (node.hasAttribute && node.hasAttribute('data-clf-call')) return true;
+    // A row that carries the tool-call control is a tool row whatever its size. Expanding
+    // one puts its result — markdown and all — inside it, and the length/markdown test
+    // below would then stop recognising it. Judging by the control instead of by the body
+    // is what keeps an expanded connector result out of the chronology as prose.
+    if (node.querySelector && node.querySelector(CONNECTOR)) return true;
+    if (node.closest && node.closest(CONNECTOR)) return true;
+    if (node.querySelector && node.querySelector('.markdown')) return false;
+    const label = (node.textContent || '').replace(/\s+/g, ' ').trim();
+    return label.length > 0 && label.length <= 200;
+  }
+
   /** The tool-call blocks of one logical turn, across every split section, in DOM order. */
   function toolBlocks(turn) {
     return safe(
       () =>
         turnNodes(turn).flatMap((section) => {
           const current = [...section.querySelectorAll(TOOL)];
-          return current.length > 0 ? current : [...section.querySelectorAll(TOOL_LEGACY)];
+          const found = (current.length > 0 ? current : [...section.querySelectorAll(TOOL_LEGACY)]).filter(
+            isToolBlock
+          );
+          // The two shapes nest — the display-contents wrapper can sit inside the legacy
+          // span — and relabelling both would put our icon and title inside our own row.
+          // Keep the innermost, which is the element that actually carries the label.
+          return found.filter((node) => !found.some((other) => other !== node && node.contains(other)));
         }),
       []
     );
+  }
+
+  /**
+   * Whether this block is a connector (API tool) row rather than a built-in one.
+   *
+   * Structural, not textual: the row carries the control named by CONNECTOR, and built-in
+   * rows — "Searched the web", canvas, image generation — do not. That makes it stable
+   * across locales and immune to the label games a name-frequency guess is open to.
+   *
+   * It says "a connector", not "this connector". The provider's identity — the account
+   * name, the tool name, the request path — exists in ChatGPT's client state and appears
+   * in the expanded card and the side panel, but nothing in the collapsed row carries it,
+   * so a Gmail or Calendar row is indistinguishable from this app's from here. Callers
+   * that use this as evidence must treat it as narrowing, not as proof of provider.
+   */
+  /**
+   * Visible assistant activity in the exact DOM order ChatGPT drew it.
+   *
+   * Local Files remains authoritative for its own call labels/results. This only supplies
+   * the missing chronology: a visible commentary paragraph can sit between two calls, and
+   * the recorder clock cannot recover that after a fast turn. ChatGPT's completed DOM can.
+   */
+  function activityItems(turn) {
+    return safe(() => {
+      const out = [];
+      let markerBase = 0;
+      for (const section of turnNodes(turn)) {
+        const roots = [...section.querySelectorAll('[data-interrupted]')].filter((node) => {
+          const parent = node.parentElement && node.parentElement.closest
+            ? node.parentElement.closest('[data-interrupted]')
+            : null;
+          return !parent;
+        });
+
+        for (const root of roots) {
+          // ChatGPT's reasoning is one outer data-interrupted container. Its inner
+          // display-contents activity rows are the *actual chronology slots*; plain text
+          // between them is the visible commentary. Replacing those rows with sentinels in
+          // a clone gives us the ordering without having to depend on hashed prose classes.
+          // Strip our own stream before reading a single character of this subtree. Without
+          // it, every repaint reads back what we rendered last time and republishes it.
+          const clone = stripOwn(root.cloneNode(true));
+          const found = [...clone.querySelectorAll(TOOL)].filter(isToolBlock);
+          const slots = found.filter((node) => !found.some((other) => other !== node && node.contains(other)));
+          if (slots.length === 0) {
+            const value = (clone.innerText || clone.textContent || '').trim();
+            if (value) out.push({ kind: 'progress', text: value });
+            continue;
+          }
+
+          const markers = [];
+          slots.forEach((node, index) => {
+            const token = `\n[[CLF_ACTIVITY_${markerBase + index}]]\n`;
+            markers.push(token.trim());
+            node.replaceWith(document.createTextNode(token));
+          });
+          markerBase += slots.length;
+
+          const text = (clone.innerText || clone.textContent || '').replace(/\u00a0/g, ' ');
+          const pattern = /\[\[CLF_ACTIVITY_(\d+)\]\]/g;
+          let at = 0;
+          let match;
+          while ((match = pattern.exec(text)) !== null) {
+            const prose = text.slice(at, match.index).trim();
+            if (prose) out.push({ kind: 'progress', text: prose });
+            out.push({ kind: 'tool' });
+            at = match.index + match[0].length;
+          }
+          const tail = text.slice(at).trim();
+          if (tail) out.push({ kind: 'progress', text: tail });
+        }
+      }
+      return out;
+    }, []);
+  }
+
+  /**
+   * Whether this row is one of our own connector calls rather than something ChatGPT did.
+   *
+   * The answer is remembered on the row once it is known, and that is the point. The only
+   * live marker is the control ChatGPT puts in a connector row, and it does not survive
+   * everything the page does to that row: a collapse, a relabel, a React replacement of the
+   * button can all take it away. A row that loses its marker then reads as ChatGPT-native,
+   * and the call this app already recorded first-hand — with its arguments, outcome and
+   * duration — gets written down a second time as an anonymous page caption.
+   *
+   * Being wrong in this direction is cheap and the other direction is not: a row wrongly
+   * remembered as ours is one missing native caption, while a row wrongly read as native is
+   * a duplicate of work already in the log.
+   */
+  function isConnectorBlock(node) {
+    return safe(() => {
+      if (!node) return false;
+      if (node.getAttribute && node.getAttribute('data-clf-local') === '1') return true;
+      const found = !!node.querySelector(CONNECTOR) || !!node.closest(CONNECTOR);
+      if (found) markLocalBlock(node);
+      return found;
+    }, false);
+  }
+
+  /**
+   * Records that a row belongs to this connector, for callers who know it from elsewhere.
+   *
+   * The Fiber pass can prove it — a request whose resource path is this app's — and that
+   * proof outlives the DOM control, so it is worth keeping on the row.
+   */
+  function markLocalBlock(node) {
+    return safe(() => {
+      if (!node || !node.setAttribute) return false;
+      node.setAttribute('data-clf-local', '1');
+      return true;
+    }, false);
+  }
+
+  /**
+   * Whether this node is a connector row or contains one.
+   *
+   * Separate from isConnectorBlock because the questions are different: that one asks what
+   * a known tool row is, and answers upwards as well, while this one asks whether an
+   * arbitrary node that just appeared brought any evidence with it. React inserts whole
+   * subtrees, so the row is as often a descendant of what was added as it is the node
+   * itself, and only looking at the node would miss it.
+   */
+  function hasConnectorRow(node) {
+    return safe(() => !!node && node.nodeType === 1 && (node.matches(CONNECTOR) || !!node.querySelector(CONNECTOR)), false);
+  }
+
+  /**
+   * The connector rows inside a root, outermost first and counted once each.
+   *
+   * The evidence path asks this rather than filtering toolBlocks(), and that is deliberate.
+   * toolBlocks() exists for *relabelling*, so it has to find the element that carries the
+   * visible title, which means the display-contents/tool-message shapes and a heuristic
+   * about what a row looks like. Attribution needs none of that: it only needs to know how
+   * many connector calls this page has shown, and the one anchor that says so is CONNECTOR.
+   * Depending on the relabelling shapes for it meant a renderer change that moved the title
+   * silently turned every call in the browser into an unplaceable one.
+   *
+   * Nested matches are collapsed to the outermost, so a row whose control is labelled twice
+   * — the wrapper and the button inside it — is still one call.
+   */
+  function connectorRows(root) {
+    return safe(() => {
+      const scope = root || document;
+      const found = [...scope.querySelectorAll(CONNECTOR)];
+      if (scope.nodeType === 1 && scope.matches(CONNECTOR)) found.unshift(scope);
+      return found.filter((node) => !found.some((other) => other !== node && other.contains(node)));
+    }, []);
+  }
+
+  /**
+   * The index the MAIN-world helper stamped on this block's connector row, or -1.
+   *
+   * The stamp is how the two worlds agree on which row a descriptor describes without
+   * both having to query the DOM at the same instant — React can re-render in between.
+   * A tool block is either inside the connector row or wraps it, depending on which of
+   * the two live row shapes the renderer used, so both directions are tried.
+   */
+  function fiberIndex(block) {
+    return safe(() => {
+      if (!block) return -1;
+      const marked =
+        (block.closest && block.closest('[data-clf-fiber]')) ||
+        (block.querySelector && block.querySelector('[data-clf-fiber]'));
+      if (!marked) return -1;
+      const raw = Number(marked.getAttribute('data-clf-fiber'));
+      return Number.isInteger(raw) && raw >= 0 ? raw : -1;
+    }, -1);
   }
 
   /**
@@ -247,18 +1094,37 @@ var CLF_DOM = (() => {
     }, null);
   }
 
-  /** Visible error banners plus narrowly recognised transport-failure markdown. */
+  /**
+   * Visible error banners plus narrowly recognised transport-failure markdown.
+   *
+   * Occurrences, not strings. The same wording failing twice is two failures, and the
+   * caller has to be able to tell them apart: keyed on text alone, "Message delivery timed
+   * out" on turn nine was indistinguishable from the same banner on turn three, so the
+   * second one was never recorded and — because the outcome check consults the same
+   * filter — the failed turn could be written down as completed instead.
+   *
+   * What gives an occurrence its identity is the node it is rendered in, plus the turn it
+   * belongs to when it is inside one. A toast lives outside every turn, so it has no
+   * turnId; its node is still its identity.
+   */
   function errors() {
     return safe(() => {
-      const out = [...document.querySelectorAll('[role="alert"]')]
-        .map((node) => (node.innerText || node.textContent || '').replace(/\s+/g, ' ').trim())
-        .filter((value) => value.length > 2 && value.length < 500);
+      const out = [];
+      const texts = new Set();
+      for (const node of document.querySelectorAll('[role="alert"]')) {
+        const value = (node.innerText || node.textContent || '').replace(/\s+/g, ' ').trim();
+        if (value.length <= 2 || value.length >= 500) continue;
+        out.push({ text: value, node, turnId: null });
+        texts.add(value);
+      }
       for (const turn of turns()) {
         if (turn.role !== 'assistant') continue;
         for (const section of turnNodes(turn)) {
           for (const markdown of section.querySelectorAll('.markdown')) {
             const value = text(markdown, 500).replace(/\s+/g, ' ').trim();
-            if (value && transportFailure(value) && !out.includes(value)) out.push(value);
+            if (!value || !transportFailure(value) || texts.has(value)) continue;
+            texts.add(value);
+            out.push({ text: value, node: markdown, turnId: turn.id, turn });
           }
         }
       }
@@ -268,6 +1134,204 @@ var CLF_DOM = (() => {
 
   function composer() {
     return safe(() => document.querySelector('#prompt-textarea'), null);
+  }
+
+  /** The composer as a whole, used as the root to watch for React replacing it. */
+  function composerBox() {
+    return safe(() => {
+      const box = composer();
+      if (!box) return null;
+      return box.closest('form') || box.parentElement || null;
+    }, null);
+  }
+
+  /**
+   * Whether the page is currently drawn light or dark: `'light'` or `'dark'`.
+   *
+   * Not `prefers-color-scheme`. ChatGPT's appearance setting is its own — it can be pinned
+   * to Light on a dark Windows and the other way round — so asking the operating system
+   * gives our injected menu the opposite surface from the page it is sitting on. Not the
+   * `html` class either: the theme classes are ChatGPT's and would be one more name to
+   * break. What is asked instead is the paint: the composer's own background, which is the
+   * surface our control physically sits on, climbing until an ancestor is actually opaque
+   * (the composer's inner layers are transparent over the one that carries the colour).
+   */
+  function pageTheme() {
+    return safe(() => {
+      for (let node = composerBox() || document.body; node; node = node.parentElement) {
+        const found = luminance(getComputedStyle(node).backgroundColor);
+        if (found !== null) return found < 0.5 ? 'dark' : 'light';
+      }
+      const declared = getComputedStyle(document.documentElement).colorScheme || '';
+      return declared.indexOf('dark') >= 0 ? 'dark' : 'light';
+    }, 'dark');
+  }
+
+  /** Perceived brightness of a painted colour, or null if it paints nothing at all. */
+  function luminance(color) {
+    const parts = String(color).match(/[\d.]+/g);
+    if (!parts || parts.length < 3) return null;
+    // A transparent layer shows what is behind it, so it is not this node's answer.
+    if (parts.length > 3 && Number(parts[3]) === 0) return null;
+    const [red, green, blue] = parts.slice(0, 3).map(Number);
+    return (0.2126 * red + 0.7152 * green + 0.0722 * blue) / 255;
+  }
+
+  /**
+   * Where a control of ours belongs in the composer: `{ host, before }`.
+   *
+   * ChatGPT gives its trailing button row no stable id, so the anchor is the send button
+   * (or the stop button that replaces it while generating, or the dictation button when
+   * the composer is empty and there is no send button at all). Our control goes *before*
+   * that anchor, so send stays the rightmost thing in the composer — moving the primary
+   * action of the page is not ours to do.
+   */
+  function composerActions() {
+    return safe(() => {
+      const anchor = document.querySelector(SEND) || document.querySelector(STOP) || document.querySelector(SPEECH);
+      const explicit = anchor ? anchor.closest(TRAILING) : document.querySelector(TRAILING);
+      if (!anchor) return explicit ? { host: explicit, before: null } : null;
+
+      // The row that holds several controls, not the wrapper around this one button.
+      // Capped: climbing all the way to <body> because every ancestor happens to have one
+      // child would put our control somewhere it has no business being.
+      let host = anchor.parentElement;
+      for (let up = 0; up < 3 && host && host !== explicit && host.children.length < 2 && host.parentElement; up++) {
+        host = host.parentElement;
+      }
+      if (!host) return null;
+      let before = anchor;
+      while (before && before.parentElement !== host) before = before.parentElement;
+      return { host, before: before || null };
+    }, null);
+  }
+
+  /**
+   * The node holding the text of the chat's first user message, if there is one.
+   *
+   * Only ever asked for on a chat this app opened, where the first user message is the
+   * instruction the app typed. Returns the message element itself, so the caller folds
+   * away the text and nothing structural around it.
+   */
+  function firstUserMessage() {
+    return safe(() => {
+      for (const turn of turns()) {
+        for (const section of turnNodes(turn)) {
+          for (const node of section.querySelectorAll('[data-message-id]')) {
+            const role = node.getAttribute('data-message-author-role') || turn.role;
+            if (role === 'assistant') return null;
+            if (role === 'user') return node;
+          }
+        }
+      }
+      return null;
+    }, null);
+  }
+
+  /**
+   * Where a panel of ours belongs *above* the composer: `{ host, before }`.
+   *
+   * Outside the composer's own container rather than inside it. A block element inside
+   * ChatGPT's input row fights the row's layout, and a click that lands anywhere in there
+   * is turned into "focus the textarea" — so a panel with text to read and scroll cannot
+   * live there.
+   */
+  function composerStack() {
+    return safe(() => {
+      const box = composerBox();
+      if (!box || !box.parentElement) return null;
+      return { host: box.parentElement, before: box };
+    }, null);
+  }
+
+  /**
+   * Stable mount point for the extension-owned activity stream of one assistant turn.
+   * The stream is a sibling of ChatGPT's own activity, so replacing a tool/reasoning
+   * subtree cannot take the local transcript with it.
+   */
+  function turnMount(turn) {
+    return safe(() => {
+      const sections = turnNodes(turn);
+      const host = sections[0] || null;
+      if (!host) return null;
+
+      // Where ChatGPT itself put this turn's activity. Anchoring there is the whole point:
+      // the stream stands in for that block, so it has to occupy the same place in the
+      // turn. Mounting at the top of the section instead — which is what this did — lifted
+      // every reconstructed call and caption above the commentary and prose they belong
+      // between, and made a long turn read as if all the work happened first.
+      for (const section of sections) {
+        for (const box of progressRoots(section)) {
+          if (box.closest && box.closest(OWN_SURFACES)) continue;
+          if (box.parentElement) return { host: box.parentElement, before: box };
+        }
+      }
+
+      // No activity block yet. The answer is the only other fixed landmark, and the stream
+      // belongs above it: everything in the stream happened before the turn could answer.
+      for (const section of sections) {
+        for (const prose of section.querySelectorAll('.markdown')) {
+          if (prose.closest && (prose.closest(TOOL) || prose.closest(OWN_SURFACES))) continue;
+          if (prose.parentElement) return { host: prose.parentElement, before: prose };
+        }
+      }
+
+      // Neither: append, rather than prepend. An assistant section with tool rows and no
+      // reasoning box renders those rows first, and the stream stands after them.
+      return { host, before: null };
+    }, null);
+  }
+
+  /**
+   * Does this progress box also contain the turn's answer?
+   *
+   * ChatGPT's reasoning container can expand and reparent around content that started
+   * outside it, so a `[data-interrupted]` subtree is not reliably progress-only. Hiding
+   * one that has grown to hold the final prose is what leaves a turn showing "Worked for
+   * 45s" above an empty gap with no answer under it.
+   */
+  function holdsAnswer(box) {
+    return safe(() => {
+      const prose = [...box.querySelectorAll('.markdown')].filter(
+        (node) => !(node.closest && node.closest(TOOL)) && !(node.closest && node.closest(OWN_SURFACES))
+      );
+      return prose.some((node) => text(node).length > 0);
+    }, true);
+  }
+
+  /** Hides/restores only ChatGPT's own visible progress boxes for this logical turn. */
+  function hideProgress(turn, hidden) {
+    return safe(() => {
+      for (const section of turnNodes(turn)) {
+        for (const box of section.querySelectorAll('[data-interrupted]')) {
+          // Restoring is always safe; hiding is not. A box carrying the answer stays.
+          if (hidden && !holdsAnswer(box)) box.setAttribute('data-clf-native-hidden', '1');
+          else box.removeAttribute('data-clf-native-hidden');
+        }
+      }
+    }, undefined);
+  }
+
+  /**
+   * Makes one assistant turn an app-owned surface without deleting any React-owned DOM.
+   *
+   * The recorder still needs ChatGPT's native subtree to exist so it can observe final
+   * prose, progress and lifecycle changes. Visually, however, Overwrite means exactly what
+   * it says: every native child is hidden and the Local Files stream is the only visible
+   * child of the first section. Turning Overwrite off only removes the marker; React never
+   * has to reconstruct anything we destroyed.
+   */
+  function replaceTurn(turn, root, replaced) {
+    return safe(() => {
+      const sections = turnNodes(turn);
+      if (sections.length === 0) return false;
+      for (const section of sections) {
+        if (replaced) section.setAttribute('data-clf-turn-replaced', '1');
+        else section.removeAttribute('data-clf-turn-replaced');
+      }
+      if (replaced && root && root.parentElement !== sections[0]) sections[0].append(root);
+      return true;
+    }, false);
   }
 
   /** Types into the composer. Refuses if the user already has a draft there. */
@@ -305,16 +1369,37 @@ var CLF_DOM = (() => {
   return {
     conversationId,
     turns,
+    presentationTurns,
     messages,
+    messagesIn,
+    sectionSignature,
     generating,
     stopButton,
     progressLine,
+    progressItems,
+    assistantProseItems,
+    assistantProseSnapshot,
+    pageToolItems,
     interrupted,
     markProgress,
     toolBlocks,
+    activityItems,
+    isConnectorBlock,
+    markLocalBlock,
+    hasConnectorRow,
+    connectorRows,
+    fiberIndex,
     toolLabel,
     errors,
     composer,
+    composerBox,
+    pageTheme,
+    composerActions,
+    composerStack,
+    firstUserMessage,
+    turnMount,
+    hideProgress,
+    replaceTurn,
     insertPrompt,
     send
   };

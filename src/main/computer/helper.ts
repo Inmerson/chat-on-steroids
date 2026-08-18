@@ -19,6 +19,13 @@ $ProgressPreference = 'SilentlyContinue'
 # Without this the reply is written in the console codepage, and any window title
 # with a non-ASCII character comes back as mojibake.
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+# And the same in the other direction, which was missing. Requests are written to this
+# process's stdin as UTF-8, but [Console]::In decodes them through the legacy OEM input
+# codepage, so every non-ASCII character in a request was corrupted before ConvertFrom-Json
+# ever saw it: an em dash (E2 80 94) arrived as three CP437 characters and was then typed
+# into the target window exactly as mangled. That hits every textual argument the helper
+# takes — type, set_value, UIA queries — not only keystrokes.
+[Console]::InputEncoding = [System.Text.Encoding]::UTF8
 Add-Type -AssemblyName System.Drawing
 Add-Type -AssemblyName UIAutomationClient
 Add-Type -AssemblyName UIAutomationTypes
@@ -333,13 +340,73 @@ function Get-ScreenRect {
   }
 }
 
-function Assert-Focused([int64]$id) {
+function Try-Focus([int64]$id) {
   [Clf]::Focus($id) | Out-Null
   Start-Sleep -Milliseconds 120
-  $foreground = [Clf]::ForegroundId()
-  if ($foreground -ne $id) {
-    throw "FOCUS_FAILED: requested $id but foreground is $foreground"
+  return ([Clf]::ForegroundId() -eq $id)
+}
+
+function Assert-Focused([int64]$id) {
+  if (-not (Try-Focus $id)) {
+    $foreground = [Clf]::ForegroundId()
+    throw "FOCUS_FAILED: requested $id but foreground is $foreground after asking Windows to activate it. Another window is holding focus; click it away or retry."
   }
+}
+
+function Ui-RuntimeKey($element) {
+  try { return (@($element.GetRuntimeId()) -join '.') } catch { return '' }
+}
+
+function Resolve-UiElement([int64]$id, [string]$runtimeKey) {
+  try {
+    $root = [System.Windows.Automation.AutomationElement]::FromHandle([IntPtr]$id)
+  } catch {
+    throw "UIA_FAILED: no accessible window with id $id"
+  }
+  if ($null -eq $root) { throw "UIA_FAILED: no accessible window with id $id" }
+  if ((Ui-RuntimeKey $root) -eq $runtimeKey) { return $root }
+  try {
+    $all = $root.FindAll(
+      [System.Windows.Automation.TreeScope]::Descendants,
+      [System.Windows.Automation.Condition]::TrueCondition
+    )
+    for ($i = 0; $i -lt $all.Count; $i++) {
+      $element = $all.Item($i)
+      if ((Ui-RuntimeKey $element) -eq $runtimeKey) { return $element }
+    }
+  } catch {
+    throw "UIA_FAILED: $($_.Exception.Message)"
+  }
+  throw "UI_ELEMENT_GONE: the referenced UI element is no longer present"
+}
+
+function Act-UiElement($request) {
+  $id = [int64]$request.id
+  $element = Resolve-UiElement $id ([string]$request.runtimeKey)
+  if (-not $element.Current.IsEnabled) { throw "UI_ELEMENT_DISABLED: the referenced element is disabled" }
+  $action = [string]$request.action
+  if ($action -eq 'set_value') {
+    $pattern = $null
+    if (-not $element.TryGetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern, [ref]$pattern)) {
+      throw "UI_VALUE_UNSUPPORTED: the referenced element does not expose ValuePattern"
+    }
+    $value = [System.Windows.Automation.ValuePattern]$pattern
+    if ($value.Current.IsReadOnly) { throw "UI_VALUE_READONLY: the referenced element is read-only" }
+    $value.SetValue([string]$request.value)
+  } elseif ($action -eq 'click') {
+    $pattern = $null
+    if ($element.TryGetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern, [ref]$pattern)) {
+      ([System.Windows.Automation.InvokePattern]$pattern).Invoke()
+    } else {
+      $r = $element.Current.BoundingRectangle
+      if ($r.Width -le 0 -or $r.Height -le 0) { throw "UI_ELEMENT_OFFSCREEN: the referenced element has no clickable bounds" }
+      [Clf]::Click([int][Math]::Round($r.X + $r.Width / 2), [int][Math]::Round($r.Y + $r.Height / 2), 'left', 1)
+    }
+  } else {
+    throw "BAD_ACTION: unsupported UI element action $action"
+  }
+  Start-Sleep -Milliseconds 30
+  return @{ runtimeKey = (Ui-RuntimeKey $element); name = [string]$element.Current.Name }
 }
 
 function Find-UiElements($request) {
@@ -372,6 +439,7 @@ function Find-UiElements($request) {
         $r = $current.BoundingRectangle
         if ($r.Width -le 0 -or $r.Height -le 0) { continue }
         $found += @{
+          runtimeKey = (Ui-RuntimeKey $all.Item($i))
           name = $name
           role = $control
           automationId = $automationId
@@ -409,6 +477,11 @@ function Handle-Request($request) {
       $result.window = $ui.window
       $result.elements = @($ui.elements)
     }
+    'act_ui' {
+      $ui = Act-UiElement $request
+      $result.runtimeKey = $ui.runtimeKey
+      $result.name = $ui.name
+    }
     'capture' {
       $screen = Get-ScreenRect
       if ($request.region) {
@@ -416,7 +489,11 @@ function Handle-Request($request) {
         $w = [int]$request.region.width; $h = [int]$request.region.height
       } elseif ($request.id) {
         $id = [int64]$request.id
-        Assert-Focused $id
+        # Looking at a window is not an action on it, so this never refuses for lack of
+        # focus. It asks Windows to bring the window forward, because unoccluded pixels
+        # are better, and then reports whether that worked so the caller can say the
+        # picture may be covered instead of failing a read the user asked for.
+        $result.focused = (Try-Focus $id)
         $r = [Clf]::Rect($id) -split ','
         $x = [int]$r[0]; $y = [int]$r[1]; $w = [int]$r[2]; $h = [int]$r[3]
       } elseif ($request.full) {
@@ -443,6 +520,8 @@ function Handle-Request($request) {
     'act' {
       foreach ($a in $request.actions) {
         switch ($a.type) {
+          'click_ui'     { Act-UiElement @{ id = $a.window; runtimeKey = $a.runtimeKey; action = 'click' } | Out-Null }
+          'set_value_ui' { Act-UiElement @{ id = $a.window; runtimeKey = $a.runtimeKey; action = 'set_value'; value = $a.value } | Out-Null }
           'move'         { [Clf]::Move([int]$a.x, [int]$a.y) }
           'click'        { [Clf]::Click([int]$a.x, [int]$a.y, $a.button, 1) }
           'double_click' { [Clf]::Click([int]$a.x, [int]$a.y, $a.button, 2) }
