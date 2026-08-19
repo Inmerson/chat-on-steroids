@@ -1,0 +1,73 @@
+/**
+ * Constants and small helpers from `codex-rs/core/src/unified_exec/mod.rs`.
+ *
+ * Kept in their own module so `head-tail-buffer.ts` can use the omission marker without
+ * importing the process manager, exactly as the Rust crate splits them.
+ */
+
+export const MIN_YIELD_TIME_MS = 250;
+export const WINDOWS_INITIAL_EXEC_YIELD_TIME_FLOOR_MS = 10_000;
+/** Minimum yield time for an empty `write_stdin`. */
+export const MIN_EMPTY_YIELD_TIME_MS = 5_000;
+export const MAX_YIELD_TIME_MS = 30_000;
+export const DEFAULT_MAX_BACKGROUND_TERMINAL_TIMEOUT_MS = 300_000;
+export const DEFAULT_MAX_OUTPUT_TOKENS = 10_000;
+export const UNIFIED_EXEC_OUTPUT_MAX_BYTES = 1024 * 1024; // 1 MiB
+export const UNIFIED_EXEC_OUTPUT_MAX_TOKENS = UNIFIED_EXEC_OUTPUT_MAX_BYTES / 4;
+export const MAX_UNIFIED_EXEC_PROCESSES = 64;
+
+export const DEFAULT_EXEC_YIELD_TIME_MS = 10_000;
+export const DEFAULT_WRITE_STDIN_YIELD_TIME_MS = 250;
+export const DEFAULT_TTY = false;
+
+/** The Ctrl-C character (U+0003), the one input a pipe session will still accept. */
+export const INTERRUPT = String.fromCharCode(3);
+
+/**
+ * Environment Codex forces on every unified exec child.
+ *
+ * `codex-rs/core/src/unified_exec/process_manager.rs`. It exists to make command output
+ * deterministic and pager-free rather than to sandbox anything.
+ */
+export const UNIFIED_EXEC_ENV: ReadonlyArray<readonly [string, string]> = [
+  ['NO_COLOR', '1'],
+  ['TERM', 'dumb'],
+  ['LANG', 'C.UTF-8'],
+  ['LC_CTYPE', 'C.UTF-8'],
+  ['LC_ALL', 'C.UTF-8'],
+  ['COLORTERM', ''],
+  ['PAGER', 'cat'],
+  ['GIT_PAGER', 'cat'],
+  ['GH_PAGER', 'cat'],
+  ['CODEX_CI', '1']
+];
+
+/** portable_pty's `TerminalSize::default()`. */
+export const DEFAULT_TERMINAL_ROWS = 24;
+export const DEFAULT_TERMINAL_COLS = 80;
+
+/**
+ * The Windows floor is why an ordinary command can appear to wait: on this platform Codex
+ * refuses to yield a session id sooner than ten seconds, so a command that finishes in
+ * 200 ms still returns in 200 ms, but one that does not is waited on for the full floor.
+ */
+export function clampYieldTime(yieldTimeMs: number): number {
+  const floored =
+    process.platform === 'win32' ? Math.max(yieldTimeMs, WINDOWS_INITIAL_EXEC_YIELD_TIME_FLOOR_MS) : yieldTimeMs;
+  return Math.min(Math.max(floored, MIN_YIELD_TIME_MS), MAX_YIELD_TIME_MS);
+}
+
+export function resolveMaxTokens(maxTokens: number | undefined): number {
+  return maxTokens ?? DEFAULT_MAX_OUTPUT_TOKENS;
+}
+
+export function formatOutputOmissionMarker(omittedBytes: number): string {
+  return `... ${omittedBytes} bytes omitted ...`;
+}
+
+/** Six random lowercase hex characters, as `generate_chunk_id`. */
+export function generateChunkId(): string {
+  let out = '';
+  for (let index = 0; index < 6; index++) out += Math.floor(Math.random() * 16).toString(16);
+  return out;
+}

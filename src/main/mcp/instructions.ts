@@ -49,6 +49,9 @@ function coreInstructions(ctx: ToolContext): string {
     'Never send read’s line-number prefixes to apply_patch; they are display metadata, not file content.',
     'apply_patch is the only way to change files: it adds, updates, moves and deletes, and it is atomic across files.',
     'exec_command runs git, npm, builds, tests and anything else; a long-running one gives you a session_id to continue with write_stdin.',
+    // The one exception to the virtual-path rule above, and the model has to be told: cmd
+    // is a program, not a path, so it reaches the shell exactly as written.
+    'exec_command’s workdir is virtual, but its cmd is not translated — set workdir and write paths inside the command relative to it.',
     'Output is capped. When a result says it was truncated, narrow the request instead of repeating it.'
   ];
 

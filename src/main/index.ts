@@ -8,7 +8,7 @@ import { getConfig, initConfigPath, loadConfig } from './config.js';
 import { connect, disconnect, getStatus, onStatusChange } from './connection.js';
 import { registerIpc } from './ipc.js';
 import { logError, logInfo } from './logger.js';
-import { stopAllManagedProcesses } from './process-manager.js';
+import { unifiedExecManager } from './codex/manager.js';
 import { initSecretsPath } from './secrets.js';
 import { installBridgeLiveness, setBrowserOpener, startBridge, stopBridge } from './bridge.js';
 import { flushSessions, initSessionStore, pruneSessions } from './session/store.js';
@@ -255,7 +255,7 @@ app.on('will-quit', (event) => {
   // shutdown still lands on disk instead of dying with the debounce timer. flushRecorder
   // comes before them: tool calls are filed off the connector's path, so the last one or
   // two of a session can still be queued at this point.
-  void Promise.all([disconnect(), stopAllManagedProcesses(), stopBridge()])
+  void Promise.all([disconnect(), unifiedExecManager.terminateAllProcesses(), stopBridge()])
     .then(() => flushRecorder())
     .then(() => Promise.all([flushSessions(), flushDurable()]))
     .finally(() => app.quit());

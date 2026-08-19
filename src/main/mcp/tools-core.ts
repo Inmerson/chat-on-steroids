@@ -1,13 +1,13 @@
 /**
  * The Core connector: reading, changing and running code on this PC.
  *
- * Six tools at the absolute maximum, and usually four. That number is the design (see
+ * Seven tools at the absolute maximum, and usually five. That number is the design (see
  * `docs/tool-surface.md` §3): a no-query discovery pull against this connector returns
  * every schema here at once, so the surface is sized for the worst case rather than for
  * the case where the harness happens to ask a narrow question.
  *
- * What used to be forty-five tools did not become six by dropping capability. It became
- * six by separating *primitives* from *procedures*: `exec_command` can run git, so `git`
+ * What used to be forty-five tools did not become seven by dropping capability. It became
+ * seven by separating *primitives* from *procedures*: `exec_command` can run git, so `git`
  * is a skill rather than a tool; `read` can open a directory, a text file or an image,
  * because those are three shapes of one question. Anything that reads as "and also, for
  * this special case…" belongs in a skill over these primitives, not in a schema every
@@ -17,34 +17,65 @@
 import { rawPromises as fs } from '../rawfs.js';
 import nodePath from 'node:path';
 import { z } from 'zod';
+import { DEFAULT_READ_BYTES, MAX_READ_BYTES, formatBytes } from '../fsops.js';
+import { listDirectoryLevel, readTextFile, statInfo, walkFiles } from '../codex/read-backend.js';
 import {
-  DEFAULT_READ_BYTES,
-  MAX_READ_BYTES,
-  formatBytes,
-  listDirectory,
-  readImageFile,
-  readTextFile,
-  statInfo
-} from '../fsops.js';
+  VIEW_IMAGE_DESCRIPTION,
+  VIEW_IMAGE_PATH_DESCRIPTION,
+  ViewImageError,
+  viewImage
+} from '../codex/view-image.js';
 import { logInfo } from '../logger.js';
-import { SandboxError, resolvePath, type Resolved } from '../sandbox.js';
+import { SandboxError, resolvePath } from '../sandbox.js';
 import { currentWorkspace, setCurrentWorkspace } from '../workspace.js';
-import type { Root } from '../../shared/types.js';
+import type { Capabilities, Root } from '../../shared/types.js';
+import type { FileChange } from '../../shared/session.js';
 import { DEFAULT_EXCLUDES, globToRegExp, search, searchOneFile } from '../search.js';
-import { parsePatch, PatchError, type PatchFileOperation } from '../patch.js';
-import { applyResolvedPatch, type ResolvedPatchOperation } from '../patch-files.js';
 import {
-  DEFAULT_TTY_COLS,
-  DEFAULT_TTY_ROWS,
-  getManagedProcess,
-  listManagedProcesses,
-  MAX_EXEC_YIELD_MS,
-  MAX_PROCESS_INPUT_CHARS,
-  startManagedShellProcess,
-  stopManagedProcess,
-  waitManagedProcess,
-  writeManagedProcess
-} from '../process-manager.js';
+  ApplyPatchError,
+  PatchParseError,
+  executeApplyPatch,
+  parsePatch,
+  verifyApplyPatchArgs,
+  type AppliedPatchDelta,
+  type Hunk,
+  type PatchPathResolver
+} from '../codex/apply-patch/index.js';
+import { DEFAULT_APPLY_PATCH_FILE_UPDATE_MODE } from '../codex/apply-patch/mode.js';
+import { hunkPath } from '../codex/apply-patch/hunk.js';
+import { maybeParseApplyPatchForExec } from '../codex/apply-patch/invocation.js';
+import { formatExecOutputForModel, newStreamOutput } from '../codex/exec-output.js';
+import { DEFAULT_TRUNCATION_POLICY, unifiedExecManager } from '../codex/manager.js';
+import {
+  UnifiedExecError,
+  applyUnifiedExecEnv,
+  execCommandResponseText,
+  execCommandStructuredOutput,
+  type ExecCommandToolOutput
+} from '../codex/unified-exec.js';
+import {
+  DEFAULT_EXEC_YIELD_TIME_MS,
+  DEFAULT_TTY,
+  DEFAULT_WRITE_STDIN_YIELD_TIME_MS
+} from '../codex/unified-exec-constants.js';
+import { defaultUserShell, deriveExecArgs, getShellByModelProvidedPath, shlexJoin } from '../codex/shell.js';
+import {
+  APPLY_PATCH_ARGUMENT_DESCRIPTION,
+  APPLY_PATCH_DESCRIPTION,
+  EXEC_COMMAND_CMD_DESCRIPTION,
+  EXEC_COMMAND_DESCRIPTION,
+  EXEC_COMMAND_LOGIN_DESCRIPTION,
+  EXEC_COMMAND_SHELL_DESCRIPTION,
+  EXEC_COMMAND_TTY_DESCRIPTION,
+  EXEC_COMMAND_WORKDIR_DESCRIPTION,
+  EXEC_COMMAND_YIELD_TIME_DESCRIPTION,
+  MAX_OUTPUT_TOKENS_DESCRIPTION,
+  WRITE_STDIN_CHARS_DESCRIPTION,
+  WRITE_STDIN_DESCRIPTION,
+  WRITE_STDIN_SESSION_ID_DESCRIPTION,
+  WRITE_STDIN_YIELD_TIME_DESCRIPTION
+} from '../codex/tool-specs.js';
+import { lineDelta } from '../diffstat.js';
 import {
   agentForCaller,
   finishAgent,
@@ -61,8 +92,7 @@ import {
   noteChanges,
   noteCount,
   noteDetail,
-  noteExec,
-  noteProcess
+  noteExec
 } from './call-context.js';
 import {
   awaitFreshCallOrigin,
@@ -70,19 +100,16 @@ import {
   recordAgentMessage,
   sessionTokens
 } from '../session/recorder.js';
-import { formatDelta } from '../diffstat.js';
 import { readEvents } from '../session/store.js';
 import { getConfig } from '../config.js';
 import { tokenPressure } from '../../shared/session.js';
 import {
   adoptAgent,
   chunkText,
-  commandEnvArg,
   describeEvent,
   expandStored,
   fail,
   formatFileInfo,
-  formatManagedProcess,
   friendlyError,
   guard,
   MAX_HISTORY_CALL_CHARS,
@@ -107,6 +134,39 @@ const MAX_READ_TARGETS = 40;
 const GLOB_SCAN_LIMIT = 5_000;
 
 const IMAGE_EXTENSIONS = new Set(['.png', '.jpg', '.jpeg', '.gif', '.webp']);
+
+// Codex advertises these as JSON Schema `number`, but serde still deserializes them into
+// integer Rust types. Refinements preserve the model-visible number schema while rejecting
+// values Rust would reject before the handler runs.
+const int32Number = z
+  .number()
+  .refine((value) => Number.isInteger(value) && value >= -2_147_483_648 && value <= 2_147_483_647);
+const unsignedIntegerNumber = z.number().refine((value) => Number.isSafeInteger(value) && value >= 0);
+
+const unifiedExecOutputSchema = z
+  .object({
+    chunk_id: z.string().optional().describe('Chunk identifier included when the response reports one.'),
+    wall_time_seconds: z.number().describe('Elapsed wall time spent waiting for output in seconds.'),
+    exit_code: z.number().optional().describe('Process exit code when the command finished during this call.'),
+    session_id: z
+      .number()
+      .optional()
+      .describe('Session identifier to pass to write_stdin when the process is still running.'),
+    original_token_count: z.number().optional().describe('Approximate token count before output truncation.'),
+    output: z.string().describe('Command output text, possibly truncated.')
+  })
+  .strict();
+
+const viewImageOutputSchema = z
+  .object({
+    image_url: z.string().describe('Data URL for the loaded image.'),
+    detail: z
+      .enum(['high', 'original'])
+      .describe(
+        'Image detail hint returned by view_image. Returns `high` for default resized behavior or `original` when original resolution is preserved.'
+      )
+  })
+  .strict();
 
 export function registerCoreTools(reg: SurfaceRegistrar): void {
   const { ctx, caps, exposedCaps } = reg;
@@ -228,6 +288,43 @@ export function registerCoreTools(reg: SurfaceRegistrar): void {
     );
   }
 
+  // -------------------------------------------------------------- view_image
+
+  if (exposedCaps.read) {
+    reg.register(
+      'view_image',
+      {
+        description: VIEW_IMAGE_DESCRIPTION,
+        inputSchema: z
+          .object({
+            path: z.string().describe(VIEW_IMAGE_PATH_DESCRIPTION)
+          })
+          .strict(),
+        outputSchema: viewImageOutputSchema
+      },
+      async ({ path }) =>
+        guard('view_image', async () => {
+          if (!caps.read) {
+            return fail(
+              'TOOL_DISABLED: view_image is disabled by the current ChatGPT Local Files permissions. Ask the user to enable reading in the app.'
+            );
+          }
+          const resolved = await resolveIn(ctx.roots, path);
+          try {
+            const image = await viewImage(resolved.real, null, undefined, resolved.virtual);
+            logInfo(`tool view_image ${resolved.virtual} (${formatBytes(image.bytes)})`);
+            return {
+              content: [{ type: 'image' as const, data: image.base64, mimeType: image.mimeType }],
+              structuredContent: { image_url: image.imageUrl, detail: image.detail }
+            };
+          } catch (error) {
+            if (error instanceof ViewImageError) return fail(error.message);
+            throw error;
+          }
+        })
+    );
+  }
+
   // ------------------------------------------------------------------- find
   //
   // Only when commands are unavailable. With `exec_command` present, ripgrep through the
@@ -334,108 +431,40 @@ export function registerCoreTools(reg: SurfaceRegistrar): void {
     reg.register(
       'apply_patch',
       {
-        title: 'Apply a code patch',
-        description:
-          'The only way to change files. Applies a multi-file patch: *** Begin Patch, *** Add File:, *** Update File:, *** Delete File:, *** Move to:, @@ context hunks, *** End of File, *** End Patch. ' +
-          'Adding a file creates its parent folders; deleting and moving are patch operations too, so there is no separate tool for them. ' +
-          'Matching is line-based and tolerates CRLF/LF, trailing whitespace, indentation drift and smart quotes, so context copied out of read lands correctly; repeated context is fine — hunks apply in order, each searching on from the previous one. ' +
-          'Every file and hunk is checked before the first change and commit failures roll back where safe, so a patch either lands or does not. ' +
-          'A file may be updated more than once in one patch; the blocks apply in order, each seeing the previous one’s result. ' +
-          'Write context lines as they appear in the file, without read’s line-number prefix. Relative paths resolve from cwd, else from the folder this chat is working in.',
-        inputSchema: z.object({
-          patch: z.string().min(1).max(1_000_000).describe('Patch text from *** Begin Patch through *** End Patch.'),
-          cwd: pathArg.optional().describe('Approved folder for relative patch paths.')
-        }),
-        annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false }
+        description: APPLY_PATCH_DESCRIPTION,
+        inputSchema: z
+          .object({
+            patch: z.string().describe(APPLY_PATCH_ARGUMENT_DESCRIPTION)
+          })
+          .strict()
       },
-      async ({ patch, cwd }) =>
+      async ({ patch }) =>
         guard('apply_patch', async () => {
-          let parsed: PatchFileOperation[];
-          try {
-            parsed = parsePatch(patch);
-          } catch (error) {
-            return fail(`PATCH_INVALID: ${error instanceof PatchError ? error.message : friendlyError(error)}`);
+          if (!caps.create && !caps.edit && !caps.move && !caps.deleteFile) {
+            return fail(
+              'TOOL_DISABLED: apply_patch is disabled by the current ChatGPT Local Files permissions. Ask the user to enable changing files in the app.'
+            );
           }
 
-          let baseVirtual: string;
-          if (cwd) {
-            const base = await resolveIn(ctx.roots, cwd);
-            const stat = await fs.stat(base.real);
-            if (!stat.isDirectory()) return fail('apply_patch cwd must be a folder');
-            baseVirtual = base.virtual;
-          } else if (currentWorkspace()) {
-            // The folder this chat has been working in, before the first root. Patching
-            // `src/main/patch.ts` after reading it should hit the file that was read.
-            baseVirtual = currentWorkspace()!.virtual;
-          } else if (ctx.roots[0]) {
-            baseVirtual = `/${ctx.roots[0].name}`;
-          } else {
+          let args: { patch: string; hunks: Hunk[]; workdir: string | null; environmentId: string | null };
+          try {
+            args = parsePatch(patch);
+          } catch (error) {
+            return fail(`apply_patch verification failed: ${applyPatchErrorText(error)}`);
+          }
+
+          // This connector exposes one local environment. Current Codex accepts the hidden
+          // `*** Environment ID:` preamble only when spec_plan enabled multi-environment
+          // selection; in the single-environment case the handler rejects it verbatim.
+          if (args.environmentId !== null) {
+            return fail('apply_patch environment selection is unavailable for this turn');
+          }
+          const baseVirtual = currentWorkspace()?.virtual ?? (ctx.roots[0] ? `/${ctx.roots[0].name}` : null);
+          if (baseVirtual === null) {
             return fail('No folder is approved, so there is nowhere to apply the patch.');
           }
-
-          // The patch path goes to the sandbox exactly as it was written, with the base
-          // passed alongside rather than pasted on in front. Joining and normalising here is
-          // what let `../../elsewhere` become a clean absolute path before any check ran:
-          // `posix.normalize` erases the very `..` that `checkSegment` exists to refuse, and
-          // nothing downstream can tell the result apart from a path that was always that.
-          // Patch paths now meet the same containment, `..` and symlink checks as a path
-          // given to read or exec.
-          const patchTarget = (raw: string, allowMissing?: boolean): Promise<Resolved> =>
-            resolveIn(ctx.roots, raw, { base: baseVirtual, ...(allowMissing ? { allowMissing } : {}) });
-
-          const resolved: ResolvedPatchOperation[] = [];
-          for (const operation of parsed) {
-            if (operation.kind === 'add') {
-              if (!caps.create) return fail('TOOL_DISABLED: this patch adds a file but Create files and folders is disabled.');
-              const target = await patchTarget(operation.path, true);
-              resolved.push({ kind: 'add', path: target, content: operation.content });
-              continue;
-            }
-            if (operation.kind === 'delete') {
-              if (!caps.deleteFile) return fail('TOOL_DISABLED: this patch deletes a file but Delete files is disabled.');
-              const target = await patchTarget(operation.path);
-              resolved.push({ kind: 'delete', path: target });
-              continue;
-            }
-            // Move and edit stayed separate permissions when the file tools were folded
-            // into apply_patch, so the checks stay separate too: a rename carrying no
-            // hunks is a move and must not demand Edit, while a move that also rewrites
-            // the file is both operations and needs both.
-            const contentChange = operation.hunks.length > 0 || !operation.moveTo;
-            if (contentChange && !caps.edit) {
-              return fail('TOOL_DISABLED: this patch updates a file but Edit files is disabled.');
-            }
-            const target = await patchTarget(operation.path);
-            let moveTo = null;
-            if (operation.moveTo) {
-              if (!caps.move) return fail('TOOL_DISABLED: this patch moves a file but Move / rename is disabled.');
-              moveTo = await patchTarget(operation.moveTo, true);
-            }
-            resolved.push({ kind: 'update', path: target, moveTo, hunks: operation.hunks });
-          }
-
-          const results = await applyResolvedPatch(resolved);
-          noteChanges(
-            results.map((result) => ({
-              path: result.destination ?? result.path,
-              ...result.delta
-            }))
-          );
-          logInfo(`tool apply_patch (${results.length} files)`);
-          const lines = results.map((result) => {
-            const verb = result.kind === 'add' ? 'A' : result.kind === 'delete' ? 'D' : result.kind === 'move' ? 'M→' : 'M';
-            const target = result.destination ? `${result.path} -> ${result.destination}` : result.path;
-            const delta = formatDelta(result.delta);
-            const shown = delta && result.delta.approximate ? `~${delta}` : delta;
-            return `${verb} ${target}${shown ? ` (${shown})` : ''}`;
-          });
-          // Placement notes, not failures. The patch is already on disk; these say where a
-          // hunk landed when the file offered more than one plausible home for it.
-          const notes = results.flatMap((result) => (result.warnings ?? []).map((note) => `${result.path}: ${note}`));
-          return ok(
-            `Applied patch to ${results.length} file(s)\n${lines.join('\n')}` +
-              (notes.length > 0 ? `\n\nNotes:\n${notes.join('\n')}` : '')
-          );
+          const base = await resolveIn(ctx.roots, baseVirtual);
+          return (await runParsedPatch(args, ctx.roots, base, caps)).result;
         })
     );
   }
@@ -446,133 +475,137 @@ export function registerCoreTools(reg: SurfaceRegistrar): void {
     reg.register(
       'exec_command',
       {
-        title: 'Run a command',
-        description:
-          'Run one PowerShell command (or cmd) in an approved folder, wait briefly, and return the output. ' +
-          'This is how git, npm, builds, tests, linters and everything else on this PC are run. ' +
-          'A non-zero exit is reported in the output rather than raised as an error. ' +
-          'If the process is still running when the wait ends you get a session_id back: it can run as long as it needs to — dev servers, watchers, long builds — and you continue it with write_stdin. ' +
-          'By default stdin/stdout are pipes, so a program that insists on a console will not work; tty=true gives it a real Windows console, which is what interactive CLIs, prompts and REPLs need. ' +
-          'With tty=true stderr is interleaved into stdout and colour/cursor control is stripped. ' +
-          'The command is not sandboxed to the folder: it can reach anything this Windows account can.',
-        inputSchema: z.object({
-          cmd: z.string().min(1).max(32_000).describe('Shell command or script to execute.'),
-          cwd: pathArg.optional().describe('Approved working folder. Defaults to the first root.'),
-          shell: z.enum(['powershell', 'cmd']).optional().describe('Default powershell.'),
-          env: commandEnvArg.optional(),
-          tty: z.boolean().optional().describe('Attach a real console instead of pipes. Default false.'),
-          cols: z.number().int().min(20).max(500).optional().describe(`Console width when tty. Default ${DEFAULT_TTY_COLS}.`),
-          rows: z.number().int().min(20).max(500).optional().describe(`Console height when tty. Default ${DEFAULT_TTY_ROWS}.`),
-          yield_time_ms: z
-            .number()
-            .int()
-            .min(0)
-            .max(MAX_EXEC_YIELD_MS)
-            .optional()
-            .describe(`How long to wait before returning a live session. Default 10000, max ${MAX_EXEC_YIELD_MS}.`),
-          max_lines: z.number().int().min(1).max(200).optional().describe('Captured lines per stream. Default 80.')
-        }),
-        annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true }
+        description: EXEC_COMMAND_DESCRIPTION,
+        inputSchema: z
+          .object({
+            cmd: z.string().describe(EXEC_COMMAND_CMD_DESCRIPTION),
+            workdir: z.string().optional().describe(EXEC_COMMAND_WORKDIR_DESCRIPTION),
+            tty: z.boolean().optional().describe(EXEC_COMMAND_TTY_DESCRIPTION),
+            yield_time_ms: unsignedIntegerNumber.optional().describe(EXEC_COMMAND_YIELD_TIME_DESCRIPTION),
+            max_output_tokens: unsignedIntegerNumber.optional().describe(MAX_OUTPUT_TOKENS_DESCRIPTION),
+            shell: z.string().optional().describe(EXEC_COMMAND_SHELL_DESCRIPTION),
+            login: z.boolean().optional().describe(EXEC_COMMAND_LOGIN_DESCRIPTION)
+          })
+          .strict(),
+        outputSchema: unifiedExecOutputSchema
       },
       async (input) =>
         reg.guarded('command', 'exec_command', async () => {
-          const dir = await resolveCwd(ctx, input.cwd);
-          const shellKind = input.shell ?? 'powershell';
-          const started = await startManagedShellProcess(input.cmd, shellKind, dir.real, input.env, {
-            tty: input.tty,
-            cols: input.cols,
-            rows: input.rows
-          });
-          const result = await waitManagedProcess(started.id, input.yield_time_ms ?? 10_000, input.max_lines ?? 80);
-          logInfo(`tool exec_command ${shellKind} -> ${result.id}${result.running ? ' running' : ' exited'}`);
-          noteExec({
-            id: result.id,
-            running: result.running,
-            exitCode: result.exitCode,
-            timedOut: false,
-            durationMs: result.durationMs
-          });
-          noteDetail(input.cmd.replace(/\s+/g, ' ').slice(0, 120));
-          // Asking for a console and silently not getting one is the kind of thing a model
-          // cannot diagnose from the output, so say it in the reply rather than in a log.
-          const downgraded =
-            input.tty === true && !result.tty
-              ? 'NOTE: a real console was not available on this machine, so this ran on pipes. Interactive prompts will not work.\n'
-              : '';
-          const header = result.running
-            ? `session_id: ${result.id}\nStill running. Continue it with write_stdin, or end it with write_stdin signal=kill.\n`
-            : '';
-          // Which folder this actually ran in, every time. A defaulted cwd says so outright:
-          // `npm run build` from the wrong root looks identical in the output otherwise.
-          const where = `cwd: ${dir.virtual}${dir.defaulted ? ' (default — no cwd was given)' : ''}\n`;
-          return ok(`${downgraded}${where}${header}${formatManagedProcess(result)}`);
+          const dir = await resolveCwd(ctx, input.workdir);
+          const shell = input.shell === undefined ? defaultUserShell() : getShellByModelProvidedPath(input.shell);
+          const command = deriveExecArgs(shell, input.cmd, input.login ?? true);
+          const processId = unifiedExecManager.allocateProcessId();
+          try {
+            // Current Codex intercepts an explicit `apply_patch` shell invocation before spawning
+            // the shell process. The parser is the port of apply-patch/src/invocation.rs and uses
+            // the same tree-sitter-bash grammar/query as upstream.
+            const interceptedPatch = maybeParseApplyPatchForExec(command, dir.real);
+            if (interceptedPatch.kind === 'correctness_error') {
+              unifiedExecManager.releaseProcessId(processId);
+              return fail(`apply_patch verification failed: ${interceptedPatch.error.message}`);
+            }
+            if (interceptedPatch.kind === 'body') {
+              try {
+                const patchRun = await runParsedPatch(interceptedPatch.args, ctx.roots, dir);
+                if (patchRun.result.isError || patchRun.content === null) return patchRun.result;
+
+                // `exec_command.rs` converts a successful intercepted patch into an
+                // ExecCommandToolOutput with zero wall time and no process/exit/chunk metadata.
+                const output: ExecCommandToolOutput = {
+                  chunkId: '',
+                  wallTimeMs: 0,
+                  rawOutput: Buffer.from(patchRun.content, 'utf8'),
+                  truncationPolicy: DEFAULT_TRUNCATION_POLICY,
+                  maxOutputTokens: input.max_output_tokens,
+                  processId: null,
+                  exitCode: null,
+                  originalTokenCount: null,
+                  outputOmittedBytes: null
+                };
+                noteExec({ running: false, exitCode: null, timedOut: false, durationMs: 0 });
+                noteDetail(input.cmd.replace(/\s+/g, ' ').slice(0, 120));
+                return {
+                  content: [{ type: 'text' as const, text: execCommandResponseText(output) }],
+                  structuredContent: execCommandStructuredOutput(output)
+                };
+              } finally {
+                unifiedExecManager.releaseProcessId(processId);
+              }
+            }
+
+            const output = await unifiedExecManager.execCommand({
+              command,
+              shellType: shell.shellType,
+              hookCommand: input.cmd,
+              processId,
+              yieldTimeMs: input.yield_time_ms ?? DEFAULT_EXEC_YIELD_TIME_MS,
+              maxOutputTokens: input.max_output_tokens,
+              truncationPolicy: DEFAULT_TRUNCATION_POLICY,
+              cwd: dir.real,
+              displayCwd: dir.virtual,
+              env: applyUnifiedExecEnv(process.env),
+              tty: input.tty ?? DEFAULT_TTY
+            });
+            noteExec({
+              ...(output.processId === null ? {} : { id: String(output.processId) }),
+              running: output.processId !== null,
+              exitCode: output.exitCode,
+              timedOut: false,
+              durationMs: output.wallTimeMs
+            });
+            noteDetail(input.cmd.replace(/\s+/g, ' ').slice(0, 120));
+            logInfo(`tool exec_command ${shell.shellType} -> ${output.processId ?? `exit ${output.exitCode ?? 'unknown'}`}`);
+            return {
+              content: [{ type: 'text' as const, text: execCommandResponseText(output) }],
+              structuredContent: execCommandStructuredOutput(output)
+            };
+          } catch (error) {
+            const detail = error instanceof UnifiedExecError ? error.debug() : friendlyError(error);
+            return fail(`exec_command failed for \`${shlexJoin(command)}\`: ${detail}`);
+          }
         })
     );
 
     reg.register(
       'write_stdin',
       {
-        title: 'Continue a running command',
-        description:
-          'Continue a session_id returned by exec_command: send input, poll for more output, or end it. ' +
-          'chars are sent raw with no automatic newline — send a trailing \\r for Enter — and an empty chars just waits. ' +
-          'Pass the cursor from the previous reply to get only what is new; when a reply says lines are waiting, call again with its cursor until nothing is left. ' +
-          'close=true closes stdin. signal=int is Ctrl-C (it reaches a tty session; on a pipe session it closes stdin instead) and signal=kill terminates the process tree. ' +
-          'On a pipe session this cannot answer prompts that read the console directly; on a tty session it can, and the console echoes your keystrokes back.',
-        inputSchema: z.object({
-          session_id: z.string().min(1).max(32).describe('Session id returned by exec_command.'),
-          chars: z.string().max(MAX_PROCESS_INPUT_CHARS).optional().describe('Raw characters to send. Default empty, which only waits.'),
-          yield_time_ms: z
-            .number()
-            .int()
-            .min(0)
-            .max(MAX_EXEC_YIELD_MS)
-            .optional()
-            .describe(`How long to wait for output or exit. Default 250 after input, 5000 when polling; max ${MAX_EXEC_YIELD_MS}.`),
-          max_lines: z.number().int().min(1).max(200).optional().describe('Captured lines per stream. Default 80.'),
-          cursor: z.string().min(1).max(100).optional().describe('Cursor from the previous reply, for new output only.'),
-          close: z.boolean().optional().describe('Close stdin after sending chars. Default false.'),
-          signal: z.enum(['int', 'kill']).optional().describe('int = Ctrl-C, kill = terminate the process tree.')
-        }),
-        annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true }
+        description: WRITE_STDIN_DESCRIPTION,
+        inputSchema: z
+          .object({
+            session_id: int32Number.describe(WRITE_STDIN_SESSION_ID_DESCRIPTION),
+            chars: z.string().optional().describe(WRITE_STDIN_CHARS_DESCRIPTION),
+            yield_time_ms: unsignedIntegerNumber.optional().describe(WRITE_STDIN_YIELD_TIME_DESCRIPTION),
+            max_output_tokens: unsignedIntegerNumber.optional().describe(MAX_OUTPUT_TOKENS_DESCRIPTION)
+          })
+          .strict(),
+        outputSchema: unifiedExecOutputSchema
       },
       async (input) =>
         reg.guarded('command', 'write_stdin', async () => {
-          const lines = input.max_lines ?? 80;
-          if (input.signal === 'kill') {
-            const stopped = await stopManagedProcess(input.session_id, lines, input.cursor);
-            noteProcess(stopped);
-            logInfo(`tool write_stdin ${input.session_id} kill`);
-            noteDetail('kill');
-            return ok(formatManagedProcess(stopped));
+          try {
+            const output = await unifiedExecManager.writeStdin({
+              processId: input.session_id,
+              input: input.chars ?? '',
+              yieldTimeMs: input.yield_time_ms ?? DEFAULT_WRITE_STDIN_YIELD_TIME_MS,
+              maxOutputTokens: input.max_output_tokens,
+              truncationPolicy: DEFAULT_TRUNCATION_POLICY
+            });
+            noteExec({
+              ...(output.processId === null ? {} : { id: String(output.processId) }),
+              running: output.processId !== null,
+              exitCode: output.exitCode,
+              timedOut: false,
+              durationMs: output.wallTimeMs
+            });
+            logInfo(`tool write_stdin ${input.session_id} (${(input.chars ?? '').length} chars)`);
+            return {
+              content: [{ type: 'text' as const, text: execCommandResponseText(output) }],
+              structuredContent: execCommandStructuredOutput(output)
+            };
+          } catch (error) {
+            const message = error instanceof Error ? error.message : String(error);
+            return fail(`write_stdin failed: ${message}`);
           }
-          if (input.signal === 'int') {
-            // Ctrl-C only exists for a process that owns a console. On a pipe session the
-            // honest equivalent is closing stdin, and the reply says which one happened so
-            // the model does not conclude the program ignored an interrupt it never got.
-            const status = getManagedProcess(input.session_id, 0);
-            const viaConsole = status.tty;
-            await writeManagedProcess(input.session_id, viaConsole ? '\x03' : '', false, !viaConsole, lines, input.cursor);
-            const after = await waitManagedProcess(input.session_id, input.yield_time_ms ?? 1_000, lines, input.cursor);
-            noteProcess(after);
-            logInfo(`tool write_stdin ${input.session_id} int (${viaConsole ? 'ctrl-c' : 'stdin closed'})`);
-            noteDetail(viaConsole ? 'ctrl-c' : 'stdin closed');
-            const note = viaConsole
-              ? 'Sent Ctrl-C to the console.\n'
-              : 'This is a pipe session with no console, so Ctrl-C cannot be delivered; stdin was closed instead. Use signal=kill to stop it outright.\n';
-            return ok(`${note}${formatManagedProcess(after)}`);
-          }
-
-          const chars = input.chars ?? '';
-          const waitMs = input.yield_time_ms ?? (chars.length === 0 && input.close !== true ? 5_000 : 250);
-          if (chars.length > 0 || input.close === true) {
-            await writeManagedProcess(input.session_id, chars, false, input.close ?? false, lines, input.cursor);
-          }
-          const result = await waitManagedProcess(input.session_id, waitMs, lines, input.cursor);
-          noteProcess(result);
-          logInfo(`tool write_stdin ${input.session_id} (${chars.length} chars${input.close ? ', close' : ''})`);
-          const header = result.running ? `session_id: ${result.id}\n` : '';
-          return ok(`${header}${formatManagedProcess(result)}`);
         })
     );
   }
@@ -635,14 +668,17 @@ function registerSessionTool(reg: SurfaceRegistrar): void {
         if (input.action === 'status') {
           const config = getConfig();
           const id = input.session_id ?? activeSessionId() ?? null;
-          const running = listManagedProcesses().filter((entry) => entry.running);
+          const running = unifiedExecManager.listProcesses();
           const processLines =
             running.length === 0
               ? 'running commands: none'
               : `running commands (${running.length}):\n` +
                 running
                   .slice(0, 10)
-                  .map((entry) => `  ${entry.id}  pid ${entry.pid}  ${entry.command.replace(/\s+/g, ' ').slice(0, 100)}`)
+                  .map(
+                    (entry) =>
+                      `  ${entry.processId}  pid ${entry.pid}  ${entry.command.replace(/\s+/g, ' ').slice(0, 100)}`
+                  )
                   .join('\n');
           if (!id) return ok(`No session is being recorded right now.\n${processLines}`);
           const pressure = tokenPressure(
@@ -738,7 +774,7 @@ function registerAgentsTool(reg: SurfaceRegistrar): void {
       title: 'Multi-agent run',
       description:
         'Coordinate a run of ChatGPT worker agents on this machine. ' +
-        'spawn — create workers for parts of the task; the chat that calls it becomes the prime agent of the run, and each worker opens in its own ChatGPT conversation, already bound to its slot, with its task as the first message. ' +
+        'spawn — create workers for parts of the task; the chat that calls it becomes the prime agent of the run, and each worker opens in its own ChatGPT conversation, already bound to its slot, with its task as the first message. Workers start with no conversation or project context, so every task brief must contain enough context to understand and execute the assignment on its own. ' +
         'message — the prime may message any worker; a worker may only message "prime". Replies arrive at the end of a later tool result, so never wait or poll. ' +
         'status — every agent, what it was asked to do, and what is waiting. ' +
         'finish — workers only, terminal: hand your final result to the prime and stop. ' +
@@ -750,7 +786,11 @@ function registerAgentsTool(reg: SurfaceRegistrar): void {
           .array(
             z.object({
               label: z.string().max(60).optional().describe('Short name shown to the user'),
-              task: z.string().min(1).max(4000).describe('Self-contained brief. The worker sees only this.')
+              task: z
+                .string()
+                .min(1)
+                .max(4000)
+                .describe('Self-contained brief sufficient to execute without any prior conversation or project context. The worker sees only this.')
             })
           )
           .min(1)
@@ -919,6 +959,200 @@ async function callerNow(startedAt: number, options: { exact?: boolean } = {}): 
 }
 
 // ---------------------------------------------------------------------------
+// apply_patch adapter helpers
+// ---------------------------------------------------------------------------
+
+function applyPatchErrorText(error: unknown): string {
+  return error instanceof PatchParseError || error instanceof ApplyPatchError ? error.message : friendlyError(error);
+}
+
+interface ParsedPatchRun {
+  result: ToolResult;
+  content: string | null;
+  exitCode: number | null;
+}
+
+/** Shared execution path for the standalone tool and exec_command's upstream apply_patch intercept. */
+async function runParsedPatch(
+  args: { patch: string; hunks: Hunk[]; workdir: string | null; environmentId: string | null },
+  roots: readonly Root[],
+  base: { real: string; virtual: string },
+  caps?: Capabilities
+): Promise<ParsedPatchRun> {
+  if (caps !== undefined) {
+    // Product permission gates around the otherwise ported Codex patch runtime. exec_command's
+    // interception deliberately omits this extra gate because command execution already grants
+    // shell-equivalent mutation ability, matching Codex's shell-tool interception path.
+    const denial = patchCapabilityDenial(args.hunks, caps);
+    if (denial !== null) return { result: fail(denial), content: null, exitCode: null };
+  }
+
+  // `invocation.rs` turns `cd foo && apply_patch ...` into `args.workdir = "foo"`. Resolve that
+  // once against the selected exec environment, then clear it before handing the already-effective
+  // cwd to the verifier/runtime. The patch text itself never contains this shell-level workdir.
+  let effectiveBase = base;
+  let effectiveArgs = args;
+  if (args.workdir !== null) {
+    try {
+      effectiveBase = await resolveIn(roots, args.workdir, { base: base.virtual, allowMissing: true });
+    } catch (error) {
+      return { result: fail(friendlyError(error)), content: null, exitCode: null };
+    }
+    effectiveArgs = { ...args, workdir: null };
+  }
+
+  // Every path the patch names is resolved through the connector environment up front, and the
+  // synchronous resolver handed into the Codex port reads that table back.
+  let resolution: PatchResolution;
+  try {
+    resolution = await resolvePatchPaths(roots, effectiveBase.virtual, effectiveArgs.hunks);
+  } catch (error) {
+    return { result: fail(friendlyError(error)), content: null, exitCode: null };
+  }
+
+  try {
+    await verifyApplyPatchArgs(
+      effectiveArgs,
+      effectiveBase.real,
+      DEFAULT_APPLY_PATCH_FILE_UPDATE_MODE,
+      resolution.resolve
+    );
+  } catch (error) {
+    return {
+      result: fail(`apply_patch verification failed: ${applyPatchErrorText(error)}`),
+      content: null,
+      exitCode: null
+    };
+  }
+
+  const execution = await executeApplyPatch({
+    patch: effectiveArgs.patch,
+    cwd: effectiveBase.real,
+    updateFileMode: DEFAULT_APPLY_PATCH_FILE_UPDATE_MODE,
+    resolvePath: resolution.resolve
+  });
+  const content = formatExecOutputForModel(
+    {
+      exitCode: execution.exitCode,
+      stdout: newStreamOutput(execution.stdout),
+      stderr: newStreamOutput(execution.stderr),
+      aggregatedOutput: newStreamOutput(execution.aggregatedOutput),
+      durationMs: execution.durationMs,
+      timedOut: false
+    },
+    DEFAULT_TRUNCATION_POLICY
+  );
+
+  noteChanges(patchFileChanges(execution.delta, resolution.virtualPaths));
+  logInfo(`tool apply_patch (${execution.delta.changes.length} file(s), exit ${execution.exitCode})`);
+  return {
+    result: execution.exitCode === 0 ? ok(content) : fail(content),
+    content,
+    exitCode: execution.exitCode
+  };
+}
+
+/** Product permission gates around the otherwise ported Codex patch runtime. */
+function patchCapabilityDenial(hunks: readonly Hunk[], caps: Capabilities): string | null {
+  for (const hunk of hunks) {
+    if (hunk.kind === 'add_file') {
+      if (!caps.create) return 'TOOL_DISABLED: this patch adds a file but Create files and folders is disabled.';
+      continue;
+    }
+    if (hunk.kind === 'delete_file') {
+      if (!caps.deleteFile) return 'TOOL_DISABLED: this patch deletes a file but Delete files is disabled.';
+      continue;
+    }
+
+    // Current Codex rejects an entirely empty Update hunk, including a move-only one. A rename
+    // can still be expressed with a context-only chunk (` old` == `new`), so distinguish that
+    // no-op content check from a real rewrite and preserve this app's separate Move permission.
+    const contentChange =
+      hunk.movePath === null ||
+      hunk.chunks.some(
+        (chunk) =>
+          chunk.oldLines.length !== chunk.newLines.length ||
+          chunk.oldLines.some((line, index) => line !== chunk.newLines[index])
+      );
+    if (contentChange && !caps.edit) {
+      return 'TOOL_DISABLED: this patch updates a file but Edit files is disabled.';
+    }
+    if (hunk.movePath !== null && !caps.move) {
+      return 'TOOL_DISABLED: this patch moves a file but Move / rename is disabled.';
+    }
+  }
+  return null;
+}
+
+interface PatchResolution {
+  resolve: PatchPathResolver;
+  /** Real path -> safe virtual path, used only for recorder change evidence. */
+  virtualPaths: Map<string, string>;
+}
+
+/**
+ * Resolves every spelling before the Codex verifier/runtime sees it.
+ *
+ * Codex normally does `cwd.join(path)`. This connector must retain its approved-root boundary,
+ * so the synchronous resolver handed into the port reads a table that was produced by the same
+ * sandbox path resolver every other filesystem tool uses.
+ */
+async function resolvePatchPaths(
+  roots: readonly Root[],
+  baseVirtual: string,
+  hunks: readonly Hunk[]
+): Promise<PatchResolution> {
+  const realBySpelling = new Map<string, string>();
+  const virtualPaths = new Map<string, string>();
+
+  const add = async (spelledPath: string, allowMissing: boolean): Promise<void> => {
+    const resolved = await resolveIn(roots, spelledPath, { base: baseVirtual, allowMissing });
+    realBySpelling.set(spelledPath, resolved.real);
+    virtualPaths.set(resolved.real, resolved.virtual);
+  };
+
+  for (const hunk of hunks) {
+    await add(hunk.path, hunk.kind === 'add_file');
+    if (hunk.kind === 'update_file' && hunk.movePath !== null) await add(hunk.movePath, true);
+  }
+
+  const resolve: PatchPathResolver = (spelledPath) => {
+    const resolved = realBySpelling.get(spelledPath);
+    if (resolved === undefined) {
+      throw new SandboxError(`Patch path was not validated before use: ${spelledPath}`);
+    }
+    return resolved;
+  };
+  return { resolve, virtualPaths };
+}
+
+function patchFileChanges(delta: AppliedPatchDelta, virtualPaths: ReadonlyMap<string, string>): FileChange[] {
+  return delta.changes.map(({ path, change }) => {
+    let realPath = path;
+    let before: string;
+    let after: string;
+    if (change.kind === 'add') {
+      before = change.overwrittenContent ?? '';
+      after = change.content;
+    } else if (change.kind === 'delete') {
+      before = change.content;
+      after = '';
+    } else {
+      realPath = change.movePath ?? path;
+      before = change.oldContent;
+      after = change.newContent;
+    }
+    const counts = lineDelta(before, after);
+    return {
+      path: virtualPaths.get(realPath) ?? '[unresolved patch path]',
+      added: counts.added,
+      removed: counts.removed,
+      approximate: counts.approximate || !delta.exact
+    };
+  });
+}
+
+// ---------------------------------------------------------------------------
 // read helpers
 // ---------------------------------------------------------------------------
 
@@ -950,21 +1184,24 @@ async function expandGlob(
   if (!rest) return { matches: [normalised], truncated: false };
 
   const resolved = await resolveIn(roots, base);
-  const stat = await fs.stat(resolved.real);
-  if (!stat.isDirectory()) throw new SandboxError(`${resolved.virtual} is not a folder, so it cannot be globbed`);
+  const info = await statInfo(resolved.real, resolved.virtual);
+  if (info.type !== 'directory') throw new SandboxError(`${resolved.virtual} is not a folder, so it cannot be globbed`);
 
-  const { entries } = await listDirectory(resolved.real, resolved.virtual, {
-    recursive: rest.includes('**'),
-    maxEntries: GLOB_SCAN_LIMIT,
-    exclude: DEFAULT_EXCLUDES
-  });
+  // `**` walks with Codex's bounded breadth-first walk; a single-level pattern needs one
+  // directory read and nothing more.
+  const candidates = rest.includes('**')
+    ? (await walkFiles(resolved.real, resolved.virtual, { maxEntries: GLOB_SCAN_LIMIT, exclude: DEFAULT_EXCLUDES }))
+        .files
+    : (await listDirectoryLevel(resolved.real, resolved.virtual, GLOB_SCAN_LIMIT)).entries
+        .filter((entry) => entry.type === 'file')
+        .map((entry) => entry.virtualPath);
+
   const matcher = globToRegExp(rest, false);
   const prefixLength = resolved.virtual.length + 1;
   const matches: string[] = [];
-  for (const entry of entries) {
-    if (entry.type !== 'file') continue;
-    if (!matcher.test(entry.virtualPath.slice(prefixLength))) continue;
-    matches.push(entry.virtualPath);
+  for (const candidate of candidates) {
+    if (!matcher.test(candidate.slice(prefixLength))) continue;
+    matches.push(candidate);
     if (matches.length >= MAX_GLOB_MATCHES) return { matches, truncated: true };
   }
   return { matches, truncated: false };
@@ -998,11 +1235,7 @@ async function readOne(
     if (!options.canBrowse) {
       return { text: `--- ${resolved.virtual} ---\nTOOL_DISABLED: listing folders needs the Browse folders permission.`, bytes: 0 };
     }
-    const { entries, truncated } = await listDirectory(resolved.real, resolved.virtual, {
-      recursive: false,
-      maxEntries: MAX_DIR_ENTRIES,
-      exclude: DEFAULT_EXCLUDES
-    });
+    const { entries, truncated } = await listDirectoryLevel(resolved.real, resolved.virtual, MAX_DIR_ENTRIES);
     const prefixLength = resolved.virtual.length + 1;
     const body = entries
       .map((entry) => {
@@ -1033,12 +1266,16 @@ async function readOne(
 
   const extension = nodePath.extname(resolved.virtual).toLowerCase();
   if (IMAGE_EXTENSIONS.has(extension)) {
-    const image = await readImageFile(resolved.real);
+    // The same loader `view_image` uses, so an image opened through either tool is validated and
+    // decoded identically. `view_image` still exists in its own right: it is Codex's tool, with
+    // Codex's name, schema and errors, and this branch is only `read` continuing to answer "what
+    // is at this path" for a path that happens to be a picture.
+    const image = await viewImage(resolved.real, null, undefined, resolved.virtual);
     logInfo(`tool read image ${resolved.virtual} (${formatBytes(image.bytes)})`);
     return {
       text: `--- ${resolved.virtual} — ${formatBytes(image.bytes)} ${image.mimeType} ---`,
       bytes: image.bytes,
-      image: { data: image.data, mimeType: image.mimeType }
+      image: { data: image.base64, mimeType: image.mimeType }
     };
   }
 

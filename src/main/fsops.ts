@@ -230,7 +230,7 @@ export async function appendTextFile(realPath: string, content: string): Promise
 
 export type SupportedImageMime = 'image/png' | 'image/jpeg' | 'image/gif' | 'image/webp';
 
-function imageMime(data: Buffer): SupportedImageMime | null {
+export function imageMime(data: Buffer): SupportedImageMime | null {
   if (
     data.length >= 8 &&
     data[0] === 0x89 && data[1] === 0x50 && data[2] === 0x4e && data[3] === 0x47 &&
@@ -353,7 +353,7 @@ function validateWebp(data: Buffer): void {
   if (!sawImageChunk) invalidImage('WebP', 'image payload chunk is missing');
 }
 
-function validateImageStructure(data: Buffer, mimeType: SupportedImageMime): void {
+export function validateImageStructure(data: Buffer, mimeType: SupportedImageMime): void {
   if (mimeType === 'image/png') validatePng(data);
   else if (mimeType === 'image/jpeg') validateJpeg(data);
   else if (mimeType === 'image/gif') validateGif(data);

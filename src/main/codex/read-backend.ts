@@ -1,0 +1,326 @@
+/**
+ * `read`'s filesystem backend, rebuilt on Codex's primitives.
+ *
+ * Codex exposes no model-visible `read`, so this tool stays a ChatGPT Local Files convenience:
+ * the schema, the section headers, the line numbering and the caps are unchanged. What changed is
+ * everything underneath. Where the old implementation opened files itself, this module reaches the
+ * disk only through `filesystem.ts` -- `getMetadata`, `readDirectory`, `readFileStream`, `walk` --
+ * so `read` now inherits Codex's open gating (a path that is not a regular file is refused at the
+ * handle, not after the read), its 512 MiB ceiling, its 1 MiB chunking and its bounded
+ * breadth-first walk.
+ *
+ * Two consequences worth naming:
+ *
+ * - Codex's `FileMetadata` carries no permission bits, so `read` no longer reports
+ *   `readonly: true`. Nothing else in the header changes.
+ * - `getMetadata` follows symlinks (Codex stats the link, then the target), so a symlink to a file
+ *   now reads as that file instead of coming back as "not a regular file".
+ *
+ * Decoding stays here rather than moving to Codex's `read_file_text`, which is a strict UTF-8
+ * decode and would turn every UTF-16 file this connector reads today into an error.
+ */
+
+import nodePath from 'node:path';
+
+import {
+  MAX_WALK_DEPTH,
+  MAX_WALK_DIRECTORIES,
+  MAX_WALK_ENTRIES,
+  getMetadata,
+  readDirectory,
+  readFileStream,
+  walk
+} from './filesystem.js';
+import {
+  DEFAULT_READ_BYTES,
+  FsOpError,
+  MAX_READ_BYTES,
+  clamp,
+  formatBytes,
+  isExcludedFolderName,
+  type DirEntry,
+  type FileInfo
+} from '../fsops.js';
+
+/** Bytes inspected when deciding whether a file is binary. */
+const BINARY_SNIFF_BYTES = 8192;
+
+/** Above this a file is reported without a line count rather than read end to end for one. */
+const MAX_LINE_COUNT_BYTES = MAX_READ_BYTES * 8;
+
+interface TextFormat {
+  encoding: 'utf-8' | 'utf-16le' | 'utf-16be';
+  bom: boolean;
+}
+
+/** The `ReadResult` shape `read` has always rendered. */
+export interface ReadTextResult {
+  text: string;
+  truncated: boolean;
+  hasMore: boolean;
+  firstLine: number;
+  lastLine: number;
+  totalLines: number | null;
+  bytesReturned: number;
+  fileBytes: number;
+}
+
+function detectTextFormat(head: Buffer): TextFormat {
+  if (head.length >= 2 && head[0] === 0xff && head[1] === 0xfe) return { encoding: 'utf-16le', bom: true };
+  if (head.length >= 2 && head[0] === 0xfe && head[1] === 0xff) return { encoding: 'utf-16be', bom: true };
+  return {
+    encoding: 'utf-8',
+    bom: head.length >= 3 && head[0] === 0xef && head[1] === 0xbb && head[2] === 0xbf
+  };
+}
+
+/** `sniffBinary`'s heuristic, applied to bytes already in hand. */
+function sniffBinaryBytes(slice: Buffer): boolean {
+  if (slice.length === 0) return false;
+  // UTF-16 text contains NUL bytes by design, so detect its BOM before applying the usual
+  // binary heuristic. UTF-8 BOM is harmless as well.
+  if (
+    (slice.length >= 2 && slice[0] === 0xff && slice[1] === 0xfe) ||
+    (slice.length >= 2 && slice[0] === 0xfe && slice[1] === 0xff) ||
+    (slice.length >= 3 && slice[0] === 0xef && slice[1] === 0xbb && slice[2] === 0xbf)
+  ) {
+    return false;
+  }
+  // A NUL byte in the first 8 KiB is the standard heuristic and is what git uses.
+  if (slice.includes(0)) return true;
+  // A high proportion of bytes that are neither printable nor common whitespace catches things
+  // like compressed data that happen to avoid NUL.
+  let suspicious = 0;
+  for (const byte of slice) {
+    if (byte === 9 || byte === 10 || byte === 13) continue;
+    if (byte < 32 || byte === 127) suspicious++;
+  }
+  return suspicious / slice.length > 0.3;
+}
+
+function stripBom(text: string): string {
+  return text.charCodeAt(0) === 0xfeff ? text.slice(1) : text;
+}
+
+/**
+ * One streamed pass that answers both questions the header needs: is this binary, and how many
+ * lines does it have. The old implementation opened the file three times to learn that; Codex's
+ * chunked read hands over the same bytes once.
+ */
+async function scanFile(realPath: string, wantLines: boolean): Promise<{ binary: boolean; lines: number | null }> {
+  let sniffed = false;
+  let lines = 0;
+  let sawAny = false;
+  let endsWithNewline = true;
+
+  for await (const chunk of readFileStream(realPath)) {
+    if (chunk.length === 0) continue;
+    if (!sniffed) {
+      sniffed = true;
+      if (sniffBinaryBytes(chunk.subarray(0, Math.min(BINARY_SNIFF_BYTES, chunk.length)))) {
+        return { binary: true, lines: null };
+      }
+      if (!wantLines) return { binary: false, lines: null };
+    }
+    sawAny = true;
+    for (const byte of chunk) if (byte === 10) lines++;
+    endsWithNewline = chunk[chunk.length - 1] === 10;
+  }
+
+  if (!wantLines) return { binary: false, lines: null };
+  if (!sawAny) return { binary: false, lines: 0 };
+  return { binary: false, lines: endsWithNewline ? lines : lines + 1 };
+}
+
+/**
+ * `statInfo`, over `fs/getMetadata`.
+ *
+ * `readOnly` is always false: Codex's metadata does not carry permission bits, and adding a second
+ * stat purely to recover one advisory line would put a non-Codex filesystem call back in the path
+ * this port exists to remove.
+ */
+export async function statInfo(realPath: string, virtualPath: string): Promise<FileInfo> {
+  const metadata = await getMetadata(realPath);
+  const type = metadata.isDirectory ? 'directory' : metadata.isFile ? 'file' : 'other';
+  const info: FileInfo = {
+    virtualPath,
+    type,
+    bytes: metadata.size,
+    modified: new Date(metadata.modifiedAtMs).toISOString(),
+    created: new Date(metadata.createdAtMs).toISOString(),
+    readOnly: false,
+    binary: null,
+    lines: null,
+    sha256: null
+  };
+  if (type !== 'file') return info;
+
+  const scan = await scanFile(realPath, metadata.size <= MAX_LINE_COUNT_BYTES);
+  info.binary = scan.binary;
+  info.lines = scan.lines;
+  return info;
+}
+
+/** `listDirectory` for one level, over `fs/readDirectory` plus one `fs/getMetadata` per file. */
+export async function listDirectoryLevel(
+  realDir: string,
+  virtualDir: string,
+  maxEntries: number
+): Promise<{ entries: DirEntry[]; truncated: boolean }> {
+  const raw = await readDirectory(realDir);
+  // Directories first, then names, which is the order `read` has always printed.
+  raw.sort((left, right) => {
+    const leftDir = left.isDirectory ? 0 : 1;
+    const rightDir = right.isDirectory ? 0 : 1;
+    return leftDir !== rightDir ? leftDir - rightDir : left.fileName.localeCompare(right.fileName);
+  });
+
+  const entries: DirEntry[] = [];
+  let truncated = false;
+  for (const entry of raw) {
+    if (entries.length >= maxEntries) {
+      truncated = true;
+      break;
+    }
+    let bytes: number | null = null;
+    if (entry.isFile) {
+      try {
+        bytes = (await getMetadata(nodePath.join(realDir, entry.fileName))).size;
+      } catch {
+        bytes = null;
+      }
+    }
+    entries.push({
+      name: entry.fileName,
+      virtualPath: `${virtualDir}/${entry.fileName}`,
+      type: entry.isDirectory ? 'directory' : entry.isFile ? 'file' : 'other',
+      bytes
+    });
+  }
+  return { entries, truncated };
+}
+
+/**
+ * Every file below `realDir`, for glob expansion, over `fs/walk`.
+ *
+ * Codex's walk is breadth-first where the old listing was depth-first, so a `**` pattern now
+ * matches shallow files before deep ones. That is the order the entry budget is spent in, and for
+ * a truncated expansion it is the better of the two.
+ */
+export async function walkFiles(
+  realDir: string,
+  virtualDir: string,
+  options: { maxEntries: number; exclude: readonly string[] }
+): Promise<{ files: string[]; truncated: boolean }> {
+  const outcome = await walk(realDir, {
+    maxDepth: MAX_WALK_DEPTH,
+    maxDirectories: MAX_WALK_DIRECTORIES,
+    maxEntries: clamp(options.maxEntries, 1, MAX_WALK_ENTRIES),
+    followDirectorySymlinks: false,
+    pruneDirectory: (entry) => isExcludedFolderName(entry.fileName, options.exclude)
+  });
+
+  const prefix = realDir.endsWith(nodePath.sep) ? realDir : realDir + nodePath.sep;
+  const files: string[] = [];
+  for (const entry of outcome.entries) {
+    if (entry.kind !== 'file') continue;
+    if (!entry.path.startsWith(prefix)) continue;
+    const relative = entry.path.slice(prefix.length).split(nodePath.sep).join('/');
+    files.push(`${virtualDir}/${relative}`);
+  }
+  return { files, truncated: outcome.truncated };
+}
+
+/**
+ * `readTextFile`, over `fs/readFileStream`.
+ *
+ * Still streamed, so reading lines 10-20 of a 2 GB file does not load the file; the chunk size is
+ * now Codex's 1 MiB rather than the 64 KiB this used to ask for.
+ */
+export async function readTextFile(
+  realPath: string,
+  opts: { startLine?: number; endLine?: number; maxBytes?: number } = {}
+): Promise<ReadTextResult> {
+  const metadata = await getMetadata(realPath);
+  if (!metadata.isFile) throw new FsOpError('Not a file');
+
+  const maxBytes = clamp(opts.maxBytes ?? DEFAULT_READ_BYTES, 1, MAX_READ_BYTES);
+  const startLine = opts.startLine === undefined ? 1 : Math.max(1, Math.floor(opts.startLine));
+  const endLine = opts.endLine === undefined ? Infinity : Math.floor(opts.endLine);
+  if (endLine < startLine) throw new FsOpError('endLine must be greater than or equal to startLine');
+
+  const out: string[] = [];
+  let bytesReturned = 0;
+  let lineNo = 0;
+  let firstLine = 0;
+  let lastLine = 0;
+  let truncated = false;
+  let carry = '';
+  let sawAllLines = true;
+  let decoder: TextDecoder | null = null;
+
+  const pushLine = (line: string): boolean => {
+    lineNo++;
+    if (lineNo < startLine) return true;
+    if (lineNo > endLine) return false;
+    const size = Buffer.byteLength(line, 'utf8') + 1;
+    if (bytesReturned + size > maxBytes) {
+      truncated = true;
+      return false;
+    }
+    if (firstLine === 0) firstLine = lineNo;
+    lastLine = lineNo;
+    out.push(line);
+    bytesReturned += size;
+    return true;
+  };
+
+  for await (const chunk of readFileStream(realPath)) {
+    if (decoder === null) {
+      if (sniffBinaryBytes(chunk.subarray(0, Math.min(BINARY_SNIFF_BYTES, chunk.length)))) {
+        throw new FsOpError(
+          `This is a binary file (${formatBytes(metadata.size)}). Use file_info for its metadata and hash.`
+        );
+      }
+      decoder = new TextDecoder(detectTextFormat(chunk).encoding);
+    }
+    carry += decoder.decode(chunk, { stream: true });
+    let index = carry.indexOf('\n');
+    while (index !== -1) {
+      const line = carry.slice(0, index).replace(/\r$/, '');
+      carry = carry.slice(index + 1);
+      if (!pushLine(line)) {
+        sawAllLines = false;
+        carry = '';
+        break;
+      }
+      index = carry.indexOf('\n');
+    }
+    if (!sawAllLines) break;
+  }
+
+  if (sawAllLines && decoder !== null) {
+    carry += decoder.decode();
+    if (carry.length > 0) {
+      if (!pushLine(carry.replace(/\r$/, ''))) sawAllLines = false;
+    }
+  }
+
+  if (firstLine === 0) {
+    // Nothing matched: either an empty file or a range past the end.
+    firstLine = startLine;
+    lastLine = startLine - 1;
+  }
+
+  return {
+    text: stripBom(out.join('\n')),
+    truncated,
+    // Reading stopped early exactly when a line existed that we did not return.
+    hasMore: !sawAllLines,
+    firstLine,
+    lastLine,
+    totalLines: sawAllLines ? lineNo : null,
+    bytesReturned,
+    fileBytes: metadata.size
+  };
+}

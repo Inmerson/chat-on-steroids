@@ -89,7 +89,7 @@ export type ToolContent =
   | { type: 'text'; text: string }
   | { type: 'image'; data: string; mimeType: string };
 
-export type ToolResult = { content: ToolContent[]; isError?: boolean };
+export type ToolResult = { content: ToolContent[]; structuredContent?: Record<string, unknown>; isError?: boolean };
 
 export const ok = (text: string): ToolResult => ({ content: [{ type: 'text', text }] });
 export const fail = (text: string): ToolResult => ({ content: [{ type: 'text', text }], isError: true });
@@ -437,8 +437,8 @@ export async function resolveIn(
   requested: string,
   options: { allowMissing?: boolean; base?: string | null } = {}
 ): Promise<Resolved> {
-  // An explicit base — `apply_patch`'s `cwd` — beats the workspace; otherwise the workspace
-  // is the base. Either way the joining happens inside `resolvePath`, ahead of validation,
+  // An explicit adapter-supplied base beats the workspace; otherwise the workspace is the base.
+  // Either way the joining happens inside `resolvePath`, ahead of validation,
   // so a `..` in the caller's text still meets `checkSegment` instead of being normalised
   // away first. Doing that join here is how a relative patch path could climb out of the
   // workspace: `posix.normalize('/root/a/../../elsewhere')` is a perfectly clean-looking
@@ -465,21 +465,23 @@ export interface ResolvedCwd {
  * The working directory a command tool may use, restricted to an approved root.
  *
  * The caller is told which folder this turned out to be, and whether it was a default,
- * because omitting `cwd` while working inside a nested project is a quiet way to run the
+ * because omitting `workdir` while working inside a nested project is a quiet way to run the
  * wrong build: a live run meant for `…/minecraft-web-demo` fell back to the first root and
  * rebuilt the parent Electron app instead, and nothing in the reply said so.
  */
 export async function resolveCwd(ctx: ToolContext, virtualPath: string | undefined): Promise<ResolvedCwd> {
-  // The chat's own folder before the first root: a command with no `cwd` should run where the
+  // The chat's own folder before the first root: a command with no `workdir` should run where the
   // chat has been working, which is the whole point of the workspace and is exactly the case
   // the note above describes going wrong.
   const workspace = currentWorkspace();
-  const target = virtualPath ?? workspace?.virtual ?? (ctx.roots[0] ? `/${ctx.roots[0].name}` : '');
+  // Codex treats an explicitly empty workdir exactly like an omitted one.
+  const provided = virtualPath !== undefined && virtualPath !== '';
+  const target = provided ? virtualPath : (workspace?.virtual ?? (ctx.roots[0] ? `/${ctx.roots[0].name}` : ''));
   if (!target) throw new SandboxError('No folder is approved, so there is nowhere to run');
   const resolved = await resolveIn(ctx.roots, target);
   const stat = await fs.stat(resolved.real);
-  if (!stat.isDirectory()) throw new SandboxError('cwd must be a folder');
-  return { real: resolved.real, virtual: resolved.virtual, defaulted: virtualPath === undefined };
+  if (!stat.isDirectory()) throw new SandboxError('workdir must be a folder');
+  return { real: resolved.real, virtual: resolved.virtual, defaulted: !provided };
 }
 
 // ------------------------------------------------------------------ shared args
@@ -536,7 +538,13 @@ export interface SurfaceRegistrar {
   findExposed: boolean;
   register<Schema extends z.ZodType>(
     name: string,
-    config: { title: string; description: string; inputSchema: Schema; annotations: ToolAnnotations },
+    config: {
+      title?: string;
+      description: string;
+      inputSchema: Schema;
+      outputSchema?: z.ZodType;
+      annotations?: ToolAnnotations;
+    },
     handler: (args: z.output<Schema>) => Promise<ToolResult>
   ): void;
   /** Runs `fn` only while `cap` is live, and explains the refusal otherwise. */

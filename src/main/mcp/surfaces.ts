@@ -92,9 +92,9 @@ export interface SurfaceDefinition {
  *    and a dedicated connector for a single optional schema is pure setup overhead
  *    with no discovery benefit.
  *
- * Worst case, everything switched on: 6 schemas. `find` and the exec pair are mutually
- * exclusive — `find` exists only when command execution is off — so no configuration
- * reaches 7.
+ * Core declares 8 possible tool names below, but at most 7 schemas are live at once. `find`
+ * and the exec pair are mutually exclusive — `find` exists only when command execution is
+ * off — so no runtime tools/list reaches all 8 declarations.
  */
 const CORE: SurfaceDefinition = {
   id: 'core',
@@ -108,7 +108,7 @@ const CORE: SurfaceDefinition = {
     'worker agents, subagents or a parallel swarm across several ChatGPT conversations.',
   cardSummary: 'Files, patches and the terminal. Required — this is the coding connector.',
   required: true,
-  tools: ['read', 'find', 'apply_patch', 'exec_command', 'write_stdin', 'session', 'agents']
+  tools: ['read', 'view_image', 'find', 'apply_patch', 'exec_command', 'write_stdin', 'session', 'agents']
 };
 
 /**

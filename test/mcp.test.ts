@@ -27,7 +27,7 @@ import { createSession, initSessionStore } from '../src/main/session/store.js';
 import { createHandoff } from '../src/main/session/handoff.js';
 import { resetWorkspaces, setWorkspaceFor, workspaceEntries } from '../src/main/workspace.js';
 import { DEFAULT_CAPABILITIES, type Capabilities, type Root } from '../src/shared/types.js';
-import { emptyEvidence, noteExec, runInCallContext, type CallContext } from '../src/main/mcp/call-context.js';
+import { emptyEvidence, noteExec, noteOutcome, runInCallContext, type CallContext } from '../src/main/mcp/call-context.js';
 import { makeTempDir, removeTempDir, writeTree } from './helpers.js';
 
 // ---------------------------------------------------------------- transport
@@ -523,7 +523,7 @@ describe('surface boundaries', () => {
     everything();
     const names = toolNames(await core('tools/list'));
     // find is absent because exec_command is present — they are mutually exclusive.
-    expect(names).toEqual(['agents', 'apply_patch', 'exec_command', 'read', 'session', 'write_stdin']);
+    expect(names).toEqual(['agents', 'apply_patch', 'exec_command', 'read', 'session', 'view_image', 'write_stdin']);
     for (const name of surfaceDefinition('desktop').tools) expect(names, name).not.toContain(name);
   });
 
@@ -636,7 +636,6 @@ describe('surface boundaries', () => {
       'list_directory',
       'search_files',
       'file_info',
-      'view_image',
       'create_file',
       'write_file',
       'write_binary_file',
@@ -683,9 +682,9 @@ describe('surface boundaries', () => {
     const coreTools = toolList(await core('tools/list'));
     const desktopTools = toolList(await desktop('tools/list'));
 
-    // Counts are the design: Core is capped at six live schemas because find and the exec
+    // Counts are the design: Core is capped at seven live schemas because find and the exec
     // pair cannot both exist, and Desktop is two.
-    expect(coreTools).toHaveLength(6);
+    expect(coreTools).toHaveLength(7);
     expect(desktopTools).toHaveLength(2);
 
     // And the size, which is what a discovery pull actually costs the model on every
@@ -695,7 +694,7 @@ describe('surface boundaries', () => {
     // catches the regression it exists to catch.
     const coreBytes = Buffer.byteLength(JSON.stringify(coreTools), 'utf8');
     const desktopBytes = Buffer.byteLength(JSON.stringify(desktopTools), 'utf8');
-    expect(coreBytes, `core tools/list is ${coreBytes} bytes`).toBeLessThan(13_500);
+    expect(coreBytes, `core tools/list is ${coreBytes} bytes`).toBeLessThan(18_000);
     expect(desktopBytes, `desktop tools/list is ${desktopBytes} bytes`).toBeLessThan(8_500);
 
     // Per tool as well as per surface, so one schema cannot quietly eat the whole budget
@@ -704,7 +703,7 @@ describe('surface boundaries', () => {
     // its validation errors small and its action set explicit.
     for (const tool of [...coreTools, ...desktopTools]) {
       const bytes = Buffer.byteLength(JSON.stringify(tool), 'utf8');
-      const budget = tool.name === 'computer' ? 6_000 : 3_000;
+      const budget = tool.name === 'computer' ? 6_000 : tool.name === 'apply_patch' ? 5_000 : 3_000;
       expect(bytes, `${tool.name} schema is ${bytes} bytes`).toBeLessThan(budget);
     }
   });
@@ -759,6 +758,7 @@ describe('2025-era clients', () => {
     });
     const instructions: string = reply.body.result.instructions ?? '';
     expect(instructions).toContain('/workspace');
+    expect(instructions).toContain('start_line/end_line require exactly one path');
     // Progress guidance lives once at server level rather than bloating every tool description.
     expect(instructions).toContain('Keep the user visibly informed more than usual while you work');
     // Short enough not to burn the model's context on every conversation.
@@ -799,10 +799,21 @@ describe('2025-era clients', () => {
     expect(textOf(reply)).toContain('export const name = "app";');
   });
 
-  it('returns a local image as native MCP image content', async () => {
+  it('exposes Codex view_image separately and returns native MCP image content', async () => {
+    const tool = toolList(await core('tools/list')).find((entry) => entry.name === 'view_image');
+    const schema = tool?.inputSchema;
+    expect(Object.keys(schema?.properties ?? {})).toEqual(['path']);
+    expect(schema?.required).toEqual(['path']);
+    expect(schema?.additionalProperties).toBe(false);
+    expect(tool?.outputSchema).toMatchObject({
+      type: 'object',
+      required: ['image_url', 'detail'],
+      additionalProperties: false
+    });
+
     const reply = await core('tools/call', {
-      name: 'read',
-      arguments: { paths: ['/workspace/pixel.png'] }
+      name: 'view_image',
+      arguments: { path: '/workspace/pixel.png' }
     });
     expect(reply.status).toBe(200);
     const content = reply.body.result?.content as Array<Record<string, unknown>>;
@@ -810,6 +821,8 @@ describe('2025-era clients', () => {
     expect(image?.mimeType).toBe('image/png');
     expect(typeof image?.data).toBe('string');
     expect(Buffer.from(String(image?.data), 'base64').subarray(0, 4)).toEqual(Buffer.from([0x89, 0x50, 0x4e, 0x47]));
+    expect(reply.body.result?.structuredContent).toMatchObject({ detail: 'high' });
+    expect(reply.body.result?.structuredContent?.image_url).toMatch(/^data:application\/octet-stream;base64,/);
   });
 });
 
@@ -844,7 +857,7 @@ describe('capability gating', () => {
     ctx.caps = effectiveCapabilities(config);
     ctx.readOnly = true;
 
-    expect(toolNames(await core('tools/list'))).toEqual(['find', 'read']);
+    expect(toolNames(await core('tools/list'))).toEqual(['find', 'read', 'view_image']);
   });
 
   it('offers apply_patch only when a writing permission is on', async () => {
@@ -1096,23 +1109,19 @@ describe('desktop capabilities', () => {
 });
 
 describe('tool annotations', () => {
-  it('marks read tools read-only so ChatGPT does not prompt for each call', async () => {
-    for (const tool of toolList(await core('tools/list'))) {
-      expect(tool.annotations?.readOnlyHint, tool.name).toBe(true);
-      expect(tool.annotations?.destructiveHint, tool.name).toBe(false);
+  it('keeps connector annotations off copied Codex ToolSpecs', async () => {
+    ctx.readOnly = false;
+    ctx.caps = withCaps({ read: true, create: true, edit: true, move: true, deleteFile: true, command: true });
+    const tools = toolList(await core('tools/list'));
+    for (const name of ['view_image', 'apply_patch', 'exec_command', 'write_stdin']) {
+      expect(tools.find((tool) => tool.name === name)?.annotations, name).toBeUndefined();
     }
   });
 
-  it('marks the tools that change this PC so ChatGPT asks before running them', async () => {
-    ctx.readOnly = false;
-    ctx.caps = withCaps({ create: true, edit: true, move: true, deleteFile: true, command: true });
-    const tools = toolList(await core('tools/list'));
-    for (const name of ['apply_patch', 'exec_command', 'write_stdin']) {
-      const tool = tools.find((t) => t.name === name);
-      expect(tool, name).toBeDefined();
-      expect(tool?.annotations?.readOnlyHint, name).toBe(false);
-      expect(tool?.annotations?.destructiveHint, name).toBe(true);
-    }
+  it('retains annotations on connector-native tools', async () => {
+    const read = toolList(await core('tools/list')).find((tool) => tool.name === 'read');
+    expect(read?.annotations?.readOnlyHint).toBe(true);
+    expect(read?.annotations?.destructiveHint).toBe(false);
   });
 });
 
@@ -1174,22 +1183,16 @@ describe('sandbox enforcement through the tool layer', () => {
     await expect(fs.stat(path.join(outside, 'planted.txt'))).rejects.toThrow();
   });
 
-  it('refuses a relative patch path that climbs out through an explicit cwd', async () => {
+  it('does not advertise the retired apply_patch cwd argument', async () => {
     ctx.readOnly = false;
     ctx.caps = withCaps({ create: true });
-    const reply = await core('tools/call', {
-      name: 'apply_patch',
-      arguments: { patch: addPatch('../../private/planted.txt', ['x']), cwd: '/workspace' }
-    });
-    expect(reply.body.result?.isError).toBe(true);
-    await expect(fs.stat(path.join(outside, 'planted.txt'))).rejects.toThrow();
+    const tool = toolList(await core('tools/list')).find((entry) => entry.name === 'apply_patch')!;
+    expect(Object.keys(tool.inputSchema.properties)).toEqual(['patch']);
+    expect(tool.inputSchema.required).toEqual(['patch']);
+    expect(tool.inputSchema.additionalProperties).toBe(false);
   });
 
-  it('refuses a relative patch path that climbs out of its base but stays inside the root', async () => {
-    // The sharp version of the same defect, and the one that would not have shown up as an
-    // error at all. `posix.normalize('/workspace/nested/../escaped.txt')` is
-    // `/workspace/escaped.txt`: a perfectly resolvable path inside an approved root, so the
-    // patch simply landed a folder above the one the caller named and nothing said so.
+  it('does not let a retired cwd field silently rebase relative patch paths', async () => {
     ctx.readOnly = false;
     ctx.caps = withCaps({ create: true });
     await fs.mkdir(path.join(approved, 'nested'), { recursive: true });
@@ -1252,6 +1255,13 @@ describe('bounded output', () => {
   });
 
   it('refuses a line range it cannot honour rather than silently dropping it', async () => {
+    // This must be discoverable before the model spends a failed call. The runtime refusal
+    // below is the safety net; the advertised contract is what prevents the routine failure.
+    const readTool = toolList(await core('tools/list')).find((tool) => tool.name === 'read')!;
+    expect(String(readTool.description)).toMatch(/Line ranges.*exactly one path/i);
+    expect(String(readTool.inputSchema.properties.start_line.description)).toMatch(/exactly one file/i);
+    expect(String(readTool.inputSchema.properties.end_line.description)).toMatch(/exactly one file/i);
+
     // Live, this returned both files from line 1 until the byte cap with no hint that the
     // range had been discarded — a valid-looking call quietly changing what it means.
     const many = await core('tools/call', {
@@ -1382,6 +1392,8 @@ describe('apply_patch', () => {
           '*** Begin Patch',
           '*** Update File: /workspace/scratch.txt',
           '*** Move to: /workspace/moved.txt',
+          '@@',
+          ' SECOND',
           '*** End Patch'
         ].join('\n')
       }
@@ -1397,9 +1409,8 @@ describe('apply_patch', () => {
     await expect(fs.stat(path.join(approved, 'moved.txt'))).rejects.toThrow();
   });
 
-  // Move and edit were separate permissions before the file tools were folded into
-  // apply_patch, and folding them together must not quietly merge the permissions: a user
-  // who granted renaming but not editing gave permission to move a file, not to rewrite it.
+  // Current Codex rejects an entirely empty Update hunk, so a pure rename carries one
+  // context-only line. That line changes no content and must not quietly require Edit.
   it('renames without Edit, and still refuses to rewrite content', async () => {
     const source = path.join(approved, 'rename-me.txt');
     await fs.writeFile(source, `keep this${String.fromCharCode(10)}`, 'utf8');
@@ -1412,6 +1423,8 @@ describe('apply_patch', () => {
           '*** Begin Patch',
           '*** Update File: /workspace/rename-me.txt',
           '*** Move to: /workspace/renamed.txt',
+          '@@',
+          ' keep this',
           '*** End Patch'
         ].join(String.fromCharCode(10))
       }
@@ -1438,6 +1451,29 @@ describe('apply_patch', () => {
     expect(await fs.readFile(path.join(approved, 'renamed.txt'), 'utf8')).toContain('keep this');
   });
 
+  it('rejects an empty move-only Update hunk, matching current Codex', async () => {
+    const source = path.join(approved, 'empty-move-source.txt');
+    const target = path.join(approved, 'empty-move-target.txt');
+    await fs.writeFile(source, 'keep this\n', 'utf8');
+
+    const reply = await core('tools/call', {
+      name: 'apply_patch',
+      arguments: {
+        patch: [
+          '*** Begin Patch',
+          '*** Update File: /workspace/empty-move-source.txt',
+          '*** Move to: /workspace/empty-move-target.txt',
+          '*** End Patch'
+        ].join('\n')
+      }
+    });
+
+    expect(reply.body.result?.isError).toBe(true);
+    expect(textOf(reply)).toContain("Update file hunk for path '/workspace/empty-move-source.txt' is empty");
+    expect(await fs.readFile(source, 'utf8')).toBe('keep this\n');
+    await expect(fs.stat(target)).rejects.toThrow();
+  });
+
   it('changes several files in one atomic patch', async () => {
     const a = path.join(approved, 'batch-a.txt');
     const b = path.join(approved, 'batch-b.txt');
@@ -1462,7 +1498,9 @@ describe('apply_patch', () => {
       }
     });
     expect(reply.body.result?.isError).toBeFalsy();
-    expect(textOf(reply)).toContain('Applied patch to 2 file(s)');
+    expect(textOf(reply)).toContain('Success. Updated the following files:');
+    expect(textOf(reply)).toContain('M /workspace/batch-a.txt');
+    expect(textOf(reply)).toContain('M /workspace/batch-b.txt');
     expect(await fs.readFile(a, 'utf8')).toBe('ALPHA\n');
     expect(await fs.readFile(b, 'utf8')).toBe('BETA\n');
   });
@@ -1495,13 +1533,13 @@ describe('apply_patch', () => {
     expect(await fs.readFile(b, 'utf8')).toBe('beta\n');
   });
 
-  it('will not overwrite an existing file by accident', async () => {
+  it('matches Codex Add File semantics and overwrites an existing file', async () => {
     const reply = await core('tools/call', {
       name: 'apply_patch',
       arguments: { patch: addPatch('/workspace/notes.txt', ['clobbered']) }
     });
-    expect(reply.body.result?.isError).toBe(true);
-    expect(await fs.readFile(path.join(approved, 'notes.txt'), 'utf8')).toContain('note line 1');
+    expect(reply.body.result?.isError, textOf(reply)).toBeFalsy();
+    expect(await fs.readFile(path.join(approved, 'notes.txt'), 'utf8')).toBe('clobbered\n');
   });
 
   it('names the problem when the patch itself is malformed', async () => {
@@ -1510,10 +1548,24 @@ describe('apply_patch', () => {
       arguments: { patch: 'just some text' }
     });
     expect(reply.body.result?.isError).toBe(true);
-    expect(textOf(reply)).toContain('PATCH_INVALID');
+    expect(textOf(reply)).toContain("invalid patch: The first line of the patch must be '*** Begin Patch'");
   });
 
-  it('marks a deliberately bounded huge-rewrite line count as approximate in the direct reply', async () => {
+  it('rejects hidden environment selection in this single-environment adapter like Codex', async () => {
+    const patch = [
+      '*** Begin Patch',
+      '*** Environment ID: other',
+      '*** Add File: env-selected.txt',
+      '+should-not-land',
+      '*** End Patch'
+    ].join('\n');
+    const reply = await core('tools/call', { name: 'apply_patch', arguments: { patch } });
+    expect(reply.body.result?.isError).toBe(true);
+    expect(textOf(reply)).toBe('apply_patch environment selection is unavailable for this turn');
+    await expect(fs.stat(path.join(approved, 'env-selected.txt'))).rejects.toMatchObject({ code: 'ENOENT' });
+  });
+
+  it('keeps Codex apply_patch output shape for a huge rewrite', async () => {
     const before = Array.from({ length: 1600 }, (_, index) => `old-${index}`);
     await fs.writeFile(path.join(approved, 'rewrite.txt'), `${before.join('\n')}\n`, 'utf8');
     const hunk = [
@@ -1527,7 +1579,10 @@ describe('apply_patch', () => {
 
     const reply = await core('tools/call', { name: 'apply_patch', arguments: { patch: hunk } });
     expect(reply.body.result?.isError, textOf(reply)).toBeFalsy();
-    expect(textOf(reply)).toContain('(~+1600 −1600)');
+    expect(textOf(reply)).toContain('Exit code: 0');
+    expect(textOf(reply)).toContain('Success. Updated the following files:');
+    expect(textOf(reply)).toContain('M /workspace/rewrite.txt');
+    expect(textOf(reply)).not.toContain('(~+');
   });
 });
 
@@ -1537,74 +1592,217 @@ describe('exec_command and write_stdin', () => {
     ctx.caps = withCaps({ command: true });
   });
 
-  it('uses one Codex-style exec lifecycle for quick and long-running shell commands', async () => {
+  it('intercepts explicit apply_patch shell invocations through the Codex patch runtime', async () => {
+    const patch = [
+      '*** Begin Patch',
+      '*** Add File: intercepted.txt',
+      '+intercepted-ok',
+      '*** End Patch'
+    ].join('\n');
+    const reply = await core('tools/call', {
+      name: 'exec_command',
+      arguments: {
+        cmd: `apply_patch <<'PATCH'\n${patch}\nPATCH`,
+        workdir: '/workspace'
+      }
+    });
+
+    expect(reply.body.result?.isError, textOf(reply)).toBeFalsy();
+    expect(textOf(reply)).toContain('Wall time: 0.0000 seconds');
+    expect(textOf(reply)).toContain('Exit code: 0');
+    expect(textOf(reply)).toContain('A intercepted.txt');
+    expect(await fs.readFile(path.join(approved, 'intercepted.txt'), 'utf8')).toBe('intercepted-ok\n');
+    expect(reply.body.result?.structuredContent).toMatchObject({
+      wall_time_seconds: 0,
+      output: expect.stringContaining('Success. Updated the following files:')
+    });
+    expect(reply.body.result?.structuredContent).not.toHaveProperty('exit_code');
+    expect(reply.body.result?.structuredContent).not.toHaveProperty('session_id');
+  });
+
+  it('applies intercepted cd workdir exactly once', async () => {
+    await fs.mkdir(path.join(approved, 'nested'), { recursive: true });
+    const patch = [
+      '*** Begin Patch',
+      '*** Add File: from-cd.txt',
+      '+nested-ok',
+      '*** End Patch'
+    ].join('\n');
+    const reply = await core('tools/call', {
+      name: 'exec_command',
+      arguments: {
+        cmd: `cd nested && apply_patch <<'PATCH'\n${patch}\nPATCH`,
+        workdir: '/workspace'
+      }
+    });
+
+    expect(reply.body.result?.isError, textOf(reply)).toBeFalsy();
+    expect(await fs.readFile(path.join(approved, 'nested', 'from-cd.txt'), 'utf8')).toBe('nested-ok\n');
+    await expect(fs.stat(path.join(approved, 'nested', 'nested', 'from-cd.txt'))).rejects.toMatchObject({ code: 'ENOENT' });
+  });
+
+  it('rejects a raw patch body passed as command with Codex implicit-invocation wording', async () => {
+    const patch = ['*** Begin Patch', '*** Add File: implicit.txt', '+nope', '*** End Patch'].join('\n');
+    const reply = await core('tools/call', {
+      name: 'exec_command',
+      arguments: { cmd: patch, workdir: '/workspace' }
+    });
+    expect(reply.body.result?.isError).toBe(true);
+    expect(textOf(reply)).toBe(
+      'apply_patch verification failed: patch detected without explicit call to apply_patch. Rerun as ["apply_patch", "<patch>"]'
+    );
+    await expect(fs.stat(path.join(approved, 'implicit.txt'))).rejects.toMatchObject({ code: 'ENOENT' });
+  });
+
+  it('passes command text through unchanged even when it looks like a virtual path', async () => {
+    const reply = await core('tools/call', {
+      name: 'exec_command',
+      arguments: { cmd: "Write-Output '/workspace/src'", workdir: '/workspace', yield_time_ms: 5_000 }
+    });
+    expect(reply.body.result?.isError).not.toBe(true);
+    expect(textOf(reply)).toContain('/workspace/src');
+  });
+
+  it('advertises the current Codex exec_command and write_stdin schemas', async () => {
+    const tools = toolList(await core('tools/list'));
+    const exec = tools.find((tool) => tool.name === 'exec_command')!;
+    const stdin = tools.find((tool) => tool.name === 'write_stdin')!;
+
+    expect(Object.keys(exec.inputSchema.properties)).toEqual([
+      'cmd',
+      'workdir',
+      'tty',
+      'yield_time_ms',
+      'max_output_tokens',
+      'shell',
+      'login'
+    ]);
+    expect(exec.inputSchema.required).toEqual(['cmd']);
+    expect(exec.inputSchema.additionalProperties).toBe(false);
+    expect(exec.inputSchema.properties.workdir.type).toBe('string');
+    expect(exec.inputSchema.properties.tty.type).toBe('boolean');
+    expect(exec.inputSchema.properties.yield_time_ms.type).toBe('number');
+    expect(exec.inputSchema.properties.max_output_tokens.type).toBe('number');
+    expect(exec.inputSchema.properties.shell.type).toBe('string');
+    expect(exec.inputSchema.properties.login.type).toBe('boolean');
+    for (const retired of ['cwd', 'env', 'cols', 'rows', 'max_lines']) {
+      expect(exec.inputSchema.properties).not.toHaveProperty(retired);
+    }
+    expect(exec.outputSchema).toMatchObject({
+      type: 'object',
+      required: ['wall_time_seconds', 'output'],
+      additionalProperties: false
+    });
+
+    expect(Object.keys(stdin.inputSchema.properties)).toEqual([
+      'session_id',
+      'chars',
+      'yield_time_ms',
+      'max_output_tokens'
+    ]);
+    expect(stdin.inputSchema.required).toEqual(['session_id']);
+    expect(stdin.inputSchema.additionalProperties).toBe(false);
+    expect(stdin.inputSchema.properties.session_id.type).toBe('number');
+    expect(stdin.inputSchema.properties.chars.type).toBe('string');
+    expect(stdin.inputSchema.properties.yield_time_ms.type).toBe('number');
+    expect(stdin.inputSchema.properties.max_output_tokens.type).toBe('number');
+    for (const retired of ['cursor', 'close', 'signal', 'env', 'max_lines']) {
+      expect(stdin.inputSchema.properties).not.toHaveProperty(retired);
+    }
+    expect(stdin.outputSchema).toEqual(exec.outputSchema);
+  });
+
+  it('uses Codex response and session semantics for quick and interactive commands', async () => {
     const quick = await core('tools/call', {
       name: 'exec_command',
       arguments: {
         cmd: "Write-Output 'quick-ok'",
-        cwd: '/workspace',
+        workdir: '/workspace',
         yield_time_ms: 5_000
       }
     });
     expect(quick.body.result?.isError).not.toBe(true);
     expect(textOf(quick)).toContain('quick-ok');
-    expect(textOf(quick)).toContain('exited 0');
-    expect(textOf(quick)).not.toContain('Still running');
+    expect(textOf(quick)).toContain('Process exited with code 0');
+    expect(textOf(quick)).toContain('Chunk ID:');
+    expect(quick.body.result?.structuredContent).toMatchObject({
+      exit_code: 0,
+      output: expect.stringContaining('quick-ok')
+    });
+    expect(typeof quick.body.result?.structuredContent?.chunk_id).toBe('string');
+    expect(typeof quick.body.result?.structuredContent?.wall_time_seconds).toBe('number');
 
+    await fs.writeFile(
+      path.join(approved, 'interactive-stdin.cjs'),
+      "const readline=require('node:readline'); const rl=readline.createInterface({input:process.stdin,crlfDelay:Infinity}); let n=0; rl.on('line',(line)=>{n++; console.log((n===1?'first=':'second=')+line); if(n===2) rl.close();});\n",
+      'utf8'
+    );
     const started = await core('tools/call', {
       name: 'exec_command',
       arguments: {
-        cmd: "$s=[Console]::In.ReadToEnd(); Write-Output ('stdin='+$s)",
-        cwd: '/workspace',
+        cmd: 'node interactive-stdin.cjs',
+        workdir: '/workspace',
+        tty: true,
         yield_time_ms: 25
       }
     });
     expect(started.body.result?.isError).not.toBe(true);
-    expect(textOf(started)).toContain('Still running');
-    // The reply has to name the way out, not just the way forward.
-    expect(textOf(started)).toContain('write_stdin');
-    const sessionId = textOf(started).match(/^session_id: (p\d+)$/m)?.[1];
-    expect(sessionId).toBeTruthy();
-    const cursor = textOf(started).match(/^cursor: (.+)$/m)?.[1];
-    expect(cursor).toBeTruthy();
+    expect(textOf(started)).toContain('Process running with session ID');
+    const sessionIdText = textOf(started).match(/Process running with session ID (\d+)/)?.[1];
+    expect(sessionIdText).toBeTruthy();
+    const sessionId = Number(sessionIdText);
 
-    const continued = await core('tools/call', {
+    // write_stdin sends bytes exactly as supplied. Without a newline ReadLine must keep waiting.
+    const partial = await core('tools/call', {
       name: 'write_stdin',
       arguments: {
         session_id: sessionId,
         chars: 'raw-no-newline',
-        close: true,
-        cursor,
-        yield_time_ms: 5_000
+        yield_time_ms: 250
       }
     });
-    expect(continued.body.result?.isError).not.toBe(true);
-    expect(textOf(continued)).toContain('stdin=raw-no-newline');
-    expect(textOf(continued)).toContain('exited 0');
+    expect(partial.body.result?.isError).not.toBe(true);
+    expect(textOf(partial)).toContain(`Process running with session ID ${sessionId}`);
+    expect(textOf(partial)).not.toContain('first=');
+
+    const first = await core('tools/call', {
+      name: 'write_stdin',
+      arguments: { session_id: sessionId, chars: '\r', yield_time_ms: 1_000 }
+    });
+    expect(first.body.result?.isError).not.toBe(true);
+    expect(textOf(first)).toContain('first=raw-no-newline');
+    expect(textOf(first)).toContain(`Process running with session ID ${sessionId}`);
+
+    const second = await core('tools/call', {
+      name: 'write_stdin',
+      arguments: { session_id: sessionId, chars: 'done\r', yield_time_ms: 5_000 }
+    });
+    expect(second.body.result?.isError).not.toBe(true);
+    expect(textOf(second)).toContain('second=done');
+    expect(textOf(second)).toContain('Process exited with code 0');
+    // The process buffer is drained per call; previously delivered output is not replayed.
+    expect(textOf(second)).not.toContain('first=raw-no-newline');
   });
 
-  it('says which folder it ran in, and admits when that was only the default', async () => {
+  it('runs in workdir and omits the old connector-specific cwd header', async () => {
     const named = await core('tools/call', {
       name: 'exec_command',
-      arguments: { cmd: "Write-Output 'x'", cwd: '/workspace', yield_time_ms: 5_000 }
+      arguments: { cmd: "Get-Content 'src/app.ts'", workdir: '/workspace', yield_time_ms: 5_000 }
     });
-    expect(textOf(named)).toContain('cwd: /workspace');
-    expect(textOf(named)).not.toContain('default');
+    expect(named.body.result?.isError).not.toBe(true);
+    expect(textOf(named)).toContain('export const name = "app";');
+    expect(textOf(named)).not.toContain('cwd: /workspace');
 
-    // Omitting cwd falls back to the first approved root. That is the shape that rebuilt
-    // the wrong project in a live run, so the reply has to say it happened.
     const defaulted = await core('tools/call', {
       name: 'exec_command',
-      arguments: { cmd: "Write-Output 'x'", yield_time_ms: 5_000 }
+      arguments: { cmd: "Get-Content 'src/app.ts'", yield_time_ms: 5_000 }
     });
-    expect(textOf(defaulted)).toContain('cwd: /workspace (default — no cwd was given)');
+    expect(defaulted.body.result?.isError).not.toBe(true);
+    expect(textOf(defaulted)).toContain('export const name = "app";');
+    expect(textOf(defaulted)).not.toContain('default — no cwd was given');
   });
 
-  it('decodes a PowerShell error stream instead of returning raw CLIXML', async () => {
-    // Windows PowerShell serializes stderr as CLIXML when it decides the stream is being
-    // consumed by another PowerShell. A live worker got a screenful of `_x000D__x000A_`
-    // where the one useful line was `An empty pipe element is not allowed.`, so the payload
-    // is written verbatim here rather than hoping this machine's PowerShell produces one.
+  it('preserves Codex raw merged output instead of the retired connector CLIXML rewrite', async () => {
     const payload =
       '#< CLIXML<Objs Version="1.1.0.1" xmlns="http://schemas.microsoft.com/powershell/2004/04">' +
       '<S S="Error">An empty pipe element is not allowed._x000D__x000A_</S></Objs>';
@@ -1612,82 +1810,14 @@ describe('exec_command and write_stdin', () => {
       name: 'exec_command',
       arguments: {
         cmd: `[Console]::Error.Write('${payload}')`,
-        cwd: '/workspace',
+        workdir: '/workspace',
         yield_time_ms: 8_000
       }
     });
-    // The echoed command line necessarily contains the payload, so judge the stderr section.
-    const stderr = textOf(reply).split('--- stderr tail ---')[1] ?? '';
-    expect(stderr).toContain('An empty pipe element is not allowed.');
-    expect(stderr).not.toContain('#< CLIXML');
-    expect(stderr).not.toContain('_x000D_');
-  });
-
-
-  it('returns only new output when the caller passes the previous cursor', async () => {
-    const started = await core('tools/call', {
-      name: 'exec_command',
-      arguments: {
-        // Wide gap between the two lines on purpose: the first call has to return with
-        // 'first' captured and 'second' not yet written, and PowerShell's own startup can
-        // eat a few hundred milliseconds before the script runs at all.
-        cmd: "Write-Output 'first'; Start-Sleep -Seconds 5; Write-Output 'second'; [Console]::In.ReadToEnd() | Out-Null",
-        cwd: '/workspace',
-        yield_time_ms: 2_500
-      }
-    });
-    const sessionId = textOf(started).match(/^session_id: (p\d+)$/m)?.[1];
-    expect(sessionId).toBeTruthy();
-    expect(textOf(started).split('--- stdout')[1] ?? '').toContain('first');
-    const cursor = textOf(started).match(/^cursor: (.+)$/m)?.[1];
-
-    const delta = await core('tools/call', {
-      name: 'write_stdin',
-      arguments: { session_id: sessionId, cursor, yield_time_ms: 6_000 }
-    });
-    // Only the captured output is compared: the status header echoes the command line,
-    // which naturally contains both words.
-    const output = textOf(delta).split('--- stdout delta ---')[1] ?? '';
-    expect(output).toContain('second');
-    expect(output).not.toContain('first');
-
-    await core('tools/call', {
-      name: 'write_stdin',
-      arguments: { session_id: sessionId, signal: 'kill' }
-    });
-  });
-
-  it('ends a session outright on signal=kill', async () => {
-    const started = await core('tools/call', {
-      name: 'exec_command',
-      arguments: {
-        cmd: 'Start-Sleep -Seconds 30',
-        cwd: '/workspace',
-        yield_time_ms: 25
-      }
-    });
-    const sessionId = textOf(started).match(/^session_id: (p\d+)$/m)?.[1];
-    expect(sessionId).toBeTruthy();
-
-    const killed = await core('tools/call', {
-      name: 'write_stdin',
-      arguments: { session_id: sessionId, signal: 'kill' }
-    });
-    expect(killed.body.result?.isError).not.toBe(true);
-    expect(textOf(killed)).toContain('exited');
-  });
-
-  it('passes environment variables through to the command', async () => {
-    const reply = await core('tools/call', {
-      name: 'exec_command',
-      arguments: {
-        cmd: 'Write-Output ("env=" + $env:MCP_TEST_ENV)',
-        cwd: '/workspace',
-        env: { MCP_TEST_ENV: 'mcp-env-ok' },
-        yield_time_ms: 5_000
-      }
-    });
-    expect(textOf(reply)).toContain('env=mcp-env-ok');
+    expect(reply.body.result?.isError).not.toBe(true);
+    expect(textOf(reply)).toContain('Output:');
+    expect(textOf(reply)).toContain('#< CLIXML');
+    expect(textOf(reply)).toContain('_x000D__x000A_');
   });
 });
 
@@ -1728,5 +1858,22 @@ describe('the outcome a shell command is recorded with', () => {
 
   it('never overwrites an outcome the tool layer set deliberately', () => {
     expect(outcomeOf({ exitCode: 1 }, 'rejected')).toBe('rejected');
+  });
+
+  it('does not let the guard downgrade a command error back to ok', () => {
+    const context: CallContext = {
+      transportKey: null,
+      agent: null,
+      caller: { transportKey: null, requestId: null, conversationId: null },
+      outcome: null,
+      evidence: emptyEvidence()
+    };
+    runInCallContext(context, () => {
+      noteExec({ exitCode: 7 });
+      // This is what guard() does when the tool returns a normal ToolResult whose text says
+      // the child exited non-zero. The more specific process outcome must survive it.
+      noteOutcome('ok');
+    });
+    expect(context.outcome).toBe('error');
   });
 });
