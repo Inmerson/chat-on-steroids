@@ -69,6 +69,8 @@ interface Message {
   recipient: string;
   channel?: string;
   create_time?: number;
+  status?: string;
+  end_turn?: boolean;
   content?: Record<string, unknown>;
   metadata?: Record<string, unknown>;
 }
@@ -121,6 +123,43 @@ function answer(id: string, parent: string, tool: string, app: string = APP): Me
       request_id: 'wfr_01a009',
       invoked_plugin: { type: 'remote', namespace: 'api_tool' },
       invoked_resource: { app_name: app, resource_uri: `/${ASDK}/${LINK}/${tool}` }
+    }
+  };
+}
+
+/** Public assistant prose in the current page model. */
+function authored(
+  id: string,
+  text: string,
+  options: { status?: string; endTurn?: boolean; parent?: string; workingTurnId?: string; turnExchangeId?: string } = {}
+): Message {
+  return {
+    id,
+    author: { role: 'assistant' },
+    recipient: 'all',
+    ...(options.status ? { status: options.status } : {}),
+    ...(options.endTurn !== undefined ? { end_turn: options.endTurn } : {}),
+    content: { content_type: 'text', parts: [text] },
+    metadata: {
+      message_type: 'next',
+      ...(options.parent ? { parent_id: options.parent } : {}),
+      ...(options.workingTurnId ? { working_turn_id: options.workingTurnId } : {}),
+      ...(options.turnExchangeId ? { turn_exchange_id: options.turnExchangeId } : {})
+    }
+  };
+}
+
+/** Internal assistant reasoning/tool-summary state. It is not public authored prose. */
+function thought(id: string): Message {
+  return {
+    id,
+    author: { role: 'assistant' },
+    recipient: 'all',
+    content: { content_type: 'thoughts', parts: null, text: null },
+    metadata: {
+      message_type: 'next',
+      reasoning_status: 'is_reasoning',
+      tool_summary_type: 'chatgpt_local_files_core'
     }
   };
 }
@@ -192,20 +231,41 @@ interface TurnCall {
 }
 
 interface TurnEvidence {
-  turnId: string;
+  index: number;
+  turnId: string | null;
+  endMessageId?: string | null;
   calls: TurnCall[];
+  messages: Array<{
+    messageId: string;
+    rawMessageId: string;
+    role?: 'user' | 'assistant';
+    stable: boolean;
+    order: number;
+    createTime?: number | null;
+    rawText: string;
+    renderedHtml: string;
+  }>;
+  activities?: Array<{ messageId: string; label: string; order: number }>;
 }
 
 /** One assistant turn section, carrying its own message model the way the page does. */
 interface TurnFixture {
   id: string;
   messages: Message[];
+  rendered?: string[];
+  staleStamp?: string;
 }
 
 async function scan(
   fibers: Fiber[],
   turnSections: TurnFixture[] = []
-): Promise<{ rows: Descriptor[]; version: number; stamps: Array<string | null>; turns: TurnEvidence[] }> {
+): Promise<{
+  rows: Descriptor[];
+  version: number;
+  stamps: Array<string | null>;
+  turnStamps: Array<string | null>;
+  turns: TurnEvidence[];
+}> {
   const dom = new JSDOM('<!doctype html><html><body></body></html>', {
     url: `https://chatgpt.com/c/${THREAD}`,
     runScripts: 'outside-only',
@@ -218,7 +278,14 @@ async function scan(
     const section = document.createElement('section');
     section.setAttribute('data-testid', 'conversation-turn-2');
     section.setAttribute('data-turn-id', turn.id);
+    if (turn.staleStamp !== undefined) section.setAttribute('data-clf-fiber-turn', turn.staleStamp);
     (section as unknown as Record<string, unknown>)['__reactFiber$qlrmvxwbkkq'] = turnNode(turn.messages);
+    for (const text of turn.rendered ?? []) {
+      const block = document.createElement('div');
+      block.className = 'markdown';
+      block.textContent = text;
+      section.append(block);
+    }
     document.body.append(section);
   }
 
@@ -251,11 +318,15 @@ async function scan(
 
   const data = await reply;
   const stamps = elements.map((row) => row.getAttribute('data-clf-fiber'));
+  const turnStamps = [...document.querySelectorAll('[data-testid^="conversation-turn-"]')].map((section) =>
+    section.getAttribute('data-clf-fiber-turn')
+  );
   dom.window.close();
   return {
     rows: data.rows as Descriptor[],
     version: data.v as number,
     stamps,
+    turnStamps,
     turns: (data.turns ?? []) as TurnEvidence[]
   };
 }
@@ -297,8 +368,8 @@ describe('reading a row out of the page', () => {
 
   it('keeps the version it was built for on the reply', async () => {
     const { version, rows } = await scan([row([request('req-1', 'read_file')])]);
-    expect(version).toBe(4);
-    expect(rows[0]!.v).toBe(4);
+    expect(version).toBe(8);
+    expect(rows[0]!.v).toBe(8);
   });
   it('counts only TobisComputer requests in the complete turn, not api_tool metadata calls', async () => {
     const mine1 = request('req-1', 'read_file');
@@ -480,11 +551,179 @@ describe('the calls a turn says it made', () => {
     expect(turns[1]!.calls.map((call) => call.tool)).toEqual(['run_command']);
   });
 
+  it('takes canonical assistant identity and raw Markdown from the public text message model, not Markdown-node cardinality', async () => {
+    const publicText = '**One** canonical update with `code`.';
+    const messages = [
+      thought('internal-thought-1'),
+      request('req-1', 'read_file'),
+      thought('internal-thought-2'),
+      authored('assistant-public-1', publicText),
+      answer('res-1', 'req-1', 'read_file')
+    ];
+    const { turns } = await scan([], [
+      {
+        id: 'turn-prose',
+        messages,
+        // Deliberately unlike the raw Markdown and deliberately more numerous. This is the
+        // live 1.8.1 failure shape: activity/tool internals also render `.markdown`, so DOM
+        // cardinality is not message cardinality and must never gate capture.
+        rendered: ['One canonical update with code.', 'Inspected a file', 'Internal activity caption']
+      }
+    ]);
+
+    expect(turns[0]!.messages).toEqual([
+      {
+        messageId: 'assistant-public-1',
+        rawMessageId: 'assistant-public-1',
+        role: 'assistant',
+        stable: false,
+        order: 3,
+        createTime: null,
+        rawText: publicText,
+        renderedHtml: ''
+      }
+    ]);
+  });
+
+  it('attaches rendered HTML only when a public message has one unique exact visible-text match', async () => {
+    const messages = [authored('assistant-public-1', 'A plain live update.')];
+    const { turns } = await scan([], [
+      { id: 'turn-html', messages, rendered: ['Unrelated activity', 'A plain live update.'] }
+    ]);
+
+    expect(turns[0]!.messages).toEqual([
+      {
+        messageId: 'assistant-public-1',
+        rawMessageId: 'assistant-public-1',
+        role: 'assistant',
+        stable: false,
+        order: 0,
+        createTime: null,
+        rawText: 'A plain live update.',
+        renderedHtml: 'A plain live update.'
+      }
+    ]);
+  });
+
+  it('keeps one exact logical id when ChatGPT rotates the raw UUID before the thought parent mounts', async () => {
+    const relation = {
+      parent: 'thought-stream-owner',
+      workingTurnId: 'working-stream-owner',
+      turnExchangeId: 'exchange-stream-owner'
+    };
+    const first = await scan([], [{
+      id: 'turn-rotating-child',
+      messages: [authored('raw-child-one', 'First partial.', relation)]
+    }]);
+    const second = await scan([], [{
+      id: 'turn-rotating-child',
+      messages: [authored('raw-child-two', 'First partial. More text.', relation)]
+    }]);
+
+    expect(first.turns[0]!.messages[0]!.rawMessageId).toBe('raw-child-one');
+    expect(second.turns[0]!.messages[0]!.rawMessageId).toBe('raw-child-two');
+    expect(first.turns[0]!.messages[0]!.messageId).toBe(second.turns[0]!.messages[0]!.messageId);
+    expect(first.turns[0]!.messages[0]!.messageId).toBe(
+      'assistant:thought-stream-owner:working-stream-owner:exchange-stream-owner'
+    );
+    expect(first.turns[0]!.messages[0]!.stable).toBe(false);
+    expect(second.turns[0]!.messages[0]!.stable).toBe(false);
+  });
+
+  it('captures the opening user message from the page model before the DOM exposes a message id', async () => {
+    const opening: Message = {
+      id: 'user-opening-model-id',
+      author: { role: 'user' },
+      recipient: 'all',
+      create_time: 1_787_165_000.125,
+      content: { content_type: 'text', parts: ['first prompt before DOM identity'] }
+    };
+    const { turns } = await scan([], [{ id: 'turn-opening-user', messages: [opening] }]);
+
+    expect(turns[0]!.messages).toEqual([
+      {
+        messageId: 'user-opening-model-id',
+        rawMessageId: 'user-opening-model-id',
+        role: 'user',
+        stable: true,
+        order: 0,
+        createTime: 1_787_165_000_125,
+        rawText: 'first prompt before DOM identity',
+        renderedHtml: ''
+      }
+    ]);
+  });
+
+  it('keeps exact transcript evidence when a virtualized assistant section has no data-turn-id', async () => {
+    const publicText = authored('assistant-idless-page-turn', 'Visible historical answer.');
+    const { turns, turnStamps } = await scan([], [{ id: '', messages: [publicText], rendered: ['Visible historical answer.'] }]);
+
+    expect(turns).toHaveLength(1);
+    expect(turns[0]!.turnId).toBeNull();
+    expect(turns[0]!.messages[0]).toMatchObject({
+      messageId: 'assistant-idless-page-turn',
+      rawText: 'Visible historical answer.'
+    });
+    expect(turnStamps).toEqual(['0']);
+  });
+
+  it('keeps a long public assistant answer beyond the old 32k transcript cap', async () => {
+    const long = 'handoff detail '.repeat(14000);
+    expect(long.length).toBeGreaterThan(180_000);
+    expect(long.length).toBeLessThan(256_000);
+    const { turns } = await scan([], [{ id: 'turn-long-answer', messages: [authored('assistant-long', long)] }]);
+
+    expect(turns[0]!.messages[0]!.rawText).toBe(long);
+  });
+
+  it('marks completion only from the finished public text message whose website object says end_turn', async () => {
+    const internal = thought('thought-terminal-looking');
+    internal.status = 'finished_successfully';
+    internal.end_turn = true;
+    const messages = [
+      internal,
+      authored('interim-public', 'Still working.', { status: 'finished_successfully', endTurn: false }),
+      authored('final-public', 'Finished.', { status: 'finished_successfully', endTurn: true })
+    ];
+    const { turns } = await scan([], [{ id: 'turn-terminal', messages, rendered: ['Still working.', 'Finished.'] }]);
+
+    expect(turns[0]!.endMessageId).toBe('final-public');
+  });
+
+  it('does not call an active turn finished merely because prior messages are finished successfully', async () => {
+    const messages = [
+      authored('prior-public', 'Checkpoint.', { status: 'finished_successfully', endTurn: false }),
+      authored('active-public', 'Continuing.', { status: 'finished_successfully', endTurn: false })
+    ];
+    const { turns } = await scan([], [{ id: 'turn-active', messages, rendered: ['Checkpoint.', 'Continuing.'] }]);
+
+    expect(turns[0]!.endMessageId ?? null).toBeNull();
+  });
+
+  it('treats a newer retry message as active even when the previous attempt ended successfully', async () => {
+    const messages = [
+      authored('old-final', 'Old completed attempt.', { status: 'finished_successfully', endTurn: true }),
+      authored('retry-active', 'Trying again.', { status: 'finished_successfully', endTurn: false })
+    ];
+    const { turns } = await scan([], [{ id: 'turn-retry', messages, rendered: ['Old completed attempt.', 'Trying again.'] }]);
+
+    expect(turns[0]!.endMessageId ?? null).toBeNull();
+  });
+
   it('says nothing about a turn that made no connector call', async () => {
     const chatter: Message = { id: 'm-1', author: { role: 'assistant' }, recipient: 'all', content: { text: 'hello' } };
     const { turns } = await scan([], [{ id: 'turn-quiet', messages: [chatter] }]);
 
     expect(turns).toEqual([]);
+  });
+
+  it('clears a stale turn stamp when that section has no descriptor in this scan', async () => {
+    const { turns, turnStamps } = await scan([], [
+      { id: 'turn-stale-stamp', messages: [], staleStamp: '0' }
+    ]);
+
+    expect(turns).toEqual([]);
+    expect(turnStamps).toEqual([null]);
   });
 });
 

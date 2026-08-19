@@ -37,7 +37,14 @@
   'use strict';
 
   /** Bumped when the descriptor shape changes, so a stale pair cannot half-understand. */
-  const VERSION = 4;
+  const VERSION = 8;
+  // The MAIN world survives an extension reload because the ChatGPT document survives it.
+  // Recovery may therefore execute this file again in a page that still has an older helper
+  // listener. Keep at most one listener for this protocol version; content.js rejects older
+  // versions, so a v5 listener can coexist harmlessly until the document itself navigates.
+  const ACTIVE_VERSION = '__clfFiberHelperVersion';
+  if (window[ACTIVE_VERSION] === VERSION) return;
+  window[ACTIVE_VERSION] = VERSION;
   const ASK = 'clf-fiber-ask';
   const REPLY = 'clf-fiber-reply';
   /** The control ChatGPT puts in a connector tool row and nowhere else. */
@@ -61,6 +68,18 @@
   const MAX_CALLS = 200;
   /** ChatGPT's own assistant turn sections, which is where a turn's message model hangs. */
   const TURN_SECTION = 'section[data-testid^="conversation-turn"][data-turn-id]';
+  /** ChatGPT-rendered authored prose. Tool rows and this extension's own surfaces are excluded. */
+  const MARKDOWN = '.markdown';
+  const TOOL = 'span[class*="tool-message"], div.pointer-events-none.contents';
+  const OWN_SURFACES = '.clf-stream, .clf-stage, .clf-composer, .clf-boot';
+  const MAX_RENDERED_HTML = 120_000;
+  // A 15k–20k-token compaction answer is routinely 60k–90k characters. Capping public
+  // assistant prose at 32k here made the canonical session transcript lose the back half
+  // even though Compact & Resume itself carried the full DOM answer. One event still stays
+  // comfortably below the 512 KiB bridge body cap alongside its bounded rendered HTML.
+  // Safety guard only. Compact & Resume is specified in tokens (up to 30k), so this must be
+  // comfortably larger than a normal handoff rather than acting as a second token budget.
+  const MAX_RENDERED_TEXT = 256_000;
   /**
    * The connectors this app is reached through. Nothing else is ours to vouch for.
    *
@@ -173,6 +192,594 @@
       if (Array.isArray(props.allMessages)) return props.allMessages;
     }
     return null;
+  }
+
+  /** ChatGPT's internal conversation identity attached to this Fiber branch. */
+  function conversationOf(fiber) {
+    let found = null;
+    let at = fiber;
+    for (let up = 0; at && up < MAX_CLIMB; up++, at = at.return) {
+      const props = at.memoizedProps;
+      if (!props || typeof props !== 'object') continue;
+      const turn = props.turn && typeof props.turn === 'object' ? props.turn : null;
+      const values = [props.clientThreadId, props.conversationId, turn && turn.clientThreadId, turn && turn.conversationId];
+      for (let index = 0; index < values.length; index++) {
+        const value = str(values[index]);
+        if (!value) continue;
+        if (found && found !== value) return null;
+        found = value;
+      }
+    }
+    return found;
+  }
+
+  /** An authored assistant message object, when a rendered prose node exposes one directly. */
+  function messageOf(fiber) {
+    let found = null;
+    let at = fiber;
+    for (let up = 0; at && up < MAX_CLIMB; up++, at = at.return) {
+      const props = at.memoizedProps;
+      if (!props || typeof props !== 'object') continue;
+      const candidate = props.message;
+      if (!candidate || typeof candidate !== 'object') continue;
+      const author = candidate.author;
+      const id = str(candidate.id);
+      if (!id || !author || author.role !== 'assistant') continue;
+      if (requestOf(candidate) || resultOf(candidate)) continue;
+      if (found && found !== id) return null;
+      found = id;
+    }
+    return found;
+  }
+
+  function hiddenMessage(message) {
+    const meta = message && typeof message === 'object' ? message.metadata : null;
+    return Boolean(
+      meta &&
+      typeof meta === 'object' &&
+      (meta.is_visually_hidden_from_conversation === true || meta.is_visually_hidden === true)
+    );
+  }
+
+  /** Whether one page-model message is ChatGPT's own reasoning/thought object. */
+  function thoughtMessage(message) {
+    if (!message || typeof message !== 'object') return false;
+    const author = message.author;
+    const content = message.content;
+    return Boolean(
+      author &&
+      author.role === 'assistant' &&
+      content &&
+      typeof content === 'object' &&
+      content.content_type === 'thoughts' &&
+      str(message.id)
+    );
+  }
+
+  /**
+   * The thought object that owns this rendered branch, when the branch exposes exactly one.
+   *
+   * Live ChatGPT hangs the same `props.message` thought object at several wrapper depths, so
+   * seeing one id repeatedly is expected. Seeing two different thought ids on one branch is
+   * ambiguity and fails closed rather than picking the nearest one.
+   */
+  function thoughtOf(fiber) {
+    let found = null;
+    let at = fiber;
+    for (let up = 0; at && up < MAX_CLIMB; up++, at = at.return) {
+      const props = at.memoizedProps;
+      if (!props || typeof props !== 'object') continue;
+      const candidates = [];
+      if (thoughtMessage(props.message)) candidates.push(props.message);
+      if (Array.isArray(props.messages)) {
+        for (let index = 0; index < props.messages.length; index++) {
+          if (thoughtMessage(props.messages[index])) candidates.push(props.messages[index]);
+        }
+      }
+      for (let index = 0; index < candidates.length; index++) {
+        const message = candidates[index];
+        const id = str(message.id);
+        if (!id) continue;
+        if (found && found.id !== id) return null;
+        const meta = message.metadata && typeof message.metadata === 'object' ? message.metadata : null;
+        found = {
+          id,
+          workingTurnId: meta ? str(meta.working_turn_id) : null,
+          turnExchangeId: meta ? str(meta.turn_exchange_id) : null
+        };
+      }
+    }
+    return found;
+  }
+
+  /**
+   * ChatGPT's row-local identity for a rendered thought item.
+   *
+   * The live renderer exposes `memoizedProps.item = { type: 'thought', key:
+   * 'thought-<message UUID>-<item index>', ... }` only a few Fibers above the visible row.
+   * The UUID portion must resolve to an actual thought message in this turn; the full key is
+   * retained because the suffix is page identity too and can distinguish two items owned by
+   * one thought if ChatGPT ever emits them.
+   */
+  function thoughtItemOf(fiber, thoughtIds) {
+    let found = null;
+    let at = fiber;
+    for (let up = 0; at && up < MAX_CLIMB; up++, at = at.return) {
+      const props = at.memoizedProps;
+      if (!props || typeof props !== 'object') continue;
+      const item = props.item;
+      if (!item || typeof item !== 'object' || item.type !== 'thought') continue;
+      const key = str(item.key);
+      if (!key) continue;
+      let owner = null;
+      for (let known = 0; known < thoughtIds.length; known++) {
+        const prefix = `thought-${thoughtIds[known]}-`;
+        if (key.indexOf(prefix) !== 0) continue;
+        const suffix = key.slice(prefix.length);
+        if (!/^\d{1,6}$/.test(suffix)) continue;
+        owner = thoughtIds[known];
+        break;
+      }
+      if (!owner) continue;
+      if (found && found.messageId !== key) return null;
+      found = { messageId: key, thoughtMessageId: owner };
+    }
+    return found;
+  }
+
+  /**
+   * The public authored text carried by one ChatGPT assistant message, or null.
+   *
+   * Live turns contain many assistant-authored *internal* messages as well: connector
+   * requests are `code`, and reasoning/tool-summary state is `thoughts`. The latter is the
+   * shape that broke canonical prose capture in 1.8.1: a turn with 3 real text messages also
+   * held 23 `thoughts` records, so the old positional fallback saw 26 candidate ids for 18
+   * rendered Markdown nodes and (correctly) refused to guess. `content_type: text` is the
+   * page model's explicit boundary for authored prose; `parts` then carries the raw Markdown
+   * exactly as ChatGPT authored it.
+   *
+   * Do not fall back to arbitrary object/string fields. This helper runs in the page world
+   * and its allowlist is a privacy boundary: only the public text payload crosses worlds.
+   */
+  function authoredText(message) {
+    const content = message && typeof message === 'object' ? message.content : null;
+    if (!content || typeof content !== 'object' || content.content_type !== 'text') return null;
+    if (Array.isArray(content.parts)) {
+      let value = '';
+      for (let at = 0; at < content.parts.length; at++) {
+        const part = content.parts[at];
+        if (typeof part !== 'string') continue;
+        if (value) value += '\n';
+        value += part;
+        if (value.length >= MAX_RENDERED_TEXT) break;
+      }
+      value = value.slice(0, MAX_RENDERED_TEXT);
+      return value.length > 0 ? value : null;
+    }
+    return typeof content.text === 'string' && content.text.length > 0
+      ? content.text.slice(0, MAX_RENDERED_TEXT)
+      : null;
+  }
+
+  /** ChatGPT's own message creation time, normalized to epoch milliseconds when present. */
+  function authoredTime(message) {
+    const raw = message && typeof message === 'object' ? Number(message.create_time) : NaN;
+    if (!Number.isFinite(raw) || raw <= 0) return null;
+    // The live model uses epoch seconds (often fractional). Accept milliseconds too so a
+    // renderer change cannot move a valid timestamp ~54,000 years into the past.
+    return Math.round(raw < 10_000_000_000 ? raw * 1000 : raw);
+  }
+
+  /** Whether two optional page turn identities contradict one another. */
+  function turnIdentityContradicts(left, right) {
+    return Boolean(left && right && left !== right);
+  }
+
+  /**
+   * Stable public-assistant identity before the owning thought object necessarily mounts.
+   *
+   * ChatGPT can rotate the child text-message UUID while one commentary item streams. The
+   * relation metadata on that child is already stable earlier: parent_id + the response/turn
+   * ids identify that exact page-model branch without using text, DOM position or timing.
+   * Keep the tuple as the canonical key for the whole lifetime of that item so discovering
+   * the thought object later does not re-key the message and leave the first partial behind.
+   *
+   * A bare parent_id is deliberately insufficient here: Retry/Regenerate branches can share
+   * a parent. If ChatGPT supplies no turn/exchange discriminator yet, fall back to its raw
+   * message id until a stronger exact identity exists.
+   */
+  function assistantLogicalId(id, parentId, workingTurnId, turnExchangeId) {
+    if (!parentId || (!workingTurnId && !turnExchangeId)) return id;
+    const value = `assistant:${parentId}:${workingTurnId || ''}:${turnExchangeId || ''}`;
+    return value.length <= 190 ? value : id;
+  }
+
+  /** Public assistant messages in ChatGPT's own turn model, in model order. */
+  function authoredAssistantMessages(messages) {
+    const out = [];
+    const seen = [];
+    if (!Array.isArray(messages)) return out;
+    for (let index = 0; index < messages.length; index++) {
+      const message = messages[index];
+      if (!message || typeof message !== 'object') continue;
+      const author = message.author;
+      if (!author || author.role !== 'assistant') continue;
+      if (requestOf(message) || resultOf(message) || hiddenMessage(message)) continue;
+      const id = str(message.id);
+      const rawText = authoredText(message);
+      if (!id || !rawText) continue;
+      let duplicate = false;
+      for (let at = 0; at < seen.length; at++) if (seen[at] === id) duplicate = true;
+      if (duplicate) continue;
+      seen.push(id);
+      const meta = message.metadata && typeof message.metadata === 'object' ? message.metadata : null;
+      const parentId = meta ? str(meta.parent_id) : null;
+      const workingTurnId = meta ? str(meta.working_turn_id) : null;
+      const turnExchangeId = meta ? str(meta.turn_exchange_id) : null;
+      let logicalId = assistantLogicalId(id, parentId, workingTurnId, turnExchangeId);
+      let stable = false;
+
+      // Live streaming can replace the raw text-message UUID while the same commentary block
+      // keeps growing. The page already supplies a stronger relation: public commentary is a
+      // child of the thought object that owns that reasoning step. Use that thought id only
+      // when the parent is actually present in this same turn model and its own turn metadata
+      // does not contradict the child. No text, order, timing or DOM position participates.
+      if (parentId) {
+        for (let parentAt = 0; parentAt < messages.length; parentAt++) {
+          const parent = messages[parentAt];
+          if (!thoughtMessage(parent) || str(parent.id) !== parentId) continue;
+          const parentMeta = parent.metadata && typeof parent.metadata === 'object' ? parent.metadata : null;
+          const parentWorking = parentMeta ? str(parentMeta.working_turn_id) : null;
+          const parentExchange = parentMeta ? str(parentMeta.turn_exchange_id) : null;
+          if (turnIdentityContradicts(workingTurnId, parentWorking)) break;
+          if (turnIdentityContradicts(turnExchangeId, parentExchange)) break;
+          // Keep the same exact tuple chosen above. If older page data has a thought parent
+          // but no working/exchange metadata, parent_id itself is the stronger identity.
+          if (logicalId === id) logicalId = parentId;
+          stable = true;
+          break;
+        }
+      }
+      // Keep the position from ChatGPT's own turn model. `messages` and native activity are
+      // transported as separate arrays below for validation, so without this ordinal the
+      // isolated-world recorder has no way to put them back together. That was visible on
+      // the first interim update of a turn: the prose and the preceding thinking headline
+      // often arrived in one scan, and content.js always emitted all prose before all
+      // headlines regardless of the order ChatGPT actually rendered them.
+      out.push({
+        id,
+        messageId: logicalId,
+        role: 'assistant',
+        stable,
+        rawText,
+        order: index,
+        createTime: authoredTime(message)
+      });
+    }
+    return out;
+  }
+
+  /**
+   * Public user messages in ChatGPT's own turn model.
+   *
+   * The DOM usually exposes `data-message-id` for user prose, but the first message of a
+   * brand-new chat can exist in the React model before that attribute is mounted. That is
+   * exactly the gap where the live recorder used to miss the opening prompt and only recover
+   * it after a reload. The model id is already ChatGPT's durable identity, so there is no
+   * reason to make user capture depend on the DOM having caught up.
+   */
+  function authoredUserMessages(messages) {
+    const out = [];
+    const seen = [];
+    if (!Array.isArray(messages)) return out;
+    for (let index = 0; index < messages.length; index++) {
+      const message = messages[index];
+      if (!message || typeof message !== 'object') continue;
+      const author = message.author;
+      if (!author || author.role !== 'user') continue;
+      const id = str(message.id);
+      const rawText = authoredText(message);
+      if (!id || !rawText) continue;
+      let duplicate = false;
+      for (let at = 0; at < seen.length; at++) if (seen[at] === id) duplicate = true;
+      if (duplicate) continue;
+      seen.push(id);
+      out.push({
+        id,
+        messageId: id,
+        role: 'user',
+        stable: true,
+        rawText,
+        order: index,
+        createTime: authoredTime(message)
+      });
+    }
+    return out;
+  }
+
+  /**
+   * Whether ChatGPT's own message model says this turn reached a terminal successful end.
+   *
+   * Live 2026-08-19 evidence: an actively generating turn can already expose
+   * `isFinalTurn:true`, and interim public messages can already have
+   * `status:'finished_successfully'`; neither is completion. The final assistant message is
+   * the one that additionally carries direct `end_turn:true`. Only that boolean plus the
+   * assistant role/status crosses worlds. No private reasoning or finish payload is copied.
+   */
+  function turnEndMessageId(messages) {
+    if (!Array.isArray(messages)) return null;
+    // The latest public text is the current state of the assistant turn. A Retry/Regenerate
+    // can leave the previous finished attempt in the same model while a newer public message
+    // is active; searching for *any* older end_turn=true would incorrectly keep the new
+    // attempt terminal forever. First public text from the tail decides, fail closed.
+    for (let index = messages.length - 1; index >= 0; index--) {
+      const message = messages[index];
+      if (!message || typeof message !== 'object') continue;
+      const author = message.author;
+      if (!author || author.role !== 'assistant') continue;
+      const content = message.content;
+      if (!content || typeof content !== 'object' || content.content_type !== 'text') continue;
+      if (message.end_turn === true && message.status === 'finished_successfully') return str(message.id);
+      return null;
+    }
+    return null;
+  }
+
+  /** Whitespace-only normalisation for an optional DOM decoration match. */
+  function visibleText(value) {
+    return typeof value === 'string' ? value.replace(/\u00a0/g, ' ').replace(/\s+/g, ' ').trim() : '';
+  }
+
+  /**
+   * Public authored prose from ChatGPT's own message model, optionally decorated with the
+   * rendered HTML of the matching visible block.
+   *
+   * Identity and raw Markdown come from the model, not the DOM. That is the important
+   * invariant: a renderer refactor may cost rich HTML for one message, but can no longer make
+   * the message disappear or mint a new identity for each streaming snapshot.
+   *
+   * HTML is decoration only. Prefer an explicit DOM/Fiber message id. Where the page no
+   * longer exposes one, an exact whitespace-normalised text equality may attach a block, but
+   * only when that match is unique on both sides. Markdown whose rendered text differs from
+   * its raw source simply keeps `renderedHtml: ''` and the recorder still has the canonical
+   * raw Markdown. Finally, the old positional fallback remains only for the fully balanced
+   * case, where every remaining candidate has exactly one remaining visible block.
+   */
+  function renderedMessagesOf(sections, messages) {
+    const assistantCandidates = authoredAssistantMessages(messages);
+    const userCandidates = authoredUserMessages(messages);
+    if (assistantCandidates.length === 0 && userCandidates.length === 0) return [];
+
+    const blocks = [];
+    for (let sectionAt = 0; sectionAt < sections.length; sectionAt++) {
+      const section = sections[sectionAt];
+      let found;
+      try {
+        found = section.querySelectorAll(MARKDOWN);
+      } catch {
+        continue;
+      }
+      for (let at = 0; at < found.length; at++) {
+        const block = found[at];
+        if (block.closest && (block.closest(TOOL) || block.closest(OWN_SURFACES))) continue;
+        const parent = block.parentElement && block.parentElement.closest ? block.parentElement.closest(MARKDOWN) : null;
+        if (parent && section.contains(parent)) continue;
+        blocks.push(block);
+      }
+    }
+
+    const used = [];
+    const ids = [];
+    for (let at = 0; at < blocks.length; at++) {
+      const block = blocks[at];
+      let id = null;
+      try {
+        const holder = block.closest && block.closest('[data-message-id]');
+        id = holder ? str(holder.getAttribute('data-message-id')) : null;
+      } catch {
+        id = null;
+      }
+      if (!id) {
+        try {
+          const fiber = fiberOf(block);
+          if (fiber) id = messageOf(fiber);
+        } catch {
+          id = null;
+        }
+      }
+      let known = false;
+      for (let c = 0; c < assistantCandidates.length; c++) if (assistantCandidates[c].id === id) known = true;
+      if (!known) id = null;
+      if (id) used.push(id);
+      ids.push(id);
+    }
+
+    const freeBlocks = [];
+    for (let at = 0; at < ids.length; at++) if (!ids[at]) freeBlocks.push(at);
+    const freeCandidates = [];
+    for (let c = 0; c < assistantCandidates.length; c++) {
+      let taken = false;
+      for (let u = 0; u < used.length; u++) if (used[u] === assistantCandidates[c].id) taken = true;
+      if (!taken) freeCandidates.push(assistantCandidates[c]);
+    }
+
+    // The live 2026-08-19 page no longer exposes a message id on authored Markdown blocks.
+    // Attach HTML by exact visible text only when the equality is unique in both directions.
+    for (let c = 0; c < freeCandidates.length; c++) {
+      const candidate = freeCandidates[c];
+      const wanted = visibleText(candidate.rawText);
+      if (!wanted) continue;
+      let match = -1;
+      let count = 0;
+      for (let b = 0; b < freeBlocks.length; b++) {
+        const blockAt = freeBlocks[b];
+        let text = '';
+        try {
+          text = visibleText(blocks[blockAt] && blocks[blockAt].textContent);
+        } catch {
+          text = '';
+        }
+        if (text !== wanted) continue;
+        match = blockAt;
+        count += 1;
+      }
+      if (count !== 1) continue;
+      let candidateCount = 0;
+      for (let other = 0; other < freeCandidates.length; other++) {
+        if (visibleText(freeCandidates[other].rawText) === wanted) candidateCount += 1;
+      }
+      if (candidateCount !== 1) continue;
+      ids[match] = candidate.id;
+      used.push(candidate.id);
+    }
+
+    const remainingBlocks = [];
+    for (let at = 0; at < ids.length; at++) if (!ids[at]) remainingBlocks.push(at);
+    const remainingCandidates = [];
+    for (let c = 0; c < assistantCandidates.length; c++) {
+      let taken = false;
+      for (let u = 0; u < used.length; u++) if (used[u] === assistantCandidates[c].id) taken = true;
+      if (!taken) remainingCandidates.push(assistantCandidates[c]);
+    }
+    if (remainingBlocks.length === remainingCandidates.length) {
+      for (let at = 0; at < remainingBlocks.length; at++) ids[remainingBlocks[at]] = remainingCandidates[at].id;
+    }
+
+    // One canonical record per model message whether or not HTML could be attached.
+    const out = [];
+    for (let c = 0; c < assistantCandidates.length; c++) {
+      out.push({
+        messageId: assistantCandidates[c].messageId,
+        rawMessageId: assistantCandidates[c].id,
+        role: 'assistant',
+        stable: assistantCandidates[c].stable,
+        order: assistantCandidates[c].order,
+        createTime: assistantCandidates[c].createTime,
+        rawText: assistantCandidates[c].rawText,
+        renderedHtml: ''
+      });
+    }
+    for (let c = 0; c < userCandidates.length; c++) {
+      out.push({
+        messageId: userCandidates[c].messageId,
+        rawMessageId: userCandidates[c].id,
+        role: 'user',
+        stable: true,
+        order: userCandidates[c].order,
+        createTime: userCandidates[c].createTime,
+        rawText: userCandidates[c].rawText,
+        renderedHtml: ''
+      });
+    }
+    for (let at = 0; at < blocks.length; at++) {
+      const id = ids[at];
+      if (!id) continue;
+      let target = -1;
+      for (let c = 0; c < out.length; c++) if (out[c].rawMessageId === id) target = c;
+      if (target < 0 || out[target].renderedHtml) continue;
+      const block = blocks[at];
+      let renderedHtml = '';
+      try {
+        renderedHtml = typeof block.innerHTML === 'string' ? block.innerHTML.slice(0, MAX_RENDERED_HTML) : '';
+      } catch {
+        renderedHtml = '';
+      }
+      if (renderedHtml) out[target].renderedHtml = renderedHtml;
+    }
+    out.sort((left, right) => left.order - right.order);
+    return out;
+  }
+
+  /**
+   * Visible ChatGPT-native activity, keyed by the thought object that owns the rendered row.
+   *
+   * The label is display data only. React may replace the DOM row or rewrite its text from
+   * "Inspecting" to "Inspected"; neither can create a new record because the identity is the
+   * page-model thought `message.id`. If two simultaneously rendered rows claim one thought
+   * with different labels (a transition/reparent race), that scan is ambiguous and emits
+   * neither version. The next stable scan reconciles it.
+   */
+  function nativeActivitiesOf(sections, messages) {
+    const thoughtIds = [];
+    const thoughtOrder = new Map();
+    for (let at = 0; at < messages.length; at++) {
+      if (!thoughtMessage(messages[at])) continue;
+      const id = str(messages[at].id);
+      if (id) {
+        thoughtIds.push(id);
+        thoughtOrder.set(id, at);
+      }
+    }
+    if (thoughtIds.length === 0) return [];
+
+    const held = [];
+    for (let sectionAt = 0; sectionAt < sections.length; sectionAt++) {
+      const section = sections[sectionAt];
+      let found;
+      try {
+        found = section.querySelectorAll(TOOL);
+      } catch {
+        continue;
+      }
+      const rows = [];
+      for (let at = 0; at < found.length; at++) {
+        const row = found[at];
+        let nested = false;
+        for (let other = 0; other < found.length; other++) {
+          if (other === at) continue;
+          try {
+            if (row.contains(found[other])) nested = true;
+          } catch {
+            nested = false;
+          }
+          if (nested) break;
+        }
+        if (!nested) rows.push(row);
+      }
+
+      for (let at = 0; at < rows.length; at++) {
+        const row = rows[at];
+        try {
+          if (row.closest && row.closest(OWN_SURFACES)) continue;
+          if ((row.querySelector && row.querySelector(CONNECTOR)) || (row.closest && row.closest(CONNECTOR))) continue;
+          if (row.querySelector && row.querySelector(MARKDOWN)) continue;
+        } catch {
+          continue;
+        }
+        const label = visibleText(row.textContent).slice(0, 300);
+        if (!label || label.length > 300) continue;
+        let activity = null;
+        try {
+          const fiber = fiberOf(row);
+          if (fiber) activity = thoughtItemOf(fiber, thoughtIds);
+        } catch {
+          activity = null;
+        }
+        if (!activity) continue;
+
+        let prior = null;
+        for (let entryAt = 0; entryAt < held.length; entryAt++) {
+          if (held[entryAt].messageId === activity.messageId) prior = held[entryAt];
+        }
+        if (!prior) {
+          held.push({
+            messageId: activity.messageId,
+            label,
+            order: thoughtOrder.get(activity.messageId),
+            conflicted: false
+          });
+        } else if (prior.label !== label) {
+          prior.conflicted = true;
+        }
+      }
+    }
+    const out = [];
+    for (let at = 0; at < held.length; at++) {
+      if (!held[at].conflicted) {
+        out.push({ messageId: held[at].messageId, label: held[at].label, order: held[at].order });
+      }
+    }
+    return out;
   }
 
   /**
@@ -439,21 +1046,76 @@
     } catch {
       return out;
     }
-    const first = Math.max(0, sections.length - MAX_TURNS);
-    for (let at = first; at < sections.length; at++) {
+    // A descriptor index is valid for one scan only. Stale stamps must disappear when a
+    // still-mounted section becomes unreadable, but clearing every stamp up front is not
+    // harmless: these attributes are observed by the isolated-world MutationObserver, so
+    // remove+restore on every scan creates a self-sustaining scan/mutation loop. Build the
+    // desired stamp set first, then change only attributes whose value actually differs.
+    const desiredTurnStamps = new Map();
+    const groups = [];
+    for (let at = 0; at < sections.length; at++) {
       const section = sections[at];
+      const id = str(section.getAttribute('data-turn-id'));
+      const previous = groups[groups.length - 1];
+      if (id && previous && previous.turnId === id) previous.sections.push(section);
+      else groups.push({ turnId: id, sections: [section] });
+    }
+    const first = Math.max(0, groups.length - MAX_TURNS);
+    for (let at = first; at < groups.length; at++) {
+      const group = groups[at];
+      const section = group.sections[0];
       let entry = null;
       try {
         const fiber = fiberOf(section);
         if (!fiber) continue;
-        const calls = callsOf(turnMessagesOf(fiber));
-        if (calls.length === 0) continue;
-        entry = { turnId: str(section.getAttribute('data-turn-id')), calls };
+        const messages = turnMessagesOf(fiber);
+        const calls = callsOf(messages);
+        const renderedMessages = renderedMessagesOf(group.sections, messages);
+        const activities = nativeActivitiesOf(group.sections, messages);
+        if (calls.length === 0 && renderedMessages.length === 0 && activities.length === 0) continue;
+        const index = out.length;
+        entry = {
+          index,
+          turnId: group.turnId,
+          conversationId: conversationOf(fiber),
+          endMessageId: turnEndMessageId(messages),
+          calls,
+          messages: renderedMessages,
+          activities
+        };
+        // The isolated-world renderer needs to know which visible section this exact Fiber
+        // turn descriptor came from. Remember the desired ephemeral scan index now and apply
+        // it after the scan, so a stable scan produces no attribute mutation at all.
+        for (let sectionAt = 0; sectionAt < group.sections.length; sectionAt++) {
+          const stamped = group.sections[sectionAt];
+          if (stamped) desiredTurnStamps.set(stamped, String(index));
+        }
       } catch {
         // One unreadable turn must not cost the others their evidence.
         entry = null;
       }
-      if (entry && entry.turnId) out.push(entry);
+      // `data-turn-id` is presentation metadata, not transcript identity. ChatGPT's current
+      // virtualized renderer can omit it from a perfectly readable assistant section while
+      // the underlying turn model still exposes exact conversation/message/request ids.
+      // Dropping that descriptor made opening or scrolling an old chat lose precisely those
+      // messages until another render happened to restore the attribute. Keep the descriptor;
+      // content.js will simply leave local turn ownership unset when the page turn id is null.
+      if (entry) out.push(entry);
+    }
+    for (let at = 0; at < sections.length; at++) {
+      const section = sections[at];
+      try {
+        if (!section || !section.getAttribute) continue;
+        const wanted = desiredTurnStamps.get(section);
+        const current = section.getAttribute('data-clf-fiber-turn');
+        if (wanted === undefined) {
+          if (current !== null && section.removeAttribute) section.removeAttribute('data-clf-fiber-turn');
+        } else if (current !== wanted && section.setAttribute) {
+          section.setAttribute('data-clf-fiber-turn', wanted);
+        }
+      } catch {
+        // One hostile/stale DOM node must not cost the remaining turns their evidence.
+      }
     }
     return out;
   }

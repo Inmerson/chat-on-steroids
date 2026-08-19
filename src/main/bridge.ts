@@ -31,22 +31,36 @@ import {
   closeConversation,
   liveConversations,
   noteChatOrigin,
+  recordAgentMessage,
   recordChatObservations,
-  setBrowserReporterPresent,
   type ChatObservation,
   type PageCallEvidence
 } from './session/recorder.js';
-import { getSession, listSessions, readEvents } from './session/store.js';
-import { inFlightToolCalls } from './mcp/call-context.js';
+import {
+  autoCompactionReady,
+  claimAutoCompaction,
+  findSessionByConversation,
+  getSession,
+  listSessions,
+  readEvents,
+  sessionDurableModifiedAt
+} from './session/store.js';
+import { inFlightMcpRequests, inFlightToolCalls } from './mcp/call-context.js';
 import { nativeHandoffPrompt } from './session/handoff-prompt.js';
 import {
   agentForConversation,
   bindConversation,
+  currentRunId,
   failAgent,
+  finishWorkerConversation,
   onSpawnRequest,
   onSwarmEnd,
   pendingWorkerSpawns,
-  primeConversationGone
+  primeConversationGone,
+  releaseQuiescentRun,
+  swarmState,
+  swarmTransferActive,
+  workerConversationGone
 } from './agents.js';
 import {
   abortContinuation,
@@ -64,7 +78,12 @@ import { APP_VERSION, BRIDGE_PROTOCOL } from './version.js';
 
 /** Fixed candidates so the extension can find the app without being told a port. */
 const PORTS = [8765, 8766, 8767, 8768, 8769];
-const MAX_BODY_BYTES = 512 * 1024;
+const MAX_BODY_BYTES = 2 * 1024 * 1024;
+/** User-requested orphan safety net: slow enough to require durable inactivity, not a heartbeat lease. */
+export const STALE_SWARM_MS = 2 * 60_000;
+const STALE_SWARM_SWEEP_MS = 30_000;
+/** /events batches currently between parse and durable/session+worker lifecycle completion. */
+let observationWritesInFlight = 0;
 /** Requests allowed per rolling minute, across all routes. */
 const RATE_LIMIT = 900;
 
@@ -96,7 +115,6 @@ const COMMANDS_STATE = 'bridge-commands';
  * inference. Generous enough to survive a throttled background tab missing a couple of
  * polls.
  */
-const CONVERSATION_LIVE_MS = 90_000;
 /**
  * How recently the extension must have been heard from for "which chats are open" to
  * be a question this app can answer at all.
@@ -109,12 +127,14 @@ const CONVERSATION_LIVE_MS = 90_000;
 const BROWSER_PRESENT_MS = 60_000;
 
 /**
- * The longest brief the page may hand back.
+ * The longest native compaction brief the browser bridge will carry across.
  *
- * A compaction brief is a page of prose about what was happening, not a transcript. The cap
- * is here rather than in the transaction because this is the untrusted edge.
+ * This used to be 24k characters, which silently forced even a model instructed to write a
+ * large token-budget handoff down to roughly six thousand tokens. The model-side prompt owns
+ * the semantic ceiling (30k tokens); this is deliberately *not* another token approximation.
+ * It is only a generous runaway-input guard, far above a normal 30k-token operational brief.
  */
-const MAX_BRIEF_CHARS = 24_000;
+const MAX_BRIEF_CHARS = 256_000;
 
 /**
  * Cuts an over-long brief down to what will be typed, from the middle.
@@ -214,8 +234,6 @@ let server: http.Server | null = null;
 let port: number | null = null;
 let lastSeenAt: number | null = null;
 let commands: Command[] = [];
-/** conversationId → when its tab last asked this app for anything. */
-const conversationSeen = new Map<string, number>();
 let requestWindow = { start: Date.now(), count: 0 };
 const listeners = new Set<() => void>();
 let extensionVersion: string | null = null;
@@ -239,33 +257,6 @@ export async function bridgeStatus(): Promise<BridgeStatus> {
   };
 }
 
-// --------------------------------------------------------------- liveness
-
-/**
- * Notes that a ChatGPT tab is there.
- *
- * Called for every authenticated request that names a conversation. An open tab polls
- * for its own activity every few seconds even when nothing is happening in it, so this
- * is first-hand evidence that the chat exists right now — which is what the multi-agent
- * broker needs before it is willing to call somebody else's run abandoned.
- */
-function noteConversation(id: string): void {
-  conversationSeen.set(id, Date.now());
-  if (conversationSeen.size > 200) {
-    const cutoff = Date.now() - CONVERSATION_LIVE_MS;
-    for (const [key, at] of conversationSeen) if (at < cutoff) conversationSeen.delete(key);
-  }
-}
-
-/** Whether that conversation's tab has been heard from recently. */
-export function conversationIsLive(id: string): boolean {
-  const at = conversationSeen.get(id);
-  if (at !== undefined && Date.now() - at < CONVERSATION_LIVE_MS) return true;
-  // A conversation with a turn in flight is live by definition, even if its next poll
-  // has not landed yet.
-  return liveConversations().some((entry) => entry.conversationId === id && entry.generating);
-}
-
 /**
  * Whether this app can currently see the browser at all.
  *
@@ -274,19 +265,6 @@ export function conversationIsLive(id: string): boolean {
  */
 export function browserPresent(): boolean {
   return lastSeenAt !== null && Date.now() - lastSeenAt < BROWSER_PRESENT_MS;
-}
-
-/**
- * Tells the recorder that this module can answer "is the browser there".
- *
- * The broker no longer asks anything about liveness: a run ends when its prime chat is
- * reported closed, which the extension states first-hand (see `/closed`), rather than when
- * some heuristic decides a run looks abandoned. Nothing infers a takeover any more.
- */
-export function installBridgeLiveness(): void {
-  // The recorder's own map of live chats is memory, and it is empty for a while after a
-  // restart even though the same tab never closed. This is the first-hand answer.
-  setBrowserReporterPresent(browserPresent);
 }
 
 /**
@@ -430,23 +408,15 @@ function rateLimited(): boolean {
 // ---------------------------------------------------------------- validation
 
 const OBSERVATION_KINDS = new Set([
+  'conversation_title',
   'user_message',
   'assistant_message',
-  'progress',
   'page_tool',
   'turn_start',
-  // Ephemeral liveness only: keeps weak generation attribution from using a turn while
-  // ChatGPT has temporarily removed its direct generating signal. The recorder does not
-  // persist this observation.
-  'turn_state',
   'turn_end',
   'chat_error',
-  // Not stored: the page vouching that this conversation made a tool call. See
-  // claimConversation in the recorder for why that is the only attribution evidence there is.
-  'tool_block',
-  // Also not stored, and strictly better than 'tool_block': the individual connector
-  // requests this turn actually issued, read out of ChatGPT's own message model rather
-  // than counted off the rows it happened to draw. See noteCallEvidence in the recorder.
+  // Not stored as transcript content. These request records populate the exact
+  // requestId -> conversationId correlation registry.
   'tool_evidence'
 ]);
 const OUTCOMES = new Set(['completed', 'failed', 'stopped', 'interrupted', 'stalled', 'unknown']);
@@ -509,12 +479,15 @@ function parseCallEvidence(input: unknown): PageCallEvidence[] {
  * Turns whatever the extension posted into observations we are willing to store.
  *
  * The extension reads an undocumented page that can change under it, so nothing from
- * it is trusted structurally: unknown kinds are dropped, text is capped, and a
- * timestamp from the future or the distant past is replaced with now.
+ * it is trusted structurally: unknown kinds are dropped, text is capped, and an impossible
+ * timestamp is replaced with now. Historical transcript timestamps are valid input: opening
+ * a months-old chat is exactly when we need ChatGPT's own creation time so its messages can
+ * be interleaved with already-recorded MCP calls instead of all appearing at reload time.
  */
 function parseObservations(input: unknown): ChatObservation[] {
   if (!Array.isArray(input)) return [];
   const now = Date.now();
+  const earliestChatGpt = Date.UTC(2022, 10, 30);
   const out: ChatObservation[] = [];
   for (const raw of input.slice(0, MAX_OBSERVATIONS)) {
     if (!raw || typeof raw !== 'object') continue;
@@ -524,27 +497,25 @@ function parseObservations(input: unknown): ChatObservation[] {
     const time = typeof item['time'] === 'number' && Number.isFinite(item['time']) ? item['time'] : now;
     const observation: ChatObservation = {
       kind: kind as ChatObservation['kind'],
-      time: time > now + 60_000 || time < now - 7 * 24 * 3600_000 ? now : time
+      time: time > now + 60_000 || time < earliestChatGpt ? now : time
     };
-    if (typeof item['text'] === 'string') observation.text = item['text'].slice(0, 64_000);
+    // Long final handoff-style answers are valid transcript content too. Keep this aligned
+    // with the page-side assistant bound so the bridge does not silently become the next
+    // truncation point after Fiber/content.js accepted the whole message.
+    if (typeof item['text'] === 'string') observation.text = item['text'].slice(0, 256_000);
     if (typeof item['messageId'] === 'string') observation.messageId = item['messageId'].slice(0, 100);
     if (typeof item['turnId'] === 'string') observation.turnId = item['turnId'].slice(0, 100);
+    if (typeof item['renderedHtml'] === 'string') observation.renderedHtml = item['renderedHtml'].slice(0, 120_000);
+    if (item['state'] === 'streaming' || item['state'] === 'final') observation.state = item['state'];
+    if (typeof item['fiberConversationId'] === 'string') {
+      const fiberId = conversationId(item['fiberConversationId']);
+      if (fiberId) observation.fiberConversationId = fiberId;
+    }
     if (item['final'] === true) observation.final = true;
-    if (kind === 'turn_state' && typeof item['active'] === 'boolean') observation.active = item['active'];
     if (typeof item['outcome'] === 'string' && OUTCOMES.has(item['outcome'])) {
       observation.outcome = item['outcome'] as ChatObservation['outcome'];
     }
     if (typeof item['detail'] === 'string') observation.detail = item['detail'].slice(0, 500);
-    if (typeof item['count'] === 'number' && Number.isFinite(item['count'])) {
-      observation.count = Math.max(0, Math.min(500, Math.floor(item['count'])));
-    }
-    // Identity of one visible commentary item, so the recorder can grow the record it
-    // already has instead of writing another one every time ChatGPT redraws the block.
-    // Capped like every other page-supplied string; a page that supplies nonsense here
-    // costs itself one extra commentary row and nothing else.
-    if (typeof item['progressId'] === 'string' && item['progressId'].length > 0) {
-      observation.progressId = item['progressId'].slice(0, 120);
-    }
     if (Array.isArray(item['calls'])) observation.calls = parseCallEvidence(item['calls']);
     out.push(observation);
   }
@@ -645,14 +616,60 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
     }
     const id = conversationId(body['conversationId']);
     if (!id) return json(res, 400, { error: 'bad_conversation_id' }, origin);
-    noteConversation(id);
     if (typeof body['agent'] === 'string' && /^[a-z0-9-]{1,40}$/i.test(body['agent'])) {
-      bindConversation(body['agent'], id);
+      // Recovery only. The page's label is not authority: it may bind a worker only while
+      // the app itself still owns a claimed bootstrap for that exact slot. The normal path
+      // binds from /commands/ack below using the command id, without trusting this field.
+      const pending = commands.some(
+        (command) =>
+          command.spec.type === 'worker' &&
+          command.spec.agent === body['agent'] &&
+          command.claimedAt !== null
+      );
+      if (pending) bindConversation(body['agent'], id);
     }
     const observations = parseObservations(body['events']);
-    const agent = agentForConversation(id);
-    const result = await recordChatObservations(id, observations, agent);
-    return json(res, 200, { sessionId: result.sessionId, stored: result.stored }, origin);
+    observationWritesInFlight += 1;
+    try {
+      const agent = agentForConversation(id);
+      // The command acknowledgement normally supplies this origin before the worker's first
+      // observation. Its pending copy lives in recorder memory until a session exists, though,
+      // so an app restart in that narrow gap used to create an origin-less worker session even
+      // though the broker had durably restored the exact worker binding and task. Reconstitute
+      // the same origin from that authoritative binding before the recorder creates the session.
+      if (agent && agent !== 'prime') {
+        const worker = swarmState().agents.find(
+          (entry) => entry.id === agent && entry.role === 'worker' && entry.conversationId === id
+        );
+        if (worker) {
+          await noteChatOrigin(id, {
+            kind: 'worker',
+            fromSessionId: null,
+            agentId: worker.id,
+            task: worker.task
+          });
+        }
+      }
+      const result = await recordChatObservations(id, observations, agent);
+      // Workers are one-shot jobs. A settled assistant answer plus its matching turn_end is
+      // first-hand page evidence that the worker has completed a turn; waiting for the model
+      // to make another MCP call solely to say `finish` leaves normal final answers as zombie
+      // workers forever. Historical assistant messages replayed on reload do not carry a fresh
+      // matching turn_end in this batch, so they cannot terminalise a worker.
+      const final = [...observations]
+        .reverse()
+        .find((entry) => entry.kind === 'assistant_message' && entry.final === true && entry.text && entry.turnId);
+      if (
+        final &&
+        observations.some((entry) => entry.kind === 'turn_end' && entry.turnId === final.turnId)
+      ) {
+        const finished = finishWorkerConversation(id, final.text ?? 'Worker completed its task.');
+        if (finished?.report) await recordAgentMessage(finished.report, 'sent');
+      }
+      return json(res, 200, { sessionId: result.sessionId, stored: result.stored }, origin);
+    } finally {
+      observationWritesInFlight -= 1;
+    }
   }
 
   if (route === '/closed' && req.method === 'POST') {
@@ -673,6 +690,7 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
       // broker knows that because the continuation pinned the prime binding before the old
       // chat was replaced.
       if (primeConversationGone(id)) logInfo(`bridge: the prime chat ${id} closed, so its run ended`);
+      else if (workerConversationGone(id)) logInfo(`bridge: worker chat ${id} closed, so its worker slot was released`);
     }
     return json(res, 200, { ok: true }, origin);
   }
@@ -685,10 +703,9 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
     if (!id) return json(res, 400, { error: 'bad_conversation_id' }, origin);
     // Every open ChatGPT tab polls this for its own conversation every few seconds, so
     // this is the app's primary first-hand evidence of which chats exist right now.
-    noteConversation(id);
     const live = liveConversations().find((entry) => entry.conversationId === id);
     if (!live) {
-      return json(res, 200, { sessionId: null, entries: [], stream: [], nextSince: Number.isFinite(since) ? Math.max(0, since) : 0, job: null }, origin);
+      return json(res, 200, { sessionId: null, entries: [], stream: [], userAnchors: [], nextSince: Number.isFinite(since) ? Math.max(0, since) : 0, job: null }, origin);
     }
     const summary = await getSession(live.sessionId);
     const events = await readEvents(live.sessionId, {
@@ -702,6 +719,7 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
       switch (event.kind) {
         case 'tool_call':
           return [{ ...base, kind: 'tool_call', tool: event.call.tool, callId: event.call.callId,
+            requestId: event.call.requestId ?? null,
             attribution: event.call.attribution, outcome: event.call.outcome, durationMs: event.call.durationMs,
             summary: event.call.summary, changes: event.call.changes ?? [] }];
         case 'progress':
@@ -732,8 +750,16 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
             }
           ];
         case 'assistant_message':
-          return [{ ...base, kind: 'assistant_message', text: event.message.text, final: event.final,
-            messageId: event.messageId ?? null }];
+          return [{
+            ...base,
+            kind: 'assistant_message',
+            text: event.message.text,
+            renderedHtml: event.renderedHtml?.text ?? '',
+            state: event.state ?? (event.final ? 'final' : 'streaming'),
+            final: event.final,
+            messageId: event.messageId ?? null,
+            origin: event.origin ?? event.seq
+          }];
         case 'agent_message':
           return [{ ...base, kind: 'agent_message', from: event.from, to: event.to, text: event.message.text,
             delivery: event.delivery, messageId: event.messageId }];
@@ -747,6 +773,17 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
           return [];
       }
     });
+    // Stable page-authored boundaries for presentation reconciliation. The extension only
+    // needs identity and order here, never the user's text: a visible assistant response is
+    // exactly the response after one visible user message, even when our own local
+    // turn_start/turn_end lifecycle was split by a reload or a transient terminal marker.
+    // Keeping anchors separate from `stream` means they can participate in the join without
+    // ever becoming synthetic transcript rows.
+    const userAnchors = events.flatMap((event) =>
+      event.kind === 'user_message' && event.messageId
+        ? [{ seq: event.origin ?? event.seq, time: event.time, messageId: event.messageId }]
+        : []
+    );
 
     // Legacy tool-only view, kept only while the old native-row relabeller is still a
     // fallback. It is derived from the same stream cursor and contains no raw args/result.
@@ -787,6 +824,9 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
         // history and its identity across the move, so a meter reading the lifetime figure
         // would come back full the moment the replacement chat opened and compact it again.
         tokens: summary?.contextTokens ?? 0,
+        // A durable threshold *crossing*, not a level check. Old chats that merely happen
+        // to open above the threshold never set this bit; only live growth from below can.
+        autoCompactReady: autoCompactionReady(summary),
         // What the composer's meter fills against, and what its automatic trigger fires
         // on. Sent from here rather than worked out in the page so that the bar someone
         // is watching and the threshold that acts are the same number: a meter that
@@ -800,6 +840,7 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
         bootstrap: summary?.origin?.kind ?? null,
         entries,
         stream,
+        userAnchors,
         nextSince,
         // How this chat's own Compact & Resume is going, so the page can say what is
         // happening instead of spinning.
@@ -815,6 +856,46 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
       },
       origin
     );
+  }
+
+  /**
+   * Claims the one durable automatic-compaction edge for this chat.
+   *
+   * This is intentionally separate from `/compact`: the browser claims *before* it starts
+   * the stop-and-settle barrier. A failed barrier, reload or lost response can therefore
+   * never turn one threshold crossing into an automatic retry loop.
+   */
+  if (route === '/compact/claim-auto' && req.method === 'POST') {
+    let body: Record<string, unknown>;
+    try {
+      body = (await readBody(req)) as Record<string, unknown>;
+    } catch (err) {
+      if ((err as Error).message === 'body_too_large') return tooLarge(res, origin);
+      return json(res, 400, { error: 'bad_request' }, origin);
+    }
+    const id = conversationId(body['conversationId']);
+    if (!id) return json(res, 400, { error: 'bad_conversation_id' }, origin);
+    const live = liveConversations().find((entry) => entry.conversationId === id);
+    const known = live ? null : (await listSessions()).find((entry) => entry.conversationId === id);
+    const sessionId = live?.sessionId ?? known?.id ?? null;
+    if (!sessionId) {
+      return json(
+        res,
+        409,
+        { error: 'session_not_recorded', message: 'This chat has no recorded local session to compact.' },
+        origin
+      );
+    }
+    // A browser claim is only meaningful for the live page that is actually idle. Check on
+    // both sides of the durable write: if a new turn races in, consume the one-shot but tell
+    // the page `claimed:false`, so it never interrupts that new turn or retries the old edge.
+    const idle = (): boolean => {
+      const current = liveConversations().find((entry) => entry.conversationId === id);
+      return Boolean(current && !current.generating && !current.activeTurnId && inFlightToolCalls() === 0);
+    };
+    if (!idle()) return json(res, 200, { claimed: false, sessionId }, origin);
+    const claimed = await claimAutoCompaction(sessionId, id);
+    return json(res, 200, { claimed: claimed && idle(), sessionId }, origin);
   }
 
   /**
@@ -843,7 +924,6 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
     }
     const id = conversationId(body['conversationId']);
     if (!id) return json(res, 400, { error: 'bad_conversation_id' }, origin);
-    noteConversation(id);
     const live = liveConversations().find((entry) => entry.conversationId === id);
     const known = live ? null : (await listSessions()).find((entry) => entry.conversationId === id);
     const sessionId = live?.sessionId ?? known?.id ?? null;
@@ -968,6 +1048,12 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
     // Renew rather than count another attempt: the app already spent one opening this
     // page, and this is that same attempt arriving.
     command.claimedAt = Date.now();
+    // `claim()` armed the original browser-open deadline. A page can legitimately spend a
+    // large part of that window just getting Chrome/ChatGPT started before it redeems the
+    // marker, and content.js then has its own bounded composer + conversation-id wait. Merely
+    // moving `claimedAt` made `isLeased()` say the lease was fresh while the old timer still
+    // expired it at the original wall-clock deadline. Renew both halves of the lease here.
+    armDeadline(command);
     changed();
     persistCommands();
     return json(res, 200, { command: describe(command, client) }, origin);
@@ -987,11 +1073,21 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
     const raw = typeof body['status'] === 'string' ? body['status'] : 'sent';
     const status: AckStatus = raw === 'failed' ? 'failed' : 'sent';
     const error = typeof body['error'] === 'string' ? body['error'].slice(0, 200) : null;
+    const client = typeof body['client'] === 'string' ? body['client'].slice(0, 64) : '';
     // Binding first: a tab that reported its conversation but timed out before sending
     // should still have its agent filed correctly.
     const conversation = conversationId(body['conversationId']);
-    const agent = typeof body['agent'] === 'string' ? body['agent'] : null;
-    if (conversation) noteConversation(conversation);
+    const ownedCommand = commands.find((command) => command.id === id) ?? null;
+    // The document that redeemed the marker is the only document allowed to finish it.
+    // `client` is optional on the wire for compatibility with an extension already open
+    // during an app upgrade, but every current page sends it. When present, fail closed if
+    // the command has since been superseded/released or another document owns it: accepting
+    // a delayed ACK from the old page could otherwise bind a worker or commit a continuation
+    // to the wrong chat after ownership had moved.
+    if (ownedCommand && client && ownedCommand.owner !== client) {
+      return json(res, 409, { error: 'command_owner_changed' }, origin);
+    }
+    const agent = ownedCommand?.spec.type === 'worker' ? ownedCommand.spec.agent : null;
     // This is where a worker starts. The extension is the only party that knows which fresh
     // tab it opened for which slot, and it knows it before the model in that tab has said
     // anything — so binding here makes the worker active before it reads its task, and every
@@ -1032,13 +1128,120 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
   return json(res, 404, { error: 'not_found' }, origin);
 }
 
+// ------------------------------------------------------------ stale swarm
+
+interface DurableQuiescence {
+  quiescent: boolean;
+  ended: boolean;
+  lastOutcome: string | null;
+}
+
+/**
+ * Durable proof that one bound ChatGPT conversation has been inactive long enough to treat
+ * as orphaned. Silence by itself is never enough: a still-open turn fails this check even if
+ * its last write is hours old.
+ */
+async function durableQuiescence(conversationId: string, now: number): Promise<DurableQuiescence> {
+  const live = liveConversations().find((entry) => entry.conversationId === conversationId);
+  if (live?.generating) return { quiescent: false, ended: false, lastOutcome: null };
+  const summary = await findSessionByConversation(conversationId, { requireUnique: true });
+  if (!summary) return { quiescent: false, ended: false, lastOutcome: null };
+  const modifiedAt = await sessionDurableModifiedAt(summary.id);
+  const lastDurableWrite = Math.max(summary.updatedAt, summary.endedAt ?? 0, modifiedAt ?? 0);
+  if (lastDurableWrite <= 0 || now - lastDurableWrite < STALE_SWARM_MS) {
+    return { quiescent: false, ended: summary.endedAt !== null, lastOutcome: summary.lastTurnOutcome };
+  }
+
+  const openTurns = new Set<string>();
+  let lastOutcome: string | null = null;
+  for (const event of await readEvents(summary.id, { kinds: ['turn_start', 'turn_end'] })) {
+    if (event.kind === 'turn_start' && event.turnId) openTurns.add(event.turnId);
+    else if (event.kind === 'turn_end') {
+      if (event.turnId) openTurns.delete(event.turnId);
+      lastOutcome = event.outcome;
+    }
+  }
+  if (openTurns.size > 0) return { quiescent: false, ended: summary.endedAt !== null, lastOutcome };
+  if (summary.endedAt !== null) return { quiescent: true, ended: true, lastOutcome };
+  // A live-but-idle session needs one durable terminal turn. A session with only a bootstrap
+  // message and no turn_end is not proof that ChatGPT ever finished the worker/prime turn.
+  return { quiescent: lastOutcome !== null, ended: false, lastOutcome };
+}
+
+/**
+ * Retires only runs that durable state proves are quiescent/orphaned.
+ *
+ * Immediate cleanup remains the normal path: worker Turn completed terminalises its slot,
+ * and the prime's next authenticated MCP call acknowledges final reports and releases the run.
+ * This sweep exists for the abandoned-tail case where no such next call arrives.
+ */
+export async function sweepStaleSwarm(now = Date.now()): Promise<boolean> {
+  const runId = currentRunId();
+  if (!runId || swarmTransferActive() || inFlightMcpRequests() > 0 || observationWritesInFlight > 0) return false;
+
+  let state = swarmState();
+  if (!state.running) return false;
+
+  // First recover the case where browser completion was durably recorded but the bridge died
+  // before finishWorkerConversation() ran. Invited/unbound workers remain the bootstrap
+  // timeout's responsibility; there is no conversation/session whose inactivity we can prove.
+  for (const worker of state.agents.filter((agent) => agent.role === 'worker' && agent.state !== 'finished' && agent.state !== 'failed')) {
+    if (!worker.conversationId) continue;
+    const proof = await durableQuiescence(worker.conversationId, now);
+    if (currentRunId() !== runId || swarmTransferActive() || inFlightMcpRequests() > 0 || observationWritesInFlight > 0) return false;
+    if (!proof.quiescent) continue;
+
+    if (proof.lastOutcome === 'completed') {
+      const finished = finishWorkerConversation(
+        worker.conversationId,
+        'Worker turn completed and remained durably inactive for the orphan grace period.'
+      );
+      if (finished?.report) await recordAgentMessage(finished.report, 'sent');
+    } else {
+      const failed = failAgent(
+        worker.id,
+        proof.ended
+          ? 'the worker session ended and remained durably inactive'
+          : `the worker turn ended ${proof.lastOutcome ?? 'without a completed outcome'} and remained durably inactive`,
+        `[${worker.id} stale] Its ChatGPT work is durably quiescent after the orphan grace period. The worker slot is free.`
+      );
+      if (failed?.report) await recordAgentMessage(failed.report, 'sent');
+    }
+  }
+
+  if (currentRunId() !== runId || swarmTransferActive() || inFlightMcpRequests() > 0 || observationWritesInFlight > 0) return false;
+  state = swarmState();
+  const workers = state.agents.filter((agent) => agent.role === 'worker');
+  if (workers.length === 0 || workers.some((agent) => agent.state !== 'finished' && agent.state !== 'failed')) return false;
+
+  // Normal safe release: every final report has already been acknowledged.
+  if (releaseQuiescentRun()) return true;
+
+  // Orphan fallback may discard still-pending final reports only after the prime and every
+  // bound terminal worker are themselves durably quiescent for the full grace period.
+  const prime = state.agents.find((agent) => agent.role === 'prime') ?? null;
+  if (!prime?.conversationId) return false;
+  const primeProof = await durableQuiescence(prime.conversationId, now);
+  if (!primeProof.quiescent) return false;
+  for (const worker of workers) {
+    if (!worker.conversationId) continue;
+    const proof = await durableQuiescence(worker.conversationId, now);
+    if (!proof.quiescent) return false;
+  }
+  if (currentRunId() !== runId || swarmTransferActive() || inFlightMcpRequests() > 0 || observationWritesInFlight > 0) return false;
+  return releaseQuiescentRun({
+    allowPendingReports: true,
+    reason: 'all workers are terminal and the run remained durably quiescent past the orphan grace period'
+  });
+}
+
 // -------------------------------------------------------------------- server
 
 /** Unsubscribes this module's swarm-end listener. Held so a restart cannot double it. */
 let dropSwarmEndListener: (() => void) | null = null;
+let staleSwarmTimer: NodeJS.Timeout | null = null;
 
 export async function startBridge(): Promise<number | null> {
-  installBridgeLiveness();
   if (server) return port;
   const instance = http.createServer((req, res) => {
     handle(req, res).catch((err: Error) => {
@@ -1089,6 +1292,11 @@ export async function startBridge(): Promise<number | null> {
         // calls the connector, which is the only place it can act from anyway.
         cancelWorkerCommands(reason);
       });
+      if (staleSwarmTimer) clearInterval(staleSwarmTimer);
+      staleSwarmTimer = setInterval(() => {
+        void sweepStaleSwarm().catch((err: Error) => logWarn(`stale swarm sweep failed: ${err.message}`));
+      }, STALE_SWARM_SWEEP_MS);
+      staleSwarmTimer.unref?.();
       // Anything restored from the previous run goes out now rather than waiting for a
       // browser to come and ask.
       deliver();
@@ -1112,6 +1320,8 @@ export async function stopBridge(): Promise<void> {
   }
   dropSwarmEndListener?.();
   dropSwarmEndListener = null;
+  if (staleSwarmTimer) clearInterval(staleSwarmTimer);
+  staleSwarmTimer = null;
   await new Promise<void>((resolve) => {
     instance.closeAllConnections();
     instance.close(() => resolve());
@@ -1155,6 +1365,10 @@ function queue(spec: CommandSpec): Command {
       // which is precisely the storm of duplicate chats this queue exists to prevent.
       existing.createdAt = Date.now();
       existing.claimedAt = null;
+      // Any page that redeemed the previous payload no longer owns the replacement. Current
+      // pages echo their document client on ACK, so a late result from that old payload is
+      // refused by /commands/ack rather than applied to this newer one.
+      existing.owner = null;
       if (existing.timer) clearTimeout(existing.timer);
       existing.timer = null;
       // A newer handoff for the same chat replaces the older one in place. The queued job
@@ -1754,7 +1968,6 @@ export function resetBridgeForTests(): void {
   commands = [];
   resetContinuationsForTests();
   sessionTokens.clear();
-  conversationSeen.clear();
   openInBrowser = null;
   lastSeenAt = null;
   extensionVersion = null;

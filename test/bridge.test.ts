@@ -9,7 +9,7 @@
 
 import http from 'node:http';
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
-import { APP_VERSION } from '../src/main/version.js';
+import { APP_VERSION, BRIDGE_PROTOCOL } from '../src/main/version.js';
 
 // safeStorage only exists inside a running Electron main process. The bridge stores
 // its bearer token through it, so the test provides the same interface, unencrypted.
@@ -35,19 +35,31 @@ const {
   restoreCommands,
   resumeJobFor,
   setBrowserOpener,
+  STALE_SWARM_MS,
   startBridge,
   stopBridge,
+  sweepStaleSwarm,
   unpair
 } = await import('../src/main/bridge.js');
 const { flushDurable, initDurableStore, readDurable, writeDurableSoon } = await import('../src/main/durable.js');
 const { createSession, getSession, initSessionStore, readEvents, resetSessionStoreForTests } = await import(
   '../src/main/session/store.js'
 );
-const { noteChatOrigin, recordToolCall, resetRecorderForTests } = await import('../src/main/session/recorder.js');
+const { closeConversation, noteChatOrigin, recordChatObservations, recordToolCall, resetRecorderForTests } = await import('../src/main/session/recorder.js');
 const { abortContinuation, attachSummary, continuationByToken, openContinuation } = await import(
   '../src/main/session/continuation.js'
 );
-const { bindConversation, mintWorkerJoinKey, spawn, pendingWorkerSpawns, resetSwarm, swarmState } = await import(
+const {
+  beginPrimeTransfer,
+  bindConversation,
+  cancelPrimeTransfer,
+  finishAgent,
+  mintWorkerJoinKey,
+  spawn,
+  pendingWorkerSpawns,
+  resetSwarm,
+  swarmState
+} = await import(
   '../src/main/agents.js'
 );
 const { makeTempDir, removeTempDir } = await import('./helpers.js');
@@ -228,7 +240,7 @@ describe('who is allowed to talk to it', () => {
     // Against the constant, not a literal: what matters is that the handshake reports the
     // build's own version, and a hard-coded number here only ever fails on release day.
     expect(reply.body.version).toBe(APP_VERSION);
-    expect(reply.body.bridge).toBe(4);
+    expect(reply.body.bridge).toBe(BRIDGE_PROTOCOL);
     expect(reply.body.paired).toBe(false);
     // Identification must not double as a status leak.
     expect(Object.keys(reply.body)).toEqual(['app', 'version', 'bridge', 'paired']);
@@ -351,7 +363,7 @@ describe('observations', () => {
         events: [
           { kind: 'user_message', time: Date.now(), text: 'first requirement', messageId: 'm1' },
           { kind: 'turn_start', time: Date.now(), turnId: 'turn-1' },
-          { kind: 'progress', time: Date.now(), text: 'reading files' },
+          { kind: 'assistant_message', time: Date.now(), text: 'reading files', renderedHtml: '<p><strong>reading</strong> files</p>', messageId: 'a1', state: 'streaming' },
           { kind: 'invented_kind', time: Date.now(), text: 'should be dropped' },
           { kind: 'turn_end', time: Date.now(), turnId: 'turn-1', outcome: 'not-a-real-outcome' }
         ]
@@ -365,7 +377,7 @@ describe('observations', () => {
       'session_start',
       'user_message',
       'turn_start',
-      'progress',
+      'assistant_message',
       'turn_end'
     ]);
     const end = events.at(-1)!;
@@ -379,11 +391,25 @@ describe('observations', () => {
     const reply = await request('POST', '/events', {
       body: {
         conversationId,
-        events: [{ kind: 'progress', time: Date.now() + 10 * 24 * 3600_000, text: 'from the future' }]
+        events: [{ kind: 'assistant_message', time: Date.now() + 10 * 24 * 3600_000, text: 'from the future', renderedHtml: '<p>from the future</p>', messageId: 'future-a', state: 'streaming' }]
       }
     });
-    const events = await readEvents(reply.body.sessionId, { kinds: ['progress'] });
+    const events = await readEvents(reply.body.sessionId, { kinds: ['assistant_message'] });
     expect(events[0]!.time).toBeLessThanOrEqual(Date.now() + 1000);
+  });
+
+  it('preserves ChatGPT creation times from an old chat instead of moving them to reload time', async () => {
+    await pair();
+    const conversationId = 'bbbbbbbb-cccc-dddd-eeee-ffffffffffff';
+    const historical = Date.now() - 90 * 24 * 3600_000;
+    const reply = await request('POST', '/events', {
+      body: {
+        conversationId,
+        events: [{ kind: 'assistant_message', time: historical, text: 'historical answer', messageId: 'historical-a', state: 'final', final: true }]
+      }
+    });
+    const events = await readEvents(reply.body.sessionId, { kinds: ['assistant_message'] });
+    expect(events[0]!.time).toBe(historical);
   });
 
   it('stores a message once when a reloaded tab reports it twice', async () => {
@@ -399,7 +425,7 @@ describe('observations', () => {
 
   it('refuses an over-sized body with an answer, not a reset connection', async () => {
     await pair();
-    const reply = await request('POST', '/events', { raw: 'x'.repeat(600 * 1024) });
+    const reply = await request('POST', '/events', { raw: 'x'.repeat(3 * 1024 * 1024) });
     expect(reply.status).toBe(413);
     expect(reply.body.error).toBe('body_too_large');
   });
@@ -413,6 +439,7 @@ describe('activity feed', () => {
     const conversationId = '99999999-8888-7777-6666-555555555555';
     await request('POST', '/events', {
       body: { conversationId, events: [
+          { kind: 'user_message', time: Date.now(), text: 'private user text stays out of the render anchor', messageId: 'user-anchor-42' },
           { kind: 'turn_start', time: Date.now(), turnId: 'turn-42' },
           { kind: 'page_tool', time: Date.now(), turnId: 'turn-42', text: 'Searched the web', messageId: 'native-1' },
           { kind: 'tool_block', time: Date.now(), turnId: 'turn-42', count: 1 }
@@ -426,6 +453,8 @@ describe('activity feed', () => {
       outcome: 'ok',
       durationMs: 30,
       startedAt: Date.now(),
+      requestId: 'wfr_bridge_patch',
+      conversationId,
       evidence: {
         changes: [{ path: '/project/src/main.ts', added: 18, removed: 4, approximate: false }],
         assets: [],
@@ -444,13 +473,16 @@ describe('activity feed', () => {
     expect(reply.body.entries).toHaveLength(1);
     const entry = reply.body.entries[0];
     expect(entry.turnId).toBe('turn-42');
-    expect(entry.attribution).toBe('turn');
+    expect(entry.attribution).toBe('request_id');
     expect(entry.summary.title).toBe('Edited src/main.ts');
     expect(entry.summary.metric).toBe('+18 −4');
     expect(entry.generating).toBeUndefined();
     expect(entry).not.toHaveProperty('args');
     expect(entry).not.toHaveProperty('argsTruncated');
     expect(entry).not.toHaveProperty('result');
+    expect(reply.body.userAnchors).toHaveLength(1);
+    expect(reply.body.userAnchors[0]).toMatchObject({ messageId: 'user-anchor-42' });
+    expect(reply.body.userAnchors[0]).not.toHaveProperty('text');
     expect(reply.body.stream.map((item: any) => item.kind)).toEqual(['turn_start', 'page_tool', 'tool_call']);
     expect(reply.body.stream[1]).toMatchObject({
       turnId: 'turn-42',
@@ -515,7 +547,9 @@ describe('activity feed', () => {
         content: [{ type: 'text', text: 'body' }],
         outcome: 'ok',
         durationMs: 2,
-        startedAt: Date.now()
+        startedAt: Date.now(),
+        requestId: `wfr_bridge_page_${i}`,
+        conversationId
       });
     }
     // A later user message is not rendered in the assistant stream, but it still advances
@@ -556,7 +590,9 @@ describe('activity feed', () => {
       // exercises the leak path that an otherwise-successful call would not touch.
       outcome: 'error',
       durationMs: 2,
-      startedAt: Date.now()
+      startedAt: Date.now(),
+      requestId: 'wfr_bridge_secret',
+      conversationId
     });
 
     const reply = await request('GET', `/activity?conversationId=${conversationId}&since=0`);
@@ -723,6 +759,42 @@ describe('delivering a bootstrap', () => {
     expect((await getSession(reply.body.sessionId))?.title).toBe('worker-1 · Rewrite the recorder fixture');
   });
 
+  it('rebuilds a worker origin from the durable broker binding if the recorder restarts before first observation', async () => {
+    await pair();
+    spawn({ workers: [{ task: 'Keep durable worker attribution' }], caller: { conversationId: PRIME_CHAT } });
+    const command = await redeem();
+    const conversationId = 'abababab-3434-5656-7878-909090909090';
+    await request('POST', '/commands/ack', {
+      body: { id: command.id, status: 'sent', conversationId }
+    });
+
+    // The ack retired its command after binding the worker, but the recorder had not created
+    // a session yet. Losing recorder memory here used to lose SessionOrigin permanently even
+    // though the swarm snapshot still held worker-1 + its task + this exact conversation.
+    resetRecorderForTests();
+    const reply = await request('POST', '/events', {
+      body: {
+        conversationId,
+        events: [
+          {
+            kind: 'user_message',
+            time: Date.now(),
+            text: 'Keep durable worker attribution',
+            messageId: 'boot-worker-after-recorder-restart'
+          }
+        ]
+      }
+    });
+    const summary = await getSession(reply.body.sessionId);
+    expect(summary?.origin).toEqual({
+      kind: 'worker',
+      fromSessionId: null,
+      agentId: 'worker-1',
+      task: 'Keep durable worker attribution'
+    });
+    expect(summary?.title).toBe('worker-1 · Keep durable worker attribution');
+  });
+
   /** A bootstrap that never reached a tab has no chat to name. */
   it('does not name anything for a failed acknowledgement', async () => {
     await pair();
@@ -818,7 +890,9 @@ describe('delivering a bootstrap', () => {
     expect(swarmState().agents.find((agent) => agent.id === 'worker-1')?.state).toBe('invited');
 
     await request('POST', '/commands/ack', {
-      body: { id: command.id, status: 'sent', conversationId, agent: 'worker-1' }
+      // Deliberately wrong. The worker slot comes from the app-owned command id, never from
+      // a page/body field that merely repeats what it was told.
+      body: { id: command.id, status: 'sent', conversationId, agent: 'worker-99' }
     });
 
     const worker = swarmState().agents.find((agent) => agent.id === 'worker-1')!;
@@ -826,6 +900,182 @@ describe('delivering a bootstrap', () => {
     expect(worker.conversationId).toBe(conversationId);
     expect(pendingCommands()).toEqual([]);
     expect(pendingWorkerSpawns()).toEqual([]);
+  });
+
+  it('refuses an acknowledgement from a document that does not own the redeemed command', async () => {
+    await pair();
+    spawn({ workers: [{ task: 'ownership audit' }], caller: { conversationId: PRIME_CHAT } });
+    const command = await redeem(undefined, 'owner-page');
+    const conversationId = 'abcdef12-3456-7890-abcd-ef1234567890';
+
+    const stale = await request('POST', '/commands/ack', {
+      body: {
+        id: command.id,
+        status: 'sent',
+        conversationId,
+        client: 'old-page'
+      }
+    });
+    expect(stale.status).toBe(409);
+    expect(pendingCommands().some((entry) => entry.id === command.id)).toBe(true);
+    expect(pendingWorkerSpawns().map((worker) => worker.id)).toEqual(['worker-1']);
+
+    const current = await request('POST', '/commands/ack', {
+      body: {
+        id: command.id,
+        status: 'sent',
+        conversationId,
+        client: 'owner-page'
+      }
+    });
+    expect(current.status).toBe(200);
+    expect(pendingCommands().some((entry) => entry.id === command.id)).toBe(false);
+  });
+
+  it('releases an active worker when the browser reports its final chat tab closed', async () => {
+    await pair();
+    spawn({ workers: [{ task: 'close lifecycle' }], caller: { conversationId: PRIME_CHAT } });
+    const command = await redeem();
+    const conversationId = 'fedcba98-7654-3210-fedc-ba9876543210';
+    await request('POST', '/commands/ack', {
+      body: { id: command.id, status: 'sent', conversationId, agent: 'worker-1' }
+    });
+    expect(swarmState().agents.find((agent) => agent.id === 'worker-1')?.state).toBe('active');
+
+    const closed = await request('POST', '/closed', { body: { conversationId } });
+    expect(closed.body.ok).toBe(true);
+    const worker = swarmState().agents.find((agent) => agent.id === 'worker-1')!;
+    expect(worker.state).toBe('failed');
+    expect(worker.result).toMatch(/closed/i);
+    expect(swarmState().running).toBe(true);
+  });
+
+  it('auto-finishes a one-shot worker when its settled assistant turn completes', async () => {
+    await pair();
+    spawn({ workers: [{ task: 'write the audit' }], caller: { conversationId: PRIME_CHAT } });
+    const command = await redeem();
+    const conversationId = 'beefbeef-7654-3210-fedc-ba9876543210';
+    await request('POST', '/commands/ack', {
+      body: { id: command.id, status: 'sent', conversationId, agent: 'worker-1' }
+    });
+    expect(swarmState().agents.find((agent) => agent.id === 'worker-1')?.state).toBe('active');
+
+    const now = Date.now();
+    const recorded = await request('POST', '/events', {
+      body: {
+        conversationId,
+        events: [
+          { kind: 'turn_start', time: now, turnId: 'g-worker-final' },
+          {
+            kind: 'assistant_message',
+            time: now + 1,
+            turnId: 'g-worker-final',
+            messageId: 'assistant:g-worker-final',
+            text: 'Final audit: request IDs are the authority and the slot is free now.',
+            final: true
+          },
+          { kind: 'turn_end', time: now + 2, turnId: 'g-worker-final', outcome: 'completed' }
+        ]
+      }
+    });
+    expect(recorded.status).toBe(200);
+    const worker = swarmState().agents.find((agent) => agent.id === 'worker-1')!;
+    expect(worker.state).toBe('finished');
+    expect(worker.result).toContain('Final audit: request IDs are the authority');
+  });
+
+  it('keeps an unacknowledged terminal run during the grace period, then releases it after durable quiescence', async () => {
+    spawn({ workers: [{ task: 'stale fallback proof' }], caller: { conversationId: PRIME_CHAT } });
+    const workerConversation = 'stale-worker-terminal';
+    expect(bindConversation('worker-1', workerConversation)).toBe(true);
+    const now = Date.now();
+    await recordChatObservations(PRIME_CHAT, [
+      { kind: 'turn_start', time: now, turnId: 'g-prime-stale' },
+      { kind: 'turn_end', time: now + 1, turnId: 'g-prime-stale', outcome: 'completed' }
+    ], 'prime');
+    await recordChatObservations(workerConversation, [
+      { kind: 'turn_start', time: now, turnId: 'g-worker-stale' },
+      { kind: 'turn_end', time: now + 1, turnId: 'g-worker-stale', outcome: 'completed' }
+    ], 'worker-1');
+    finishAgent({ conversationId: workerConversation }, 'worker finished, report still pending');
+    expect(swarmState().running).toBe(true);
+    expect(swarmState().agents.find((agent) => agent.role === 'prime')?.pending).toBe(1);
+
+    expect(await sweepStaleSwarm(now + STALE_SWARM_MS - 1)).toBe(false);
+    expect(swarmState().running).toBe(true);
+
+    expect(await sweepStaleSwarm(now + STALE_SWARM_MS + 5_000)).toBe(true);
+    expect(swarmState().running).toBe(false);
+  });
+
+  it('never stale-releases a run whose durable prime turn is still open', async () => {
+    spawn({ workers: [{ task: 'open turn veto' }], caller: { conversationId: PRIME_CHAT } });
+    const workerConversation = 'stale-worker-open-prime';
+    expect(bindConversation('worker-1', workerConversation)).toBe(true);
+    const now = Date.now();
+    await recordChatObservations(PRIME_CHAT, [
+      { kind: 'turn_start', time: now, turnId: 'g-prime-open' }
+    ], 'prime');
+    await recordChatObservations(workerConversation, [
+      { kind: 'turn_start', time: now, turnId: 'g-worker-done' },
+      { kind: 'turn_end', time: now + 1, turnId: 'g-worker-done', outcome: 'completed' }
+    ], 'worker-1');
+    finishAgent({ conversationId: workerConversation }, 'done while prime still works');
+
+    expect(await sweepStaleSwarm(now + STALE_SWARM_MS + 10_000)).toBe(false);
+    expect(swarmState().running).toBe(true);
+
+    await recordChatObservations(PRIME_CHAT, [
+      { kind: 'turn_end', time: now + 2, turnId: 'g-prime-open', outcome: 'completed' }
+    ], 'prime');
+    expect(await sweepStaleSwarm(now + STALE_SWARM_MS + 20_000)).toBe(true);
+    expect(swarmState().running).toBe(false);
+  });
+
+  it('stale-releases after page detach durably closes the exact active turn even if broker cleanup was lost', async () => {
+    spawn({ workers: [{ task: 'detach crash proof' }], caller: { conversationId: PRIME_CHAT } });
+    const workerConversation = 'stale-worker-prime-detached';
+    expect(bindConversation('worker-1', workerConversation)).toBe(true);
+    const now = Date.now();
+    await recordChatObservations(PRIME_CHAT, [
+      { kind: 'turn_start', time: now, turnId: 'g-prime-detached' }
+    ], 'prime');
+    // Simulate the crash window between the recorder persisting page detach and the bridge
+    // getting far enough to call primeConversationGone(). The durable turn_end must name the
+    // same turn or orphan recovery will reconstruct it as open forever after restart.
+    await closeConversation(PRIME_CHAT);
+    await recordChatObservations(workerConversation, [
+      { kind: 'turn_start', time: now, turnId: 'g-worker-detached' },
+      { kind: 'turn_end', time: now + 1, turnId: 'g-worker-detached', outcome: 'completed' }
+    ], 'worker-1');
+    finishAgent({ conversationId: workerConversation }, 'worker done before broker crash');
+
+    expect(await sweepStaleSwarm(now + STALE_SWARM_MS + 10_000)).toBe(true);
+    expect(swarmState().running).toBe(false);
+  });
+
+  it('defers stale release while Compact & Resume owns the prime transfer', async () => {
+    spawn({ workers: [{ task: 'transfer veto' }], caller: { conversationId: PRIME_CHAT } });
+    const workerConversation = 'stale-worker-transfer';
+    expect(bindConversation('worker-1', workerConversation)).toBe(true);
+    const now = Date.now();
+    await recordChatObservations(PRIME_CHAT, [
+      { kind: 'turn_start', time: now, turnId: 'g-prime-transfer' },
+      { kind: 'turn_end', time: now + 1, turnId: 'g-prime-transfer', outcome: 'completed' }
+    ], 'prime');
+    await recordChatObservations(workerConversation, [
+      { kind: 'turn_start', time: now, turnId: 'g-worker-transfer' },
+      { kind: 'turn_end', time: now + 1, turnId: 'g-worker-transfer', outcome: 'completed' }
+    ], 'worker-1');
+    finishAgent({ conversationId: workerConversation }, 'done before transfer');
+    expect(beginPrimeTransfer(PRIME_CHAT)).toBe(true);
+
+    expect(await sweepStaleSwarm(now + STALE_SWARM_MS + 10_000)).toBe(false);
+    expect(swarmState().running).toBe(true);
+
+    cancelPrimeTransfer(PRIME_CHAT);
+    expect(await sweepStaleSwarm(now + STALE_SWARM_MS + 20_000)).toBe(true);
+    expect(swarmState().running).toBe(false);
   });
 
   /**
@@ -1034,6 +1284,8 @@ describe('targeted open', () => {
     const chat = '33333333-4444-5555-6666-777777777777';
     const older = await compactedSession(chat, 'the older brief');
     const first = queueResume(older.sessionId, older.token)!;
+    const oldPage = await request('POST', '/commands/redeem', { body: { id: first.id, client: 'old-tab' } });
+    expect(oldPage.body.command.text).toContain('the older brief');
 
     // Pressing the button again is a second compaction of the same session, with its own
     // brief and its own one-time token. The first transaction ends where it stands.
@@ -1043,6 +1295,15 @@ describe('targeted open', () => {
 
     // One session is one queued replacement chat, however many times it is compacted.
     expect(second.id).toBe(first.id);
+    expect(pendingCommands()).toHaveLength(1);
+
+    // The old page may finish its send after the command has been replaced in place. It no
+    // longer owns this id, so its delayed ACK must not commit the newer continuation to the
+    // old page's conversation.
+    const stale = await request('POST', '/commands/ack', {
+      body: { id: second.id, status: 'sent', conversationId: chat, client: 'old-tab' }
+    });
+    expect(stale.status).toBe(409);
     expect(pendingCommands()).toHaveLength(1);
 
     const redeemed = await request('POST', '/commands/redeem', { body: { id: second.id, client: 'tab-1' } });
@@ -1117,6 +1378,33 @@ describe('targeted open', () => {
     expect((await request('POST', '/commands/redeem', { body: { id: 'not-a-command', client: 'tab-1' } })).status).toBe(
       404
     );
+  });
+
+  it('renews the command deadline when the opened page finally redeems it', async () => {
+    vi.useFakeTimers();
+    try {
+      setBrowserOpener(async (url) => {
+        opened.push(url);
+      });
+      await pair();
+      const { sessionId, token } = await compactedSession(
+        '44444444-5555-6666-7777-888888888888',
+        'the slow-start brief'
+      );
+      const command = queueResume(sessionId, token)!;
+
+      // Browser/ChatGPT startup consumes most of the original open-attempt deadline.
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect((await redeem(command.id, 'slow-tab')).text).toContain('the slow-start brief');
+
+      // content.js can still legitimately be waiting for the composer/conversation id here.
+      // The original timer would fire 30s after redeem despite `claimedAt` having been renewed.
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(pendingCommands().map((entry) => entry.what)).toEqual([`resume:${sessionId}`]);
+      expect(continuationByToken(token)?.state).not.toBe('aborted');
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
 

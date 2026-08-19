@@ -9,28 +9,33 @@
 
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
-import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from 'vitest';
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { defaultConfig, initConfigPath, saveConfig } from '../src/main/config.js';
 import { lineDelta, formatDelta } from '../src/main/diffstat.js';
 import { chunkText } from '../src/main/mcp/tools.js';
 import { emptyEvidence } from '../src/main/mcp/call-context.js';
 import {
+  awaitFreshCallOrigin,
   closeConversation,
+  freshCallOrigin,
   flushRecorder,
   liveConversations,
   noteChatOrigin,
   recordChatObservations,
   recordToolCall,
+  rebindConversation,
+  repairDeterministicAttribution,
   resetRecorderForTests,
   sessionForConversation,
-  setAgentBinder,
-  setBrowserReporterPresent,
-  soleGeneratingConversation
+  setAgentBinder
 } from '../src/main/session/recorder.js';
 import {
   appendEvent,
+  autoCompactionReady,
+  claimAutoCompaction,
   createSession,
   deleteSession,
+  endSession,
   flushSessions,
   getSession,
   initSessionStore,
@@ -41,14 +46,18 @@ import {
   readAsset,
   readEvents,
   readHandoff,
+  rebindSession,
   renameSession,
+  reopenSession,
   resetSessionStoreForTests,
   saveHandoff,
   sessionsRoot,
   unsetSessionRootForTests,
+  upsertMessageEvent,
   writeAsset
 } from '../src/main/session/store.js';
 import { summarizeToolCall } from '../src/main/session/summarize.js';
+import { HANDOFF_BRIEF_RULES, nativeHandoffPrompt } from '../src/main/session/handoff-prompt.js';
 import {
   estimateTokens,
   eventTokens,
@@ -84,6 +93,17 @@ beforeEach(() => {
 });
 
 const evidence = (patch: Partial<ReturnType<typeof emptyEvidence>> = {}) => ({ ...emptyEvidence(), ...patch });
+const legacyRecordChatObservations = recordChatObservations as unknown as (
+  conversationId: string,
+  observations: readonly unknown[],
+  agent?: string | null
+) => Promise<{ sessionId: string | null; stored: number }>;
+
+// Compile-only shims for the skipped 1.7 heuristic regression archive below. Production no
+// longer exports either API; keeping that block skipped is useful history without reviving
+// the dead ownership mechanisms just to satisfy TypeScript.
+const setBrowserReporterPresent = (_present: () => boolean): void => undefined;
+const soleGeneratingConversation = (): string | null => null;
 
 // ------------------------------------------------------------------- store
 
@@ -111,22 +131,30 @@ describe('session store', () => {
     expect(events.map((event) => event.kind)).toEqual(kinds);
   });
 
-  /**
-   * Written in the order it arrived, read back in the order it happened.
-   *
-   * These stopped being the same thing when tool calls began waiting to find out which
-   * chat they belonged to: a call can be appended after the page has already reported the
-   * answer it fed into. Every source stamps `time` from this machine's clock at the moment
-   * the thing happened, so that is what the order is taken from, and seq breaks ties.
-   */
-  it('reads events back in the order they happened, not the order they were written', async () => {
+  it('reorders late events only inside the durable turn that owns them', async () => {
     const summary = await createSession({ title: 'deferred append' });
-    await appendEvent(summary.id, { time: 5000, source: 'extension', kind: 'turn_end', outcome: 'completed' });
-    await appendEvent(summary.id, { time: 1000, source: 'mcp', kind: 'turn_start' });
+    await appendEvent(summary.id, { time: 1000, source: 'extension', kind: 'turn_start', turnId: 'g-order' });
+    await appendEvent(summary.id, {
+      time: 5000,
+      source: 'extension',
+      kind: 'progress',
+      turnId: 'g-order',
+      message: { text: 'later progress', truncated: false, chars: 14 }
+    });
+    // Arrived late, but logically happened between the two rows above.
+    await appendEvent(summary.id, {
+      time: 2000,
+      source: 'extension',
+      kind: 'progress',
+      turnId: 'g-order',
+      message: { text: 'earlier progress', truncated: false, chars: 16 }
+    });
+    await appendEvent(summary.id, { time: 6000, source: 'extension', kind: 'turn_end', turnId: 'g-order', outcome: 'completed' });
     const events = await readEvents(summary.id);
-    expect(events.map((event) => event.kind)).toEqual(['turn_start', 'turn_end']);
-    // The file itself is untouched: seq is still append order, and still what paging uses.
-    expect(events[0]!.seq).toBeGreaterThan(events[1]!.seq);
+    expect(events.map((event) => event.kind)).toEqual(['turn_start', 'progress', 'progress', 'turn_end']);
+    expect(events.slice(1, 3).map((event) => event.time)).toEqual([2000, 5000]);
+    // The JSONL stays append-only: the logically earlier progress still has the later seq.
+    expect(events[1]!.seq).toBeGreaterThan(events[2]!.seq);
   });
 
   it('keeps a session from ageing backwards when a call is written late', async () => {
@@ -154,6 +182,219 @@ describe('session store', () => {
     expect(await readEvents(summary.id, { limit: 2 })).toHaveLength(2);
   });
 
+  it('never downgrades a final canonical message when a stale streaming snapshot arrives later', async () => {
+    const summary = await createSession({ title: 'terminal canonical final' });
+    const messageId = 'msg-terminal-final';
+    const final = await upsertMessageEvent(summary.id, {
+      time: 100,
+      source: 'extension',
+      kind: 'assistant_message',
+      messageId,
+      message: { text: 'Complete answer.', truncated: false, chars: 16 },
+      renderedHtml: { text: '<p><strong>Complete</strong> answer.</p>', truncated: false, chars: 40 },
+      state: 'final',
+      final: true
+    });
+    const stale = await upsertMessageEvent(summary.id, {
+      time: 120,
+      source: 'extension',
+      kind: 'assistant_message',
+      messageId,
+      message: { text: 'Complete', truncated: false, chars: 8 },
+      renderedHtml: { text: '<p>Complete</p>', truncated: false, chars: 15 },
+      state: 'streaming',
+      final: false
+    });
+
+    expect(stale.changed).toBe(false);
+    expect(stale.event.seq).toBe(final.event.seq);
+    const [stored] = await readEvents(summary.id, { kinds: ['assistant_message'] });
+    expect(stored?.kind === 'assistant_message' && stored.final).toBe(true);
+    expect(stored?.kind === 'assistant_message' && stored.message.text).toBe('Complete answer.');
+  });
+
+  it('keeps rich HTML when the same canonical prose is reobserved without rendered HTML', async () => {
+    const summary = await createSession({ title: 'sparse rich final' });
+    const messageId = 'msg-sparse-rich';
+    const message = { text: 'Bold answer', truncated: false, chars: 11 };
+    await upsertMessageEvent(summary.id, {
+      time: 200,
+      source: 'extension',
+      kind: 'assistant_message',
+      messageId,
+      message,
+      renderedHtml: { text: '<p><strong>Bold</strong> answer</p>', truncated: false, chars: 35 },
+      state: 'final',
+      final: true
+    });
+    const repeated = await upsertMessageEvent(summary.id, {
+      time: 220,
+      source: 'extension',
+      kind: 'assistant_message',
+      messageId,
+      message,
+      state: 'final',
+      final: true
+    });
+
+    expect(repeated.changed).toBe(false);
+    expect(repeated.event.kind === 'assistant_message' && repeated.event.renderedHtml?.text).toBe(
+      '<p><strong>Bold</strong> answer</p>'
+    );
+    expect(await readEvents(summary.id, { kinds: ['assistant_message'] })).toHaveLength(1);
+  });
+
+  it('revises one canonical row only when the website logical identity is the same', async () => {
+    const summary = await createSession({ title: 'stable website identity' });
+    const turnId = 'g-stream-growth';
+    const logicalId = 'thought-website-parent';
+    const snapshots = [
+      'Eight calls in, still zero writes.',
+      'Eight calls in, still zero writes. The repo was already very',
+      'Eight calls in, still zero writes. The repo was already very dirty before this check.'
+    ];
+
+    for (let index = 0; index < snapshots.length; index++) {
+      const text = snapshots[index]!;
+      await upsertMessageEvent(summary.id, {
+        time: 100 + index,
+        source: 'extension',
+        kind: 'assistant_message',
+        turnId,
+        messageId: logicalId,
+        message: { text, truncated: false, chars: text.length },
+        state: index === snapshots.length - 1 ? 'final' : 'streaming',
+        final: index === snapshots.length - 1
+      });
+    }
+
+    const messages = await readEvents(summary.id, { kinds: ['assistant_message'] });
+    expect(messages).toHaveLength(1);
+    expect(messages[0]?.kind === 'assistant_message' && messages[0].messageId).toBe(logicalId);
+    expect(messages[0]?.kind === 'assistant_message' && messages[0].message.text).toBe(snapshots.at(-1));
+    expect(messages[0]?.kind === 'assistant_message' && messages[0].state).toBe('final');
+  });
+
+  it('keeps the first sequence as the origin of a revised stable user message', async () => {
+    const summary = await createSession({ title: 'stable user boundary' });
+    const message = { text: 'the user turn boundary', truncated: false, chars: 22 };
+    const first = await upsertMessageEvent(summary.id, {
+      time: 100,
+      source: 'extension',
+      kind: 'user_message',
+      turnId: 'page-user-before',
+      messageId: 'user-stable-boundary',
+      message
+    });
+    const revised = await upsertMessageEvent(summary.id, {
+      time: 200,
+      source: 'extension',
+      kind: 'user_message',
+      turnId: 'page-user-after',
+      messageId: 'user-stable-boundary',
+      message
+    });
+
+    expect(revised.changed).toBe(true);
+    expect(first.event.kind === 'user_message' && first.event.origin).toBe(first.event.seq);
+    expect(revised.event.kind === 'user_message' && revised.event.origin).toBe(first.event.seq);
+    expect(revised.event.seq).toBeGreaterThan(first.event.seq);
+    const stored = await readEvents(summary.id, { kinds: ['user_message'] });
+    expect(stored).toHaveLength(1);
+    expect(stored[0]?.kind === 'user_message' && stored[0].origin).toBe(first.event.seq);
+  });
+
+  it('never merges distinct website identities merely because their prose is a prefix continuation', async () => {
+    const summary = await createSession({ title: 'distinct website identities' });
+    const turnId = 'g-distinct-prefix';
+    const first = 'First checkpoint.';
+    const second = 'First checkpoint. Second checkpoint.';
+
+    for (const [messageId, text] of [
+      ['thought-parent-a', first],
+      ['thought-parent-b', second]
+    ] as const) {
+      await upsertMessageEvent(summary.id, {
+        time: Date.now(),
+        source: 'extension',
+        kind: 'assistant_message',
+        turnId,
+        messageId,
+        message: { text, truncated: false, chars: text.length },
+        state: 'streaming',
+        final: false
+      });
+    }
+
+    const messages = await readEvents(summary.id, { kinds: ['assistant_message'] });
+    expect(messages).toHaveLength(2);
+    expect(messages.map((event) => event.kind === 'assistant_message' && event.messageId)).toEqual([
+      'thought-parent-a',
+      'thought-parent-b'
+    ]);
+  });
+
+  it('does not merge separate streaming commentary that merely shares a turn', async () => {
+    const summary = await createSession({ title: 'separate streaming commentary' });
+    const turnId = 'g-separate-commentary';
+    for (const [messageId, text] of [
+      ['comment-a', 'First three are clean; continuing the checks.'],
+      ['comment-b', 'Eight calls in; still zero writes.']
+    ] as const) {
+      await upsertMessageEvent(summary.id, {
+        time: Date.now(),
+        source: 'extension',
+        kind: 'assistant_message',
+        turnId,
+        messageId,
+        message: { text, truncated: false, chars: text.length },
+        state: 'streaming',
+        final: false
+      });
+    }
+
+    const messages = await readEvents(summary.id, { kinds: ['assistant_message'] });
+    expect(messages).toHaveLength(2);
+    expect(messages.map((event) => event.kind === 'assistant_message' && event.message.text)).toEqual([
+      'First three are clean; continuing the checks.',
+      'Eight calls in; still zero writes.'
+    ]);
+  });
+
+  it('keeps a settled raw website id distinct from a different provisional id', async () => {
+    const summary = await createSession({ title: 'different id at final' });
+    const turnId = 'g-stream-final-remount';
+    const text = 'The completed answer is already fully visible.';
+    await upsertMessageEvent(summary.id, {
+      time: 100,
+      source: 'extension',
+      kind: 'assistant_message',
+      turnId,
+      messageId: 'raw-streaming',
+      message: { text, truncated: false, chars: text.length },
+      state: 'streaming',
+      final: false
+    });
+    await upsertMessageEvent(summary.id, {
+      time: 110,
+      source: 'extension',
+      kind: 'assistant_message',
+      turnId,
+      messageId: 'raw-final-remount',
+      message: { text, truncated: false, chars: text.length },
+      state: 'final',
+      final: true
+    });
+
+    const messages = await readEvents(summary.id, { kinds: ['assistant_message'] });
+    expect(messages).toHaveLength(2);
+    expect(messages.map((event) => event.kind === 'assistant_message' && event.messageId)).toEqual([
+      'raw-streaming',
+      'raw-final-remount'
+    ]);
+    expect(messages[1]?.kind === 'assistant_message' && messages[1].state).toBe('final');
+  });
+
   it('keeps running counters and a token estimate on the summary', async () => {
     const summary = await createSession({ title: 'counters' });
     await appendEvent(summary.id, {
@@ -175,6 +416,37 @@ describe('session store', () => {
     expect(after?.errors).toBe(1);
     expect(after?.lastTurnOutcome).toBe('interrupted');
     expect(after?.estimatedTokens).toBeGreaterThanOrEqual(100);
+  });
+
+  it('does not advance seq or summary state when the durable append fails', async () => {
+    const summary = await createSession({ title: 'append failure is not an event' });
+    const append = vi.spyOn(fs, 'appendFile').mockRejectedValueOnce(new Error('disk full'));
+    try {
+      await expect(
+        appendEvent(summary.id, {
+          time: 10,
+          source: 'extension',
+          kind: 'user_message',
+          message: { text: 'phantom', truncated: false, chars: 7 }
+        })
+      ).rejects.toThrow('disk full');
+    } finally {
+      append.mockRestore();
+    }
+
+    const afterFailure = await getSession(summary.id);
+    expect(afterFailure?.events).toBe(0);
+    expect(afterFailure?.userMessages).toBe(0);
+    expect(await readEvents(summary.id)).toHaveLength(0);
+
+    const written = await appendEvent(summary.id, {
+      time: 11,
+      source: 'extension',
+      kind: 'user_message',
+      message: { text: 'real', truncated: false, chars: 4 }
+    });
+    expect(written.seq).toBe(1);
+    expect((await getSession(summary.id))?.events).toBe(1);
   });
 
   it('skips a torn final line and keeps appending after it', async () => {
@@ -236,6 +508,194 @@ describe('session store', () => {
     expect(files).toHaveLength(1);
     expect(await readAsset(summary.id, first.id)).toEqual(png);
     expect(await readAsset(summary.id, '../../../config.json')).toBeNull();
+  });
+
+  it('arms automatic compaction only on a real below-to-above threshold crossing', async () => {
+    const base = defaultConfig();
+    await saveConfig({ ...base, compaction: { ...base.compaction, auto: true, autoTokens: 10_000 } });
+    try {
+      const summary = await createSession({ title: 'auto edge', conversationId: 'conv-auto-edge' });
+      await appendEvent(summary.id, {
+        time: 1,
+        source: 'extension',
+        kind: 'user_message',
+        messageId: 'u1',
+        message: { text: 'a'.repeat(30_000), truncated: false, chars: 30_000 }
+      });
+      expect(autoCompactionReady(await getSession(summary.id))).toBe(false);
+
+      await appendEvent(summary.id, { time: 2, source: 'extension', kind: 'turn_start', turnId: 't-edge' });
+      await appendEvent(summary.id, {
+        time: 3,
+        source: 'extension',
+        kind: 'user_message',
+        messageId: 'u2',
+        turnId: 't-edge',
+        message: { text: 'b'.repeat(12_000), truncated: false, chars: 12_000 }
+      });
+      let current = await getSession(summary.id);
+      expect(current?.autoCompactThreshold).toBe(10_000);
+      expect(current?.autoCompactArmedAt).toBe(3);
+      expect(current?.autoCompactReadyAt).toBeNull();
+
+      await appendEvent(summary.id, { time: 4, source: 'extension', kind: 'turn_end', turnId: 't-edge', outcome: 'completed' });
+      current = await getSession(summary.id);
+      expect(autoCompactionReady(current)).toBe(true);
+      expect(current?.autoCompactReadyAt).toBe(4);
+      expect(await claimAutoCompaction(summary.id, 'conv-auto-edge')).toBe(true);
+      expect(await claimAutoCompaction(summary.id, 'conv-auto-edge')).toBe(false);
+      expect((await getSession(summary.id))?.autoCompactTriggeredAt).not.toBeNull();
+    } finally {
+      await saveConfig(base);
+    }
+  });
+
+  it('never makes a stopped crossing ready, even if a final assistant snapshot arrived first', async () => {
+    const base = defaultConfig();
+    await saveConfig({ ...base, compaction: { ...base.compaction, auto: true, autoTokens: 10_000 } });
+    try {
+      const summary = await createSession({ title: 'stopped auto edge', conversationId: 'conv-auto-stopped' });
+      await appendEvent(summary.id, {
+        time: 1,
+        source: 'extension',
+        kind: 'user_message',
+        messageId: 'before',
+        message: { text: 'a'.repeat(30_000), truncated: false, chars: 30_000 }
+      });
+      await appendEvent(summary.id, { time: 2, source: 'extension', kind: 'turn_start', turnId: 't-stop' });
+      await appendEvent(summary.id, {
+        time: 3,
+        source: 'extension',
+        kind: 'user_message',
+        messageId: 'cross',
+        turnId: 't-stop',
+        message: { text: 'b'.repeat(12_000), truncated: false, chars: 12_000 }
+      });
+      await appendEvent(summary.id, {
+        time: 4,
+        source: 'extension',
+        kind: 'assistant_message',
+        messageId: 'a-stop',
+        turnId: 't-stop',
+        message: { text: 'Looks final for a moment.', truncated: false, chars: 25 },
+        state: 'final',
+        final: true
+      });
+      expect(autoCompactionReady(await getSession(summary.id))).toBe(false);
+
+      // An unrelated completion cannot release this edge either.
+      await appendEvent(summary.id, { time: 5, source: 'extension', kind: 'turn_end', turnId: 't-other', outcome: 'completed' });
+      expect(autoCompactionReady(await getSession(summary.id))).toBe(false);
+
+      await appendEvent(summary.id, { time: 6, source: 'extension', kind: 'turn_end', turnId: 't-stop', outcome: 'stopped' });
+      const current = await getSession(summary.id);
+      expect(autoCompactionReady(current)).toBe(false);
+      expect(current?.autoCompactArmedAt).toBeNull();
+      expect(current?.autoCompactReadyAt).toBeNull();
+      expect(current?.autoCompactTurnId).toBeNull();
+    } finally {
+      await saveConfig(base);
+    }
+  });
+
+  it('does not turn stale transcript hydration into a live automatic crossing', async () => {
+    const base = defaultConfig();
+    await saveConfig({ ...base, compaction: { ...base.compaction, auto: true, autoTokens: 10_000 } });
+    try {
+      const summary = await createSession({ title: 'hydrated stale chat', conversationId: 'conv-hydrated-stale' });
+      await appendEvent(summary.id, {
+        time: 1,
+        source: 'extension',
+        kind: 'user_message',
+        messageId: 'historic-user',
+        message: { text: 'x'.repeat(44_000), truncated: false, chars: 44_000 }
+      });
+      await appendEvent(summary.id, {
+        time: 2,
+        source: 'extension',
+        kind: 'assistant_message',
+        messageId: 'historic-answer',
+        message: { text: 'old settled answer', truncated: false, chars: 18 },
+        state: 'final',
+        final: true
+      });
+      let current = await getSession(summary.id);
+      expect(current?.contextTokens).toBeGreaterThan(10_000);
+      expect(autoCompactionReady(current)).toBe(false);
+      expect(current?.autoCompactArmedAt).toBeNull();
+
+      // Even a later clean turn while the chat remains above the line is not a new crossing.
+      await appendEvent(summary.id, { time: 3, source: 'extension', kind: 'turn_start', turnId: 't-later' });
+      await appendEvent(summary.id, { time: 4, source: 'extension', kind: 'turn_end', turnId: 't-later', outcome: 'completed' });
+      current = await getSession(summary.id);
+      expect(autoCompactionReady(current)).toBe(false);
+      expect(current?.autoCompactReadyAt).toBeNull();
+    } finally {
+      await saveConfig(base);
+    }
+  });
+
+  it('does not synthesize an automatic crossing when an old chat is already above the threshold', async () => {
+    const base = defaultConfig();
+    await saveConfig({ ...base, compaction: { ...base.compaction, auto: false, autoTokens: 10_000 } });
+    try {
+      const summary = await createSession({ title: 'stale high chat', conversationId: 'conv-stale-high' });
+      await appendEvent(summary.id, {
+        time: 1,
+        source: 'extension',
+        kind: 'user_message',
+        messageId: 'old',
+        message: { text: 'x'.repeat(44_000), truncated: false, chars: 44_000 }
+      });
+      expect((await getSession(summary.id))?.contextTokens).toBeGreaterThan(10_000);
+
+      // Turning automatic compaction on, opening the chat, or writing another message while
+      // already above the line is still not a threshold crossing.
+      await saveConfig({ ...base, compaction: { ...base.compaction, auto: true, autoTokens: 10_000 } });
+      await appendEvent(summary.id, {
+        time: 2,
+        source: 'extension',
+        kind: 'user_message',
+        messageId: 'new',
+        message: { text: 'still here', truncated: false, chars: 10 }
+      });
+      const current = await getSession(summary.id);
+      expect(autoCompactionReady(current)).toBe(false);
+      expect(current?.autoCompactArmedAt).toBeNull();
+      expect(current?.autoCompactReadyAt).toBeNull();
+    } finally {
+      await saveConfig(base);
+    }
+  });
+
+  it('forgets an unclaimed automatic edge when a genuinely closed chat is reopened later', async () => {
+    const base = defaultConfig();
+    await saveConfig({ ...base, compaction: { ...base.compaction, auto: true, autoTokens: 10_000 } });
+    try {
+      const summary = await createSession({ title: 'stale ready edge', conversationId: 'conv-stale-ready' });
+      await appendEvent(summary.id, { time: 1, source: 'extension', kind: 'turn_start', turnId: 't-ready' });
+      await appendEvent(summary.id, {
+        time: 2,
+        source: 'extension',
+        kind: 'user_message',
+        messageId: 'cross-ready',
+        turnId: 't-ready',
+        message: { text: 'r'.repeat(44_000), truncated: false, chars: 44_000 }
+      });
+      await appendEvent(summary.id, { time: 3, source: 'extension', kind: 'turn_end', turnId: 't-ready', outcome: 'completed' });
+      expect(autoCompactionReady(await getSession(summary.id))).toBe(true);
+
+      await endSession(summary.id);
+      await reopenSession(summary.id);
+      const reopened = await getSession(summary.id);
+      expect(autoCompactionReady(reopened)).toBe(false);
+      expect(reopened?.autoCompactThreshold).toBeNull();
+      expect(reopened?.autoCompactReadyAt).toBeNull();
+      expect(reopened?.autoCompactTurnId).toBeNull();
+      expect(await claimAutoCompaction(summary.id, 'conv-stale-ready')).toBe(false);
+    } finally {
+      await saveConfig(base);
+    }
   });
 });
 
@@ -333,11 +793,30 @@ describe('handoff storage', () => {
   it('returns one part when the brief already fits', () => {
     expect(chunkText('short brief', 1000)).toEqual(['short brief']);
   });
+
+  it('asks for user-authoritative handoffs up to the documented 30k-token ceiling', () => {
+    const prompt = nativeHandoffPrompt();
+    expect(prompt).toContain(HANDOFF_BRIEF_RULES);
+    expect(prompt).toMatch(/user's messages as the highest-authority source/i);
+    expect(prompt).toMatch(/10,000[–-]30,000 tokens/i);
+    expect(prompt).toMatch(/~6,000-token brief is normally too short/i);
+    expect(prompt).toMatch(/Never exceed 30,000 tokens/i);
+    expect(prompt).toMatch(/lossless operational compression/i);
+    expect(prompt).toMatch(/failure.*root cause.*change.*verification/i);
+    expect(prompt).toMatch(/PLANNED \/ DECIDED/i);
+    expect(prompt).toMatch(/FAILED \/ UNRESOLVED/i);
+    expect(prompt).toMatch(/VERIFICATION/i);
+    expect(prompt).toMatch(/completed and verified/i);
+  });
 });
 
 // ---------------------------------------------------------------- recorder
 
-describe('recorder', () => {
+describe.skip('legacy recorder heuristics removed in 1.8', () => {
+  // Historical fixtures below intentionally contain browser observation kinds 1.8 no longer
+  // accepts. Keep the archive compileable without widening the production ChatObservation
+  // contract back to progress/tool_block/turn_state.
+  const recordChatObservations = legacyRecordChatObservations;
   it('records nothing at all while recording is switched off', async () => {
     const before = (await listSessions()).length;
     await enableRecording(false);
@@ -404,6 +883,65 @@ describe('recorder', () => {
     expect(last.kind === 'progress' && last.message.text).toBe(
       'Checking the README and will report only the heading plus one sentence.'
     );
+  });
+
+  it('forks a reused DOM progress id when ChatGPT starts a genuinely new caption', async () => {
+    const sessionId = await sessionForConversation('conv-reused-progress-root');
+    const now = Date.now();
+    await recordChatObservations('conv-reused-progress-root', [
+      { kind: 'turn_start', time: now, turnId: 'turn-reused-progress-root' },
+      {
+        kind: 'progress',
+        time: now + 1,
+        turnId: 'turn-reused-progress-root',
+        text: 'Inspecting session attribution',
+        progressId: 'turn-reused-progress-root#p0'
+      },
+      {
+        // Same DOM root, much later, completely different logical commentary. This is the
+        // live shape that put "Inspection finished…" at the beginning of a 15 minute turn.
+        kind: 'progress',
+        time: now + 15_000,
+        turnId: 'turn-reused-progress-root',
+        text: 'Inspection finished, no files modified. The ranked',
+        progressId: 'turn-reused-progress-root#p0'
+      },
+      {
+        kind: 'progress',
+        time: now + 15_001,
+        turnId: 'turn-reused-progress-root',
+        text: 'Inspection finished, no files modified. The ranked critique is ready.',
+        progressId: 'turn-reused-progress-root#p0'
+      }
+    ]);
+
+    const stored = await readEvents(sessionId!, { kinds: ['progress'] });
+    expect(stored).toHaveLength(3);
+    expect(stored[0]!.kind === 'progress' && stored[0]!.progressId).toBe('turn-reused-progress-root#p0');
+    expect(stored[1]!.kind === 'progress' && stored[1]!.progressId).not.toBe('turn-reused-progress-root#p0');
+    expect(stored[1]!.kind === 'progress' && stored[1]!.origin).toBeUndefined();
+    expect(stored[2]!.kind === 'progress' && stored[2]!.origin).toBe(stored[1]!.seq);
+    expect(stored[1]!.time).toBe(now + 15_000);
+  });
+
+  it('restores the newest still-open generation after the recorder restarts', async () => {
+    const now = Date.now();
+    const before = await sessionForConversation('conv-open-after-restart');
+    await recordChatObservations('conv-open-after-restart', [
+      { kind: 'turn_start', time: now, turnId: 'g-old-document-1' }
+    ]);
+    expect(liveConversations().find((entry) => entry.conversationId === 'conv-open-after-restart')?.activeTurnId).toBe(
+      'g-old-document-1'
+    );
+
+    // Memory is gone; the durable session remains. A replacement content script must be
+    // handed the old document's generation id instead of minting a second one.
+    resetRecorderForTests();
+    const after = await sessionForConversation('conv-open-after-restart');
+    expect(after).toBe(before);
+    const restored = liveConversations().find((entry) => entry.conversationId === 'conv-open-after-restart');
+    expect(restored?.generating).toBe(true);
+    expect(restored?.activeTurnId).toBe('g-old-document-1');
   });
 
   it('attributes a tool call to the conversation whose page showed the tool block', async () => {
@@ -602,6 +1140,411 @@ describe('recorder', () => {
     expect(callTwo?.attribution).toBe('turn');
     expect(await readEvents(first!, { kinds: ['tool_call'] })).toHaveLength(1);
     expect(await readEvents(second!, { kinds: ['tool_call'] })).toHaveLength(1);
+  });
+
+  /**
+   * Live 1.8 regression: ChatGPT reuses one request_id for every connector request in a
+   * single assistant turn. The second message/tool under that key is more evidence for the
+   * same owner, not a contradiction. Treating it as a per-call id split a fresh chat after
+   * its first few calls and sent the rest to Unattributed activity.
+   */
+  it('keeps a turn-level request id owned when later calls in the same chat have different messages and tools', async () => {
+    const now = Date.now();
+    const conversationId = 'conv-shared-turn-request';
+    const requestId = 'wfr_shared_turn';
+    const sessionId = await sessionForConversation(conversationId);
+    const unattributedBefore =
+      (await listSessions()).find((entry) => entry.title === 'Unattributed activity')?.toolCalls ?? 0;
+
+    await recordChatObservations(conversationId, [
+      { kind: 'turn_start', time: now, turnId: 'turn-shared-request' },
+      {
+        kind: 'tool_evidence',
+        time: now,
+        turnId: 'turn-shared-request',
+        calls: [{ messageId: 'msg-read', tool: 'read', order: 0, answered: true, requestId }]
+      }
+    ]);
+    const first = await recordToolCall({
+      tool: 'read',
+      args: { paths: ['/project/a.ts'] },
+      content: [{ type: 'text', text: 'ok' }],
+      outcome: 'ok',
+      durationMs: 1,
+      startedAt: now + 1,
+      requestId
+    });
+
+    await recordChatObservations(conversationId, [
+      {
+        kind: 'tool_evidence',
+        time: now + 2,
+        turnId: 'turn-shared-request',
+        calls: [{ messageId: 'msg-exec', tool: 'exec_command', order: 1, answered: false, requestId }]
+      }
+    ]);
+    expect(freshCallOrigin('exec_command', now + 2, requestId)).toBe(conversationId);
+
+    const second = await recordToolCall({
+      tool: 'exec_command',
+      args: { cmd: 'rg foo' },
+      content: [{ type: 'text', text: 'ok' }],
+      outcome: 'ok',
+      durationMs: 1,
+      startedAt: now + 3,
+      requestId
+    });
+
+    expect(first?.conversationId).toBe(conversationId);
+    expect(second?.conversationId).toBe(conversationId);
+    expect(await readEvents(sessionId!, { kinds: ['tool_call'] })).toHaveLength(2);
+    const unattributedAfter =
+      (await listSessions()).find((entry) => entry.title === 'Unattributed activity')?.toolCalls ?? 0;
+    expect(unattributedAfter).toBe(unattributedBefore);
+  });
+  it('does not substitute another chat’s agents request while an exact HTTP request id is still waiting', async () => {
+    const now = Date.now();
+    await sessionForConversation('conv-prime');
+    await sessionForConversation('conv-worker');
+
+    await recordChatObservations('conv-worker', [
+      { kind: 'turn_start', time: now, turnId: 'turn-worker' },
+      {
+        kind: 'tool_evidence',
+        time: now,
+        turnId: 'turn-worker',
+        calls: [
+          {
+            messageId: 'worker-agents',
+            tool: 'agents',
+            order: 0,
+            answered: false,
+            requestId: 'wfr_worker',
+            createTime: now / 1000
+          }
+        ]
+      }
+    ]);
+
+    // This MCP call says it is wfr_prime. Seeing a worker agents request nearby must not
+    // turn the prime into worker-1 while the prime page is one observation tick late.
+    expect(freshCallOrigin('agents', now, 'wfr_prime')).toBeNull();
+
+    const waiting = awaitFreshCallOrigin('agents', now, 1_000, { requestId: 'wfr_prime' });
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    await recordChatObservations('conv-prime', [
+      { kind: 'turn_start', time: now + 10, turnId: 'turn-prime' },
+      {
+        kind: 'tool_evidence',
+        time: now + 10,
+        turnId: 'turn-prime',
+        calls: [
+          {
+            messageId: 'prime-agents',
+            tool: 'agents',
+            order: 0,
+            answered: false,
+            requestId: 'wfr_prime',
+            createTime: (now + 10) / 1000
+          }
+        ]
+      }
+    ]);
+
+    expect(await waiting).toBe('conv-prime');
+  });
+
+  it('leaves an unmatched HTTP-id call unattributed instead of borrowing another chat’s evidence', async () => {
+    const now = Date.now();
+    const worker = await sessionForConversation('conv-worker-only');
+    await recordChatObservations('conv-worker-only', [
+      { kind: 'turn_start', time: now, turnId: 'turn-worker-only' },
+      {
+        kind: 'tool_evidence',
+        time: now,
+        turnId: 'turn-worker-only',
+        calls: [
+          {
+            messageId: 'worker-read',
+            tool: 'read',
+            order: 0,
+            answered: false,
+            requestId: 'wfr_worker_read',
+            createTime: now / 1000
+          }
+        ]
+      }
+    ]);
+
+    const workerBefore = (await readEvents(worker!, { kinds: ['tool_call'] })).length;
+    const call = await recordToolCall({
+      tool: 'read',
+      args: { paths: ['/project/a.ts'] },
+      content: [{ type: 'text', text: 'ok' }],
+      outcome: 'ok',
+      durationMs: 1,
+      startedAt: now,
+      requestId: 'wfr_prime_read'
+    });
+
+    expect(call?.attribution).toBe('inferred');
+    expect((await readEvents(worker!, { kinds: ['tool_call'] })).length).toBe(workerBefore);
+    const unattributed = (await listSessions()).find((entry) => entry.title === 'Unattributed activity');
+    expect(unattributed?.toolCalls).toBeGreaterThan(0);
+  });
+
+  it('repairs an old unattributed bucket once every call has the same proven request-id owner', async () => {
+    const now = Date.now();
+    const conversationId = 'conv-repair';
+    const requestId = 'wfr-repair';
+    const target = await sessionForConversation(conversationId);
+    await recordChatObservations(conversationId, [
+      {
+        kind: 'tool_evidence',
+        time: now,
+        calls: [
+          {
+            messageId: 'msg-repair',
+            tool: 'read',
+            order: 0,
+            answered: false,
+            requestId,
+            createTime: now / 1000
+          }
+        ]
+      }
+    ]);
+
+    const source = await createSession({ title: 'Unattributed activity' });
+    await appendEvent(source.id, {
+      time: now,
+      source: 'app',
+      kind: 'session_start',
+      conversationId: null,
+      title: source.title
+    });
+    const image = await writeAsset(source.id, Buffer.from('fake image bytes'), 'image/png');
+    await appendEvent(source.id, {
+      time: now + 1,
+      source: 'mcp',
+      kind: 'tool_call',
+      call: {
+        callId: 'call-repair',
+        tool: 'read',
+        attribution: 'unattributed',
+        requestId,
+        conversationId: null,
+        attributionMethod: 'unattributed',
+        args: { text: '{}', truncated: false, chars: 2 },
+        result: { text: 'ok', truncated: false, chars: 2 },
+        outcome: 'ok',
+        durationMs: 1,
+        summary: { kind: 'read', tone: 'neutral', title: 'Read repair fixture' },
+        assets: [image]
+      }
+    });
+
+    expect(await repairDeterministicAttribution()).toEqual({ sessions: 1, calls: 1 });
+    expect(await getSession(source.id)).toBeNull();
+
+    const repaired = await readEvents(target!, { kinds: ['tool_call'] });
+    expect(repaired).toHaveLength(1);
+    expect(repaired[0]?.kind === 'tool_call' && repaired[0].call).toMatchObject({
+      callId: 'call-repair',
+      requestId,
+      conversationId,
+      attribution: 'request_id',
+      attributionMethod: 'request_id'
+    });
+    expect(await readAsset(target!, image.id)).toEqual(Buffer.from('fake image bytes'));
+  });
+
+  it('repairs the proven part of a mixed bucket and leaves only the genuinely unknown call', async () => {
+    const now = Date.now();
+    await sessionForConversation('conv-known');
+    await recordChatObservations('conv-known', [
+      {
+        kind: 'tool_evidence',
+        time: now,
+        calls: [
+          {
+            messageId: 'msg-known',
+            tool: 'read',
+            order: 0,
+            answered: false,
+            requestId: 'wfr-known',
+            createTime: now / 1000
+          }
+        ]
+      }
+    ]);
+
+    const source = await createSession({ title: 'Unattributed activity' });
+    await appendEvent(source.id, {
+      time: now,
+      source: 'app',
+      kind: 'session_start',
+      conversationId: null,
+      title: source.title
+    });
+    for (const [callId, requestId] of [
+      ['known-call', 'wfr-known'],
+      ['unknown-call', 'wfr-unknown']
+    ] as const) {
+      await appendEvent(source.id, {
+        time: now + 1,
+        source: 'mcp',
+        kind: 'tool_call',
+        call: {
+          callId,
+          tool: 'read',
+          attribution: 'unattributed',
+          requestId,
+          conversationId: null,
+          attributionMethod: 'unattributed',
+          args: { text: '{}', truncated: false, chars: 2 },
+          result: { text: 'ok', truncated: false, chars: 2 },
+          outcome: 'ok',
+          durationMs: 1,
+          summary: { kind: 'read', tone: 'neutral', title: callId }
+        }
+      });
+    }
+
+    expect(await repairDeterministicAttribution()).toEqual({ sessions: 1, calls: 1 });
+    expect(await getSession(source.id)).not.toBeNull();
+    const left = await readEvents(source.id, { kinds: ['tool_call'] });
+    expect(left).toHaveLength(1);
+    expect(left[0]?.kind === 'tool_call' && left[0].call.callId).toBe('unknown-call');
+
+    const target = await sessionForConversation('conv-known');
+    const repaired = await readEvents(target!, { kinds: ['tool_call'] });
+    expect(repaired.some((event) => event.kind === 'tool_call' && event.call.callId === 'known-call')).toBe(true);
+  });
+
+  it('repairs an already-unattributed call as soon as its exact request id is later observed', async () => {
+    const now = Date.now();
+    const conversationId = 'conv-late-request-proof';
+    const requestId = 'wfr-late-request-proof';
+    const target = await sessionForConversation(conversationId);
+    expect(target).toBeTruthy();
+
+    const source = await createSession({ title: 'Unattributed activity' });
+    await appendEvent(source.id, {
+      time: now,
+      source: 'app',
+      kind: 'session_start',
+      conversationId: null,
+      title: source.title
+    });
+    await appendEvent(source.id, {
+      time: now + 1,
+      source: 'mcp',
+      kind: 'tool_call',
+      call: {
+        callId: 'call-late-request-proof',
+        tool: 'read',
+        attribution: 'unattributed',
+        requestId,
+        conversationId: null,
+        attributionMethod: 'unattributed',
+        args: { text: '{}', truncated: false, chars: 2 },
+        result: { text: 'ok', truncated: false, chars: 2 },
+        outcome: 'ok',
+        durationMs: 1,
+        summary: { kind: 'read', tone: 'neutral', title: 'Read before page proof' }
+      }
+    });
+
+    await recordChatObservations(conversationId, [
+      {
+        kind: 'tool_evidence',
+        time: now + 10,
+        fiberConversationId: conversationId,
+        calls: [
+          {
+            messageId: 'page-request-message-late-proof',
+            tool: 'read',
+            order: 0,
+            answered: true,
+            requestId,
+            createTime: now / 1000
+          }
+        ]
+      }
+    ]);
+    // Production repair is debounced; flushRecorder is the deterministic durability barrier
+    // and forces a queued repair to complete before returning.
+    await flushRecorder();
+
+    expect(await getSession(source.id)).toBeNull();
+    const moved = await readEvents(target!, { kinds: ['tool_call'] });
+    expect(moved.some((event) =>
+      event.kind === 'tool_call' &&
+      event.call.callId === 'call-late-request-proof' &&
+      event.call.conversationId === conversationId &&
+      event.call.attributionMethod === 'request_id'
+    )).toBe(true);
+  });
+
+  /**
+   * The blackout case. A browser that reports no request ids at all cannot answer the join
+   * for anybody, so treating the id on the HTTP request as a requirement sent a whole
+   * working session to "Unattributed activity" while the older evidence sat unused.
+   */
+  it('falls back to page evidence when no conversation is reporting request ids', async () => {
+    const now = Date.now();
+    const sessionId = await sessionForConversation('conv-no-ids');
+    await recordChatObservations('conv-no-ids', [
+      { kind: 'turn_start', time: now, turnId: 'turn-no-ids' },
+      {
+        kind: 'tool_evidence',
+        time: now,
+        turnId: 'turn-no-ids',
+        calls: [{ messageId: 'msg-no-id', tool: 'read', order: 0, answered: false }]
+      }
+    ]);
+
+    const call = await recordToolCall({
+      tool: 'read',
+      args: { paths: ['/project/a.ts'] },
+      content: [{ type: 'text', text: 'ok' }],
+      outcome: 'ok',
+      durationMs: 2,
+      startedAt: now,
+      requestId: 'wfr_no_mate'
+    });
+
+    expect(call?.attribution).toBe('turn');
+    expect(await readEvents(sessionId!, { kinds: ['tool_call'] })).toHaveLength(1);
+    expect(freshCallOrigin('read', now, 'wfr_no_mate')).toBeNull();
+  });
+
+  it('fails closed when one HTTP request id is reported by two conversations', async () => {
+    const now = Date.now();
+    for (const conversationId of ['conv-a', 'conv-b']) {
+      await sessionForConversation(conversationId);
+      await recordChatObservations(conversationId, [
+        { kind: 'turn_start', time: now, turnId: `turn-${conversationId}` },
+        {
+          kind: 'tool_evidence',
+          time: now,
+          turnId: `turn-${conversationId}`,
+          calls: [
+            {
+              messageId: `msg-${conversationId}`,
+              tool: 'agents',
+              order: 0,
+              answered: false,
+              requestId: 'wfr_conflict',
+              createTime: now / 1000
+            }
+          ]
+        }
+      ]);
+    }
+
+    expect(freshCallOrigin('agents', now, 'wfr_conflict')).toBeNull();
   });
 
   /** The other half: a turn that rendered no row at all still accounts for its calls. */
@@ -1235,6 +2178,38 @@ describe('recorder', () => {
     expect(await readEvents(first.sessionId!, { kinds: ['assistant_message'] })).toHaveLength(1);
   });
 
+  it('stores at most one final answer for one local generation even after a React remount renames it', async () => {
+    const now = Date.now();
+    const first = await recordChatObservations('conv-final-generation', [
+      { kind: 'turn_start', time: now, turnId: 'g-final-1' },
+      {
+        kind: 'assistant_message',
+        time: now + 1,
+        turnId: 'g-final-1',
+        messageId: 'assistant:g-final-1',
+        text: 'the completed answer',
+        final: true
+      },
+      { kind: 'turn_end', time: now + 2, turnId: 'g-final-1', outcome: 'completed' }
+    ]);
+
+    // Same logical generation, but React remounted the final prose under another page id.
+    const second = await recordChatObservations('conv-final-generation', [
+      {
+        kind: 'assistant_message',
+        time: now + 3,
+        turnId: 'g-final-1',
+        messageId: 'some-new-dom-message-id',
+        text: 'the completed answer',
+        final: true
+      }
+    ]);
+
+    expect(second.sessionId).toBe(first.sessionId);
+    expect(second.stored).toBe(0);
+    expect(await readEvents(first.sessionId!, { kinds: ['assistant_message'] })).toHaveLength(1);
+  });
+
   it('tells two long answers apart when only their endings differ', async () => {
     // Same id, same length, same opening, same elided copy on the log line: everything a
     // head-and-length identity can see is identical, and only the whole text differs. The
@@ -1280,6 +2255,7 @@ describe('recorder', () => {
     let ends = await readEvents(sessionId!, { kinds: ['turn_end'] });
     expect(ends).toHaveLength(1);
     expect(ends[0]!.kind === 'turn_end' && ends[0]!.outcome).toBe('unknown');
+    expect(ends[0]!.kind === 'turn_end' && ends[0]!.turnId).toBe('t1');
     expect(liveConversations()).toHaveLength(0);
 
     const reopened = await recordChatObservations('conv-closing', [
@@ -1317,13 +2293,35 @@ describe('recorder', () => {
   it('records the outcome the page reported, without upgrading a guess', async () => {
     const sessionId = await sessionForConversation('conv-outcomes');
     await recordChatObservations('conv-outcomes', [
-      { kind: 'turn_start', time: 1 },
-      { kind: 'turn_end', time: 2, outcome: 'stalled', detail: 'no visible output for ten minutes' },
-      { kind: 'turn_start', time: 3 },
-      { kind: 'turn_end', time: 4 }
+      { kind: 'turn_start', time: 1, turnId: 'turn-stalled' },
+      { kind: 'turn_end', time: 2, turnId: 'turn-stalled', outcome: 'stalled', detail: 'no visible output for ten minutes' },
+      { kind: 'turn_start', time: 3, turnId: 'turn-unknown' },
+      { kind: 'turn_end', time: 4, turnId: 'turn-unknown' }
     ]);
     const ends = await readEvents(sessionId!, { kinds: ['turn_end'] });
     expect(ends.map((event) => (event.kind === 'turn_end' ? event.outcome : null))).toEqual(['stalled', 'unknown']);
+  });
+
+  it('drops unnamed lifecycle boundaries and never lets a stale end close the current named turn', async () => {
+    const sessionId = await sessionForConversation('conv-lifecycle-identity');
+    await recordChatObservations('conv-lifecycle-identity', [
+      { kind: 'turn_start', time: 1 },
+      { kind: 'turn_end', time: 2, outcome: 'unknown' },
+      { kind: 'turn_start', time: 3, turnId: 'turn-old' },
+      { kind: 'turn_start', time: 4, turnId: 'turn-current' },
+      { kind: 'turn_end', time: 5, turnId: 'turn-old', outcome: 'unknown' }
+    ]);
+
+    const lifecycle = await readEvents(sessionId!, { kinds: ['turn_start', 'turn_end'] });
+    expect(lifecycle.map((event) => [event.kind, 'turnId' in event ? event.turnId : null])).toEqual([
+      ['turn_start', 'turn-old'],
+      ['turn_start', 'turn-current'],
+      ['turn_end', 'turn-old']
+    ]);
+    expect(liveConversations().find((item) => item.conversationId === 'conv-lifecycle-identity')).toMatchObject({
+      generating: true,
+      activeTurnId: 'turn-current'
+    });
   });
 
   it('keeps credentials and clipboard text out of the log', async () => {
@@ -1394,6 +2392,186 @@ describe('recorder', () => {
     expect(stored.kind === 'user_message' && stored.message.truncated).toBe(true);
     expect(stored.kind === 'user_message' && stored.message.chars).toBe(40_000);
     expect(stored.kind === 'user_message' && stored.message.text.length).toBeGreaterThan(30_000);
+  });
+});
+
+describe('canonical recorder 1.8', () => {
+  const tool = (requestId: string, startedAt = Date.now()) =>
+    recordToolCall({
+      tool: 'read',
+      args: { paths: ['/project/a.ts'] },
+      content: [{ type: 'text', text: 'ok' }],
+      outcome: 'ok' as const,
+      durationMs: 1,
+      startedAt,
+      requestId
+    });
+
+  it('creates exactly one session when the same conversation is first observed concurrently', async () => {
+    const conversationId = 'conv-concurrent-first-sight';
+    const [first, second] = await Promise.all([
+      sessionForConversation(conversationId),
+      sessionForConversation(conversationId)
+    ]);
+    expect(second).toBe(first);
+    expect((await listSessions()).filter((entry) => entry.conversationId === conversationId)).toHaveLength(1);
+    expect(await readEvents(first!, { kinds: ['session_start'] })).toHaveLength(1);
+  });
+
+  it('many streaming updates become exactly one final canonical message', async () => {
+    const conversationId = 'conv-canonical-stream';
+    const messageId = 'msg-stream-123';
+    const result = await recordChatObservations(conversationId, [
+      { kind: 'assistant_message', time: 100, messageId, text: 'I inspected', renderedHtml: '<p>I inspected</p>', state: 'streaming' },
+      { kind: 'assistant_message', time: 110, messageId, text: 'I inspected the current tree', renderedHtml: '<p>I inspected the current tree</p>', state: 'streaming' },
+      { kind: 'assistant_message', time: 120, messageId, text: 'I inspected the current tree.', renderedHtml: '<p><strong>I inspected</strong> the current tree.</p>', state: 'final', final: true }
+    ]);
+
+    const messages = await readEvents(result.sessionId!, { kinds: ['assistant_message'] });
+    expect(messages).toHaveLength(1);
+    const message = messages[0]!;
+    expect(message.kind).toBe('assistant_message');
+    if (message.kind !== 'assistant_message') throw new Error('wrong event');
+    expect(message.messageId).toBe(messageId);
+    expect(message.state).toBe('final');
+    expect(message.final).toBe(true);
+    expect(message.message.text).toBe('I inspected the current tree.');
+    expect(message.renderedHtml?.text).toBe('<p><strong>I inspected</strong> the current tree.</p>');
+  });
+
+  it('repeating the same final snapshot never creates another logical message', async () => {
+    const conversationId = 'conv-repeat-final';
+    const snapshot = {
+      kind: 'assistant_message' as const,
+      time: 200,
+      messageId: 'msg-repeat-final',
+      text: 'Done.',
+      renderedHtml: '<p>Done.</p>',
+      state: 'final' as const,
+      final: true
+    };
+    const first = await recordChatObservations(conversationId, [snapshot]);
+    await recordChatObservations(conversationId, [{ ...snapshot, time: 210 }, { ...snapshot, time: 220 }]);
+    const messages = await readEvents(first.sessionId!, { kinds: ['assistant_message'] });
+    expect(messages).toHaveLength(1);
+  });
+
+  it('correlates every hidden or rowless MCP request independently by request id', async () => {
+    const conversationId = 'conv-rowless-modern';
+    const sessionId = await sessionForConversation(conversationId);
+    const now = Date.now();
+    await recordChatObservations(conversationId, [
+      {
+        kind: 'tool_evidence',
+        time: now,
+        fiberConversationId: conversationId,
+        calls: Array.from({ length: 5 }, (_unused, index) => ({
+          messageId: `hidden-${index}`,
+          tool: 'read',
+          order: index,
+          answered: false,
+          requestId: `wfr_hidden_${index}`
+        }))
+      }
+    ]);
+    for (let index = 0; index < 5; index++) await tool(`wfr_hidden_${index}`, now + index);
+    const calls = await readEvents(sessionId!, { kinds: ['tool_call'] });
+    expect(calls).toHaveLength(5);
+    for (const event of calls) {
+      if (event.kind !== 'tool_call') throw new Error('wrong event');
+      expect(event.call.attributionMethod).toBe('request_id');
+      expect(event.call.conversationId).toBe(conversationId);
+      expect(event.call.requestId).toMatch(/^wfr_hidden_/);
+    }
+  });
+
+  it('never cross-attributes concurrent same-tool calls from two chats', async () => {
+    const now = Date.now();
+    const firstId = 'conv-concurrent-a';
+    const secondId = 'conv-concurrent-b';
+    const first = await sessionForConversation(firstId);
+    const second = await sessionForConversation(secondId);
+    await recordChatObservations(firstId, [{
+      kind: 'tool_evidence', time: now, fiberConversationId: firstId,
+      calls: [{ messageId: 'call-a', tool: 'read', order: 0, answered: false, requestId: 'wfr_concurrent_a' }]
+    }]);
+    await recordChatObservations(secondId, [{
+      kind: 'tool_evidence', time: now, fiberConversationId: secondId,
+      calls: [{ messageId: 'call-b', tool: 'read', order: 0, answered: false, requestId: 'wfr_concurrent_b' }]
+    }]);
+
+    await Promise.all([tool('wfr_concurrent_b', now), tool('wfr_concurrent_a', now)]);
+    const firstCalls = await readEvents(first!, { kinds: ['tool_call'] });
+    const secondCalls = await readEvents(second!, { kinds: ['tool_call'] });
+    expect(firstCalls).toHaveLength(1);
+    expect(secondCalls).toHaveLength(1);
+    expect(firstCalls[0]!.kind === 'tool_call' && firstCalls[0]!.call.requestId).toBe('wfr_concurrent_a');
+    expect(secondCalls[0]!.kind === 'tool_call' && secondCalls[0]!.call.requestId).toBe('wfr_concurrent_b');
+  });
+
+  it('keeps an unmatched modern request unattributed and never borrows another chat', async () => {
+    vi.useFakeTimers();
+    try {
+      const other = await sessionForConversation('conv-other-evidence');
+      await recordChatObservations('conv-other-evidence', [{
+        kind: 'tool_evidence', time: Date.now(), fiberConversationId: 'conv-other-evidence',
+        calls: [{ messageId: 'other-call', tool: 'read', order: 0, answered: false, requestId: 'wfr_other' }]
+      }]);
+      const pending = tool('wfr_missing', Date.now());
+      await vi.advanceTimersByTimeAsync(15_100);
+      const call = await pending;
+      expect(call?.attributionMethod).toBe('unattributed');
+      expect(call?.conversationId).toBeNull();
+      expect(await readEvents(other!, { kinds: ['tool_call'] })).toHaveLength(0);
+      const unattributed = (await listSessions()).find((entry) => entry.title === 'Unattributed activity');
+      expect(unattributed?.toolCalls).toBe(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('rejects URL/Fiber conversation conflicts instead of choosing either identity', async () => {
+    const now = Date.now();
+    await sessionForConversation('conv-url-identity');
+    await sessionForConversation('conv-fiber-identity');
+    await recordChatObservations('conv-url-identity', [{
+      kind: 'tool_evidence',
+      time: now,
+      fiberConversationId: 'conv-fiber-identity',
+      calls: [{ messageId: 'conflict-call', tool: 'read', order: 0, answered: false, requestId: 'wfr_identity_conflict' }]
+    }]);
+    const call = await tool('wfr_identity_conflict', now);
+    expect(call?.attributionMethod).toBe('unattributed');
+    expect(call?.conversationId).toBeNull();
+  });
+
+  it('preserves captured rendered Markdown HTML on the canonical transcript message', async () => {
+    const html = '<h2>Heading</h2><p><strong>bold</strong> and <em>italic</em></p><pre><code>const x = 1;</code></pre><table><tbody><tr><td>A</td></tr></tbody></table>';
+    const result = await recordChatObservations('conv-rendered', [{
+      kind: 'assistant_message', time: 300, messageId: 'msg-rendered', text: 'Heading\nbold and italic\nconst x = 1;\nA', renderedHtml: html, state: 'final', final: true
+    }]);
+    const [message] = await readEvents(result.sessionId!, { kinds: ['assistant_message'] });
+    expect(message?.kind === 'assistant_message' && message.renderedHtml?.text).toBe(html);
+  });
+
+  it('keeps one message anchored before tool calls while streaming revisions update it', async () => {
+    const conversationId = 'conv-interleaved';
+    const sessionId = await sessionForConversation(conversationId);
+    const now = Date.now();
+    await recordChatObservations(conversationId, [{
+      kind: 'assistant_message', time: now, messageId: 'msg-interleaved', text: 'Working', renderedHtml: '<p>Working</p>', state: 'streaming'
+    }]);
+    await recordChatObservations(conversationId, [{
+      kind: 'tool_evidence', time: now + 10, fiberConversationId: conversationId,
+      calls: [{ messageId: 'tool-interleaved', tool: 'read', order: 0, answered: false, requestId: 'wfr_interleaved' }]
+    }]);
+    await tool('wfr_interleaved', now + 20);
+    await recordChatObservations(conversationId, [{
+      kind: 'assistant_message', time: now + 30, messageId: 'msg-interleaved', text: 'Working — done', renderedHtml: '<p>Working — <strong>done</strong></p>', state: 'final', final: true
+    }]);
+    const timeline = (await readEvents(sessionId!)).filter((event) => event.kind === 'assistant_message' || event.kind === 'tool_call');
+    expect(timeline.map((event) => event.kind)).toEqual(['assistant_message', 'tool_call']);
+    expect(timeline.filter((event) => event.kind === 'assistant_message')).toHaveLength(1);
   });
 });
 
@@ -1513,6 +2691,155 @@ describe('naming the chats this app opened', () => {
     expect(summary?.title).toBe('why is the bridge flaky');
     expect(summary?.origin).toBeNull();
   });
+
+  it('promotes only the generic fallback when the first authored user title arrives late', async () => {
+    const conversationId = 'conv-late-first-user-title';
+    const sessionId = await sessionForConversation(conversationId);
+    expect((await getSession(sessionId!))?.title).toBe('ChatGPT session');
+
+    const observed = await recordChatObservations(conversationId, [
+      { kind: 'user_message', time: Date.now(), text: 'the real opening question', messageId: 'late-first-user' }
+    ]);
+    expect(observed.sessionId).toBe(sessionId);
+    expect((await getSession(sessionId!))?.title).toBe('the real opening question');
+
+    const manualConversation = 'conv-manual-title-before-user';
+    const manualSessionId = await sessionForConversation(manualConversation);
+    await renameSession(manualSessionId!, 'My chosen title');
+    await recordChatObservations(manualConversation, [
+      { kind: 'user_message', time: Date.now(), text: 'must not replace manual title', messageId: 'manual-first-user' }
+    ]);
+    expect((await getSession(manualSessionId!))?.title).toBe('My chosen title');
+  });
+
+  it('promotes the first-user fallback to ChatGPT’s real generated conversation title', async () => {
+    const conversationId = 'conv-real-page-title';
+    const opened = await recordChatObservations(conversationId, [
+      { kind: 'user_message', time: Date.now(), text: 'bro fix this exact thing please', messageId: 'title-user-1' }
+    ]);
+    expect((await getSession(opened.sessionId!))?.title).toBe('bro fix this exact thing please');
+
+    await recordChatObservations(conversationId, [
+      { kind: 'conversation_title', time: Date.now(), text: 'Fix Local Files Reconstruction' }
+    ]);
+    expect((await getSession(opened.sessionId!))?.title).toBe('Fix Local Files Reconstruction');
+
+    await renameSession(opened.sessionId!, 'My manual title');
+    await recordChatObservations(conversationId, [
+      { kind: 'conversation_title', time: Date.now(), text: 'A Later ChatGPT Rename' }
+    ]);
+    expect((await getSession(opened.sessionId!))?.title).toBe('My manual title');
+  });
+
+  it('recovers a late worker call agent from the durable worker session origin after live broker state is gone', async () => {
+    const conversationId = 'conv-late-worker-call';
+    const requestId = 'wfr_late_worker_exact';
+    await noteChatOrigin(conversationId, worker);
+    const opened = await recordChatObservations(conversationId, [
+      { kind: 'user_message', time: Date.now(), text: 'worker bootstrap', messageId: 'worker-boot-late-call' },
+      {
+        kind: 'tool_evidence',
+        time: Date.now(),
+        fiberConversationId: conversationId,
+        calls: [{ messageId: 'worker-late-request', tool: 'read', order: 0, answered: false, requestId }]
+      }
+    ]);
+    const originalSessionId = opened.sessionId!;
+    await closeConversation(conversationId);
+    expect((await getSession(originalSessionId))?.endedAt).not.toBeNull();
+
+    const call = await recordToolCall({
+      tool: 'read',
+      args: { paths: ['/project/src/main.ts'] },
+      content: [{ type: 'text', text: 'ok' }],
+      outcome: 'ok',
+      durationMs: 5,
+      startedAt: Date.now(),
+      requestId,
+      // Deliberately contradictory live broker context. Durable request/session epoch wins.
+      agent: 'prime'
+    });
+
+    expect(call?.conversationId).toBe(conversationId);
+    expect(call?.attributionMethod).toBe('request_id');
+    const stored = await readEvents(originalSessionId, { kinds: ['tool_call'] });
+    expect(stored).toHaveLength(1);
+    const recorded = stored[0];
+    expect(recorded?.kind === 'tool_call' && recorded.agent).toBe('worker-1');
+    expect(recorded?.kind === 'tool_call' && recorded.call.requestId).toBe(requestId);
+    // A late request is not evidence that the worker tab or browser conversation reopened.
+    expect((await getSession(originalSessionId))?.endedAt).not.toBeNull();
+  });
+
+  it('pins a late pre-transfer request to its original session epoch even after the old conversation starts a fresh session', async () => {
+    const oldConversation = 'conv-worker-before-transfer';
+    const newConversation = 'conv-worker-after-transfer';
+    const oldRequest = 'wfr_worker_before_transfer';
+    const freshRequest = 'wfr_stale_tab_fresh_epoch';
+    await noteChatOrigin(oldConversation, worker);
+    const original = await recordChatObservations(oldConversation, [
+      { kind: 'user_message', time: Date.now(), text: 'worker bootstrap', messageId: 'boot-before-transfer' },
+      {
+        kind: 'tool_evidence',
+        time: Date.now(),
+        fiberConversationId: oldConversation,
+        calls: [{ messageId: 'old-request-message', tool: 'read', order: 0, answered: false, requestId: oldRequest }]
+      }
+    ]);
+    const originalSessionId = original.sessionId!;
+
+    expect(await rebindSession(originalSessionId, oldConversation, newConversation)).toBe(true);
+    rebindConversation(originalSessionId, oldConversation, newConversation);
+
+    // The stale old tab is now honestly a new local session epoch for the same old ChatGPT id.
+    const stale = await recordChatObservations(oldConversation, [
+      { kind: 'user_message', time: Date.now(), text: 'stale tab carried on', messageId: 'stale-epoch-user' }
+    ]);
+    const staleSessionId = stale.sessionId!;
+    expect(staleSessionId).not.toBe(originalSessionId);
+
+    // A request proved before the transfer stays pinned to the exact old session epoch even
+    // though live broker context is now contradictory and the old conversation has a new epoch.
+    await recordToolCall({
+      tool: 'read',
+      args: { paths: ['/project/old.ts'] },
+      content: [{ type: 'text', text: 'old request completed late' }],
+      outcome: 'ok',
+      durationMs: 10,
+      startedAt: Date.now(),
+      requestId: oldRequest,
+      agent: 'prime'
+    });
+    const originalCalls = await readEvents(originalSessionId, { kinds: ['tool_call'] });
+    const staleCallsBefore = await readEvents(staleSessionId, { kinds: ['tool_call'] });
+    expect(originalCalls).toHaveLength(1);
+    expect(staleCallsBefore).toHaveLength(0);
+    expect(originalCalls[0]?.kind === 'tool_call' && originalCalls[0].agent).toBe('worker-1');
+
+    // This must not be implemented as "historical session always wins": a genuinely new
+    // request first proved in the stale tab's new epoch belongs to that new epoch.
+    await recordChatObservations(oldConversation, [
+      {
+        kind: 'tool_evidence',
+        time: Date.now(),
+        fiberConversationId: oldConversation,
+        calls: [{ messageId: 'fresh-request-message', tool: 'read', order: 0, answered: false, requestId: freshRequest }]
+      }
+    ]);
+    await recordToolCall({
+      tool: 'read',
+      args: { paths: ['/project/fresh.ts'] },
+      content: [{ type: 'text', text: 'fresh request' }],
+      outcome: 'ok',
+      durationMs: 1,
+      startedAt: Date.now(),
+      requestId: freshRequest,
+      agent: null
+    });
+    const staleCallsAfter = await readEvents(staleSessionId, { kinds: ['tool_call'] });
+    expect(staleCallsAfter).toHaveLength(1);
+    expect(staleCallsAfter[0]?.kind === 'tool_call' && staleCallsAfter[0].call.requestId).toBe(freshRequest);
+  });
 });
 
 // --------------------------------------------------------------- summaries
@@ -1584,9 +2911,16 @@ describe('tool summaries', () => {
   it('describes a read by its paths and range', () => {
     expect(summarize('read', { paths: ['/p/tools.ts'], start_line: 200, end_line: 420 })).toMatchObject({
       title: 'Read tools.ts',
-      detail: 'lines 200–420'
+      detail: 'lines 200–420',
+      metric: '221 lines'
     });
-    expect(summarize('read', { paths: ['/p/a.ts', '/p/b.ts', '/p/c.ts'] }).title).toBe('Read 3 paths');
+    expect(
+      summarize('read', { paths: ['/p/tools.ts'], start_line: 200, end_line: 420 }, { detail: 'lines 200–237' })
+    ).toMatchObject({ detail: 'lines 200–237', metric: '38 lines' });
+    expect(summarize('read', { paths: ['/p/a.ts', '/p/b.ts', '/p/c.ts'] })).toMatchObject({
+      title: 'Read 3 paths',
+      detail: 'a.ts, b.ts, c.ts'
+    });
   });
 
   it('reports how a command exited', () => {

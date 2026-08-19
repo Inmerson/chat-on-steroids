@@ -119,7 +119,7 @@ export type ToolOutcome = 'ok' | 'error' | 'rejected';
  * than guessed into somebody's history. The extension refuses to rewrite ChatGPT's UI for
  * an inferred call.
  */
-export type CallAttribution = 'turn' | 'agent' | 'generation' | 'inferred';
+export type CallAttribution = 'request_id' | 'unattributed' | 'turn' | 'agent' | 'generation' | 'inferred';
 
 /**
  * What each grade of attribution actually rests on, in the words shown to the user.
@@ -141,6 +141,8 @@ export type CallAttribution = 'turn' | 'agent' | 'generation' | 'inferred';
  * goes rather than being guessed into somebody's history.
  */
 export const ATTRIBUTION_LABELS: Record<CallAttribution, string> = {
+  request_id: 'exact request id',
+  unattributed: 'request id not resolved',
   agent: 'agent key',
   turn: 'tool block on the page',
   generation: 'the only chat generating',
@@ -151,6 +153,12 @@ export interface ToolCallRecord {
   callId: string;
   tool: string;
   attribution: CallAttribution;
+  /** Normalized inbound HTTP x-request-id, retained for forensic correlation. */
+  requestId: string | null;
+  /** Conversation proven by that request id, or null when ownership was unresolved. */
+  conversationId: string | null;
+  /** New 1.8 calls use only these two deterministic outcomes. */
+  attributionMethod: 'request_id' | 'unattributed';
   /** Exact arguments as JSON. Cut inline past the cap, with the whole text in an asset. */
   args: StoredText;
   result: StoredText;
@@ -161,6 +169,8 @@ export interface ToolCallRecord {
   changes?: FileChange[];
   assets?: AssetRef[];
 }
+
+export type MessageState = 'streaming' | 'final';
 
 interface BaseEvent {
   /** 1-based, strictly increasing within a session. Ordering never relies on time. */
@@ -175,8 +185,35 @@ interface BaseEvent {
 
 export type SessionEvent =
   | (BaseEvent & { kind: 'session_start'; conversationId: string | null; title: string })
-  | (BaseEvent & { kind: 'user_message'; message: StoredText; messageId?: string })
-  | (BaseEvent & { kind: 'assistant_message'; message: StoredText; messageId?: string; final: boolean })
+  | (BaseEvent & {
+      kind: 'user_message';
+      message: StoredText;
+      messageId?: string;
+      /** First sequence assigned to this stable website message; revisions keep this anchor. */
+      origin?: number;
+    })
+  | (BaseEvent & {
+      kind: 'assistant_message';
+      message: StoredText;
+      /**
+       * Stable ChatGPT website identity used by the local canonical store.
+       *
+       * For streaming commentary this is an exact tuple of ChatGPT's parent/working-turn/
+       * turn-exchange ids when those are available, so it remains stable even if React rotates
+       * the child text-message UUID before the thought row mounts. Older page shapes with a
+       * proven thought parent may use that thought `message.id`; a text object with no stronger
+       * relation uses its own ChatGPT message id. Local turn ids, text prefixes and DOM
+       * positions do not participate in this identity.
+       */
+      messageId?: string;
+      /** ChatGPT's canonical rendered representation captured from the page. */
+      renderedHtml?: StoredText;
+      state?: MessageState;
+      /** Compatibility mirror for older consumers; equivalent to state === 'final'. */
+      final: boolean;
+      /** First sequence assigned to this logical message; later revisions keep this anchor. */
+      origin?: number;
+    })
   /**
    * One visible ChatGPT commentary item, as it stood when this snapshot was taken.
    *
@@ -197,12 +234,10 @@ export type SessionEvent =
   /**
    * Visible ChatGPT-native tool activity that never passed through this MCP server.
    *
-   * `messageId` is the identity of one rendered activity row, and it supersedes the same
-   * way `progress` does. ChatGPT rewrites a row's label as the work completes — "Inspecting
-   * project files" becomes "Inspected project files" — and treating the rewrite as a second
-   * row is what put the same step on screen three and four times under slightly different
-   * wording. `origin` names the seq of the first record of that row, for readers working
-   * from a cursor that has already consumed it.
+   * `messageId` is ChatGPT's own thought/message identity for the activity. The rendered row
+   * may be replaced entirely and its label may change from "Inspecting" to "Inspected";
+   * neither affects identity. `origin` names the seq of the first record of that site object,
+   * for readers working from a cursor that has already consumed it.
    */
   | (BaseEvent & { kind: 'page_tool'; messageId: string; label: string; origin?: number })
   | (BaseEvent & { kind: 'turn_start' })
@@ -338,6 +373,25 @@ export interface SessionSummary {
    * compaction immediately after every compaction.
    */
   contextTokens: number;
+  /**
+   * Durable automatic-compaction edge state for the currently attached ChatGPT chat.
+   *
+   * `armedAt` is set only when this chat's context estimate crosses the configured
+   * threshold from below. `readyAt` is set once the crossing turn finishes successfully.
+   * `triggeredAt` is set before the browser starts the automatic compaction, so reloads or
+   * failed attempts cannot turn one crossing into a retry loop. All four fields reset when
+   * Compact & Resume attaches the durable session to a fresh ChatGPT conversation.
+   */
+  autoCompactThreshold: number | null;
+  /** Turn currently open in the recorder, used only to prove a crossing belongs to live work. */
+  autoCompactActiveTurnId: string | null;
+  /** Seq where the below-to-above edge was observed; pairs a just-sent user message with its turn_start. */
+  autoCompactArmedSeq: number | null;
+  /** The exact local generation that owns the armed edge. Null only while a crossing user message awaits turn_start. */
+  autoCompactTurnId: string | null;
+  autoCompactArmedAt: number | null;
+  autoCompactReadyAt: number | null;
+  autoCompactTriggeredAt: number | null;
   /** Id of the newest stored handoff, or null when the session was never compacted. */
   lastHandoffId: string | null;
   lastHandoffAt: number | null;
