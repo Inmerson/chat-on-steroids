@@ -5,130 +5,225 @@
  *   build/icon-preview.png    256px preview, for looking at what changed
  *   extension/icons/*.png     16/32/48/128 for the Chrome extension
  *
- * Kept as a script rather than committed binaries so the icon is reviewable and
- * reproducible: run `node scripts/make-icon.mjs` (or `npm run icon`) to regenerate.
+ *   artwork/app-icon-source.png  selected ImageGen concept (the one source image)
  *
- * The mark is a folder drawn as a conversation — a two-plane folder with a message
- * tail — because that is exactly what the app is: local files on one side, a chat on
- * the other. Below 48px the tail and the plane split stop resolving, so those sizes
- * drop them and keep the silhouette instead of turning to mush.
+ * The selected concept is a single continuous ribbon that folds into both a folder
+ * pocket and a conversation tail. It keeps the old product meaning while matching the
+ * monochrome, generously rounded app redesign. The source is decoded, reduced to the
+ * UI's ink/paper palette, and area-resampled here so every shipped size is reproducible.
  */
 
-import { deflateSync } from 'node:zlib';
-import { mkdirSync, writeFileSync } from 'node:fs';
+import { deflateSync, inflateSync } from 'node:zlib';
+import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const ICO_SIZES = [256, 128, 64, 48, 32, 16];
 const EXTENSION_SIZES = [128, 48, 32, 16];
+const SOURCE_PATH = path.join(root, 'artwork', 'app-icon-source.png');
+const INK = [12, 12, 14];
+const PAPER = [244, 244, 246];
 
-// A deeper, warmer range than the flat UI accent: #10a37f sits between these two, so
-// the tile reads as the same brand at a glance but has somewhere to go across 256px.
-const TOP_LEFT = [22, 190, 150];
-const BOTTOM_RIGHT = [7, 106, 87];
-const WHITE = [255, 255, 255];
+// ------------------------------------------------------------- source png
 
-// ------------------------------------------------------------------ geometry
-
-/** Coverage test for a rounded rectangle, in unit coordinates. */
-function inRoundedRect(x, y, x0, y0, x1, y1, r) {
-  if (x < x0 || x > x1 || y < y0 || y > y1) return false;
-  const cx = Math.min(Math.max(x, x0 + r), x1 - r);
-  const cy = Math.min(Math.max(y, y0 + r), y1 - r);
-  const dx = x - cx;
-  const dy = y - cy;
-  return dx * dx + dy * dy <= r * r;
+function paeth(left, up, upperLeft) {
+  const estimate = left + up - upperLeft;
+  const leftDistance = Math.abs(estimate - left);
+  const upDistance = Math.abs(estimate - up);
+  const upperLeftDistance = Math.abs(estimate - upperLeft);
+  if (leftDistance <= upDistance && leftDistance <= upperLeftDistance) return left;
+  return upDistance <= upperLeftDistance ? up : upperLeft;
 }
 
-/** Half-plane sign, for the triangle test. */
-function side(px, py, ax, ay, bx, by) {
-  return (px - bx) * (ay - by) - (ax - bx) * (py - by);
+/** Decode the one controlled RGBA source PNG without adding a native image dependency. */
+function decodeSourcePng(encoded) {
+  const signature = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+  if (encoded.length < signature.length || !encoded.subarray(0, 8).equals(signature)) {
+    throw new Error('artwork/app-icon-source.png is not a PNG');
+  }
+
+  let width = 0;
+  let height = 0;
+  let bitDepth = 0;
+  let colourType = 0;
+  let interlace = 0;
+  const idat = [];
+  for (let offset = 8; offset + 12 <= encoded.length; ) {
+    const length = encoded.readUInt32BE(offset);
+    const type = encoded.toString('ascii', offset + 4, offset + 8);
+    const start = offset + 8;
+    const end = start + length;
+    if (end + 4 > encoded.length) throw new Error('truncated app icon PNG');
+    if (type === 'IHDR') {
+      width = encoded.readUInt32BE(start);
+      height = encoded.readUInt32BE(start + 4);
+      bitDepth = encoded[start + 8];
+      colourType = encoded[start + 9];
+      interlace = encoded[start + 12];
+    } else if (type === 'IDAT') {
+      idat.push(encoded.subarray(start, end));
+    } else if (type === 'IEND') {
+      break;
+    }
+    offset = end + 4;
+  }
+
+  if (width < 1 || height < 1 || bitDepth !== 8 || colourType !== 6 || interlace !== 0 || idat.length === 0) {
+    throw new Error('app icon source must be a non-interlaced 8-bit RGBA PNG');
+  }
+
+  const stride = width * 4;
+  const inflated = inflateSync(Buffer.concat(idat));
+  if (inflated.length !== height * (stride + 1)) throw new Error('unexpected app icon PNG data length');
+  const pixels = Buffer.alloc(width * height * 4);
+  let input = 0;
+  for (let y = 0; y < height; y++) {
+    const filter = inflated[input++];
+    if (filter > 4) throw new Error(`unsupported app icon PNG filter ${filter}`);
+    const row = y * stride;
+    for (let x = 0; x < stride; x++) {
+      const left = x >= 4 ? pixels[row + x - 4] : 0;
+      const up = y > 0 ? pixels[row + x - stride] : 0;
+      const upperLeft = y > 0 && x >= 4 ? pixels[row + x - stride - 4] : 0;
+      let value = inflated[input++];
+      if (filter === 1) value += left;
+      else if (filter === 2) value += up;
+      else if (filter === 3) value += Math.floor((left + up) / 2);
+      else if (filter === 4) value += paeth(left, up, upperLeft);
+      pixels[row + x] = value & 0xff;
+    }
+  }
+  return { width, height, pixels };
 }
 
-function inTriangle(x, y, [ax, ay], [bx, by], [cx, cy]) {
-  const d1 = side(x, y, ax, ay, bx, by);
-  const d2 = side(x, y, bx, by, cx, cy);
-  const d3 = side(x, y, cx, cy, ax, ay);
-  const negative = d1 < 0 || d2 < 0 || d3 < 0;
-  const positive = d1 > 0 || d2 > 0 || d3 > 0;
-  return !(negative && positive);
-}
-
-/** The back plate: the tab and the part of the body that shows above the front. */
-function inFolderBack(x, y) {
-  return (
-    inRoundedRect(x, y, 0.205, 0.275, 0.505, 0.40, 0.035) ||
-    inRoundedRect(x, y, 0.205, 0.335, 0.795, 0.70, 0.055)
-  );
-}
-
-/** The front flap, inset so the back plate reads as a separate plane behind it. */
-function inFolderFront(x, y, detailed) {
-  const body = inRoundedRect(x, y, 0.225, detailed ? 0.445 : 0.335, 0.775, 0.705, 0.05);
-  // The message tail. Merged into the flap so the whole glyph is one silhouette.
-  const tail = inTriangle(x, y, [0.285, 0.66], [0.44, 0.66], [0.265, 0.83]);
-  return body || tail;
-}
+const source = decodeSourcePng(readFileSync(SOURCE_PATH));
 
 /**
- * Renders one square RGBA bitmap.
- *
- * Supersampled rather than analytically antialiased: at these sizes the cost is
- * milliseconds, and it keeps every shape above a plain boolean test.
+ * Image generation left a handful of isolated opaque flecks outside the mark. Keep the
+ * largest alpha-connected component only; the ribbon, its outline and the local dot are
+ * one continuous component, while dust is not. The threshold also discards the model's
+ * near-transparent shadow matte before any downsampling can turn it into a grey halo.
+ */
+function sourceMask() {
+  const count = source.width * source.height;
+  const labels = new Uint32Array(count);
+  const queue = new Int32Array(count);
+  let nextLabel = 0;
+  let largestLabel = 0;
+  let largestSize = 0;
+  for (let start = 0; start < count; start++) {
+    if (labels[start] !== 0 || source.pixels[start * 4 + 3] < 32) continue;
+    const label = ++nextLabel;
+    let head = 0;
+    let tail = 0;
+    queue[tail++] = start;
+    labels[start] = label;
+    while (head < tail) {
+      const index = queue[head++];
+      const x = index % source.width;
+      const neighbours = [
+        x > 0 ? index - 1 : -1,
+        x + 1 < source.width ? index + 1 : -1,
+        index >= source.width ? index - source.width : -1,
+        index + source.width < count ? index + source.width : -1
+      ];
+      for (const neighbour of neighbours) {
+        if (
+          neighbour < 0 ||
+          labels[neighbour] !== 0 ||
+          source.pixels[neighbour * 4 + 3] < 32
+        ) {
+          continue;
+        }
+        labels[neighbour] = label;
+        queue[tail++] = neighbour;
+      }
+    }
+    if (tail > largestSize) {
+      largestLabel = label;
+      largestSize = tail;
+    }
+  }
+  if (largestLabel === 0) throw new Error('app icon source contains no visible component');
+  const mask = new Uint8Array(count);
+  for (let index = 0; index < count; index++) if (labels[index] === largestLabel) mask[index] = 1;
+  return mask;
+}
+
+const visibleSource = sourceMask();
+
+/** Tight square crop with deliberate breathing room, derived from visible source alpha. */
+function sourceCrop() {
+  let left = source.width;
+  let top = source.height;
+  let right = -1;
+  let bottom = -1;
+  for (let y = 0; y < source.height; y++) {
+    for (let x = 0; x < source.width; x++) {
+      if (visibleSource[y * source.width + x] === 0) continue;
+      left = Math.min(left, x);
+      top = Math.min(top, y);
+      right = Math.max(right, x);
+      bottom = Math.max(bottom, y);
+    }
+  }
+  if (right < left || bottom < top) throw new Error('app icon source contains no visible pixels');
+  const visible = Math.max(right - left + 1, bottom - top + 1);
+  const side = visible / 0.84; // 8% transparent padding on every side.
+  return {
+    left: (left + right + 1 - side) / 2,
+    top: (top + bottom + 1 - side) / 2,
+    side
+  };
+}
+
+const crop = sourceCrop();
+
+/**
+ * Area-resample the generated concept after collapsing its near-monochrome shading to
+ * the exact renderer palette. Premultiplied accumulation keeps transparent edges clean.
  */
 function render(size) {
   const pixels = Buffer.alloc(size * size * 4);
-  const detailed = size >= 48;
-  // Small icons need more samples, not fewer: one pixel covers far more of the shape.
-  const samples = size >= 128 ? 4 : size >= 32 ? 6 : 8;
-  const total = samples * samples;
-  const shadowDrop = 0.018;
-
   for (let py = 0; py < size; py++) {
+    const y0 = crop.top + (py * crop.side) / size;
+    const y1 = crop.top + ((py + 1) * crop.side) / size;
     for (let px = 0; px < size; px++) {
-      let tile = 0;
-      let back = 0;
-      let front = 0;
-      let shadow = 0;
-
-      for (let sy = 0; sy < samples; sy++) {
-        for (let sx = 0; sx < samples; sx++) {
-          const x = (px + (sx + 0.5) / samples) / size;
-          const y = (py + (sy + 0.5) / samples) / size;
-          if (inRoundedRect(x, y, 0.02, 0.02, 0.98, 0.98, 0.235)) tile++;
-          if (inFolderBack(x, y)) back++;
-          if (inFolderFront(x, y, detailed)) front++;
-          if (detailed && (inFolderBack(x, y - shadowDrop) || inFolderFront(x, y - shadowDrop, detailed))) {
-            shadow++;
+      const x0 = crop.left + (px * crop.side) / size;
+      const x1 = crop.left + ((px + 1) * crop.side) / size;
+      let alphaWeight = 0;
+      let totalWeight = 0;
+      const premultiplied = [0, 0, 0];
+      for (let sy = Math.floor(y0); sy < Math.ceil(y1); sy++) {
+        if (sy < 0 || sy >= source.height) continue;
+        const yWeight = Math.min(y1, sy + 1) - Math.max(y0, sy);
+        for (let sx = Math.floor(x0); sx < Math.ceil(x1); sx++) {
+          if (sx < 0 || sx >= source.width) continue;
+          const xWeight = Math.min(x1, sx + 1) - Math.max(x0, sx);
+          const weight = Math.max(0, xWeight) * Math.max(0, yWeight);
+          if (weight === 0) continue;
+          const sourceIndex = sy * source.width + sx;
+          if (visibleSource[sourceIndex] === 0) continue;
+          const at = sourceIndex * 4;
+          const alpha = source.pixels[at + 3] / 255;
+          const luminance =
+            source.pixels[at] * 0.2126 + source.pixels[at + 1] * 0.7152 + source.pixels[at + 2] * 0.0722;
+          const colour = luminance >= 128 ? PAPER : INK;
+          for (let channel = 0; channel < 3; channel++) {
+            premultiplied[channel] += colour[channel] * alpha * weight;
           }
+          alphaWeight += alpha * weight;
+          totalWeight += weight;
         }
       }
-
-      const tileA = tile / total;
-      const backA = back / total;
-      const frontA = front / total;
-      const shadowA = Math.max(0, shadow / total - Math.max(backA, frontA));
-
-      // Diagonal gradient, so the light has a direction instead of just a top and a
-      // bottom. t runs corner to corner.
-      const t = (px / Math.max(1, size - 1) + py / Math.max(1, size - 1)) / 2;
-      let rgb = TOP_LEFT.map((c, i) => c + (BOTTOM_RIGHT[i] - c) * t);
-
-      // A specular band across the top third keeps the tile from looking like paper.
-      const gloss = Math.max(0, 1 - py / (size * 0.55)) ** 2 * 0.16;
-      rgb = rgb.map((c) => c + (255 - c) * gloss);
-
-      // Shadow first, then the two glyph planes over it, back to front.
-      rgb = rgb.map((c) => c * (1 - shadowA * 0.28));
-      rgb = rgb.map((c, i) => c * (1 - backA * 0.82) + WHITE[i] * backA * 0.82);
-      rgb = rgb.map((c, i) => c * (1 - frontA) + WHITE[i] * frontA);
-
-      const offset = (py * size + px) * 4;
-      pixels[offset] = Math.round(Math.min(255, Math.max(0, rgb[0])));
-      pixels[offset + 1] = Math.round(Math.min(255, Math.max(0, rgb[1])));
-      pixels[offset + 2] = Math.round(Math.min(255, Math.max(0, rgb[2])));
-      pixels[offset + 3] = Math.round(tileA * 255);
+      const output = (py * size + px) * 4;
+      if (alphaWeight > 0) {
+        for (let channel = 0; channel < 3; channel++) {
+          pixels[output + channel] = Math.round(premultiplied[channel] / alphaWeight);
+        }
+      }
+      pixels[output + 3] = Math.round((alphaWeight / Math.max(totalWeight, Number.EPSILON)) * 255);
     }
   }
   return pixels;
