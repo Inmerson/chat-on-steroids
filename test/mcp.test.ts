@@ -28,6 +28,8 @@ import { createHandoff } from '../src/main/session/handoff.js';
 import { resetWorkspaces, setWorkspaceFor, workspaceEntries } from '../src/main/workspace.js';
 import { DEFAULT_CAPABILITIES, type Capabilities, type Root } from '../src/shared/types.js';
 import { emptyEvidence, noteExec, noteOutcome, runInCallContext, type CallContext } from '../src/main/mcp/call-context.js';
+import { observeRequestCorrelation } from '../src/main/session/correlation.js';
+import { resetExecOwnershipForTests } from '../src/main/codex/ownership.js';
 import { makeTempDir, removeTempDir, writeTree } from './helpers.js';
 
 // ---------------------------------------------------------------- transport
@@ -1821,6 +1823,100 @@ describe('exec_command and write_stdin', () => {
   });
 });
 
+describe('exec sessions belong to the chat that opened them', () => {
+  beforeEach(() => {
+    ctx.readOnly = false;
+    ctx.caps = withCaps({ command: true });
+    // `session status` lists the running commands, which is the other place one chat could
+    // learn another's session ids.
+    ctx.sessionTools = true;
+    // Ownership is process-global with no natural lifetime boundary, and clearing it can only
+    // make the guard more permissive — never the other way round.
+    resetExecOwnershipForTests();
+  });
+
+  /** What the page reports once it has seen this connector request leave a given chat. */
+  const prove = (requestId: string, conversationId: string) =>
+    observeRequestCorrelation({
+      requestId,
+      conversationId,
+      sessionId: '2026-08-20-execown',
+      messageId: `msg-${requestId}`,
+      tool: 'exec_command',
+      observedAt: Date.now()
+    });
+
+  /** A tools/call carrying the `x-request-id` ChatGPT sends, so the caller is identifiable. */
+  const asChat = (requestId: string | null, name: string, args: Record<string, unknown>) =>
+    modern(
+      'tools/call',
+      { name, arguments: args },
+      requestId ? { 'x-request-id': `${requestId}/att1` } : {}
+    );
+
+  it('refuses write_stdin from a chat that does not own the session, and keeps serving the one that does', async () => {
+    expect(prove('wfr_execown_opener', 'conv-execown-opener')).toBe('stored');
+    expect(prove('wfr_execown_stranger', 'conv-execown-stranger')).toBe('stored');
+
+    await fs.writeFile(
+      path.join(approved, 'owned-stdin.cjs'),
+      "const readline=require('node:readline'); const rl=readline.createInterface({input:process.stdin,crlfDelay:Infinity}); rl.on('line',(line)=>{ console.log('echo='+line); if(line==='bye') rl.close(); });\n",
+      'utf8'
+    );
+
+    const started = await asChat('wfr_execown_opener', 'exec_command', {
+      cmd: 'node owned-stdin.cjs',
+      workdir: '/workspace',
+      tty: true,
+      yield_time_ms: 25
+    });
+    expect(started.body.result?.isError).not.toBe(true);
+    const sessionId = Number(textOf(started).match(/Process running with session ID (\d+)/)?.[1]);
+    expect(Number.isInteger(sessionId)).toBe(true);
+
+    // The other chat can name that small integer just as easily as its owner can. Codex never
+    // has to think about this because its manager hangs off one conversation's services.
+    const stranger = await asChat('wfr_execown_stranger', 'write_stdin', {
+      session_id: sessionId,
+      chars: 'stolen\r',
+      yield_time_ms: 250
+    });
+    expect(stranger.body.result?.isError).toBe(true);
+    expect(textOf(stranger)).toContain(
+      `write_stdin failed: session ${sessionId} belongs to a different ChatGPT conversation.`
+    );
+    expect(textOf(stranger)).not.toContain('echo=stolen');
+
+    // A caller this app cannot identify is not proven to be someone else, and taking a working
+    // terminal away on a guess would be the worse failure.
+    const unproven = await asChat(null, 'write_stdin', {
+      session_id: sessionId,
+      chars: 'anon\r',
+      yield_time_ms: 1_000
+    });
+    expect(unproven.body.result?.isError).not.toBe(true);
+    expect(textOf(unproven)).toContain('echo=anon');
+
+    // The stranger must not even learn the session id exists.
+    const strangerStatus = await asChat('wfr_execown_stranger', 'session', { action: 'status' });
+    expect(strangerStatus.body.result?.isError).not.toBe(true);
+    expect(textOf(strangerStatus)).not.toMatch(new RegExp(`^\\s*${sessionId}\\s+pid `, 'm'));
+
+    const ownerStatus = await asChat('wfr_execown_opener', 'session', { action: 'status' });
+    expect(ownerStatus.body.result?.isError).not.toBe(true);
+    expect(textOf(ownerStatus)).toMatch(new RegExp(`^\\s*${sessionId}\\s+pid `, 'm'));
+
+    const owner = await asChat('wfr_execown_opener', 'write_stdin', {
+      session_id: sessionId,
+      chars: 'bye\r',
+      yield_time_ms: 5_000
+    });
+    expect(owner.body.result?.isError).not.toBe(true);
+    expect(textOf(owner)).toContain('echo=bye');
+    expect(textOf(owner)).toContain('Process exited with code 0');
+  });
+});
+
 describe('the outcome a shell command is recorded with', () => {
   /** Runs `noteExec` the way a tool does, and reports what the recorder would store. */
   const outcomeOf = (
@@ -1828,6 +1924,7 @@ describe('the outcome a shell command is recorded with', () => {
     preset: 'ok' | 'error' | 'rejected' | null = null
   ) => {
     const context: CallContext = {
+      startedAt: Date.now(),
       transportKey: null,
       agent: null,
       caller: { transportKey: null, requestId: null, conversationId: null },
@@ -1862,6 +1959,7 @@ describe('the outcome a shell command is recorded with', () => {
 
   it('does not let the guard downgrade a command error back to ok', () => {
     const context: CallContext = {
+      startedAt: Date.now(),
       transportKey: null,
       agent: null,
       caller: { transportKey: null, requestId: null, conversationId: null },

@@ -39,13 +39,15 @@ const {
   onSwarmPersist,
   pendingCount,
   pendingWorkerSpawns,
+  releaseQuiescentRun,
   resetAgentsForTests,
   restoreSwarm,
   sendMessage,
   snapshotSwarm,
   spawn,
   swarmRunning,
-  swarmState
+  swarmState,
+  workerConversationGone
 } = await import('../src/main/agents.js');
 const { startMcpServer } = await import('../src/main/mcp/server.js');
 const { initDurableStore } = await import('../src/main/durable.js');
@@ -239,6 +241,33 @@ describe('at-least-once delivery', () => {
     expect(swarmRunning()).toBe(true);
     expect(pendingCount(PRIME_ID)).toBe(2);
   });
+
+  it('releases the global run only after the prime has acknowledged every terminal worker report', () => {
+    const ended: string[] = [];
+    onSwarmEnd((reason) => ended.push(reason));
+    startSwarm(1);
+    const worker = startWorker('worker-1');
+    finishAgent(worker.caller, 'finished safely');
+
+    // Terminal worker is not enough: the prime still has an unseen final report.
+    expect(pendingCount(PRIME_ID)).toBe(1);
+    expect(releaseQuiescentRun()).toBe(false);
+    expect(swarmRunning()).toBe(true);
+
+    // Merely putting the report in one result is still not proof that ChatGPT received it.
+    expect(offerMessages(PRIME_ID)).toHaveLength(1);
+    expect(releaseQuiescentRun()).toBe(false);
+    expect(swarmRunning()).toBe(true);
+
+    // The prime's next authenticated call proves the previous result arrived. Now no work or
+    // report remains, so the single global swarm claim can disappear immediately.
+    expect(acknowledgeOffers(PRIME_ID)).toHaveLength(1);
+    expect(pendingCount(PRIME_ID)).toBe(0);
+    expect(releaseQuiescentRun()).toBe(true);
+    expect(swarmRunning()).toBe(false);
+    expect(ended).toHaveLength(1);
+    expect(ended[0]).toMatch(/terminal|delivered/i);
+  });
 });
 
 describe('an agent that has ended', () => {
@@ -296,6 +325,28 @@ describe('a worker whose chat never opened', () => {
     startSwarm(1);
     expect(failAgent(PRIME_ID, 'whatever')).toBeNull();
     expect(swarmRunning()).toBe(true);
+  });
+});
+
+describe('a worker whose chat closed', () => {
+  it('terminalises the exact bound worker, frees its slot, and reports to prime', () => {
+    startSwarm(1);
+    startWorker('worker-1');
+    expect(workerConversationGone('c-worker-1')).toBe(true);
+    const info = swarmState().agents.find((agent) => agent.id === 'worker-1');
+    expect(info?.state).toBe('failed');
+    expect(info?.result).toMatch(/closed/i);
+    expect(pendingCount(PRIME_ID)).toBe(1);
+    expect(() => spawn({ workers: [{ task: 'replacement after close' }], caller: prime })).not.toThrow();
+  });
+
+  it('does nothing for the prime, a stranger, or an already finished worker', () => {
+    startSwarm(1);
+    const worker = startWorker('worker-1');
+    expect(workerConversationGone(PRIME_CHAT)).toBe(false);
+    expect(workerConversationGone('c-stranger')).toBe(false);
+    finishAgent(worker.caller, 'done');
+    expect(workerConversationGone('c-worker-1')).toBe(false);
   });
 });
 
@@ -375,7 +426,7 @@ describe('through the MCP endpoint', () => {
   let endpoint: Awaited<ReturnType<typeof startMcpServer>>;
   let nextId = 1;
 
-  const post = (body: unknown): Promise<any> =>
+  const post = (body: unknown, extraHeaders: Record<string, string> = {}): Promise<any> =>
     new Promise((resolve, reject) => {
       const url = new URL(endpoint.url);
       const payload = JSON.stringify(body);
@@ -388,7 +439,8 @@ describe('through the MCP endpoint', () => {
           headers: {
             'content-type': 'application/json',
             accept: 'application/json, text/event-stream',
-            'content-length': Buffer.byteLength(payload)
+            'content-length': Buffer.byteLength(payload),
+            ...extraHeaders
           }
         },
         (res) => {
@@ -417,6 +469,18 @@ describe('through the MCP endpoint', () => {
   const agents = (action: string, args: Record<string, unknown> = {}): Promise<string> =>
     callTool('agents', { action, ...args });
 
+  const agentsWithRequestId = async (
+    requestId: string,
+    action: string,
+    args: Record<string, unknown> = {}
+  ): Promise<string> => {
+    const reply = await post(
+      { jsonrpc: '2.0', id: nextId++, method: 'tools/call', params: { name: 'agents', arguments: { action, ...args } } },
+      { 'x-request-id': `${requestId}/relay` }
+    );
+    return ((reply.result?.content ?? []) as Array<{ text?: string }>).map((part) => part.text ?? '').join('\n');
+  };
+
   /**
    * Makes a call that ChatGPT's own message model names, from one conversation.
    *
@@ -429,16 +493,17 @@ describe('through the MCP endpoint', () => {
    */
   let evidenceSeq = 0;
   const asChat = async (conversationId: string, action: string, args: Record<string, unknown> = {}): Promise<string> => {
-    const pending = agents(action, args);
-    await new Promise((resolve) => setTimeout(resolve, 60));
     const seq = ++evidenceSeq;
+    const requestId = `wfr_agents_${seq}`;
+    const pending = agentsWithRequestId(requestId, action, args);
+    await new Promise((resolve) => setTimeout(resolve, 60));
     await recordChatObservations(conversationId, [
       { kind: 'turn_start', time: Date.now(), turnId: `t-${seq}` },
       {
         kind: 'tool_evidence',
         time: Date.now(),
         turnId: `t-${seq}`,
-        calls: [{ messageId: `m-${seq}`, tool: 'agents', order: 0, answered: false }]
+        calls: [{ messageId: `m-${seq}`, tool: 'agents', order: 0, answered: false, requestId }]
       }
     ]);
     return pending;
@@ -490,23 +555,20 @@ describe('through the MCP endpoint', () => {
     expect(Object.keys(schema.properties)).not.toContain('agent');
   });
 
-  it('is identified by page evidence that arrived before the call it names', async () => {
-    // Measured live: ChatGPT reported the `agents` row 5.5 seconds *before* the request
-    // reached the app, with 2 ms of relay lag — the page paints the connector row while the
-    // model is still composing the call. The identity path used to require evidence dated
-    // at or after the call start, threw this away, and refused every real spawn with
-    // UNIDENTIFIED_CALLER while the page had named the caller all along.
+  it('is identified by exact request-id evidence that arrived before the call it names', async () => {
+    // Evidence may arrive before HTTP. The timestamp is irrelevant; the normalized request
+    // id is the join, so a pre-existing exact mate remains authoritative.
     await recordChatObservations('c-ahead', [
       { kind: 'turn_start', time: Date.now() - 5_500, turnId: 't-ahead' },
       {
         kind: 'tool_evidence',
         time: Date.now() - 5_500,
         turnId: 't-ahead',
-        calls: [{ messageId: 'm-ahead', tool: 'agents', order: 0, answered: false }]
+        calls: [{ messageId: 'm-ahead', tool: 'agents', order: 0, answered: false, requestId: 'wfr_agents_ahead' }]
       }
     ]);
 
-    const text = await agents('spawn', { workers: [{ task: 'read the file' }] });
+    const text = await agentsWithRequestId('wfr_agents_ahead', 'spawn', { workers: [{ task: 'read the file' }] });
 
     expect(text).not.toContain('UNIDENTIFIED_CALLER');
     expect(swarmRunning()).toBe(true);
@@ -549,6 +611,63 @@ describe('through the MCP endpoint', () => {
     expect(text).toContain('WORKER_IDENTITY_LOST');
     expect(text).toMatch(/join/i);
     expect(text).not.toContain('worker-1');
+  });
+
+  it('uses the inbound HTTP request id instead of stealing a worker’s earlier agents evidence', async () => {
+    startSwarm(1);
+    expect(bindConversation('worker-1', 'c-worker-1')).toBe(true);
+    const now = Date.now();
+
+    // The worker has an unclaimed agents request visible first. Before the HTTP-id hardening,
+    // callerNow() saw this while the prime page was one poll late and authenticated the prime
+    // call as worker-1, producing the live "An agent cannot message itself" failure.
+    await recordChatObservations('c-worker-1', [
+      { kind: 'turn_start', time: now, turnId: 'worker-stale' },
+      {
+        kind: 'tool_evidence',
+        time: now,
+        turnId: 'worker-stale',
+        calls: [
+          {
+            messageId: 'worker-stale-agents',
+            tool: 'agents',
+            order: 0,
+            answered: false,
+            requestId: 'wfr_worker_stale',
+            createTime: now / 1000
+          }
+        ]
+      }
+    ]);
+
+    const pending = agentsWithRequestId('wfr_prime_current', 'message', {
+      to: 'worker-1',
+      text: 'prime correction'
+    });
+    await new Promise((resolve) => setTimeout(resolve, 80));
+    await recordChatObservations(PRIME_CHAT, [
+      { kind: 'turn_start', time: now + 80, turnId: 'prime-current' },
+      {
+        kind: 'tool_evidence',
+        time: now + 80,
+        turnId: 'prime-current',
+        calls: [
+          {
+            messageId: 'prime-current-agents',
+            tool: 'agents',
+            order: 0,
+            answered: false,
+            requestId: 'wfr_prime_current',
+            createTime: (now + 80) / 1000
+          }
+        ]
+      }
+    ]);
+
+    const text = await pending;
+    expect(text).toContain('Sent to worker-1');
+    expect(text).not.toContain('cannot message itself');
+    expect(pendingCount('worker-1')).toBe(1);
   });
 
   it('carries a worker through message and finish on its conversation alone', async () => {

@@ -2007,6 +2007,46 @@
    * bound row on its page and each one arrived at by a rule that "fit". A blank row is a
    * missing label; a wrong row is a lie about what this machine did.
    */
+  /**
+   * The app's recorded calls for one visible assistant turn.
+   *
+   * `data-turn-id` belongs to one page load and to nothing beyond it: a turn streams as
+   * `g-1s6atlm1inbjf2-0-1` and the very same turn comes back as
+   * `request-WEB:<load-uuid>-<n>` once the tab is refreshed. So after a reload the recorded
+   * turn ids matched no visible turn, every block fell through to applyPageLabel, and a
+   * chat that had been fully relabelled a second earlier came back wearing nothing but
+   * ChatGPT's own quiet names. Nothing was switched off; the join had simply expired.
+   *
+   * ChatGPT's connector request id is the durable half of that join, and both sides already
+   * hold it: the app records it from the `x-request-id` on the MCP request, and the page
+   * carries the same value on the tool message's own metadata (see readTurnCalls). It is
+   * ChatGPT's identifier for the request, not an observation of ours, so it means the same
+   * thing before and after a refresh.
+   *
+   * Two conditions, both the ones anchoredRenderForTurn already relies on. The turn must
+   * name exactly one request — several is a turn this cannot order — and the request must
+   * not already have been claimed by an earlier turn in this pass, since one response's
+   * calls cannot belong to two visible turns. Where either fails the turn keeps ChatGPT's
+   * own labels, which is the same outcome it had before this fallback existed.
+   */
+  function recordedCallsFor(turn, byTurn, byRequest, spent) {
+    const own = (turn.id && byTurn.get(turn.id)) || [];
+    if (own.length > 0) return own;
+    const descriptor = fiberTurnFor(turn);
+    if (!descriptor) return [];
+    const requestIds = new Set();
+    for (const call of descriptor.calls || []) if (call && call.requestId) requestIds.add(call.requestId);
+    if (requestIds.size !== 1) return [];
+    const requestId = requestIds.values().next().value;
+    if (spent.has(requestId)) return [];
+    const recorded = byRequest.get(requestId) || [];
+    if (recorded.length === 0) return [];
+    spent.add(requestId);
+    // Run order, which is the order planLabels pairs against. `seq` is the app's own
+    // append-only sequence, so it says which call ran first without consulting the page.
+    return [...recorded].sort((a, b) => a.seq - b.seq);
+  }
+
   function planLabels(blocks, calls) {
     /** How many calls this row folded away behind the one it shows. */
     const hiddenOf = (block) => {
@@ -2490,7 +2530,16 @@
     // With no recorded calls and no page evidence there is nothing any of this could say.
     if (entries.length === 0 && !fiberPresent) return;
     const byTurn = new Map();
+    const byRequest = new Map();
     for (const entry of entries) {
+      // ChatGPT's own request id, which unlike a turn id outlives the page load that saw
+      // the call run. Indexed for every entry that has one, including the calls whose
+      // local turn id was lost — those are exactly the ones a reload leaves stranded.
+      if (entry.requestId) {
+        const sharing = byRequest.get(entry.requestId) || [];
+        sharing.push(entry);
+        byRequest.set(entry.requestId, sharing);
+      }
       // A call the app could not tie to a turn it can see. Attribution 'inferred' never
       // carries a turn id, so this one test covers both.
       if (!entry.turnId) continue;
@@ -2498,9 +2547,11 @@
       list.push(entry);
       byTurn.set(entry.turnId, list);
     }
+    /** Requests already handed to a turn in this pass. One request, one turn. */
+    const spentRequests = new Set();
     for (const turn of CLF_DOM.turns()) {
       if (turn.role !== 'assistant' || !turn.id) continue;
-      const calls = byTurn.get(turn.id) || [];
+      const calls = recordedCallsFor(turn, byTurn, byRequest, spentRequests);
       const blocks = CLF_DOM.toolBlocks(turn);
       const named = new Set();
       if (blocks.length > 0 && calls.length > 0) {

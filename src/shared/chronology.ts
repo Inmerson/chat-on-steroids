@@ -28,6 +28,8 @@
 /** The minimum an entry needs to be placed. Both consumers' shapes satisfy it structurally. */
 export interface Chronological {
   seq: number;
+  /** First position of a mutable canonical item; seq may be its newer revision cursor. */
+  origin?: number;
   /** When the item logically happened: `startedAt` for a call, first appearance for prose. */
   time: number;
   kind: string;
@@ -42,7 +44,9 @@ export interface Chronological {
  * answer. Never mutates the input.
  */
 export function chronological<T extends Chronological>(entries: readonly T[]): T[] {
-  const bySeq = [...entries].sort((a, b) => a.seq - b.seq);
+  const position = (entry: T): number =>
+    typeof entry.origin === 'number' && Number.isFinite(entry.origin) ? entry.origin : entry.seq;
+  const bySeq = [...entries].sort((a, b) => position(a) - position(b) || a.seq - b.seq);
   // Only turns this window actually opened. A tail delivered from a cursor can hold events of
   // a turn whose `turn_start` is far behind it, and a group with no anchor has no bounded
   // extent — its members could be reordered past events that are not part of it at all. Those
@@ -53,7 +57,7 @@ export function chronological<T extends Chronological>(entries: readonly T[]): T
   const ends = new Map<number, number>();
   for (const entry of bySeq) {
     if (entry.kind === 'turn_start' && entry.turnId && !anchors.has(entry.turnId)) {
-      anchors.set(entry.turnId, entry.seq);
+      anchors.set(entry.turnId, position(entry));
     }
     if (entry.kind === 'turn_end' && entry.turnId) {
       const anchor = anchors.get(entry.turnId);
@@ -80,7 +84,7 @@ export function chronological<T extends Chronological>(entries: readonly T[]): T
   const openTurnAt = (entry: T): number | undefined => {
     let anchor: number | undefined;
     for (const candidate of bySeq) {
-      if (candidate.seq >= entry.seq) break;
+      if (position(candidate) >= position(entry)) break;
       if (candidate.kind === 'turn_start' && candidate.turnId) anchor = anchors.get(candidate.turnId);
     }
     if (anchor === undefined) return undefined;
@@ -93,16 +97,19 @@ export function chronological<T extends Chronological>(entries: readonly T[]): T
   // on those two events are the moment the page noticed, not the moment the turn moved.
   const rank = (entry: T): number => (entry.kind === 'turn_start' ? -1 : entry.kind === 'turn_end' ? 1 : 0);
 
-  // An entry with no usable time is ordered by `seq` alone rather than being flung to one
-  // end of its turn: a missing anchor is not evidence about when the thing happened.
+  // An entry with no usable time is ordered by its stable position (`origin` for a mutable
+  // canonical item, otherwise `seq`) rather than being flung to one end of its turn: a
+  // missing timestamp is not evidence about when the thing happened.
   const byTime = (a: T, b: T): number => {
     const apart = a.time - b.time;
-    return Number.isFinite(apart) && apart !== 0 ? apart : a.seq - b.seq;
+    return Number.isFinite(apart) && apart !== 0
+      ? apart
+      : position(a) - position(b) || a.seq - b.seq;
   };
 
   const groups = new Map<number, T[]>();
   for (const entry of bySeq) {
-    const anchor = (entry.turnId ? anchors.get(entry.turnId) : openTurnAt(entry)) ?? entry.seq;
+    const anchor = (entry.turnId ? anchors.get(entry.turnId) : openTurnAt(entry)) ?? position(entry);
     const held = groups.get(anchor);
     if (held) held.push(entry);
     else groups.set(anchor, [entry]);

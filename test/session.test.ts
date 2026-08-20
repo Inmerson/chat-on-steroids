@@ -598,6 +598,54 @@ describe('session store', () => {
     }
   });
 
+  it('keeps an automatic edge the crossing turn lost, until a turn finishes cleanly', async () => {
+    const base = defaultConfig();
+    await saveConfig({ ...base, compaction: { ...base.compaction, auto: true, autoTokens: 10_000 } });
+    try {
+      const summary = await createSession({ title: 'lost edge', conversationId: 'conv-lost-edge' });
+      await appendEvent(summary.id, { time: 1, source: 'extension', kind: 'turn_start', turnId: 't-crossed' });
+      await appendEvent(summary.id, {
+        time: 2,
+        source: 'extension',
+        kind: 'user_message',
+        messageId: 'cross',
+        turnId: 't-crossed',
+        message: { text: 'c'.repeat(44_000), truncated: false, chars: 44_000 }
+      });
+      expect((await getSession(summary.id))?.autoCompactArmedAt).toBe(2);
+
+      // The turn that crossed the line was interrupted. A counter that only grows can never
+      // cross it again, so treating this as the end of the matter loses the trigger forever.
+      await appendEvent(summary.id, { time: 3, source: 'extension', kind: 'turn_end', turnId: 't-crossed', outcome: 'interrupted' });
+      let current = await getSession(summary.id);
+      expect(autoCompactionReady(current)).toBe(false);
+      expect(current?.autoCompactReadyAt).toBeNull();
+      expect(current?.autoCompactThreshold).toBe(10_000);
+
+      // A turn that fails does not make it ready either.
+      await appendEvent(summary.id, { time: 4, source: 'extension', kind: 'turn_start', turnId: 't-failed' });
+      await appendEvent(summary.id, { time: 5, source: 'extension', kind: 'turn_end', turnId: 't-failed', outcome: 'failed' });
+      expect(autoCompactionReady(await getSession(summary.id))).toBe(false);
+
+      // The next turn this log opens and sees finish cleanly does.
+      await appendEvent(summary.id, { time: 6, source: 'extension', kind: 'turn_start', turnId: 't-clean' });
+      await appendEvent(summary.id, { time: 7, source: 'extension', kind: 'turn_end', turnId: 't-clean', outcome: 'completed' });
+      current = await getSession(summary.id);
+      expect(autoCompactionReady(current)).toBe(true);
+      expect(current?.autoCompactReadyAt).toBe(7);
+
+      // Still exactly one automatic compaction per chat: claiming it is terminal, and later
+      // clean turns above the line cannot produce a second.
+      expect(await claimAutoCompaction(summary.id, 'conv-lost-edge')).toBe(true);
+      await appendEvent(summary.id, { time: 8, source: 'extension', kind: 'turn_start', turnId: 't-after' });
+      await appendEvent(summary.id, { time: 9, source: 'extension', kind: 'turn_end', turnId: 't-after', outcome: 'completed' });
+      expect(autoCompactionReady(await getSession(summary.id))).toBe(false);
+      expect(await claimAutoCompaction(summary.id, 'conv-lost-edge')).toBe(false);
+    } finally {
+      await saveConfig(base);
+    }
+  });
+
   it('does not turn stale transcript hydration into a live automatic crossing', async () => {
     const base = defaultConfig();
     await saveConfig({ ...base, compaction: { ...base.compaction, auto: true, autoTokens: 10_000 } });

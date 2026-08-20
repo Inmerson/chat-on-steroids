@@ -72,17 +72,14 @@ const DEFAULT_SESSIONS: SessionSettings = {
  */
 const OLD_TOKEN_DEFAULTS = { advisoryTokens: 180_000, limitTokens: 200_000 };
 const DEFAULT_COMPACTION: CompactionSettings = {
-  // On, at the ceiling.
+  // On, at the advisory line.
   //
-  // This was off by default, on the grounds that compaction ends the chat the user is
-  // working in and that is not something to do to somebody who never asked. Living with it
-  // settled the argument the other way: hitting the ceiling mid-thought is the outcome
-  // people actually get, and it is worse than being moved to a fresh chat carrying a brief.
-  // The threshold is the limit rather than the advisory line, because the advisory line is
-  // where the app starts *mentioning* the size — compacting there ends chats that had
-  // hours of room left.
+  // Automatic compaction is edge-triggered since 1.8: an old chat that merely opens above
+  // this number does nothing. That makes the advisory line the useful default again — there
+  // is still room to finish the turn and write the handoff, instead of waiting until the
+  // observed failure ceiling and risking a context failure in the turn that should save it.
   auto: true,
-  autoTokens: DEFAULT_SESSIONS.limitTokens
+  autoTokens: DEFAULT_SESSIONS.advisoryTokens
 };
 // Two workers, not three: three concurrent workers reproducibly trips ChatGPT's rate limit
 // ("too many requests"), which strands the run rather than making it faster.
@@ -230,7 +227,7 @@ export async function loadConfig(): Promise<Config> {
       logError('Settings file was invalid and has been reset to defaults');
       current = defaultConfig();
     } else {
-      current = adoptAutoCompaction(recalibrateTokens(parsed.data));
+      current = adoptEdgeAutoCompaction(adoptAutoCompaction(recalibrateTokens(parsed.data)));
       // Duplicate root names would make a virtual path ambiguous.
       const seen = new Set<string>();
       current.roots = current.roots.filter((r) => {
@@ -282,6 +279,18 @@ function adoptAutoCompaction(config: Config): Config {
   return {
     ...config,
     compaction: { ...config.compaction, auto: DEFAULT_COMPACTION.auto, autoTokens: DEFAULT_COMPACTION.autoTokens }
+  };
+}
+
+/** The 1.7.x automatic default, before 1.8 made the trigger edge-based and moved it to 300k. */
+const PRE_EDGE_AUTO_DEFAULTS = { auto: true, autoTokens: 400_000 };
+
+function adoptEdgeAutoCompaction(config: Config): Config {
+  const { auto, autoTokens } = config.compaction;
+  if (auto !== PRE_EDGE_AUTO_DEFAULTS.auto || autoTokens !== PRE_EDGE_AUTO_DEFAULTS.autoTokens) return config;
+  return {
+    ...config,
+    compaction: { ...config.compaction, autoTokens: DEFAULT_COMPACTION.autoTokens }
   };
 }
 

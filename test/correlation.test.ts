@@ -1,0 +1,181 @@
+import { mkdtemp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
+import { beforeEach, describe, expect, it } from 'vitest';
+import { flushDurable, initDurableStore, resetDurableForTests } from '../src/main/durable.js';
+import {
+  appendEvent,
+  createSession,
+  initSessionStore,
+  resetSessionStoreForTests,
+  unsetSessionRootForTests
+} from '../src/main/session/store.js';
+import {
+  observeRequestCorrelation,
+  requestCorrelation,
+  requestCorrelationConflicted,
+  restoreRequestCorrelations,
+  resetCorrelationRegistryForTests
+} from '../src/main/session/correlation.js';
+
+describe('request correlation ownership', () => {
+  beforeEach(() => resetCorrelationRegistryForTests());
+
+  it('keeps one turn-level request id owned across different MCP messages and tools', () => {
+    const requestId = 'wfr_shared_turn';
+    const now = Date.now();
+    expect(
+      observeRequestCorrelation({
+        requestId,
+        conversationId: 'conv-a',
+        sessionId: 'session-a',
+        messageId: 'msg-read',
+        tool: 'read',
+        observedAt: now
+      })
+    ).toBe('stored');
+    expect(
+      observeRequestCorrelation({
+        requestId,
+        conversationId: 'conv-a',
+        sessionId: 'session-a-later',
+        messageId: 'msg-exec',
+        tool: 'exec_command',
+        observedAt: now + 1
+      })
+    ).toBe('same');
+    expect(
+      observeRequestCorrelation({
+        requestId,
+        conversationId: 'conv-a',
+        sessionId: 'session-a-later',
+        messageId: 'msg-session',
+        tool: 'session',
+        observedAt: now + 2
+      })
+    ).toBe('same');
+
+    expect(requestCorrelationConflicted(requestId)).toBe(false);
+    expect(requestCorrelation(requestId)?.conversationId).toBe('conv-a');
+    expect(requestCorrelation(requestId)?.sessionId).toBe('session-a');
+  });
+
+  it('still fails closed when the same request id is claimed by two conversations', () => {
+    const requestId = 'wfr_cross_chat';
+    const now = Date.now();
+    observeRequestCorrelation({
+      requestId,
+      conversationId: 'conv-a',
+      sessionId: 'session-a',
+      messageId: 'msg-a',
+      tool: 'read',
+      observedAt: now
+    });
+    expect(
+      observeRequestCorrelation({
+        requestId,
+        conversationId: 'conv-b',
+        sessionId: 'session-b',
+        messageId: 'msg-b',
+        tool: 'read',
+        observedAt: now + 1
+      })
+    ).toBe('conflict');
+    expect(requestCorrelationConflicted(requestId)).toBe(true);
+    expect(requestCorrelation(requestId)).toBeNull();
+  });
+
+  it('does not age a proven request owner out just because the page evidence is old', () => {
+    const requestId = 'wfr_long_running_workflow';
+    observeRequestCorrelation({
+      requestId,
+      conversationId: 'conv-a',
+      sessionId: 'session-a',
+      messageId: 'msg-a',
+      tool: 'exec_command',
+      // Deliberately ancient. 1.8.1 forgot this after ten minutes and started filing later
+      // calls from the same still-running workflow into Unattributed activity.
+      observedAt: 1
+    });
+
+    expect(requestCorrelation(requestId)?.conversationId).toBe('conv-a');
+  });
+
+  it('restores proven request ownership from durable state after an app restart', async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), 'clf-correlation-'));
+    try {
+      resetDurableForTests();
+      initDurableStore(dir);
+      const requestId = 'wfr_survives_restart';
+      observeRequestCorrelation({
+        requestId,
+        conversationId: 'conv-durable',
+        sessionId: 'session-durable',
+        messageId: 'msg-durable',
+        tool: 'read',
+        observedAt: 123
+      });
+      await flushDurable();
+
+      resetCorrelationRegistryForTests();
+      expect(requestCorrelation(requestId)).toBeNull();
+
+      await restoreRequestCorrelations();
+      expect(requestCorrelation(requestId)?.conversationId).toBe('conv-durable');
+      expect(requestCorrelation(requestId)?.sessionId).toBe('session-durable');
+    } finally {
+      resetCorrelationRegistryForTests();
+      resetDurableForTests();
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('rebuilds the first 1.8.2 owner index from already-attributed session history', async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), 'clf-correlation-migrate-'));
+    try {
+      resetDurableForTests();
+      resetSessionStoreForTests();
+      initDurableStore(dir);
+      initSessionStore(dir);
+
+      const session = await createSession({ title: 'old attributed history', conversationId: 'conv-history' });
+      await appendEvent(session.id, {
+        time: 200,
+        source: 'mcp',
+        kind: 'tool_call',
+        call: {
+          callId: 'call-history',
+          tool: 'read',
+          attribution: 'request_id',
+          requestId: 'wfr_history',
+          conversationId: 'conv-history',
+          attributionMethod: 'request_id',
+          args: { text: '{}', truncated: false, chars: 2 },
+          result: { text: 'ok', truncated: false, chars: 2 },
+          outcome: 'ok',
+          durationMs: 1,
+          summary: { kind: 'read', tone: 'neutral', title: 'Read history' }
+        }
+      });
+
+      resetCorrelationRegistryForTests();
+      await restoreRequestCorrelations();
+      expect(requestCorrelation('wfr_history')?.conversationId).toBe('conv-history');
+      expect(requestCorrelation('wfr_history')?.sessionId).toBe(session.id);
+
+      await flushDurable();
+      resetCorrelationRegistryForTests();
+      resetSessionStoreForTests();
+      unsetSessionRootForTests();
+      await restoreRequestCorrelations();
+      expect(requestCorrelation('wfr_history')?.conversationId).toBe('conv-history');
+      expect(requestCorrelation('wfr_history')?.sessionId).toBe(session.id);
+    } finally {
+      resetCorrelationRegistryForTests();
+      resetSessionStoreForTests();
+      unsetSessionRootForTests();
+      resetDurableForTests();
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+});

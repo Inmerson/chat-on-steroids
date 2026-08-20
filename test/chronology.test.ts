@@ -4,6 +4,7 @@ import { chronological } from '../src/shared/chronology.js';
 
 interface Row {
   seq: number;
+  origin?: number;
   time: number;
   kind: string;
   turnId?: string | null;
@@ -217,5 +218,15 @@ describe('the order a recorded turn is read in', () => {
 
     expect(after).toEqual(['turn_start@100', 'progress@110', 'tool_call@120', 'progress@150']);
     expect(chronological([...held.values()]).map((entry) => entry.seq)).toEqual([1, 2, 500, 3]);
+  });
+
+  it('uses a canonical revision origin to break equal-time ties', () => {
+    const rows: Row[] = [
+      row(1, 100, 'turn_start', 't1'),
+      { ...row(5, 120, 'assistant_message', 't1', 'revised assistant'), origin: 2 },
+      row(3, 120, 'tool_call', 't1'),
+      row(4, 140, 'turn_end', 't1')
+    ];
+    expect(reading(rows)).toEqual(['turn_start@100', 'revised assistant', 'tool_call@120', 'turn_end@140']);
   });
 });

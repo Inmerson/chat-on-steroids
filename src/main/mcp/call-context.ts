@@ -60,6 +60,8 @@ export interface CallCaller {
 }
 
 export interface CallContext {
+  /** Wall-clock start of this MCP request, shared by identity-sensitive handlers. */
+  startedAt: number;
   /** Stable per-conversation key when the transport offers one, else null. */
   transportKey: string | null;
   /** Resolved agent id in multi-agent mode, else null. */
@@ -117,9 +119,28 @@ export function runInCallContext<T>(context: CallContext, fn: () => T): T {
  * whole tool surface (and, through it, Electron).
  */
 let inFlight = 0;
+let inFlightRequests = 0;
 
 export function inFlightToolCalls(): number {
   return inFlight;
+}
+
+/**
+ * MCP requests that have entered dispatch, including time spent waiting for exact browser
+ * request-id evidence and the durable recorder append after the handler itself returns.
+ * Orphan cleanup needs this wider counter so those gaps can never look like global idleness.
+ */
+export function inFlightMcpRequests(): number {
+  return inFlightRequests;
+}
+
+export async function trackMcpRequest<T>(fn: () => Promise<T>): Promise<T> {
+  inFlightRequests += 1;
+  try {
+    return await fn();
+  } finally {
+    inFlightRequests -= 1;
+  }
 }
 
 /** Counts one call for as long as it runs, however it ends. */
@@ -154,7 +175,14 @@ export function bindOnAttribution(agent: string): void {
 
 export function noteOutcome(outcome: ToolOutcome): void {
   const store = storage.getStore();
-  if (store) store.outcome = outcome;
+  if (!store) return;
+  // A lower-severity wrapper result must never erase a more specific outcome the tool
+  // already established. The concrete live failure was exec_command: noteExec() marked a
+  // non-zero child exit as `error`, then guard() saw an ordinary (non-isError) ToolResult
+  // and overwrote it with `ok`. Session history consequently showed a failed build as a
+  // successful MCP call. Keep the strongest fact seen during the call instead.
+  const rank: Record<ToolOutcome, number> = { ok: 0, rejected: 1, error: 2 };
+  if (store.outcome === null || rank[outcome] > rank[store.outcome]) store.outcome = outcome;
 }
 
 export function noteChange(change: FileChange): void {

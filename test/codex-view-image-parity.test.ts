@@ -1,4 +1,5 @@
 import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { deflateSync } from 'node:zlib';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
@@ -60,6 +61,49 @@ function pngWithCorruptDeflateAndValidChunkCrc(): Buffer {
     offset = crcOffset + 4;
   }
   throw new Error('fixture has no IDAT');
+}
+
+/**
+ * The shape that actually killed live ChatGPT turns on 2026-08-20.
+ *
+ * Chunk framing, chunk CRCs and the two-byte zlib header are all valid, so every structural
+ * check passed and `view_image` returned a successful `image` content block. The DEFLATE
+ * stream underneath is garbage — `zlib` reports `invalid block type` — and the message stream
+ * died with `Error in message stream` immediately after each call on this file.
+ */
+function pngWithValidZlibHeaderOverGarbageDeflate(): Buffer {
+  return pngWithReplacedImageData(Buffer.from([0x78, 0x9c, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff]));
+}
+
+/** A PNG whose IDAT inflates cleanly but to fewer pixels than IHDR promises. */
+function pngWithTruncatedPixelData(): Buffer {
+  return pngWithReplacedImageData(deflateSync(Buffer.alloc(0)));
+}
+
+/** The 1x1 fixture above with its single IDAT payload swapped for `payload`, CRC repaired. */
+function pngWithReplacedImageData(payload: Buffer): Buffer {
+  const bytes = Buffer.from(
+    'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=',
+    'base64'
+  );
+  const out: Buffer[] = [bytes.subarray(0, 8)];
+  let offset = 8;
+  while (offset + 12 <= bytes.length) {
+    const length = bytes.readUInt32BE(offset);
+    const end = offset + 12 + length;
+    if (bytes.subarray(offset + 4, offset + 8).toString('ascii') === 'IDAT') {
+      const chunk = Buffer.alloc(12 + payload.length);
+      chunk.writeUInt32BE(payload.length, 0);
+      chunk.write('IDAT', 4, 'ascii');
+      payload.copy(chunk, 8);
+      chunk.writeUInt32BE(pngCrc32(chunk, 4, 8 + payload.length), 8 + payload.length);
+      out.push(chunk);
+    } else {
+      out.push(bytes.subarray(offset, end));
+    }
+    offset = end;
+  }
+  return Buffer.concat(out);
 }
 
 function jpegWithoutScanData(): Buffer {
@@ -150,6 +194,22 @@ describe('Codex view_image runtime parity', () => {
     const root = await tempRoot();
     const image = path.join(root, 'corrupt-deflate.png');
     await writeFile(image, pngWithCorruptDeflateAndValidChunkCrc());
+
+    await expect(viewImage(image, null)).rejects.toThrow(VIEW_IMAGE_INVALID_MESSAGE);
+  });
+
+  it('rejects the live corrupt PNG that broke the ChatGPT message stream', async () => {
+    const root = await tempRoot();
+    const image = path.join(root, 'audit-deep-corrupt.png');
+    await writeFile(image, pngWithValidZlibHeaderOverGarbageDeflate());
+
+    await expect(viewImage(image, null)).rejects.toThrow(VIEW_IMAGE_INVALID_MESSAGE);
+  });
+
+  it('rejects a PNG whose image data inflates to fewer pixels than its header promises', async () => {
+    const root = await tempRoot();
+    const image = path.join(root, 'truncated-pixels.png');
+    await writeFile(image, pngWithTruncatedPixelData());
 
     await expect(viewImage(image, null)).rejects.toThrow(VIEW_IMAGE_INVALID_MESSAGE);
   });

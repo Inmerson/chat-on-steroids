@@ -110,15 +110,16 @@ describe('settings migration', () => {
    * used to start off on the grounds that this is not something to do to somebody who never
    * asked for it. In use that reasoning turned out to be backwards: the alternative to
    * compacting is hitting the ceiling mid-thought and losing the thread entirely, which is
-   * the worse thing to have happen to somebody who never asked for it. So it starts on, at
-   * the ceiling rather than at the advisory line.
+   * the worse thing to have happen to somebody who never asked for it. Since 1.8 the trigger
+   * is edge-based rather than "currently above the line", so the advisory line is safe as
+   * the default and still leaves room to finish the crossing turn and write the handoff.
    */
-  it('starts with automatic compaction on at the ceiling', async () => {
+  it('starts with automatic compaction on at the advisory line', async () => {
     await saveConfig(defaultConfig());
     const loaded = await loadConfig();
     expect(loaded.compaction.auto).toBe(true);
-    expect(loaded.compaction.autoTokens).toBe(loaded.sessions.limitTokens);
-    expect(loaded.compaction.autoTokens).toBe(400_000);
+    expect(loaded.compaction.autoTokens).toBe(loaded.sessions.advisoryTokens);
+    expect(loaded.compaction.autoTokens).toBe(300_000);
   });
 
   /**
@@ -131,7 +132,14 @@ describe('settings migration', () => {
     await saveConfig({ ...config, compaction: { ...config.compaction, auto: false, autoTokens: 300_000 } });
     const loaded = await loadConfig();
     expect(loaded.compaction.auto).toBe(true);
-    expect(loaded.compaction.autoTokens).toBe(400_000);
+    expect(loaded.compaction.autoTokens).toBe(300_000);
+  });
+
+  it('moves the untouched 1.7 automatic default from 400k to the 1.8 edge threshold', async () => {
+    const config = defaultConfig();
+    await saveConfig({ ...config, compaction: { ...config.compaction, auto: true, autoTokens: 400_000 } });
+    const loaded = await loadConfig();
+    expect(loaded.compaction).toMatchObject({ auto: true, autoTokens: 300_000 });
   });
 
   it('leaves a user who turned automatic compaction off turned off', async () => {
@@ -165,7 +173,7 @@ describe('settings migration', () => {
     await saveConfig(older as ReturnType<typeof defaultConfig>);
     const loaded = await loadConfig();
     expect(loaded.compaction.auto).toBe(true);
-    expect(loaded.compaction.autoTokens).toBe(400_000);
+    expect(loaded.compaction.autoTokens).toBe(300_000);
   });
 
   it('serializes concurrent read-modify-write changes instead of losing one', async () => {

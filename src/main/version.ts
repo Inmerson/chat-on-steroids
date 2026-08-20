@@ -12,7 +12,7 @@
  * extension does nothing" into a diagnosable mismatch.
  */
 
-export const APP_VERSION = '1.7.6';
+export const APP_VERSION = '1.8.3';
 
 /**
  * 1 — original observations/activity bridge.
@@ -22,5 +22,7 @@ export const APP_VERSION = '1.7.6';
  *     redeems that one id through /commands/redeem, /commands also reports which ids are
  *     still active, /activity carries the resume job and compaction progress, and /pair
  *     provisions silently.
+ * 5 — canonical Fiber message/request observations, exact request-id attribution metadata,
+ *     automatic-compaction edge/claim state, and the 1.8 activity payload contract.
  */
-export const BRIDGE_PROTOCOL = 4;
+export const BRIDGE_PROTOCOL = 5;

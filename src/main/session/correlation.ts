@@ -1,0 +1,254 @@
+/**
+ * The single ownership join between ChatGPT's page model and an inbound MCP request.
+ *
+ * ChatGPT puts one opaque request id in both places:
+ *   - HTTP `x-request-id` on the MCP request (normalised at ingress), and
+ *   - `message.metadata.request_id` on the connector request in the page model.
+ *
+ * Nothing else is ownership evidence. In particular, tool names, timestamps, rendered
+ * connector rows, the active tab and "the only chat generating" never enter this registry.
+ *
+ * Once that exact join has been proved, ownership is durable. `request_id` names one ChatGPT
+ * workflow, and the MCP side may keep issuing calls after the page that originally exposed the
+ * id has been reloaded, compacted or closed. Expiring the join after ten minutes was the live
+ * 1.8.1 bug: the same still-running request went from correctly attributed to Unattributed
+ * solely because its browser evidence aged out. A proven owner therefore has no time TTL.
+ */
+
+import { readDurable, writeDurableSoon } from '../durable.js';
+import { listAllSessions, readEvents } from './store.js';
+
+export interface RequestCorrelation {
+  requestId: string;
+  conversationId: string;
+  /** Durable local session epoch that owned this request when the page first proved it. */
+  sessionId: string;
+  messageId: string;
+  tool: string;
+  observedAt: number;
+}
+
+interface HeldCorrelation {
+  value: RequestCorrelation | null;
+  /** A contradiction is sticky; null alone must not look absent. */
+  conflicted: boolean;
+}
+
+const MAX_CORRELATIONS = 50_000;
+const CORRELATIONS_STATE = 'request-correlations';
+const CORRELATIONS_STATE_VERSION = 2;
+
+const byRequest = new Map<string, HeldCorrelation>();
+const waiters = new Map<string, Set<() => void>>();
+let restored = false;
+
+interface PersistedCorrelation {
+  requestId: string;
+  value: RequestCorrelation | null;
+  conflicted: boolean;
+}
+
+interface PersistedCorrelations {
+  version: number;
+  entries: PersistedCorrelation[];
+}
+
+function wake(requestId: string): void {
+  const held = waiters.get(requestId);
+  if (!held) return;
+  waiters.delete(requestId);
+  for (const resolve of held) resolve();
+}
+
+function trim(): void {
+  while (byRequest.size > MAX_CORRELATIONS) {
+    const first = byRequest.keys().next().value as string | undefined;
+    if (!first) break;
+    byRequest.delete(first);
+    wake(first);
+  }
+}
+
+function snapshot(): PersistedCorrelations {
+  return {
+    version: CORRELATIONS_STATE_VERSION,
+    entries: [...byRequest].map(([requestId, held]) => ({
+      requestId,
+      value: held.value ? { ...held.value } : null,
+      conflicted: held.conflicted
+    }))
+  };
+}
+
+function persist(): void {
+  writeDurableSoon(CORRELATIONS_STATE, snapshot());
+}
+
+function validCorrelation(value: unknown): value is RequestCorrelation {
+  if (!value || typeof value !== 'object') return false;
+  const item = value as Partial<RequestCorrelation>;
+  return (
+    typeof item.requestId === 'string' && item.requestId.length > 0 && item.requestId.length <= 200 &&
+    typeof item.conversationId === 'string' && item.conversationId.length > 0 && item.conversationId.length <= 200 &&
+    typeof item.sessionId === 'string' && /^[0-9a-z-]{8,64}$/i.test(item.sessionId) &&
+    typeof item.messageId === 'string' && item.messageId.length > 0 && item.messageId.length <= 300 &&
+    typeof item.tool === 'string' && item.tool.length > 0 && item.tool.length <= 100 &&
+    typeof item.observedAt === 'number' && Number.isFinite(item.observedAt)
+  );
+}
+
+function merge(input: RequestCorrelation): 'stored' | 'same' | 'conflict' {
+  const previous = byRequest.get(input.requestId);
+  if (!previous) {
+    byRequest.set(input.requestId, { value: { ...input }, conflicted: false });
+    trim();
+    wake(input.requestId);
+    return 'stored';
+  }
+
+  if (previous.conflicted || !previous.value) {
+    previous.conflicted = true;
+    previous.value = null;
+    wake(input.requestId);
+    return 'conflict';
+  }
+
+  // Live ChatGPT gives every connector request in one turn the same request_id. messageId and
+  // tool identify individual calls inside that turn, so differences there are expected and
+  // must not poison the ownership join. Conversation disagreement is the actual conflict.
+  //
+  // Session epoch is intentionally first-proof-wins for the same conversation. Compact &
+  // Resume can later leave the old page model mounted while a new local session epoch exists
+  // for that same old conversation id. Re-observing the same request from that stale page must
+  // not move an already-proved in-flight request into the newer stale session.
+  if (previous.value.conversationId === input.conversationId) {
+    previous.value.observedAt = Math.max(previous.value.observedAt, input.observedAt);
+    return 'same';
+  }
+
+  previous.conflicted = true;
+  previous.value = null;
+  wake(input.requestId);
+  return 'conflict';
+}
+
+/**
+ * Restores request ownership before the bridge starts accepting page/MCP traffic.
+ *
+ * 1.8.2 persists this index directly. On the first 1.8.2 launch there is no index yet, so
+ * rebuild it once from already-recorded request_id-attributed tool calls. Those records are
+ * themselves the result of the exact page↔HTTP join, and let an old still-running workflow
+ * remain owned across the upgrade even if its original tab is already gone.
+ */
+export async function restoreRequestCorrelations(): Promise<void> {
+  if (restored) return;
+  restored = true;
+
+  const saved = await readDurable<PersistedCorrelations>(CORRELATIONS_STATE);
+  let loaded = false;
+  if (saved?.version === CORRELATIONS_STATE_VERSION && Array.isArray(saved.entries)) {
+    for (const raw of saved.entries.slice(-MAX_CORRELATIONS)) {
+      if (!raw || typeof raw !== 'object' || typeof raw.requestId !== 'string') continue;
+      if (raw.conflicted === true) {
+        byRequest.set(raw.requestId, { value: null, conflicted: true });
+        loaded = true;
+        continue;
+      }
+      if (!validCorrelation(raw.value) || raw.value.requestId !== raw.requestId) continue;
+      merge(raw.value);
+      loaded = true;
+    }
+    trim();
+  }
+
+  if (loaded) return;
+
+  // One-time upgrade/recovery path. listSessions is already bounded for the UI; future starts
+  // use the small durable index above and never rescan history.
+  for (const session of await listAllSessions()) {
+    for (const event of await readEvents(session.id, { kinds: ['tool_call'] })) {
+      if (event.kind !== 'tool_call') continue;
+      const call = event.call;
+      if (call.attributionMethod !== 'request_id' || !call.requestId || !call.conversationId) continue;
+      merge({
+        requestId: call.requestId,
+        conversationId: call.conversationId,
+        sessionId: session.id,
+        messageId: `stored:${call.callId}`,
+        tool: call.tool,
+        observedAt: event.time
+      });
+    }
+  }
+  if (byRequest.size > 0) persist();
+}
+
+/**
+ * Adds page evidence. `request_id` is a turn/workflow ownership key, not a per-tool-call id:
+ * one ChatGPT turn can legitimately report several message ids/tools under the same key.
+ * Re-reporting that key from the same conversation is therefore idempotent; only a different
+ * conversation is contradictory and makes the key permanently unresolved for this TTL.
+ */
+export function observeRequestCorrelation(input: RequestCorrelation): 'stored' | 'same' | 'conflict' {
+  const result = merge(input);
+  if (result !== 'same') persist();
+  return result;
+}
+
+/** Marks one request contradictory without ever publishing a successful ownership value. */
+export function rejectRequestCorrelation(requestId: string): void {
+  const previous = byRequest.get(requestId);
+  if (previous) {
+    previous.value = null;
+    previous.conflicted = true;
+  } else {
+    byRequest.set(requestId, { value: null, conflicted: true });
+    trim();
+  }
+  wake(requestId);
+  persist();
+}
+
+/** Exact request-id lookup. A contradiction and an absent request both resolve to null. */
+export function requestCorrelation(requestId: string | null | undefined): RequestCorrelation | null {
+  if (!requestId) return null;
+  const held = byRequest.get(requestId);
+  return held && !held.conflicted && held.value ? { ...held.value } : null;
+}
+
+/** Whether this id has contradictory page evidence. Useful only for diagnosis/tests. */
+export function requestCorrelationConflicted(requestId: string): boolean {
+  return byRequest.get(requestId)?.conflicted === true;
+}
+
+/**
+ * Waits only for this exact id. Late Fiber evidence is allowed; no other request or page
+ * state can wake this into a successful ownership decision.
+ */
+export async function awaitRequestCorrelation(requestId: string | null | undefined, timeoutMs: number): Promise<RequestCorrelation | null> {
+  if (!requestId) return null;
+  const immediate = requestCorrelation(requestId);
+  if (immediate || requestCorrelationConflicted(requestId) || timeoutMs <= 0) return immediate;
+
+  let timer: NodeJS.Timeout | null = null;
+  await new Promise<void>((resolve) => {
+    const set = waiters.get(requestId) ?? new Set<() => void>();
+    set.add(resolve);
+    waiters.set(requestId, set);
+    timer = setTimeout(() => {
+      set.delete(resolve);
+      if (set.size === 0) waiters.delete(requestId);
+      resolve();
+    }, timeoutMs);
+    timer.unref?.();
+  });
+  if (timer) clearTimeout(timer);
+  return requestCorrelation(requestId);
+}
+
+/** A conversation being closed cannot invalidate an already issued request. */
+export function resetCorrelationRegistryForTests(): void {
+  byRequest.clear();
+  restored = false;
+  for (const requestId of [...waiters.keys()]) wake(requestId);
+}

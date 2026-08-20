@@ -15,20 +15,13 @@
  *
  * The hard requirement is that two chats never share a workspace — chat B resolving
  * `src/main/patch.ts` against chat A's project would read, or worse write, the wrong file.
- * And the connector cannot tell us who is calling: `dispatch` sets `conversationId` to null
- * deliberately (see the comment there), and the MCP transport supplies no session id, which
- * `transportIdentityStatus()` measures rather than assumes.
+ * The dispatcher now adopts an exact request-id → conversation join before the handler when
+ * that evidence is already available. That conversation is stronger than the old
+ * sole-generating fallback and must win whenever present.
  *
- * So identity comes from the strongest evidence available, in order:
- *
- *   1. The agent id, when multi-agent mode is on. A worker proves who it is on every call
- *      with its short code, so its workspace is exactly its own.
- *   2. The conversation that is the *sole* ChatGPT chat mid-turn at the moment of the call.
- *      A chat that is not generating is not making tool calls, so a single generating chat
- *      is the one that called. This is the same evidence `claimGeneration()` already trusts
- *      for attribution, used here in its strict form only.
- *
- * When neither answers — two chats generating at once, or no page reporting at all — there
+ * Identity comes only from the request-correlated conversation (or its already-resolved
+ * swarm agent). When that exact identity is absent — Chrome off, late/missing Fiber evidence,
+ * or a conflicting observation — there
  * is **no workspace**, and a relative path is refused with the absolute form to use instead.
  * That is the whole safety argument: ambiguity costs a retry, never a wrong file. Nothing
  * here ever widens what may be reached; every path still goes through `resolvePath` and
@@ -39,7 +32,6 @@ import path from 'node:path';
 import { rawPromises as fs } from './rawfs.js';
 import type { Root } from '../shared/types.js';
 import { currentCall } from './mcp/call-context.js';
-import { soleGeneratingConversation } from './session/recorder.js';
 
 /** How long a learned workspace survives without being used or renewed. */
 const WORKSPACE_TTL_MS = 12 * 60 * 60 * 1000;
@@ -75,8 +67,8 @@ const workspaces = new Map<string, Workspace>();
 export function workspaceKey(): string | null {
   const call = currentCall();
   if (call?.agent) return `agent:${call.agent}`;
-  const chat = soleGeneratingConversation();
-  return chat ? `chat:${chat}` : null;
+  if (call?.caller.conversationId) return `chat:${call.caller.conversationId}`;
+  return null;
 }
 
 function prune(): void {

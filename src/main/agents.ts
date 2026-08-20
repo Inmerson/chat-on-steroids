@@ -826,6 +826,31 @@ export function pendingCount(id: string): number {
   return run?.agents.get(id)?.info.pending ?? 0;
 }
 
+/**
+ * Releases the single global swarm claim once there is nothing left for the run to deliver.
+ *
+ * Worker terminal state alone is not enough: `finishAgent()` queues the final report to the
+ * prime, and at-least-once delivery means that report must survive until a later authenticated
+ * prime call acknowledges it. The dispatcher calls this only after inbox acknowledgement and
+ * result construction, so an `agents status` call can still inspect the run that it is about
+ * to retire.
+ *
+ * `allowPendingReports` exists only for the durable orphan fallback. That path separately
+ * proves roughly two minutes of durable quiescence for every bound chat before choosing slot
+ * availability over an inbox the abandoned prime is no longer collecting.
+ */
+export function releaseQuiescentRun(options: { allowPendingReports?: boolean; reason?: string } = {}): boolean {
+  if (!run || swarmTransferActive()) return false;
+  const workers = [...run.agents.values()].filter((agent) => agent.info.role === 'worker');
+  if (workers.length === 0 || workers.some((agent) => !isOver(agent.info.state))) return false;
+  const prime = run.agents.get(PRIME_ID);
+  if (!prime) return false;
+  if (!options.allowPendingReports && prime.info.pending > 0) return false;
+  endRun(options.reason ?? 'all workers are terminal and their final reports were delivered');
+  changed();
+  return true;
+}
+
 // ------------------------------------------------------------------- finish
 
 export interface FinishResult {
@@ -896,6 +921,23 @@ export function finishAgent(caller: Caller, result: string): FinishResult {
 }
 
 /**
+ * App-owned terminal cleanup for a worker whose ChatGPT turn produced a settled answer.
+ *
+ * Broker messages ride on later tool results, so a worker that simply answers and then goes
+ * idle has no future execution point at which an explicit `agents finish` can be required.
+ * Leaving that worker `active` permanently consumed a slot and made the UI promise a worker
+ * was still working when its chat had plainly finished. Treat workers as one-shot jobs: the
+ * browser's settled assistant answer releases the slot, while an explicit finish remains the
+ * same idempotent path when the model does call it first.
+ */
+export function finishWorkerConversation(conversationId: string, result: string): FinishResult | null {
+  if (!run || !conversationId) return null;
+  const agent = agentForConversationId(conversationId);
+  if (!agent || agent.info.role !== 'worker' || isOver(agent.info.state)) return null;
+  return finishAgent({ conversationId }, result);
+}
+
+/**
  * Ends a worker that never got off the ground, definitively.
  *
  * Called by whoever owns the bootstrap once it has run out of retries or time. Before this
@@ -945,6 +987,19 @@ export function currentRunId(): string | null {
   return run?.runId ?? null;
 }
 
+/** Whether Compact & Resume currently owns the prime binding transition. */
+export function swarmTransferActive(): boolean {
+  const transfer = run?.transfer ?? null;
+  if (!transfer) return false;
+  if (!transferExpired(transfer)) return true;
+  // An abandoned unfrozen handover is no longer authority after its existing 10-minute TTL.
+  // Clear it lazily here so it cannot turn into a permanent global swarm lock. Frozen commits
+  // never expire and transferExpired() already preserves that invariant.
+  if (run) run.transfer = null;
+  changed();
+  return false;
+}
+
 /**
  * The prime chat has gone: end the run.
  *
@@ -959,6 +1014,22 @@ export function primeConversationGone(conversationId: string): boolean {
   if (run.transfer && !transferExpired(run.transfer)) return false;
   endRun('the prime conversation was closed');
   changed();
+  return true;
+}
+
+/** Ends a bound worker when the browser reports its final tab closed. */
+export function workerConversationGone(conversationId: string): boolean {
+  if (!run || !conversationId) return false;
+  const worker = [...run.agents.values()].find(
+    (agent) => agent.info.role === 'worker' && agent.info.conversationId === conversationId && !isOver(agent.info.state)
+  );
+  if (!worker) return false;
+  failAgent(
+    worker.info.id,
+    'the worker conversation was closed before it finished',
+    `[${worker.info.id} closed] Its ChatGPT conversation was closed before it reported completion. The worker slot is ` +
+      'free now. Continue without it or spawn a replacement if that work still matters.'
+  );
   return true;
 }
 

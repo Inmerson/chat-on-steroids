@@ -23,7 +23,7 @@
 const PORTS = [8765, 8766, 8767, 8768, 8769];
 const HELLO_TIMEOUT_MS = 1200;
 /** Bumped only when the request/response shape changes; the app compares it. */
-const BRIDGE_PROTOCOL = 4;
+const BRIDGE_PROTOCOL = 5;
 
 /**
  * Journal caps. The byte figure is what actually matters — chrome.storage.session has a
@@ -602,7 +602,7 @@ async function redeemCommand(id, client) {
   return { ok: true, command };
 }
 
-async function ackCommand(id, status, error, conversationId, agent) {
+async function ackCommand(id, status, error, conversationId, agent, client) {
   if (status === 'sent' && !agent) {
     // Resume commands are finished once their bootstrap message was sent. Worker
     // commands are different: the app deliberately keeps them until the join really
@@ -618,7 +618,8 @@ async function ackCommand(id, status, error, conversationId, agent) {
       status,
       error: error || undefined,
       conversationId: conversationId || undefined,
-      agent: agent || undefined
+      agent: agent || undefined,
+      client: client || undefined
     })
   });
 }
@@ -730,17 +731,31 @@ const HANDLERS = {
     await persist();
     return { ok: true };
   },
-  /**
-   * Ask every ChatGPT tab this worker already knows about to rebuild its Local Files
-   * activity stream immediately. `tabConversations` is the same durable tab registry used
-   * for conversation lifetime, so this needs neither broad tab-query permissions nor URL
-   * guessing from the popup.
-   */
+  /** Ask every eligible ChatGPT tab to rebuild its Local Files activity stream now. */
   async overwriteNow() {
     await load();
-    const tabs = Object.keys(tabConversations)
+    const known = Object.keys(tabConversations)
       .map((value) => Number(value))
       .filter((value) => Number.isInteger(value));
+    // The registry is authoritative for session lifetime, but it is populated only after a
+    // page has bound/observed something. A valid ChatGPT tab can therefore be absent at the
+    // exact moment the user turns Overwrite on. Discover the same host allowlist used by
+    // extension-reload recovery and union it with the durable registry. Host permissions in
+    // manifest.json already authorize URL-filtered tabs.query on these origins.
+    let discovered = [];
+    try {
+      discovered = await chrome.tabs.query({ url: CHATGPT_TAB_URLS });
+    } catch {
+      discovered = [];
+    }
+    const tabs = [
+      ...new Set([
+        ...known,
+        ...discovered
+          .map((tab) => (tab && typeof tab.id === 'number' ? tab.id : NaN))
+          .filter((value) => Number.isInteger(value))
+      ])
+    ];
     let applied = 0;
     for (const id of tabs) {
       try {
@@ -827,6 +842,14 @@ const HANDLERS = {
       })
     });
   },
+  async auto_compact_claim(message, sender) {
+    await load();
+    await noteTabConversation(sender, message.conversationId);
+    return call('/compact/claim-auto', {
+      method: 'POST',
+      body: JSON.stringify({ conversationId: message.conversationId })
+    });
+  },
   /** The marked page asking for the one command it was opened for. */
   async redeem(message) {
     return redeemCommand(String(message.id || ''), String(message.client || ''));
@@ -837,7 +860,8 @@ const HANDLERS = {
       message.status === 'failed' ? 'failed' : 'sent',
       message.error,
       message.conversationId,
-      message.agent
+      message.agent,
+      message.client
     );
   }
 };
@@ -863,10 +887,62 @@ chrome.tabs.onRemoved.addListener((id) => {
 // -------------------------------------------------------------------- recovery
 
 /**
- * The only thing that runs without a page.
+ * Restores the page half of the bridge after this extension itself is updated/reloaded.
  *
- * A service worker is not a daemon: Chrome stops it after seconds of idling, and nothing
- * in a stopped worker fires. An alarm is the one wake-up that survives that, which is why
- * the leftovers — a command restored from a previous run, a tab closed before its content
- * script came up — are picked up here and not on a timer.
+ * Chrome invalidates an extension's isolated content-script world when the extension is
+ * reloaded, but it does not reload the user's already-open ChatGPT document. The dead
+ * content.js then cannot send observations, request-id evidence or even the conversation's
+ * first /events batch, while fiber.js can remain visibly alive in the page's MAIN world.
+ * That exact split produces a healthy MCP tunnel plus a permanently growing Unattributed
+ * session and no session at all for the ChatGPT tab.
+ *
+ * runtime.onInstalled fires for unpacked Reload as an update, so repair only at that real
+ * lifecycle boundary — never from the service worker's ordinary wake/sleep cycle. The
+ * isolated content script has its own one-instance guard because a newly loading page can
+ * receive both its static manifest injection and this recovery injection.
  */
+const CHATGPT_TAB_URLS = ['https://chatgpt.com/*', 'https://chat.openai.com/*'];
+const PAGE_RECORDER_VERSION = 8;
+
+async function restoreOpenChatgptTabs() {
+  let tabs = [];
+  try {
+    tabs = await chrome.tabs.query({ url: CHATGPT_TAB_URLS });
+  } catch {
+    return;
+  }
+  for (const tab of tabs) {
+    const id = tab && typeof tab.id === 'number' ? tab.id : null;
+    if (id === null) continue;
+    try {
+      const live = await chrome.tabs.sendMessage(id, { type: 'clf-recorder-ping' });
+      if (live && live.ok === true && live.recorderVersion === PAGE_RECORDER_VERSION) continue;
+    } catch {
+      // No receiver is the expected signature of an already-open tab whose isolated world
+      // was invalidated by an extension reload. Fall through to deterministic recovery.
+    }
+    try {
+      // Rebuild the isolated-world DOM adapter before the recorder that consumes it.
+      await chrome.scripting.executeScript({ target: { tabId: id }, files: ['chatgpt-dom.js'] });
+      // Keep the React/Fiber reader in ChatGPT's own world, exactly like the static manifest
+      // declaration. An older helper may still answer too; the nonce/version gate in
+      // content.js makes those replies harmless, and a future version bump rejects them.
+      await chrome.scripting.executeScript({ target: { tabId: id }, world: 'MAIN', files: ['fiber.js'] });
+      await chrome.scripting.executeScript({ target: { tabId: id }, files: ['content.js'] });
+      await chrome.scripting.insertCSS({ target: { tabId: id }, files: ['overlay.css'] });
+    } catch {
+      // The tab can close or navigate between query and injection. Static content scripts
+      // cover the next eligible document, so there is nothing useful to retry here.
+    }
+  }
+}
+
+chrome.runtime.onInstalled.addListener(() => {
+  void restoreOpenChatgptTabs();
+});
+
+// `chrome://extensions` Reload does not provide a dependable install/update event across
+// development/reload paths. The service worker itself *must* start, though. Ping first, so
+// ordinary worker wake-ups are one cheap message per ChatGPT tab and inject nothing; only a
+// dead or stale recorder pays the scripting cost.
+void restoreOpenChatgptTabs();

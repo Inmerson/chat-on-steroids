@@ -308,10 +308,10 @@ describe('a brief longer than the app can type', () => {
     const { token: continuation } = await press();
 
     const head = 'TASK — finish the bridge rewrite.\n';
-    const middle = 'FILES — src/main/bridge.ts, and a great many others.\n'.repeat(1200);
+    const middle = 'FILES — src/main/bridge.ts, and a great many others.\n'.repeat(6000);
     const tail = 'NEXT — run the full suite.\nDO NOT — rebuild or reload anything.';
     const huge = head + middle + tail;
-    expect(huge.length).toBeGreaterThan(24_000);
+    expect(huge.length).toBeGreaterThan(256_000);
 
     const stored = await capture(continuation, huge);
     expect(stored.status).toBe(200);
@@ -324,6 +324,22 @@ describe('a brief longer than the app can type', () => {
     // And the cut is in the brief where the model reading it will see it, not silent.
     expect(text).toMatch(/left out/);
     expect(text.length).toBeLessThan(huge.length);
+  });
+
+  it('carries a large near-budget handoff without a hidden character-budget truncation', async () => {
+    await connect();
+    await record();
+    const { token: continuation } = await press();
+    const brief = `TASK — keep all of this.\n${'dense operational detail '.repeat(6500)}\nNEXT — continue exactly here.`;
+    expect(brief.length).toBeGreaterThan(150_000);
+    expect(brief.length).toBeLessThan(256_000);
+
+    const stored = await capture(continuation, brief);
+    const commandId = stored.body.commandId as string;
+    const text = (await redeem(commandId, 'page-long')).body.command.text as string;
+
+    expect(text).toContain(brief);
+    expect(text).not.toMatch(/middle of this brief.*left out/);
   });
 });
 

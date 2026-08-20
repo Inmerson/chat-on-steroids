@@ -9,29 +9,442 @@ Status: `[ ]` open · `[~]` in progress · `[x]` done · `[?]` needs a decision 
 into this list; do not create a second TODO. Screenshots and other raw proof may live under
 `docs/evidence/`, but every actionable item belongs here.
 
-**Installed build: v1.7.4, rebuild of 2026-08-18 13:07.** Built with `npm run dist`,
-installed silently over the earlier 1.7.4 and launched; `ChatGPT Local Files.exe`,
-`resources/app.asar` and `resources/extension/content.js` are all stamped `13:07`, the
-executable reports `1.7.4.0`, and the asar carries `WORKER_IDENTITY_LOST` / `AGENTS_BUSY`
-while the shipped `content.js` carries the `?clf=` marker and `/commands/redeem`, so the
-machine really is running the multi-agent rework. On first launch the extension reported
-three already-open ChatGPT tabs into `sessions/`, which is the bridge pairing and
-recording end to end against this build.
-`BRIDGE_PROTOCOL` stays at **4**: the wire additions in this release (`progressId`, the
-`tool_evidence` observation kind, and 1.6's `bootstrap` / `compaction.preview` /
-`compaction.reasoning`) are all additive and both peers coerce what they do not recognise,
-so bumping it would only break pairing with an older peer. The MAIN-world Fiber descriptor
-version *does* move, 3 → **4**, but that is a private handshake between `fiber.js` and
-`content.js` inside one extension build and is refused rather than mixed across versions.
+**Installed build: v1.8.0.** Verified directly on 2026-08-19 from
+`%LOCALAPPDATA%\Programs\ChatGPT Local Files\ChatGPT Local Files.exe`: file version `1.8.0`,
+product version `1.8.0.0`. Its first fresh-chat live smoke found two deterministic regressions;
+v1.8.1 below is the source-verified patch and is not installed yet.
 
-- Installer: `release/ChatGPT-Local-Files-Setup-1.7.4.exe` (135,035,549 bytes),
-  SHA-256 `A8C269BF90FAE13912DB2BF5D302F92F8B74703CFBA817CFF73B0BF0FC8DDC8B`.
-  This overwrote the stale 1.7.4 installer of 2026-08-17 20:46, which predated the rework.
-- Unpacked app: `release/win-unpacked/`.
-- Extension: `extension/` — manifest `1.7.4`, `fiber.js` `VERSION = 4`, `content.js`
-  `FIBER_VERSION = 4`. Also shipped inside the installer at `resources/extension`.
-- Green at this build: typecheck clean, **913 passed / 1 skipped / 0 failed** (27 files)
-  under real Node.
+## 2026-08-20 — turn killer, reload identity, exec isolation — **CODE DONE, NOT PACKAGED**
+
+One live session reported chats dying on their own (`Error in message stream` → `Turn ended
+for an unknown reason`, no user action), a reloaded chat showing every message twice, and
+Overwrite looking switched off after a reload. All three were reproduced from the session
+files on disk rather than guessed at. The Codex-port audit items from the same report are
+below with what was fixed and what deliberately was not.
+
+- [x] **T-167 — `view_image` returned an undecodable PNG and that killed the ChatGPT turn.
+      FIXED.** Replaying `events.jsonl` across the store: four of the five `Error in message
+      stream` events immediately follow a tool call returning `.audit-deep-corrupt.png` as an
+      MCP `image` content block, recorded `outcome: ok`, asset 68 bytes. `hasImagePayload`
+      only checked the 8-byte PNG signature, so a file that inflates to nothing was answered
+      as a successful image, and ChatGPT's stream broke on the content block. `decodesAsPng`
+      in `src/main/codex/view-image.ts` now really decodes: IHDR fields validated against
+      colour-type/bit-depth tables, PLTE required for colour type 3, IDAT payloads inflated
+      with `node:zlib`, and every scanline of every Adam7 pass checked for length and a legal
+      filter byte. Running the actual stored asset through `viewImage` now rejects; with the
+      file stashed it resolves, which is the regression pinned in
+      `test/codex-view-image-parity.test.ts`.
+      **Known gap, deliberate:** JPEG/GIF/WebP are still structural checks only. A corrupt
+      JPEG can still reach ChatGPT the way this PNG did.
+
+- [x] **T-168 — a reload made every assistant message appear twice. FIXED.** `messages.json`
+      held two keys with identical text and an identical authored `time`, differing only in
+      the `parent_id` segment of the logical id. `assistantLogicalId` keyed on
+      `parent_id + working_turn_id + turn_exchange_id`, and rehydrating a conversation from
+      the server re-parents the text message, so every already-recorded message came back
+      under a second key. Identity is now ChatGPT's own `working_turn_id` /
+      `turn_exchange_id` / `create_time`, which is the same before and after a reload. No
+      text, DOM position or local clock takes part. Two messages of one branch sharing a
+      creation millisecond fall back to the parent tuple, so a collision costs a weaker key
+      rather than a swallowed message (`extension/fiber.js`, `test/fiber.test.ts`).
+
+- [x] **T-169 — Overwrite stopped naming rows after a reload. FIXED.** Not a switch: the
+      join had expired. `data-turn-id` is minted per page load — the store has both shapes,
+      `g-1s6atlm1inbjf2-0-1` while a turn streams and `request-WEB:<load-uuid>-<n>` for the
+      same turn after a refresh — so the `turnId` on every recorded call named no visible
+      turn and every block fell through to the quieter page-named label. ChatGPT's connector
+      request id is the durable half of that join and both sides already hold it: 183 of 183
+      recent recorded calls carry one, and one request id covers a whole turn.
+      `/activity` now sends `requestId` with each entry (`src/main/bridge.ts`) and
+      `recordedCallsFor` in `extension/content.js` falls back to it when the turn id finds
+      nothing — only when the turn names exactly one request, and only for a request no
+      earlier turn claimed in the same pass. Covered in `test/content-script.test.ts`.
+
+- [x] **T-170 — automatic compaction could arm and then lose the edge forever. FIXED.**
+      No session in the store has ever had a non-null `autoCompactThreshold` or
+      `autoCompactTriggeredAt`. Replaying session `2026-08-19-9ddc2f5f` (587 events, 40k
+      threshold) shows why: it armed on the crossing tool call, lost the arm to that same
+      turn ending `interrupted`, and then ran to 433,236 context tokens with `readyAt: null`
+      — a monotonically growing counter can never cross the threshold from below twice.
+      `updateAutoCompaction` now lets a retained threshold become ready at the first turn
+      that ends `completed`. The trigger stays edge-based and once-per-chat, so a stale
+      finished chat that merely opens above the threshold still never fires
+      (`src/main/session/store.ts`, `test/session.test.ts`).
+
+- [x] **T-171 — exec sessions were global across ChatGPT chats. FIXED.** Codex hangs
+      `UnifiedExecProcessManager` off `session.services`, so one conversation cannot name
+      another's process. This connector is one long-lived process serving every chat through
+      one manager, so `write_stdin(session_id)` on a small integer from another chat reached
+      that chat's shell. `src/main/codex/ownership.ts` records the owning conversation from
+      the same request correlation the recorder uses, `write_stdin` refuses a session it can
+      *prove* belongs elsewhere, and `session status` no longer lists another chat's session
+      ids. The rule is one-sided on purpose: an unproven caller is never refused, because
+      identity is not always resolved by the time a command runs and a guess must not take a
+      working terminal away from the chat that opened it (`test/mcp.test.ts`).
+
+- [x] **T-172 — screen-reader live regions were being recorded as chat errors. FIXED.**
+      `errors()` recorded the text of every `[role="alert"]`, including the `sr-only`
+      regions ChatGPT announces ordinary UI state through, which inflated the app's error
+      counts. `displayed()` in `extension/chatgpt-dom.js` now skips a live region that is
+      visually hidden. Unmeasurable or zero-sized rects still count as displayed — jsdom
+      reports all-zero rects, and treating those as hidden silently dropped every real
+      banner (`test/content-script.test.ts`).
+
+- [ ] **T-173 — Codex-port audit items left unchanged, on purpose.** Recorded here so they
+      are decisions rather than oversights:
+      · **8 MiB `view_image` cap** — kept at Codex's number. Raising it is a wire-size
+        question for ChatGPT, not a parity one.
+      · **Frozen `view_image` schema** — kept identical to Codex's so a model that knows the
+        tool is not surprised by ours.
+      · **`Number.isSafeInteger` is stricter than Rust `u64`/`usize`** — `unsignedIntegerNumber`
+        in `src/main/mcp/tools-core.ts` refuses values above 2^53-1 that Codex would accept.
+        No real call is affected; changing it would mean carrying BigInt through the tool
+        surface for values nothing produces.
+      · **`image_url` data URL duplicated in `structuredContent`** beside the image block,
+        which roughly doubles the payload (up to ~22 MB at the cap). Left for parity; it is
+        the item most likely to be worth revisiting if large images ever misbehave.
+
+## v1.8.1 — live-smoke attribution + streaming identity patch — **PACKAGED, NOT INSTALLED**
+
+The first installed 1.8.0 smoke ran twelve sequential harmless MCP calls in a brand-new chat
+while the desktop transcript was watched live. It exposed two real shapes the synthetic tests
+had not represented; both were then proven directly from the fresh session files.
+
+- [x] **T-165 — one ChatGPT `request_id` can own many MCP calls in one turn. FIXED.** The live
+      smoke attributed its first four calls and then sent eight to `Unattributed activity`, yet
+      all twelve carried the same `wfr_01a0170d0cca72cead646a24216c8edf`. The registry had
+      incorrectly treated a new message id/tool under that id as a contradiction. Ownership is
+      now exactly **request id → conversation**: different calls in the same conversation are
+      compatible; only another conversation claiming that id conflicts and fails closed.
+      Active `test/correlation.test.ts` covers both cases.
+
+- [x] **T-166 — ChatGPT can rotate raw assistant UUIDs while one streaming block grows.
+      FIXED.** Live `messages.json` showed `Eight calls in, still zero writes.` growing through
+      four strict prefixes under four different UUIDs, producing four `ChatGPT (partial)` rows.
+      When a new raw id has no direct canonical match, the store now folds it onto the longest
+      **same-turn + still-streaming + strict-prefix predecessor**, retaining the first canonical
+      id and chronology anchor. It never matches across turns, never folds a final, and separate
+      non-prefix commentary in the same turn remains separate.
+
+**1.8.1 source verification before packaging:** `git diff --check` clean; `npm run verify`
+clean with **894 passed / 78 skipped / 0 failed across 30 test files**, TypeScript clean first.
+The cross-stack attribution/transcript group is **332 passed / 77 skipped / 0 failed**. Bridge
+protocol remains **5** and Fiber protocol remains **5**; the wire shape did not change.
+
+**1.8.1 package, deliberately not installed yet:**
+- Installer: `release/ChatGPT-Local-Files-Setup-1.8.1.exe` — **135,040,838 bytes** — SHA-256
+  `AA67994A8A50B88EA5D431ECEC11D39CFA601E065C36D601FCB906947E33918B`.
+- Blockmap: `release/ChatGPT-Local-Files-Setup-1.8.1.exe.blockmap` — **142,107 bytes**.
+- Unpacked executable reports file version `1.8.1`, product version `1.8.1.0`.
+- Packaged extension manifest is `1.8.1`; bridge protocol `5`, Fiber helper `VERSION = 5`,
+  content `FIBER_VERSION = 5`.
+- Packaged `manifest.json`, `background.js`, `content.js`, and `fiber.js` hash-identically to
+  the source extension. The installed app remains 1.8.0 until this installer is run.
+
+## v1.8.0 — canonical attribution/transcript + compaction hardening — **INSTALLED, LIVE SMOKE FAILED**
+
+This is the first-principles rebuild requested on 2026-08-18/19. The core invariant is one
+logical ChatGPT item = one stable transcript item, and one MCP request is owned only by its
+exact ChatGPT `metadata.request_id` → conversation mapping. The installed 1.7.9 data from the
+same live run was used as forensic input before packaging rather than treated as evidence for
+the new build.
+
+- [x] **T-160 — deterministic request-id attribution replaces heuristic ownership. FIXED.**
+      Incoming `x-request-id` is normalized once at ingress and joined only to ChatGPT's exact
+      `metadata.request_id`; the correlation registry records request id, conversation id,
+      message id, tool and observation time. URL and Fiber conversation identities are
+      cross-checked; disagreement poisons that request instead of guessing. Unmatched modern
+      requests go to `Unattributed activity` and never borrow a same-tool/latest/sole-active
+      chat. Recorded tool calls retain resolved request id, conversation id and attribution
+      method for diagnosis.
+
+- [x] **T-161 — assistant transcript is canonical by ChatGPT message id and rendered HTML.
+      FIXED.** Streaming/final revisions update the same logical message rather than append
+      growing snapshots. Final state is monotonic, sparse re-observations cannot erase richer
+      captured HTML, and the renderer uses sanitized ChatGPT-rendered markup instead of a
+      second Markdown parser. Chronology keeps tool calls as separate structured events while
+      message revisions remain anchored at their original logical position.
+
+- [x] **T-162 — automatic compaction was level-triggered and could repeatedly attack stale or
+      live chats. FIXED.** Automatic compaction is now a durable below→above threshold edge,
+      bound to the exact turn that crossed it. Only that turn's `turn_end: completed` makes it
+      ready; stopped/failed/interrupted turns consume the arm without readiness. Claim is
+      one-shot and durable before browser action, automatic mode never clicks Stop, local
+      tools/active turns block claim, and a genuine close→reopen clears any old unclaimed
+      ready edge. Opening an old chat already above the threshold therefore does nothing.
+
+- [x] **T-163 — 1.7.9 could lose a worker or prime attribution when ChatGPT's UI/Fiber DOM
+      glitched. FIXED.** Forensic proof from the installed 1.7.9 run: worker-2 was marked
+      failed when its conversation was considered closed, while the prime session itself
+      intermittently spilled its own calls into `Unattributed activity`; the unattributed
+      stream contains exact prime commands and rejected `agents` calls with
+      `WORKER_IDENTITY_LOST`. Two source defects were pinned: a transient
+      `conversationId() === null` was treated as a close, and live Fiber request evidence was
+      refreshed too conditionally. `null` now means temporarily unavailable; only real tab
+      removal or a proven concrete A→B navigation retires A. While any generation is live,
+      Fiber request evidence is refreshed even when there is no rendered connector row and no
+      currently bindable assistant DOM turn. Browser regressions cover both cases.
+
+- [x] **T-164 — MCP `read` advertised line ranges beside multi-path reads without saying the
+      combination is illegal. FIXED.** Tool description, `start_line` / `end_line` field
+      descriptions and connector instructions now state that line ranges require exactly one
+      resolved path; runtime rejection remains as the final guard. This removes a real
+      avoidable failed call without weakening validation.
+
+**1.8.0 verification/package:** `git diff --check` clean; `npm run verify` clean with
+**890 passed / 77 skipped / 0 failed across 29 test files**, TypeScript clean first. The two
+`HTMLFormElement.requestSubmit()` stderr lines are jsdom limitations in passing fixtures.
+Bridge protocol is **5** and Fiber protocol is **5** because older 1.7.x extension code cannot
+satisfy the new canonical message/request evidence contract.
+
+- Installer: `release/ChatGPT-Local-Files-Setup-1.8.0.exe` — **135,040,591 bytes** — SHA-256
+  `9F42BBD9A987006B7EA5500547BBB0B72534F8D34ED2B9DD8D037E5D99CB3319`.
+- Blockmap: `release/ChatGPT-Local-Files-Setup-1.8.0.exe.blockmap` — 142,144 bytes.
+- Unpacked executable reports file version `1.8.0`, product version `1.8.0.0`.
+- Packaged `resources/extension/manifest.json`, `background.js`, `content.js` and `fiber.js`
+  hash-identically to source; packaged manifest is `1.8.0`, bridge protocol `5`, Fiber helper
+  `VERSION = 5`, content `FIBER_VERSION = 5`.
+- **Later installed and live-smoked.** The executable was verified as `1.8.0 / 1.8.0.0`.
+  That fresh-chat smoke exposed T-165 and T-166 above, so 1.8.0 is retained as historical
+  evidence rather than the build to recommend. Chrome's unpacked extension still requires a
+  reload/hard-refresh whenever the replacement build is installed.
+
+## v1.7.9 — transcript / agent / resume stability rebuild — **PACKAGED, LATER INSTALLED**
+
+This is the 2026-08-18 evening stability pass driven by the live prime/worker screenshots,
+worker-1's architecture review, and the user's report that a completed Compact & Resume
+opened the replacement chat and then left it blank for roughly one to two minutes before
+typing the handoff. The user explicitly asked for an installer but **not** an install; live
+smoke of the new packaged build therefore remains a later manual step.
+That was true at package time; the executable currently installed on this machine was later
+verified as 1.7.9 / 1.7.9.0 before the 1.8.0 package above was assembled.
+
+- [x] **T-152 — the durable session journal could advance memory/meta before the JSONL line
+      existed. FIXED.** `appendEvent()` now serialises construct → validate → `appendFile` →
+      `nextSeq++` → tail/summary/meta projection. A failed disk append consumes no seq and
+      cannot make `meta.json` claim a message/tool call that never reached `events.jsonl`.
+      The same store now keeps a bounded 4096-event durable tail, so incremental `/activity`
+      reads whose cursor is in the tail are O(delta) instead of reparsing the entire JSONL on
+      every poll. Disk remains canonical; old cursors fall through to the file.
+
+- [x] **T-153 — recorder restart remembered that a turn was open but forgot which turn.
+      FIXED.** `storedHistory()` now reconstructs the newest still-open durable `turnId` and
+      its start time, and `sessionForConversation()` restores them. A content-script/app
+      restart in the middle of a generation therefore resumes the existing turn instead of
+      minting a second local turn around the same ChatGPT answer.
+
+- [x] **T-154 — reconstructed transcript could grow garbage prefixes, teleport late text to
+      the start of a turn, and show the same final twice. FIXED.** `dropEcho()` collapses the
+      live no-whitespace chain shape such as `I’veI’ve gotI’ve got…` without touching normal
+      repeated prose. Recorder progress ids are no longer trusted forever: monotonic growth /
+      redraw stays one item, but a reused DOM root carrying unrelated late commentary forks
+      to a fresh logical id and fresh timestamp. Cross-id continuation aliases are restricted
+      to a sufficiently long prefix inside a short forward-time window. `visibleStream()`
+      suppresses a progress prefix once the settled final contains it, final prose is stored
+      at most once per local generation across React remounts, and the Local Files stream is
+      mounted at ChatGPT's native activity location instead of being hoisted above the turn.
+
+- [x] **T-155 — worker identity/inbox state could split after the handler and workers could
+      remain zombies after their final answer. FIXED.** A handler-proven caller is never
+      overwritten by a weaker post-handler lookup; `callerNow()` writes the proven
+      conversation back into the call context; `adoptAgent()` always acknowledges messages
+      offered on the previous result. The bridge also auto-finishes the exact worker when one
+      observation batch contains its settled final assistant message and matching completed
+      `turn_end`, so a worker that correctly stops making tool calls still releases the slot
+      and produces a report for prime. Explicit `finish` remains idempotent.
+
+- [x] **T-156 — exact request identity and workspace resolution still had competing timing
+      fallbacks. FIXED.** The inbound `x-request-id` / page `metadata.request_id` join remains
+      the authority. Modern calls with a request id no longer let `workspaceKey()` fall
+      through to `soleGeneratingConversation()` while the exact mate is merely late. Only
+      operations that consume an existing workspace before their handler runs (relative
+      read/find, implicit/relative patch base, implicit/relative exec cwd) wait, and they use
+      the full 15 s exact-id window. Self-contained absolute reads and explicit absolute-cwd
+      execs stay fast and do not teach a guessed workspace.
+
+- [x] **T-157 — Compact & Resume replacement chat could sit blank behind unrelated startup
+      work. FIXED.** On an app-opened marked page, `runCommand()` now runs *before*
+      `checkStatus → resumeOpenTurn → restoreCapture`; the bootstrap is the reason that page
+      exists and no longer waits on ordinary session restoration. Composer readiness now uses
+      the connected composer / DOM mount itself, not four `document.readyState === complete`
+      samples chained through timers that Chrome may throttle in a background tab. A short
+      post-insert guard catches React replacing the editing host and reinserts once into the
+      new empty composer. The ACK journal gate still holds replacement-chat observations until
+      the A→B continuation commit. Regression deliberately leaves `status` unresolved and
+      proves redeem → insert → send/ACK happens anyway.
+
+- [x] **T-158 — Compact & Resume handoffs were biased toward short summaries. FIXED to the
+      user's requested policy.** `HANDOFF_BRIEF_RULES` makes user messages the highest
+      authority, preserves material user substance aggressively, centres current state,
+      completed/verified work, planned/decided work and failed/unresolved work, and explicitly
+      aims for roughly **10,000–30,000 tokens when the session warrants it, never above
+      30,000**. A regression pins the authority language, range, ceiling and required state
+      sections.
+
+- [~] **T-159 — live installed 1.7.8 `agents` calls can currently surface a transport-level
+      `ExceptionGroup: unhandled errors in a TaskGroup (1 sub-exception)`.** Reproduced in this
+      pass on both `agents spawn` and `agents status`. The current source's real MCP endpoint,
+      agent broker, bridge, swarm and resume suites are green, so there is no matching
+      source-level handler failure left to patch blindly; this may be the already-installed
+      binary / cached connector surface that this unreleased source replaces. **Do not call it
+      fixed until a later installed 1.7.9 smoke proves `spawn → message both ways → status →
+      finish` over the real connector.** The user's current instruction explicitly forbids
+      installing this build, so that smoke is intentionally deferred rather than faked.
+
+**1.7.9 source verification before packaging:** `npm run verify` clean on 2026-08-18:
+**939 passed / 1 skipped / 0 failed across 27 test files**, with TypeScript clean first.
+Targeted agent/bridge/resume/swarm/ipc group: **124/124**. Targeted MCP/workspace/session/content
+group: **398/398**. The two `HTMLFormElement.requestSubmit()` stderr lines remain jsdom
+limitations in passing fixtures, not product failures.
+
+**1.7.9 package, deliberately not installed per user instruction:**
+- Installer: `release/ChatGPT-Local-Files-Setup-1.7.9.exe` — **135,041,899 bytes** — SHA-256
+  `0694DBE66A6F15223F5B93290C8C83AF0BBCB14E0A40D014A04248F397188AD7`.
+- Blockmap: `release/ChatGPT-Local-Files-Setup-1.7.9.exe.blockmap`.
+- Unpacked executable reports file version `1.7.9`, product version `1.7.9.0`.
+- Packaged `resources/extension/manifest.json` reports `1.7.9` and matches the source
+  manifest byte-for-byte; packaged `resources/extension/content.js` also matches source
+  byte-for-byte.
+- The existing 1.7.8 installer remains alongside 1.7.9 and was not overwritten or removed.
+- No installer was launched, no installed application was replaced, and no unpacked Chrome
+  extension was reloaded. T-159 therefore remains explicitly pending a later installed-build
+  smoke instead of being marked fixed from source tests alone.
+
+---
+
+## v1.7.8 — attribution blackout / worker identity timing / exec_command paths — **INSTALLED**
+
+Three defects, all found against the real connector on 2026-08-18 and all fixed here.
+
+- **A request id vetoed every other grade of evidence.** `claimNamedCall`, `pickTarget`,
+  `freshCallOrigin` and `awaitFreshCallOrigin` treated "ChatGPT sent an `x-request-id`" as
+  "only the id may answer". Right while the join works and one page mate is late; wrong when
+  the browser reports no ids at all, which makes the join a blackout that fails every call
+  from every chat forever. Session `2026-08-18-0a7bf7bb` is the proof: 104 calls, no
+  messages, nothing placed. The veto now applies only while `requestIdJoinAvailable()` —
+  some conversation is demonstrably reporting ids. Contradictory evidence still fails closed.
+- **The identity window was shorter than a fresh worker tab.** `PRIME_EVIDENCE_MS` was
+  2.5 s; worker-1's first `agents` call was refused `WORKER_IDENTITY_LOST` at 16:33:56 after
+  2540 ms while its own page evidence landed at 16:34:04. Calls carrying a request id now
+  wait `IDENTITY_EVIDENCE_MS` (15 s), and the recorder waits `REQUEST_ID_GRACE_MS` (15 s)
+  off the response path. Both are event-driven, so a prompt page pays nothing.
+- **`exec_command` translated `cwd` and not `cmd`.** Every instruction says paths are
+  virtual, so the model wrote `/totec/whatsapp-ai-bridge/...` inside the command and
+  PowerShell read the leading slash as the current drive's root. `strayVirtualPath()` now
+  refuses a `/root/...` written inside `cmd` and names the fix (set `cwd`, write relative);
+  the tool description and the connector instructions state the exception outright. `cmd`
+  is never rewritten — quoting, regexes and URLs cannot survive a guess.
+
+---
+
+## v1.7.7 — call identity / resume / worker lifecycle / MCP result handling — **INSTALLED**
+
+This batch was found against the real ChatGPT connector on 2026-08-18. The distinction in
+this section is intentional: **only defects in Local Files handling are called bugs.** A
+schema refusal for malformed arguments, stale patch context, a shell syntax error, or a real
+test/build failure correctly returned by a tool is not an MCP reliability failure.
+
+- [x] **T-146 — prime MCP calls could be authenticated and recorded as worker-1. FIXED.**
+      Live proof was stronger than a UI symptom: a prime `agents action=message` returned
+      `An agent cannot message itself`; another prime control call returned
+      `WORKER_IDENTITY_LOST`; several Core calls made by prime appeared in worker-1's local
+      session. The app already had ChatGPT's deterministic join key but still fell back to
+      timing evidence while the exact page observation was late. The join is now authoritative:
+      inbound `x-request-id: wfr_…/<hop>` is reduced to `wfr_…` and matched to the same
+      `metadata.request_id` reported from one concrete conversation. When an HTTP request id
+      exists there is **no same-tool / sole-generation heuristic fallback**: zero matches wait
+      then fail closed; matches in two conversations fail closed. `claimNamedCall` also uses
+      request-id + tool so one ChatGPT request containing several connector calls still files
+      each call correctly. Fiber results are epoch/conversation guarded so an async scan from
+      chat A cannot arrive after SPA navigation and become evidence for chat B; ChatGPT
+      `create_time` prevents a reload from making historical request evidence fresh again.
+      Regressions cover late exact evidence, an unmatched id staying Unattributed, duplicate
+      ids across conversations, and prime-vs-worker simultaneous `agents` calls.
+
+- [x] **T-147 — Compact & Resume could create a three-event shadow `Resumed · …` session
+      before the real session moved. FIXED.** Fresh chat B could submit the pasted handoff,
+      acquire its conversation id, and post `/events` before `/commands/ack` committed the
+      continuation A→B. `sessionForConversation(B)` then created a durable B session; the ACK
+      subsequently rebound the original A session to B, leaving two local sessions for one
+      ChatGPT chat and making restart lookup nondeterministic. App-opened chats now quarantine
+      observations while their opening command is unacknowledged. The order is strict:
+      submit bootstrap → learn B id → ACK/commit A→B → release B observations into the already
+      rebound session. Regression deliberately blocks the ACK, forces an observation flush,
+      asserts zero `/events` escape, then releases the ACK and asserts the queued observation
+      appends normally. Desired invariant: one stable local session id, old timeline preserved,
+      `chatIds` extended with B, new messages/tool calls appended.
+
+- [x] **T-148 — closing a worker chat did not release its slot. FIXED.** The extension's
+      service worker already sends `/closed` only after the final real tab for an exact
+      conversation is gone and does not treat reload as close. The bridge handled that event
+      only for the prime, so a bound worker could remain `active` forever and be restored from
+      the durable swarm snapshot after restart. `workerConversationGone()` now terminalises
+      that exact unfinished worker, persists the failure, frees the configured live-worker
+      slot, and queues a report for prime. Bridge `/closed` dispatches prime first, otherwise
+      worker. Regression closes an active worker conversation and asserts failed state + free
+      slot + prime notification.
+
+- [x] **T-149 — stopped/interrupted output could become a duplicate final and even a synthetic
+      `completed` turn. FIXED.** `finishGeneration()` used to call `reportMessages(false)` for
+      every terminal outcome, so partial stopped prose could be emitted as
+      `assistant_message final:true`. A React remount could give the same partial prose a new
+      DOM/message id; recorder dedup by `(messageId,text)` then stored it twice. Worse, if the
+      explicit interrupted `turn_end` was lost across detach/reload, recovery treated that
+      `final:true` as proof of completion and synthesized `turn_end outcome:'completed'`.
+      Stopped/interrupted turns no longer publish a final answer; completed local generations
+      use the unique `g-…` generation identity and recorder stores at most one final per such
+      generation even after remount. Regression pins both the stopped-no-final behavior and
+      one-final-per-generation invariant.
+
+- [x] **T-150 — failed shell commands were internally recorded as successful MCP calls.
+      FIXED for 1.7.7.** This pass's own history exposed it: `exec_command` calls that really
+      exited 1 (including the deliberately wrong Windows PowerShell `&&` command and an early
+      failing verify run) were displayed as `(ok) … exit 1`. `noteExec()` correctly set the
+      call outcome to `error`, but the outer `guard()` later saw a normal ToolResult and wrote
+      `ok` over it. `noteOutcome()` now has monotonic severity (`error > rejected > ok`), so a
+      wrapper can never downgrade a more specific tool outcome. A normal `write_stdin` poll
+      now uses `noteExec()` too, so a long-running command that exits non-zero between the
+      initial `exec_command` and its continuation is also recorded as failed. Explicit
+      `signal=kill` / Ctrl-C remain successful control actions and intentionally use process
+      evidence without converting the requested stop into a tool failure. This changes local
+      history/UI/compaction semantics only; non-zero shell exit is still returned as ordinary
+      command output rather than a transport-level MCP exception.
+
+- [x] **T-151 — MCP SDK request-context shape had drifted; the standard header path was dead.
+      FIXED for 1.7.7.** Current `@modelcontextprotocol/server` exposes the original HTTP
+      request as `ServerContext.http.req` and the JSON-RPC request under `mcpReq`. Local Files
+      still typed a private `http.headers` shape that current SDK handlers do not provide, so
+      request identity worked only because `mcp/inbound.ts` separately carried the raw Node
+      header through `AsyncLocalStorage`. `kernel.ts` now types the callback from the SDK's
+      real `ServerContext` and reads `http.req.headers.get('x-request-id')` first, keeping the
+      raw inbound carrier only as compatibility fallback for older/odd hosts. This removes a
+      silent dependency on an obsolete context shape without weakening the proven
+      request-id→conversation join.
+
+### Explicitly **not** MCP faults in this 1.7.7 pass
+
+The following calls failed/refused exactly as they should and must not be counted in tool
+reliability metrics: an `apply_patch` whose expected import context was stale; a Windows
+PowerShell command using unsupported `&&`; the first `npm run verify` after source edits,
+which reported real TypeScript test-fixture errors; and a call that asked for `max_lines: 260`
+although the published schema caps it at 200. They are caller/source mistakes with useful,
+correct tool responses. The external ChatGPT connector has also been observed to lose a tool
+result after Local Files executed successfully; that is a host/delivery limitation rather
+than proof of a Local Files execution fault. Local mutation flows therefore remain designed
+to be retry-safe where semantics allow it (`finish`, continuation capture/commit, command
+ACKs), but Local Files must not silently deduplicate two genuinely separate model-issued
+mutations merely because their arguments happen to match.
+
+**1.7.7 source verification before packaging:** `npm run verify` clean on 2026-08-18:
+**929 passed / 1 skipped / 0 failed across 27 test files**, with TypeScript clean first.
+The two `HTMLFormElement.requestSubmit()` stderr lines are jsdom limitations in passing
+content-script fixtures, not product failures. `git diff --check` is clean apart from Git's
+normal CRLF conversion warnings on this Windows working tree.
+
+**Installed-build smoke:** after relaunching 1.7.7, a deliberate `exec_command` `exit 7`
+was returned to the model as ordinary shell output as designed, while the local session
+record correctly stored the call as `exec_command (error) … exit 7`. That directly verifies
+T-150 in the packaged/running binary rather than only in unit tests.
 
 **Correction to the record:** this file previously said "Installed build: v1.6.0" and
 "v1.7.0 assembled, not installed". That was wrong — the installed executable was already
@@ -1940,7 +2353,8 @@ Promoted out of `POST_V1.5.1_HARDENING_BACKLOG.md` so the active list is the onl
       A one-time migration moves a config still carrying both old defaults (`off` / 300k)
       onto the new one and leaves anything a user actually chose alone.
 
-- [ ] **T-129** A ChatGPT reload mid-turn records the turn two or three times over. From
+- [x] **T-129** A ChatGPT reload mid-turn records the turn two or three times over. **Resolved
+      2026-08-19.** From
       the real log `2026-08-17-30c5be99`: turn `g-w2vck21rmu96n-1-4` (seq 3) never gets a
       `turn_end`, a reload at ~8:20:19 opens `g-6ywrgby6cavy-0-1` (seq 43) and re-records
       the same six commentary captions at observation time, then a `turn_end` carrying **no
@@ -1948,16 +2362,15 @@ Promoted out of `POST_V1.5.1_HARDENING_BACKLOG.md` so the active list is the onl
       again. The visible symptom is the injected stream appearing to start at the reload
       moment with everything before it gone.
 
-      Three defects, diagnosed but not yet fixed — see CLAUDE_LIVE_FINDINGS.md for the log
-      excerpt. (1) `resumeOpenTurn()` is one-shot: it reads `appActiveTurnId` from a single
-      boot pull, and immediately after a reload the app is usually not reachable yet, so
-      adoption never happens and the next `observe()` mints a fresh generation. Adoption
-      needs to stay possible for a bounded window rather than at one tick. (2) Re-observed
-      captions are recorded as new events, because per-generation keys mean the `turn_start`
-      handler cleared `live.progress`/`live.pageTools` and supersession cannot see that the
-      new row is the old one. (3) A `turn_end` with no `turnId` should not be emitted at
-      all: it closes nothing a reader can name. Not caused by the chronology work — the
-      ordering contract renders this log faithfully; the log is what is wrong.
+      All three failure modes now have active regressions. (1) Reload identity remains pending
+      until a successful `/activity` pull supplies the app's durable open turn; Stop cannot
+      mint a replacement while that question is unanswered. (2) Reload capture is canonical
+      Fiber-v8 message/activity identity, so settled history is not replayed as the adopted
+      turn and everything genuinely after reload keeps the resumed local id. The tests cover
+      both a turn that remained live and one that finished inside the reload gap. (3) Both
+      `content.js` and the recorder fail closed on unnamed lifecycle boundaries, and a stale
+      named end can no longer tear down a newer active generation. The seven-test
+      `a content script reloaded into a turn already in flight` block is fully enabled.
 
 - [ ] **T-46** Self-update: never invoke the NSIS installer synchronously from the running
       MCP process — it kills the process carrying the call and has left a stale `app.asar`

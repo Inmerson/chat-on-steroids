@@ -25,7 +25,7 @@ import {
   ViewImageError,
   viewImage
 } from '../codex/view-image.js';
-import { logInfo } from '../logger.js';
+import { logInfo, logWarn } from '../logger.js';
 import { SandboxError, resolvePath } from '../sandbox.js';
 import { currentWorkspace, setCurrentWorkspace } from '../workspace.js';
 import type { Capabilities, Root } from '../../shared/types.js';
@@ -46,6 +46,12 @@ import { hunkPath } from '../codex/apply-patch/hunk.js';
 import { maybeParseApplyPatchForExec } from '../codex/apply-patch/invocation.js';
 import { formatExecOutputForModel, newStreamOutput } from '../codex/exec-output.js';
 import { DEFAULT_TRUNCATION_POLICY, unifiedExecManager } from '../codex/manager.js';
+import {
+  execOwnershipDenied,
+  forgetExecOwner,
+  noteExecOwner,
+  provenConversation
+} from '../codex/ownership.js';
 import {
   UnifiedExecError,
   applyUnifiedExecEnv,
@@ -88,6 +94,7 @@ import {
   type Caller
 } from '../agents.js';
 import {
+  currentCall,
   currentCaller,
   noteChanges,
   noteCount,
@@ -96,8 +103,8 @@ import {
 } from './call-context.js';
 import {
   awaitFreshCallOrigin,
-  activeSessionId,
   recordAgentMessage,
+  sessionIdForConversation,
   sessionTokens
 } from '../session/recorder.js';
 import { readEvents } from '../session/store.js';
@@ -114,6 +121,7 @@ import {
   guard,
   MAX_HISTORY_CALL_CHARS,
   numberReadLines,
+  IDENTITY_EVIDENCE_MS,
   PRIME_EVIDENCE_MS,
   ok,
   pathArg,
@@ -546,6 +554,10 @@ export function registerCoreTools(reg: SurfaceRegistrar): void {
               env: applyUnifiedExecEnv(process.env),
               tty: input.tty ?? DEFAULT_TTY
             });
+            // Which chat may later write to this session id. Codex gets this for free from a
+            // per-conversation manager; see codex/ownership.ts for why one is needed here.
+            if (output.processId === null) forgetExecOwner(processId);
+            else noteExecOwner(output.processId, provenConversation(currentCaller().requestId, currentCaller().conversationId));
             noteExec({
               ...(output.processId === null ? {} : { id: String(output.processId) }),
               running: output.processId !== null,
@@ -582,6 +594,14 @@ export function registerCoreTools(reg: SurfaceRegistrar): void {
       },
       async (input) =>
         reg.guarded('command', 'write_stdin', async () => {
+          // A session id is a small integer that means nothing outside the chat that was given
+          // it, and every chat reaches the same manager here. Refuse only what is proven to
+          // belong elsewhere; an unproven caller keeps working exactly as before.
+          if (execOwnershipDenied(input.session_id, provenConversation(currentCaller().requestId, currentCaller().conversationId))) {
+            return fail(
+              `write_stdin failed: session ${input.session_id} belongs to a different ChatGPT conversation. Start your own with exec_command.`
+            );
+          }
           try {
             const output = await unifiedExecManager.writeStdin({
               processId: input.session_id,
@@ -590,6 +610,7 @@ export function registerCoreTools(reg: SurfaceRegistrar): void {
               maxOutputTokens: input.max_output_tokens,
               truncationPolicy: DEFAULT_TRUNCATION_POLICY
             });
+            if (output.processId === null) forgetExecOwner(input.session_id);
             noteExec({
               ...(output.processId === null ? {} : { id: String(output.processId) }),
               running: output.processId !== null,
@@ -665,10 +686,27 @@ function registerSessionTool(reg: SurfaceRegistrar): void {
       guard('session', async () => {
         if (!reg.sessionToolsLive) return reg.featureDisabled('Session recording', 'Record sessions');
 
+        const callerSession = async (): Promise<string | null> => {
+          const call = currentCall();
+          let conversationId = currentCaller().conversationId;
+          if (!conversationId && call?.caller.requestId) {
+            conversationId = await awaitFreshCallOrigin('session', call.startedAt, IDENTITY_EVIDENCE_MS, {
+              requestId: call.caller.requestId
+            });
+            if (conversationId) call.caller.conversationId = conversationId;
+          }
+          return sessionIdForConversation(conversationId);
+        };
+
         if (input.action === 'status') {
           const config = getConfig();
-          const id = input.session_id ?? activeSessionId() ?? null;
-          const running = unifiedExecManager.listProcesses();
+          const id = input.session_id ?? (await callerSession());
+          // One manager serves every chat, so an unfiltered list would show one conversation
+          // the session ids of another's terminals — and `write_stdin` refuses those anyway.
+          const asking = provenConversation(currentCaller().requestId, currentCaller().conversationId);
+          const running = unifiedExecManager
+            .listProcesses()
+            .filter((entry) => !execOwnershipDenied(entry.processId, asking));
           const processLines =
             running.length === 0
               ? 'running commands: none'
@@ -700,7 +738,7 @@ function registerSessionTool(reg: SurfaceRegistrar): void {
         }
 
         // history
-        const id = input.session_id ?? activeSessionId() ?? null;
+        const id = input.session_id ?? (await callerSession());
         if (!id) return fail('No recorded session is available.');
         const events = await readEvents(id, input.kind ? { kinds: [input.kind] } : {});
         if (events.length === 0) return fail(`Session ${id} has no recorded events.`);
@@ -812,9 +850,12 @@ function registerAgentsTool(reg: SurfaceRegistrar): void {
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true }
     },
     async (input) => {
-      // Taken before any work, because it is what makes page evidence *fresh*: only a block
-      // the page rendered after this call began can belong to this call.
-      const startedAt = Date.now();
+      // One clock for one MCP call. The dispatcher owns startedAt and the recorder later uses
+      // that exact value to consume any page request reserved while proving caller identity.
+      // Taking a second Date.now() here made callerNow reserve evidence under one timestamp
+      // and recordToolCall look for it under another, leaving the first request permanently
+      // reserved until TTL and breaking the very next worker control call.
+      const startedAt = currentCall()?.startedAt ?? Date.now();
       return guard('agents', async () => {
         if (!reg.agentToolsLive) return reg.featureDisabled('Multi-agent mode', 'Multi-agent mode (experimental)');
 
@@ -926,34 +967,43 @@ function registerAgentsTool(reg: SurfaceRegistrar): void {
  * Who is making this `agents` call, established for this call alone.
  *
  * The prime holds no credential by design, and the dispatcher deliberately hands ordinary
- * tool calls no page evidence at all — "the only chat that has been active lately" is not
- * proof that that chat is the one calling, and treating it as proof would let stale page
- * state authorise swarm control. So identity is proven here, per call, from a connector block
- * rendered *after* this call began, in exactly one conversation. Anything less resolves to
- * nothing and the operation is refused by the broker, by name.
- *
- * A worker with a code pays for the same evidence: its conversation is what routes it, and
- * the code is the recovery path for the turns where the page says nothing about it.
- *
- * `exact` is for the one operation that creates a binding it can never take back — see the
- * comment in `spawn` above.
+ * tool calls no authority from "the only chat that has been active lately" — that is not
+ * proof that the chat made this call, and stale page state once authenticated prime calls as
+ * worker-1. So identity is proven here per call by joining ChatGPT's inbound MCP HTTP
+ * `x-request-id` to the same request id reported from one concrete conversation's message
+ * model. The page evidence may arrive just before or just after the MCP request; the id, not
+ * timing, is the join. If its exact mate never appears, the broker refuses the operation.
+ * Missing request-id evidence never falls back to a visible row, active/generating chat,
+ * agent key, or recent browser state.
  *
  * The proven identity is then adopted for the rest of the call, so this result is recorded
  * against the right agent and carries the right inbox.
  */
 async function callerNow(startedAt: number, options: { exact?: boolean } = {}): Promise<Caller> {
   const base = currentCaller();
+  const resolved =
+    base.conversationId ??
+    (await awaitFreshCallOrigin('agents', startedAt, base.requestId ? IDENTITY_EVIDENCE_MS : PRIME_EVIDENCE_MS, {
+      ...options,
+      // ChatGPT's own id for this request, when it sent one. It names the conversation
+      // outright, so two workers calling at the same moment are no longer a hard case.
+      requestId: base.requestId
+    }));
   const caller: Caller = {
     ...base,
-    conversationId:
-      base.conversationId ??
-      (await awaitFreshCallOrigin('agents', startedAt, PRIME_EVIDENCE_MS, {
-        ...options,
-        // ChatGPT's own id for this request, when it sent one. It names the conversation
-        // outright, so two workers calling at the same moment are no longer a hard case.
-        requestId: base.requestId
-      }))
+    conversationId: resolved
   };
+  if (resolved) {
+    const call = currentCall();
+    if (call) call.caller.conversationId = resolved;
+  }
+  if (!resolved) {
+    logWarn(
+      base.requestId
+        ? `agents caller not identified: no page evidence matched HTTP request ${base.requestId.slice(0, 20)}…`
+        : 'agents caller not identified: this MCP request carried no request id and page evidence was insufficient'
+    );
+  }
   await adoptAgent(agentForCaller(caller));
   return caller;
 }

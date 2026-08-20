@@ -10,9 +10,14 @@ import { registerIpc } from './ipc.js';
 import { logError, logInfo } from './logger.js';
 import { unifiedExecManager } from './codex/manager.js';
 import { initSecretsPath } from './secrets.js';
-import { installBridgeLiveness, setBrowserOpener, startBridge, stopBridge } from './bridge.js';
+import { setBrowserOpener, startBridge, stopBridge } from './bridge.js';
 import { flushSessions, initSessionStore, pruneSessions } from './session/store.js';
-import { flushRecorder, setAgentBinder, setAgentConversationLookup } from './session/recorder.js';
+import {
+  flushRecorder,
+  repairDeterministicAttribution,
+  setAgentBinder,
+  setAgentConversationLookup
+} from './session/recorder.js';
 import {
   agentConversation,
   bindConversation,
@@ -22,6 +27,7 @@ import {
   type SwarmSnapshot
 } from './agents.js';
 import { flushDurable, initDurableStore, readDurable, writeDurableSoon } from './durable.js';
+import { restoreRequestCorrelations } from './session/correlation.js';
 
 /** Durable state file holding the multi-agent run. Hashes only, never credentials. */
 const SWARM_STATE = 'swarm';
@@ -169,6 +175,10 @@ void app.whenReady().then(async () => {
   initSessionStore(userData);
   initDurableStore(userData);
   await loadConfig();
+  // Request ownership must exist before either side of the bridge can race in. A request id
+  // that was proved yesterday remains the same workflow today even if its ChatGPT tab closed.
+  await restoreRequestCorrelations();
+  await repairDeterministicAttribution();
   setAgentConversationLookup(agentConversation);
   // The prime's chat is the user's own, so no extension report can name it. It is bound
   // when the recorder manages to place the prime's first call. See recordToolCall.
@@ -177,7 +187,6 @@ void app.whenReady().then(async () => {
   // decides whether a previous run has been abandoned partly from which ChatGPT tabs are
   // open, and without this it can only answer "I cannot see" — which it treats, on
   // purpose, as a reason to leave the existing run alone.
-  installBridgeLiveness();
   // How a fresh chat actually opens. The app asks the OS to open the ChatGPT URL, which
   // launches the browser if it is closed and creates the tab if there is none — the two
   // cases the old "wait for a ChatGPT tab to poll us" delivery could never handle. Wired

@@ -45,7 +45,7 @@ function coreInstructions(ctx: ToolContext): string {
     // across read, find, exec_command and apply_patch alike, and repeating it per tool would
     // cost more context than the shorthand saves.
     'Once you use a full path, this chat remembers that project, and later paths may be relative to it: /project/src/main.ts, then src/other.ts. Use a full path again to move to another project. If a relative path is refused, this chat has no folder yet — use a full one.',
-    'read takes several paths at once, lists a folder, expands globs and returns images — use one call, not five.',
+    'read takes several paths at once, lists a folder, expands globs and returns images — use one call, not five. Line ranges are the exception: start_line/end_line require exactly one path.',
     'Never send read’s line-number prefixes to apply_patch; they are display metadata, not file content.',
     'apply_patch is the only way to change files: it adds, updates, moves and deletes, and it is atomic across files.',
     'exec_command runs git, npm, builds, tests and anything else; a long-running one gives you a session_id to continue with write_stdin.',

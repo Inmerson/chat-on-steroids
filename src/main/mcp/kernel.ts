@@ -20,8 +20,8 @@
  */
 
 import { rawPromises as fs } from '../rawfs.js';
-import { inboundRequestId, requestIdFromHeader } from './inbound.js';
-import { McpServer } from '@modelcontextprotocol/server';
+import { inboundRequestId } from './inbound.js';
+import { McpServer, type ServerContext } from '@modelcontextprotocol/server';
 import { z } from 'zod';
 import type { Capabilities, Root } from '../../shared/types.js';
 import { FsOpError, formatBytes, type FileInfo } from '../fsops.js';
@@ -32,7 +32,7 @@ import { ExecError, MAX_ENV_KEY_CHARS, MAX_ENV_VALUE_CHARS, MAX_ENV_VARS } from 
 import { ProcessError, type ManagedProcessStatus } from '../process-manager.js';
 import { ComputerError } from '../computer/index.js';
 import { getConfig } from '../config.js';
-import { AgentError, acknowledgeOffers, agentForCaller, offerMessages, swarmRunning } from '../agents.js';
+import { AgentError, acknowledgeOffers, agentForCaller, offerMessages, releaseQuiescentRun, swarmRunning } from '../agents.js';
 import type { SurfaceId } from './surfaces.js';
 import {
   currentCall,
@@ -40,9 +40,10 @@ import {
   noteOutcome,
   runInCallContext,
   trackInFlight,
+  trackMcpRequest,
   type CallContext
 } from './call-context.js';
-import { freshCallOrigin, recordAgentMessage, recordToolCall } from '../session/recorder.js';
+import { awaitFreshCallOrigin, freshCallOrigin, recordAgentMessage, recordToolCall } from '../session/recorder.js';
 import { readOverflowText } from '../session/store.js';
 import type { SessionEvent, StoredText } from '../../shared/session.js';
 
@@ -230,22 +231,11 @@ function noteOutcomeSafely(outcome: 'ok' | 'rejected' | 'error'): void {
  * it by name.
  */
 function callerConversation(tool: string, startedAt: number, requestId: string | null): string | null {
-  // Only while a run exists. Off by default, and nothing else here consults it.
-  if (!swarmRunning()) return null;
   return freshCallOrigin(tool, startedAt, requestId);
 }
 
-/**
- * What the protocol layer hands a handler, as much of it as this app reads.
- *
- * `http.headers` is where ChatGPT's own request id arrives. Optional throughout, because a
- * different client — the tests, another MCP host — supplies none of it, and identity then
- * falls back to page evidence exactly as before.
- */
-interface McpCallContext {
-  sessionId?: string;
-  http?: { headers?: Record<string, string | string[] | undefined> };
-}
+/** The only SDK handler context field this layer consumes; request identity comes from ingress ALS. */
+type McpCallContext = Pick<ServerContext, 'sessionId'>;
 
 /**
  * ChatGPT's id for this request, from `x-request-id`, without the per-attempt suffix.
@@ -261,10 +251,11 @@ interface McpCallContext {
  * were refused WORKER_IDENTITY_LOST. Nothing about timing needs to be assumed now.
  */
 function requestIdOf(mcpCtx: McpCallContext | undefined): string | null {
-  // The call context is tried first and is not where it has ever been found: live, the
-  // header is on the socket and `mcpCtx.http.headers` is null. The HTTP handler therefore
-  // carries it alongside the call, and that is the value that actually arrives here.
-  return requestIdFromHeader(mcpCtx?.http?.headers?.['x-request-id']) ?? inboundRequestId();
+  // server.ts normalizes x-request-id exactly once at raw HTTP ingress and binds that value
+  // to this async request. Re-reading the SDK header here would create a second parser/source
+  // of truth for the correlation key.
+  void mcpCtx;
+  return inboundRequestId();
 }
 
 /**
@@ -340,33 +331,67 @@ async function dispatch(
   surface: SurfaceId,
   run: () => Promise<ToolResult>
 ): Promise<ToolResult> {
+  return trackMcpRequest(() => dispatchTracked(name, args, transportKey, requestId, surface, run));
+}
+
+async function dispatchTracked(
+  name: string,
+  args: unknown,
+  transportKey: string | null,
+  requestId: string | null,
+  surface: SurfaceId,
+  run: () => Promise<ToolResult>
+): Promise<ToolResult> {
   noteTransportIdentity(transportKey);
   // Recorded here rather than in `guard` because only this layer knows which server
   // answered, and "was this connector ever actually used from ChatGPT" is a per-connector
   // question the setup screen has to answer honestly.
   surfaceToolCallAt.set(surface, Date.now());
   const isFinish = isFinishCall(name, args);
+  const startedAt = Date.now();
   const context: CallContext = {
+    startedAt,
     transportKey,
     agent: null,
     caller: { transportKey, requestId, conversationId: null },
     outcome: null,
     evidence: emptyEvidence()
   };
-  const startedAt = Date.now();
+  // Cheap, non-blocking ingress identity. When the page has already reported this exact
+  // request id, identity-sensitive handlers (workspace/session/agents) see it before they
+  // touch state. If the page is one tick late this stays null; only handlers that actually
+  // require identity wait for their own exact mate. Ordinary absolute reads/execs never wait.
+  context.caller.conversationId = callerConversation(name, startedAt, requestId);
+  // Only calls that need an *existing* per-chat workspace before the handler runs are
+  // identity-sensitive here. An absolute read or an exec with an explicit absolute workdir is
+  // self-contained and must stay fast; if its exact page mate is late, workspace.ts simply
+  // declines to learn a guessed workspace. Relative paths, omitted exec workdir and a patch with
+  // no explicit base really do consume caller state, so they wait for their exact request-id
+  // mate while a swarm is active. Use the full exact-id window, not the shorter prime window:
+  // the live worker failure that motivated IDENTITY_EVIDENCE_MS arrived ~8 seconds late.
+  if (!context.caller.conversationId && needsWorkspaceIdentity(name, args) && swarmRunning() && requestId) {
+    context.caller.conversationId = await awaitFreshCallOrigin(name, startedAt, IDENTITY_EVIDENCE_MS, { requestId });
+  }
+  context.agent = agentForCaller(context.caller);
   const result = await trackInFlight(() => runInCallContext(context, run));
   // Identity, once, from this call's own evidence — see callerConversation. `agents` has
   // already established its own inside the call and adopted it, and re-reading here would
   // only be able to disagree with the stronger answer it waited for.
-  if (!context.agent) {
-    context.caller.conversationId = callerConversation(name, startedAt, requestId);
-    context.agent = agentForCaller(context.caller);
+  if (!context.caller.conversationId) {
+    const resolved = callerConversation(name, startedAt, requestId);
+    if (resolved) context.caller.conversationId = resolved;
   }
+  // Never erase an identity a handler proved more strongly (agents::callerNow). The old
+  // post-handler pass could fail to rediscover evidence that callerNow had already reserved
+  // and then set agent back to null, which is the live WORKER_IDENTITY_LOST / missing-inbox
+  // split brain worker-1 observed.
+  if (!context.agent) context.agent = agentForCaller(context.caller);
   // This call is the best evidence there is that the previous result reached the agent's
   // conversation, so anything offered then can be retired and written to its history —
-  // except what was offered on a finish result, which this call may itself be the retry
-  // of. The connector supplies no request identity to tell those apart, so the broker
-  // re-offers rather than assuming; see acknowledgeOffers.
+  // except what was offered on a finish result, which this call may itself be the model's
+  // retry after a lost result. The SDK exposes the JSON-RPC id, but a model-issued retry is
+  // a new MCP request with a new id, so that id cannot prove the previous finish result was
+  // seen. The broker therefore re-offers rather than assuming; see acknowledgeOffers.
   if (context.agent) {
     for (const message of acknowledgeOffers(context.agent, isFinish)) await recordAgentMessage(message, 'delivered');
   }
@@ -374,10 +399,7 @@ async function dispatch(
   // its own lifetime is process evidence; letting that number overwrite ToolCallRecord's
   // duration is what made a 10s yield read like a command that had completed in 10s.
   const durationMs = Date.now() - startedAt;
-  // Deliberately not awaited. Attribution may have to wait a moment for the page to
-  // report the tool block that shows where this call came from, and ChatGPT must never
-  // wait on the browser for that; the recorder queues the write and keeps call order.
-  void recordToolCall({
+  const recording = recordToolCall({
     tool: name,
     args,
     content: result.content,
@@ -387,9 +409,43 @@ async function dispatch(
     evidence: context.evidence,
     agent: context.agent,
     bind: context.bindOnAttribution ?? null,
-    requestId: context.caller.requestId
+    requestId: context.caller.requestId,
+    conversationId: context.caller.conversationId
   });
-  return withInbox(context.agent, result, isFinish);
+  // Exact request-id identity needs no browser wait, so make its durable session append part
+  // of completing the MCP call. The recorder catches storage failures and returns null, so a
+  // broken history never breaks the tool itself. Only the degraded/unidentified path remains
+  // fire-and-forget because it may still spend a grace window waiting for page evidence.
+  if (context.caller.conversationId) await recording;
+  else void recording;
+  const delivered = withInbox(context.agent, result, isFinish);
+  // Retire a completed run only after this call has had every chance to acknowledge and
+  // receive its inbox. Doing it inside acknowledgeOffers would let `agents status` destroy
+  // the run halfway through identifying itself; here the handler and result are already done.
+  releaseQuiescentRun();
+  return delivered;
+}
+
+/** Whether this handler must know which chat it is before resolving its paths. */
+function needsWorkspaceIdentity(name: string, args: unknown): boolean {
+  const input = args && typeof args === 'object' ? (args as Record<string, unknown>) : {};
+  const relative = (value: unknown): boolean => typeof value === 'string' && !isAbsoluteVirtualPath(value);
+  if (name === 'read') {
+    const paths = Array.isArray(input['paths']) ? input['paths'] : [];
+    return paths.some(relative);
+  }
+  if (name === 'find') return relative(input['path']);
+  if (name === 'apply_patch') {
+    // Codex's apply_patch surface has no cwd argument. Relative patch paths therefore always
+    // consume the turn/chat cwd analogue maintained by this connector.
+    return true;
+  }
+  if (name === 'exec_command') {
+    // Omitting workdir means "this chat's folder" first, then the first approved root.
+    const workdir = input['workdir'];
+    return workdir === undefined || relative(workdir);
+  }
+  return false;
 }
 
 /**
@@ -403,11 +459,12 @@ async function dispatch(
  */
 export async function adoptAgent(agent: string | null): Promise<void> {
   const context = currentCall();
-  if (!context || !agent || context.agent === agent) return;
+  if (!context || !agent) return;
   context.agent = agent;
   // The same at-least-once rule the dispatcher applies: this call is the evidence that
-  // the previous result reached that conversation. A finish cannot arrive here — it is a
-  // worker action, and a worker is resolved by its code before the call ever runs.
+  // the previous result reached that conversation. Do this even when ingress already found
+  // the same agent: pre-resolution is exactly what made the second worker call skip this
+  // acknowledgement and leave an offered prime→worker message pending forever.
   for (const message of acknowledgeOffers(agent, false)) await recordAgentMessage(message, 'delivered');
 }
 
@@ -644,6 +701,18 @@ export const MAX_HANDOFF_CHARS = 400_000;
  * inside it. Nothing falls back to "the only chat that has been active lately".
  */
 export const PRIME_EVIDENCE_MS = 2_500;
+
+/**
+ * The same window for a call ChatGPT gave a request id, which is waiting for one exact
+ * page record rather than for whichever block turns up.
+ *
+ * Two and a half seconds was measured too short for the case that matters most: a worker's
+ * first `agents` call runs seconds after its tab opened, and on 2026-08-18 worker-1 was
+ * told WORKER_IDENTITY_LOST at 16:33:56 with the page evidence for that very call arriving
+ * at 16:34:04. The wait is event-driven and ends the instant the mate lands, so the extra
+ * seconds are only ever spent by a call that was going to be refused anyway.
+ */
+export const IDENTITY_EVIDENCE_MS = 15_000;
 
 /**
  * Recovers the complete text behind a stored field.

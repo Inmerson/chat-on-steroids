@@ -800,6 +800,12 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
               // The extension matches its DOM blocks against this, and refuses to
               // relabel anything when it is missing.
               turnId: event.turnId ?? null,
+              // ChatGPT's own id for the connector request this call answered, from the
+              // `x-request-id` it sent. `turnId` is a `data-turn-id`, which is minted per
+              // page load — the same turn is `g-…` while it streams and `request-WEB:…`
+              // after a refresh — so it cannot survive a reload, and without this the
+              // relabeller had nothing durable left to match a reloaded transcript on.
+              requestId: event.call.requestId ?? null,
               attribution: event.call.attribution,
               outcome: event.call.outcome,
               durationMs: event.call.durationMs,

@@ -37,6 +37,7 @@ let roots: Root[] = [];
 /** A call context carrying nothing but an agent identity, which is all the key needs. */
 function asAgent(agent: string | null): CallContext {
   return {
+    startedAt: Date.now(),
     transportKey: null,
     agent,
     caller: { transportKey: null, secret: null, requestId: null, conversationId: null },

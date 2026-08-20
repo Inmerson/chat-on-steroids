@@ -378,17 +378,27 @@
   /**
    * Stable public-assistant identity before the owning thought object necessarily mounts.
    *
-   * ChatGPT can rotate the child text-message UUID while one commentary item streams. The
-   * relation metadata on that child is already stable earlier: parent_id + the response/turn
-   * ids identify that exact page-model branch without using text, DOM position or timing.
-   * Keep the tuple as the canonical key for the whole lifetime of that item so discovering
-   * the thought object later does not re-key the message and leave the first partial behind.
+   * ChatGPT can rotate the child text-message UUID while one commentary item streams, so the
+   * raw message id is not identity. Three pieces of ChatGPT's own server-authored metadata
+   * are: `working_turn_id` and `turn_exchange_id` name the branch, and `create_time` names
+   * the message inside it. That tuple is the same before and after a reload, which the
+   * previous `parent_id` tuple was not: rehydrating a conversation from the server re-parents
+   * the text message, so every already-recorded message came back under a second key and the
+   * transcript showed each one twice.
    *
-   * A bare parent_id is deliberately insufficient here: Retry/Regenerate branches can share
-   * a parent. If ChatGPT supplies no turn/exchange discriminator yet, fall back to its raw
-   * message id until a stronger exact identity exists.
+   * No text, DOM position, or local observation time takes part. `create_time` here is
+   * ChatGPT's own creation stamp for that exact message, read from the page model.
+   *
+   * `parent_id` remains the fallback identity for page data old enough to carry no
+   * `create_time`. A bare parent_id is deliberately insufficient even then: Retry/Regenerate
+   * branches can share a parent. With no turn/exchange discriminator at all there is no exact
+   * identity to use, and the raw message id stands until one exists.
    */
-  function assistantLogicalId(id, parentId, workingTurnId, turnExchangeId) {
+  function assistantLogicalId(id, parentId, workingTurnId, turnExchangeId, createTime) {
+    if ((workingTurnId || turnExchangeId) && createTime) {
+      const stable = `assistant:${workingTurnId || ''}:${turnExchangeId || ''}:${createTime}`;
+      if (stable.length <= 190) return stable;
+    }
     if (!parentId || (!workingTurnId && !turnExchangeId)) return id;
     const value = `assistant:${parentId}:${workingTurnId || ''}:${turnExchangeId || ''}`;
     return value.length <= 190 ? value : id;
@@ -416,8 +426,16 @@
       const parentId = meta ? str(meta.parent_id) : null;
       const workingTurnId = meta ? str(meta.working_turn_id) : null;
       const turnExchangeId = meta ? str(meta.turn_exchange_id) : null;
-      let logicalId = assistantLogicalId(id, parentId, workingTurnId, turnExchangeId);
-      let stable = false;
+      const createTime = authoredTime(message);
+      const authoredId = assistantLogicalId(id, parentId, workingTurnId, turnExchangeId, createTime);
+      // Two messages of one branch sharing a creation millisecond would collide on that
+      // identity. Keep the first and hand the later one the parent tuple instead, so a
+      // collision costs a weaker key rather than a swallowed message.
+      let collides = false;
+      for (let at = 0; at < out.length; at++) if (out[at].messageId === authoredId) collides = true;
+      let logicalId = collides ? assistantLogicalId(id, parentId, workingTurnId, turnExchangeId, null) : authoredId;
+      // The reload-durable identity needs no thought parent to be trustworthy.
+      let stable = !collides && Boolean(createTime) && logicalId !== id && logicalId !== parentId;
 
       // Live streaming can replace the raw text-message UUID while the same commentary block
       // keeps growing. The page already supplies a stronger relation: public commentary is a
@@ -453,7 +471,7 @@
         stable,
         rawText,
         order: index,
-        createTime: authoredTime(message)
+        createTime
       });
     }
     return out;

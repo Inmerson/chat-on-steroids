@@ -8,15 +8,22 @@
  *   block additionally requires a concrete `mimeType`, so the sniffed format is carried alongside
  *   that upstream data URL for transport. The accepted formats are PNG, JPEG, GIF and WebP, which
  *   matches the format features enabled for Codex's `image` dependency in the current workspace.
- * - `image::load_from_memory` fully decodes the file to prove it is an image. There is no decoder
- *   here, so structural plus payload validation of those four formats stands in. It catches common
- *   corrupt/framed-only inputs but is not equivalent to a full pixel decode; deeper malformed
- *   bitstreams can still differ from upstream and are an explicit remaining transport/runtime gap.
+ * - `image::load_from_memory` fully decodes the file to prove it is an image. PNG gets that exact
+ *   guarantee here: its pixel data is a zlib stream, so `decodesAsPng` inflates it and checks the
+ *   result against the header's geometry, which is a real decode rather than a resemblance test.
+ *   JPEG, GIF and WebP have no decoder in the standard library and still rely on structural plus
+ *   payload validation, which catches framed-only inputs but not a deeply malformed entropy or
+ *   VP8 bitstream. Those three remain an explicit transport/runtime gap against upstream.
+ *
+ * Getting this wrong is not cosmetic. An `image` content block the consumer cannot decode breaks
+ * the ChatGPT message stream and kills the whole turn, so anything short of proof is a rejection.
  *
  * `MAX_VIEW_IMAGE_BYTES` has no counterpart in Codex, whose only limit is the 512 MiB
  * `read_file` cap. A base64 content block of that size would take the connector down, so the
  * existing 8 MiB ceiling stays as a transport limit.
  */
+
+import { inflateSync as zlibInflate } from 'node:zlib';
 
 import { getMetadata, readFile } from './filesystem.js';
 import { imageMime, validateImageStructure, formatBytes, MAX_IMAGE_BYTES, type SupportedImageMime } from '../fsops.js';
@@ -202,27 +209,119 @@ function hasImagePayload(data: Buffer, mimeType: SupportedImageMime): boolean {
     return false;
   }
 
-  let imageDataBytes = 0;
-  const zlibHeader: number[] = [];
+  return decodesAsPng(data);
+}
+
+/** Channels per pixel for each PNG colour type; `undefined` marks a colour type that is not one. */
+const PNG_CHANNELS: Record<number, number | undefined> = { 0: 1, 2: 3, 3: 1, 4: 2, 6: 4 };
+
+/** Bit depths PNG permits for each colour type. */
+const PNG_DEPTHS: Record<number, number[] | undefined> = {
+  0: [1, 2, 4, 8, 16],
+  2: [8, 16],
+  3: [1, 2, 4, 8],
+  4: [8, 16],
+  6: [8, 16]
+};
+
+/** Adam7: `[xStart, yStart, xStep, yStep]` for each interlace pass. */
+const ADAM7: ReadonlyArray<readonly [number, number, number, number]> = [
+  [0, 0, 8, 8],
+  [4, 0, 8, 8],
+  [0, 4, 4, 8],
+  [2, 0, 4, 4],
+  [0, 2, 2, 4],
+  [1, 0, 2, 2],
+  [0, 1, 1, 2]
+];
+
+/**
+ * Whether this PNG's image data actually decompresses into the pixels its header promises.
+ *
+ * This is the real decode Codex gets from `image::load_from_memory`, for the one format Node
+ * can do it for without a decoder dependency: PNG's pixels are a zlib stream, `zlib` is in the
+ * standard library, and everything after inflation — un-filtering scanlines — is arithmetic that
+ * cannot fail once the byte count and the filter codes are right.
+ *
+ * The gap it closes was not theoretical. A PNG framed correctly, with valid chunk CRCs and a
+ * valid two-byte zlib header over a corrupt DEFLATE stream, passed every structural check here
+ * and was returned as a successful `image` content block. ChatGPT could not decode it, rendered
+ * "This image is unavailable because it is of an unsupported file type", and the turn died with
+ * `Error in message stream` — four times across one recorded run, each one immediately after a
+ * `view_image`/`read` call on that file. Bytes that cannot be decoded must never reach the model.
+ */
+function decodesAsPng(data: Buffer): boolean {
+  let width = 0;
+  let height = 0;
+  let bitDepth = 0;
+  let colorType = 0;
+  let interlace = 0;
+  let sawHeader = false;
+  let sawPalette = false;
+  const parts: Buffer[] = [];
+
   let offset = 8;
   while (offset + 12 <= data.length) {
     const length = data.readUInt32BE(offset);
+    const type = data.subarray(offset + 4, offset + 8).toString('ascii');
     const payloadStart = offset + 8;
-    const end = offset + 12 + length;
+    const end = payloadStart + length + 4;
     if (end > data.length) return false;
-    if (data.subarray(offset + 4, offset + 8).toString('ascii') === 'IDAT') {
-      imageDataBytes += length;
-      for (let index = payloadStart; index < payloadStart + length && zlibHeader.length < 2; index++) {
-        zlibHeader.push(data[index]!);
-      }
+    if (type === 'IHDR') {
+      if (length !== 13) return false;
+      width = data.readUInt32BE(payloadStart);
+      height = data.readUInt32BE(payloadStart + 4);
+      bitDepth = data[payloadStart + 8]!;
+      colorType = data[payloadStart + 9]!;
+      // Compression 0 and filter 0 are the only methods PNG defines; a decoder rejects the rest.
+      if (data[payloadStart + 10] !== 0 || data[payloadStart + 11] !== 0) return false;
+      interlace = data[payloadStart + 12]!;
+      if (interlace !== 0 && interlace !== 1) return false;
+      sawHeader = true;
+    } else if (type === 'PLTE') {
+      sawPalette = true;
+    } else if (type === 'IDAT') {
+      parts.push(data.subarray(payloadStart, payloadStart + length));
     }
     offset = end;
   }
-  if (imageDataBytes === 0 || zlibHeader.length < 2) return false;
-  // PNG mandates a zlib-wrapped DEFLATE stream. This catches framed/CRC-valid IDAT garbage that
-  // the shared structural validator cannot detect, while avoiding a second full image decoder.
-  const [cmf, flg] = zlibHeader as [number, number];
-  return (cmf & 0x0f) === 8 && (cmf >> 4) <= 7 && ((cmf << 8) | flg) % 31 === 0 && (flg & 0x20) === 0;
+
+  if (!sawHeader || width === 0 || height === 0 || parts.length === 0) return false;
+  const channels = PNG_CHANNELS[colorType];
+  const depths = PNG_DEPTHS[colorType];
+  if (channels === undefined || depths === undefined || !depths.includes(bitDepth)) return false;
+  // An indexed image without its palette has no pixels, however well-formed the rest is.
+  if (colorType === 3 && !sawPalette) return false;
+
+  let raw: Buffer;
+  try {
+    raw = zlibInflate(Buffer.concat(parts));
+  } catch {
+    return false;
+  }
+
+  const bitsPerPixel = channels * bitDepth;
+  const passes: Array<[number, number]> =
+    interlace === 0
+      ? [[width, height]]
+      : ADAM7.map(([xStart, yStart, xStep, yStep]) => [
+          Math.ceil(Math.max(0, width - xStart) / xStep),
+          Math.ceil(Math.max(0, height - yStart) / yStep)
+        ]);
+
+  let at = 0;
+  for (const [passWidth, passHeight] of passes) {
+    if (passWidth === 0 || passHeight === 0) continue;
+    const stride = Math.ceil((passWidth * bitsPerPixel) / 8);
+    for (let row = 0; row < passHeight; row++) {
+      // Every scanline is one filter code plus `stride` bytes. Running out of them, or a filter
+      // code outside the five PNG defines, is exactly what a decoder refuses to reconstruct.
+      if (at + 1 + stride > raw.length) return false;
+      if (raw[at]! > 4) return false;
+      at += 1 + stride;
+    }
+  }
+  return true;
 }
 
 /**

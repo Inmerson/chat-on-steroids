@@ -58,6 +58,17 @@ function totalDelta(changes: readonly FileChange[]): string | null {
   return changes.some((change) => change.approximate) ? `~${text}` : text;
 }
 
+/** "lines 200–420" -> "221 lines", for the glanceable right edge of a read row. */
+function lineRangeMetric(detail: string | null): string | null {
+  if (!detail) return null;
+  const match = /^lines\s+(\d+)[–-](\d+)(?:\s+of\s+\d+)?$/i.exec(detail.trim());
+  if (!match) return null;
+  const first = Number(match[1]);
+  const last = Number(match[2]);
+  if (!Number.isSafeInteger(first) || !Number.isSafeInteger(last) || last < first) return null;
+  return plural(last - first + 1, 'line');
+}
+
 /**
  * A command or script as one readable line.
  *
@@ -218,11 +229,19 @@ function build(
         paths.length === 1
           ? (evidence.detail ?? (start && end ? `lines ${start}–${end}` : start ? `from line ${start}` : null))
           : null;
+      const metric = lineRangeMetric(range);
+      const multiDetail =
+        paths.length > 1
+          ? paths.length <= 3
+            ? paths.map(shortPath).join(', ')
+            : `${paths.slice(0, 2).map(shortPath).join(', ')} +${paths.length - 2} more`
+          : null;
       return {
         kind: 'read',
         tone: 'neutral',
         title: paths.length === 1 && first ? `Read ${shortPath(first)}` : `Read ${plural(paths.length, 'path')}`,
-        ...(range ? { detail: range } : {})
+        ...(range ? { detail: range } : multiDetail ? { detail: multiDetail } : {}),
+        ...(metric ? { metric } : {})
       };
     }
     case 'find': {

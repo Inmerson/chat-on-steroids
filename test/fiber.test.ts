@@ -131,7 +131,14 @@ function answer(id: string, parent: string, tool: string, app: string = APP): Me
 function authored(
   id: string,
   text: string,
-  options: { status?: string; endTurn?: boolean; parent?: string; workingTurnId?: string; turnExchangeId?: string } = {}
+  options: {
+    status?: string;
+    endTurn?: boolean;
+    parent?: string;
+    workingTurnId?: string;
+    turnExchangeId?: string;
+    createTime?: number;
+  } = {}
 ): Message {
   return {
     id,
@@ -139,6 +146,7 @@ function authored(
     recipient: 'all',
     ...(options.status ? { status: options.status } : {}),
     ...(options.endTurn !== undefined ? { end_turn: options.endTurn } : {}),
+    ...(options.createTime ? { create_time: options.createTime } : {}),
     content: { content_type: 'text', parts: [text] },
     metadata: {
       message_type: 'next',
@@ -628,6 +636,45 @@ describe('the calls a turn says it made', () => {
     );
     expect(first.turns[0]!.messages[0]!.stable).toBe(false);
     expect(second.turns[0]!.messages[0]!.stable).toBe(false);
+  });
+
+  it('keeps one exact logical id when a reload re-parents the same server message', async () => {
+    // The live shape from 2026-08-20: reloading a chat rehydrates it from the server, which
+    // hands the same authored message a different `parent_id` while `working_turn_id`,
+    // `turn_exchange_id` and `create_time` all stay put. Keyed on the parent, every message
+    // already recorded came back as a second row and the transcript showed each one twice.
+    const branch = { workingTurnId: 'working-43a30177', turnExchangeId: 'exchange-43a30177', createTime: 1_787_211_141.137 };
+    const live = await scan([], [{
+      id: 'turn-reloaded',
+      messages: [authored('raw-live', 'I am auditing the MCP-visible contract first.', { ...branch, parent: 'thought-e97025b0' })]
+    }]);
+    const reloaded = await scan([], [{
+      id: 'turn-reloaded',
+      messages: [authored('raw-rehydrated', 'I am auditing the MCP-visible contract first.', { ...branch, parent: 'thought-3ecd4ef3' })]
+    }]);
+
+    expect(live.turns[0]!.messages[0]!.messageId).toBe(
+      'assistant:working-43a30177:exchange-43a30177:1787211141137'
+    );
+    expect(reloaded.turns[0]!.messages[0]!.messageId).toBe(live.turns[0]!.messages[0]!.messageId);
+    expect(live.turns[0]!.messages[0]!.stable).toBe(true);
+    expect(reloaded.turns[0]!.messages[0]!.stable).toBe(true);
+  });
+
+  it('falls back to the parent tuple when two messages of one branch share a creation stamp', async () => {
+    const branch = { workingTurnId: 'working-same', turnExchangeId: 'exchange-same', createTime: 1_787_211_141.137 };
+    const { turns } = await scan([], [{
+      id: 'turn-collision',
+      messages: [
+        authored('raw-first', 'First.', { ...branch, parent: 'thought-first' }),
+        authored('raw-second', 'Second.', { ...branch, parent: 'thought-second' })
+      ]
+    }]);
+
+    expect(turns[0]!.messages.map((message) => message.messageId)).toEqual([
+      'assistant:working-same:exchange-same:1787211141137',
+      'assistant:thought-second:working-same:exchange-same'
+    ]);
   });
 
   it('captures the opening user message from the page model before the DOM exposes a message id', async () => {

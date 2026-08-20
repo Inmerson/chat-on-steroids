@@ -1489,9 +1489,23 @@ input[readonly] {
 }
 
 .meta.is-progress {
-  color: var(--ink);
-  font-weight: 650;
+  color: var(--soft);
+  font-weight: 520;
   letter-spacing: 0.005em;
+}
+
+.thinking-line {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  opacity: 0.76;
+}
+
+.thinking-ico {
+  width: 13px;
+  height: 13px;
+  flex: 0 0 auto;
+  color: var(--faint);
 }
 
 .meta.is-warn {
@@ -1536,6 +1550,87 @@ input[readonly] {
   scrollbar-width: thin;
 }
 
+.msg.rich {
+  white-space: normal;
+  line-height: 1.5;
+}
+
+.msg.rich > :first-child {
+  margin-top: 0;
+}
+
+.msg.rich > :last-child {
+  margin-bottom: 0;
+}
+
+.msg.rich p,
+.msg.rich ul,
+.msg.rich ol,
+.msg.rich blockquote,
+.msg.rich pre,
+.msg.rich table,
+.msg.rich h1,
+.msg.rich h2,
+.msg.rich h3,
+.msg.rich h4,
+.msg.rich h5,
+.msg.rich h6 {
+  margin: 0.55em 0;
+}
+
+.msg.rich ul,
+.msg.rich ol {
+  padding-left: 1.6em;
+}
+
+.msg.rich blockquote {
+  margin-left: 0;
+  padding-left: 0.8em;
+  border-left: 2px solid var(--line);
+  color: var(--muted);
+}
+
+.msg.rich code {
+  font-family: var(--mono);
+  font-size: 0.94em;
+  padding: 0.08em 0.28em;
+  border-radius: 4px;
+  background: var(--wash);
+}
+
+.msg.rich pre {
+  overflow: auto;
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--wash);
+  white-space: pre;
+}
+
+.msg.rich pre code {
+  padding: 0;
+  background: transparent;
+}
+
+.msg.rich a {
+  color: var(--blue);
+  text-decoration: underline;
+}
+
+.msg.rich table {
+  width: max-content;
+  min-width: 100%;
+  border-collapse: collapse;
+}
+
+.msg.rich th,
+.msg.rich td {
+  padding: 4px 7px;
+  border: 1px solid var(--line);
+  text-align: left;
+  vertical-align: top;
+}
+
 .cut {
   color: var(--faint);
   font-style: italic;
@@ -1548,15 +1643,16 @@ input[readonly] {
    right edge. Say it here so a stray rule elsewhere cannot take it away again. */
 .tool {
   display: block;
-  border: 1px solid var(--line);
-  border-radius: 8px;
+  border: 0;
+  border-radius: 0;
+  opacity: 0.76;
 }
 
 .tool > summary {
   display: flex;
   align-items: center;
   gap: 8px;
-  padding: 5px 9px;
+  padding: 4px 0;
   font-size: 12.5px;
   cursor: pointer;
   list-style: none;
@@ -1568,11 +1664,11 @@ input[readonly] {
 
 .tool > summary:hover {
   background: var(--hover);
-  border-radius: 7px;
+  border-radius: 4px;
 }
 
 .tool summary b {
-  font-weight: 600;
+  font-weight: 520;
   flex: 0 1 auto;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -1609,8 +1705,8 @@ input[readonly] {
 }
 
 .tool.tone-bad {
-  border-color: var(--red-line);
-  background: var(--red-wash);
+  color: var(--red);
+  background: transparent;
 }
 
 .tool.tone-bad .metric {

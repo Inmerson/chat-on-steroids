@@ -32,8 +32,8 @@ describe('extension release metadata', () => {
     ) as { version: string };
     expect(pkg.version).toBe(APP_VERSION);
     expect(manifest.version).toBe(APP_VERSION);
-    expect(BRIDGE_PROTOCOL).toBe(4);
-    expect(backgroundSource).toContain('const BRIDGE_PROTOCOL = 4;');
+    expect(BRIDGE_PROTOCOL).toBe(5);
+    expect(backgroundSource).toContain('const BRIDGE_PROTOCOL = 5;');
   });
 
   /**
@@ -392,9 +392,14 @@ interface WorkerHarness {
   send(message: Record<string, unknown>, tabId?: number): Promise<any>;
   /** Fires Chrome's real tab-close lifecycle event. */
   closeTab(tabId: number): Promise<void>;
+  /** Fires the extension install/update lifecycle event. */
+  installed(reason?: string): Promise<void>;
   tabsCreate: ReturnType<typeof vi.fn>;
+  tabsQuery: ReturnType<typeof vi.fn>;
   tabsUpdate: ReturnType<typeof vi.fn>;
   tabsSendMessage: ReturnType<typeof vi.fn>;
+  scriptingExecuteScript: ReturnType<typeof vi.fn>;
+  scriptingInsertCSS: ReturnType<typeof vi.fn>;
 }
 
 function response(status: number, data: unknown) {
@@ -414,9 +419,13 @@ function loadWorker(options: {
 }): WorkerHarness {
   let listener: ((message: any, sender: any, sendResponse: (value: any) => void) => boolean) | null = null;
   const tabRemovedListeners: Array<(tabId: number) => void> = [];
+  const installedListeners: Array<(details: { reason: string }) => void> = [];
   const tabsCreate = vi.fn(async () => ({ id: 99 }));
+  const tabsQuery = vi.fn(async () => [] as Array<{ id?: number }>);
   const tabsUpdate = vi.fn(async (id: number) => ({ id, windowId: 7 }));
   const tabsSendMessage = vi.fn(async () => ({ ok: true }));
+  const scriptingExecuteScript = vi.fn(async () => []);
+  const scriptingInsertCSS = vi.fn(async () => undefined);
   const windowsUpdate = vi.fn(async () => ({ id: 7 }));
   const event = () => ({ addListener: () => undefined });
   const chrome = {
@@ -428,12 +437,21 @@ function loadWorker(options: {
           listener = fn;
         }
       },
-      onInstalled: event(),
+      onInstalled: {
+        addListener(fn: (details: { reason: string }) => void) {
+          installedListeners.push(fn);
+        }
+      },
       onStartup: event()
     },
     windows: { update: windowsUpdate },
+    scripting: {
+      executeScript: scriptingExecuteScript,
+      insertCSS: scriptingInsertCSS
+    },
     tabs: {
       create: tabsCreate,
+      query: tabsQuery,
       update: tabsUpdate,
       sendMessage: tabsSendMessage,
       onRemoved: {
@@ -457,8 +475,16 @@ function loadWorker(options: {
 
   return {
     tabsCreate,
+    tabsQuery,
     tabsUpdate,
     tabsSendMessage,
+    scriptingExecuteScript,
+    scriptingInsertCSS,
+    async installed(reason = 'update') {
+      for (const fn of installedListeners) fn({ reason });
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    },
     async closeTab(tabId: number) {
       for (const fn of tabRemovedListeners) fn(tabId);
       await new Promise((resolve) => setTimeout(resolve, 0));
@@ -571,6 +597,45 @@ describe('extension command delivery', () => {
     // There is no listing route left to ask, so nothing here ever asks for one.
     expect(fetch.mock.calls.every(([input]) => new URL(String(input)).pathname !== '/commands')).toBe(true);
     expect(backgroundSource).not.toContain('chrome.alarms');
+  });
+
+  it('re-injects the recorder into already-open ChatGPT tabs after an extension reload', async () => {
+    const local = new FakeStorageArea(paired);
+    const session = new FakeStorageArea();
+    const worker = loadWorker({ local, session });
+    worker.tabsQuery.mockResolvedValueOnce([{ id: 41 }, { id: 42 }]);
+
+    await worker.installed('update');
+
+    expect(worker.tabsQuery).toHaveBeenCalledWith({
+      url: ['https://chatgpt.com/*', 'https://chat.openai.com/*']
+    });
+    expect(worker.scriptingExecuteScript.mock.calls).toEqual([
+      [{ target: { tabId: 41 }, files: ['chatgpt-dom.js'] }],
+      [{ target: { tabId: 41 }, world: 'MAIN', files: ['fiber.js'] }],
+      [{ target: { tabId: 41 }, files: ['content.js'] }],
+      [{ target: { tabId: 42 }, files: ['chatgpt-dom.js'] }],
+      [{ target: { tabId: 42 }, world: 'MAIN', files: ['fiber.js'] }],
+      [{ target: { tabId: 42 }, files: ['content.js'] }]
+    ]);
+    expect(worker.scriptingInsertCSS.mock.calls).toEqual([
+      [{ target: { tabId: 41 }, files: ['overlay.css'] }],
+      [{ target: { tabId: 42 }, files: ['overlay.css'] }]
+    ]);
+  });
+
+  it('leaves an already-live v8 recorder alone instead of stacking another content script', async () => {
+    const local = new FakeStorageArea(paired);
+    const session = new FakeStorageArea();
+    const worker = loadWorker({ local, session });
+    worker.tabsQuery.mockResolvedValueOnce([{ id: 41 }]);
+    worker.tabsSendMessage.mockResolvedValueOnce({ ok: true, recorderVersion: 8 });
+
+    await worker.installed('update');
+
+    expect(worker.tabsSendMessage).toHaveBeenCalledWith(41, { type: 'clf-recorder-ping' });
+    expect(worker.scriptingExecuteScript).not.toHaveBeenCalled();
+    expect(worker.scriptingInsertCSS).not.toHaveBeenCalled();
   });
 
   it('has no way to ask the app for work at all', async () => {
@@ -967,17 +1032,19 @@ describe('extension connection', () => {
     expect(local.data.disconnected).toBe(false);
   });
 
-  it('forces an immediate overwrite in every ChatGPT tab already known to the worker', async () => {
+  it('forces an immediate overwrite in known and newly discovered ChatGPT tabs', async () => {
     const local = new FakeStorageArea({ port: 8765, token: 'paired-token' });
     const worker = loadWorker({ local, session: new FakeStorageArea(), fetch: app().fetch });
     await worker.send({ type: 'bind', conversationId: '11111111-2222-3333-4444-555555555555' }, 11);
     await worker.send({ type: 'bind', conversationId: 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee' }, 12);
+    worker.tabsQuery.mockResolvedValueOnce([{ id: 12 }, { id: 13 }]);
 
     const result = await worker.send({ type: 'overwriteNow' });
 
-    expect(result).toMatchObject({ ok: true, tabs: 2, attempted: 2 });
-    expect(worker.tabsSendMessage).toHaveBeenCalledTimes(2);
+    expect(result).toMatchObject({ ok: true, tabs: 3, attempted: 3 });
+    expect(worker.tabsSendMessage).toHaveBeenCalledTimes(3);
     expect(worker.tabsSendMessage).toHaveBeenCalledWith(11, { type: 'clf-overwrite-now' });
     expect(worker.tabsSendMessage).toHaveBeenCalledWith(12, { type: 'clf-overwrite-now' });
+    expect(worker.tabsSendMessage).toHaveBeenCalledWith(13, { type: 'clf-overwrite-now' });
   });
 });

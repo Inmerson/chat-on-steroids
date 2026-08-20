@@ -245,11 +245,12 @@ async function loadDetail(): Promise<void> {
   }
   const detail = await run(api.getSession(selectedId));
   if (!detail) return;
-  // The log holds one record per commentary snapshot so a live reader can watch a line
-  // being written. A timeline of a finished turn wants the line, once, where it started.
-  // A tool call is appended once it has finished, so `seq` puts it after the commentary it
-  // ran underneath. Ordered once here, on load, rather than per repaint — and with the same
-  // helper the injected page stream uses, so the two views cannot disagree.
+  // User/assistant prose is canonical in messages.json, while structured page activity stays
+  // append-only by design: ChatGPT can grow one commentary caption or rewrite one activity
+  // label several times. `foldProgress` turns those snapshots back into the one logical row
+  // their stable progressId/messageId names, then chronology places that row at its first
+  // appearance. This helper existed already but was never wired into the desktop reader,
+  // which is why "Inspecting…" and "Inspected…" still appeared as siblings.
   events = chronological(foldProgress(detail.events));
   totalEvents = detail.total;
   paintDetail();
@@ -280,6 +281,82 @@ function textBlock(className: string, value: string, truncated: boolean, chars: 
     node.append(el('span', 'cut', ` … cut, ${compactNumber(chars)} characters in the original`));
   }
   return node;
+}
+
+const RENDERED_TAGS = new Set([
+  'A', 'BLOCKQUOTE', 'BR', 'CODE', 'DEL', 'DIV', 'EM', 'H1', 'H2', 'H3', 'H4', 'H5', 'H6',
+  'HR', 'KBD', 'LI', 'MARK', 'OL', 'P', 'PRE', 'S', 'SPAN', 'STRONG', 'SUB', 'SUP', 'TABLE',
+  'TBODY', 'TD', 'TFOOT', 'TH', 'THEAD', 'TR', 'UL'
+]);
+const DROP_RENDERED_TAGS = new Set([
+  'SCRIPT', 'STYLE', 'IFRAME', 'OBJECT', 'EMBED', 'SVG', 'MATH', 'FORM', 'INPUT', 'BUTTON',
+  'TEXTAREA', 'SELECT', 'OPTION', 'META', 'LINK'
+]);
+
+function safeRenderedHref(value: string): string | null {
+  const trimmed = value.trim();
+  if (trimmed.startsWith('#')) return trimmed;
+  try {
+    const url = new URL(trimmed);
+    return url.protocol === 'https:' || url.protocol === 'http:' || url.protocol === 'mailto:' ? trimmed : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Sanitizes ChatGPT's captured rendered HTML without reparsing Markdown.
+ *
+ * The page is untrusted input even though the extension produced the observation. Preserve
+ * semantic Markdown tags, discard executable/form/embed content, strip every attribute by
+ * default, and allow only the tiny attribute set that affects normal Markdown semantics.
+ */
+export function renderedMessage(html: string, fallback: string): HTMLElement {
+  const box = el('div', 'msg rich');
+  if (!html) {
+    box.textContent = fallback;
+    return box;
+  }
+  const template = document.createElement('template');
+  template.innerHTML = html;
+  const visit = (parent: ParentNode): void => {
+    for (const node of [...parent.childNodes]) {
+      // Namespace elements (SVG/MathML) are not HTMLElements. Checking HTMLElement here
+      // would let exactly the foreign content in DROP_RENDERED_TAGS bypass traversal and
+      // attribute stripping. nodeType is realm-agnostic and covers every DOM Element.
+      if (node.nodeType !== 1) continue;
+      const element = node as Element;
+      const tagName = element.tagName.toUpperCase();
+      if (DROP_RENDERED_TAGS.has(tagName)) {
+        element.remove();
+        continue;
+      }
+      visit(element);
+      if (!RENDERED_TAGS.has(tagName)) {
+        element.replaceWith(...element.childNodes);
+        continue;
+      }
+      const href = tagName === 'A' ? safeRenderedHref(element.getAttribute('href') ?? '') : null;
+      const title = element.getAttribute('title');
+      const start = tagName === 'OL' ? element.getAttribute('start') : null;
+      const colSpan = tagName === 'TD' || tagName === 'TH' ? element.getAttribute('colspan') : null;
+      const rowSpan = tagName === 'TD' || tagName === 'TH' ? element.getAttribute('rowspan') : null;
+      for (const attribute of [...element.attributes]) element.removeAttribute(attribute.name);
+      if (href) {
+        element.setAttribute('href', href);
+        element.setAttribute('target', '_blank');
+        element.setAttribute('rel', 'noreferrer noopener');
+      }
+      if (title) element.setAttribute('title', title.slice(0, 500));
+      if (start && /^\d{1,6}$/.test(start)) element.setAttribute('start', start);
+      if (colSpan && /^\d{1,3}$/.test(colSpan)) element.setAttribute('colspan', colSpan);
+      if (rowSpan && /^\d{1,3}$/.test(rowSpan)) element.setAttribute('rowspan', rowSpan);
+    }
+  };
+  visit(template.content);
+  box.append(template.content);
+  if (!box.textContent?.trim() && fallback) box.textContent = fallback;
+  return box;
 }
 
 function toolBody(event: Extract<SessionEvent, { kind: 'tool_call' }>): HTMLElement {
@@ -339,13 +416,16 @@ function eventBody(event: SessionEvent): HTMLElement {
     case 'assistant_message': {
       const box = el('div', 'said');
       box.append(el('b', '', event.final ? 'ChatGPT' : 'ChatGPT (partial)'));
-      box.append(textBlock('msg', event.message.text, event.message.truncated, event.message.chars));
+      box.append(renderedMessage(event.renderedHtml?.text ?? '', event.message.text));
       return box;
     }
     case 'progress':
       return el('p', 'meta is-progress', event.message.text);
-    case 'page_tool':
-      return el('p', 'meta is-progress', `ChatGPT: ${event.label}`);
+    case 'page_tool': {
+      const line = el('p', 'meta is-progress thinking-line');
+      line.append(icon('i-bolt', 'ico thinking-ico'), el('span', '', event.label));
+      return line;
+    }
     case 'turn_start':
       return el('p', 'meta', 'Turn started');
     case 'turn_end': {

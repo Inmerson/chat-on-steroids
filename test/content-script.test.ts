@@ -42,6 +42,8 @@ interface ActivityEntry {
   summary: { kind: string; tone: string; title: string; detail?: string; metric?: string };
   /** Which agent ran it. Absent, and shown as nothing, in a chat with no agents. */
   agent?: string | null;
+  /** ChatGPT's own id for the connector request, which outlives the page load. */
+  requestId?: string | null;
 }
 
 interface Descriptor {
@@ -2253,6 +2255,88 @@ async function bindFiberRequest(section: HTMLElement, requestId: string, tool = 
     calls: [{ messageId: `fiber-${requestId}`, tool, order: 0, answered: true, requestId }]
   } }]);
 }
+
+describe('naming rows in a chat that has been reloaded', () => {
+  /**
+   * The live failure: relabelling worked, the tab was refreshed, and the same chat came
+   * back wearing nothing but ChatGPT's own names. Nothing had been switched off — the join
+   * had expired. `data-turn-id` is minted per page load (`g-…` live, `request-WEB:<load>-…`
+   * after a refresh), so the turn id every recorded call carries names no visible turn any
+   * more. ChatGPT's connector request id is on both sides and means the same thing across
+   * a reload, so that is what the fallback matches on.
+   */
+  it('names a reloaded turn from the request id, when its recorded turn id is gone', async () => {
+    live = await harness();
+    renderingOn();
+    const section = assistantTurn(live!.document, 'request-WEB:6b1f2f0a-4d2c-4f2e-9a6a-2c1d6f0b0a11-3', [
+      'Called tool!'
+    ]);
+    live!.reply.set('activity', () => ({
+      ok: true,
+      data: {
+        entries: [
+          call({ turnId: 'g-1s6atlm1inbjf2-0-1', callId: 'call-before-reload', requestId: 'wfr_reloaded_turn' })
+        ],
+        job: null
+      }
+    }));
+    await live!.hook.pullActivity();
+    await settle();
+    await bindFiberRequest(section, 'wfr_reloaded_turn');
+    live!.hook.paint();
+
+    const row = section.querySelector('.pointer-events-none.contents') as HTMLElement;
+    expect(row.dataset['clfCall']).toBe('call-before-reload');
+    expect(labels(section)[0]).toContain('Read src/main/bridge.ts');
+    // Not the quieter page-named treatment, which is what this row used to fall back to:
+    // that one has no result, no duration and no outcome behind it.
+    expect(row.dataset['clfPage']).toBeUndefined();
+  });
+
+  it('gives one response’s calls to one visible turn and no more', async () => {
+    live = await harness();
+    renderingOn();
+    const first = assistantTurn(live!.document, 'request-WEB:6b1f2f0a-0000-4f2e-9a6a-2c1d6f0b0a11-0', [
+      'Called tool!'
+    ]);
+    const second = assistantTurn(live!.document, 'request-WEB:6b1f2f0a-0000-4f2e-9a6a-2c1d6f0b0a11-1', [
+      'Called tool!'
+    ]);
+    live!.reply.set('activity', () => ({
+      ok: true,
+      data: {
+        entries: [call({ turnId: 'g-shared-0-1', callId: 'call-once', requestId: 'wfr_one_response' })],
+        job: null
+      }
+    }));
+    await live!.hook.pullActivity();
+    await settle();
+    // Both sections claim the same request. One response's calls cannot have been made by
+    // two visible turns, so the second must not be handed the same call over again.
+    await bindFiberTurns([
+      {
+        section: first,
+        turn: {
+          turnId: first.getAttribute('data-turn-id'),
+          calls: [{ messageId: 'fiber-first', tool: 'read_file', order: 0, answered: true, requestId: 'wfr_one_response' }]
+        }
+      },
+      {
+        section: second,
+        turn: {
+          turnId: second.getAttribute('data-turn-id'),
+          calls: [{ messageId: 'fiber-second', tool: 'read_file', order: 0, answered: true, requestId: 'wfr_one_response' }]
+        }
+      }
+    ]);
+    live!.hook.paint();
+
+    expect((first.querySelector('.pointer-events-none.contents') as HTMLElement).dataset['clfCall']).toBe('call-once');
+    expect(
+      (second.querySelector('.pointer-events-none.contents') as HTMLElement).dataset['clfCall']
+    ).toBeUndefined();
+  });
+});
 
 describe('the app-owned chronological stream', () => {
   const turnId = 'turn-app-stream';
@@ -4773,6 +4857,28 @@ describe('how a turn is recorded as having ended', () => {
     expect(emitted(live.sent, 'chat_error').map((entry) => entry.event.text)).toEqual([TEXT, TEXT]);
     const ends = emitted(live.sent, 'turn_end').map((entry) => entry.event);
     expect(ends.map((event) => event.outcome)).toEqual(['failed', 'failed']);
+  });
+
+  it('ignores the screen-reader live regions ChatGPT announces ordinary UI state through', async () => {
+    live = await harness();
+    startGenerating(live.document);
+    assistantTurn(live.document, 'turn-1', []);
+    live.hook.observe();
+    await settle();
+
+    // All three are `role="alert"`. Only the last one is a failure the user could see; the
+    // first two are the announcer, which one recorded run filled with sixty "errors" that
+    // never happened.
+    const announcer = alertBanner(live.document, 'Reasoning details opened');
+    announcer.className = 'sr-only';
+    const dictation = alertBanner(live.document, 'Dictation is active and in use');
+    dictation.className = 'visually-hidden';
+    alertBanner(live.document, 'Something went wrong.');
+
+    live.hook.observe();
+    await settle();
+
+    expect(emitted(live.sent, 'chat_error').map((entry) => entry.event.text)).toEqual(['Something went wrong.']);
   });
 
   it('still reports one rendered occurrence only once, however often it is observed', async () => {

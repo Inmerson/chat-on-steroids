@@ -618,8 +618,58 @@
 
 .clf-stream-assistant_message .clf-stream-text {
   display: block;
-  white-space: pre-wrap;
+  white-space: normal;
   font-weight: 400;
+}
+
+.clf-stream-assistant_message .clf-stream-text > :first-child { margin-top: 0; }
+.clf-stream-assistant_message .clf-stream-text > :last-child { margin-bottom: 0; }
+.clf-stream-assistant_message .clf-stream-text p,
+.clf-stream-assistant_message .clf-stream-text ul,
+.clf-stream-assistant_message .clf-stream-text ol,
+.clf-stream-assistant_message .clf-stream-text blockquote,
+.clf-stream-assistant_message .clf-stream-text pre,
+.clf-stream-assistant_message .clf-stream-text table,
+.clf-stream-assistant_message .clf-stream-text h1,
+.clf-stream-assistant_message .clf-stream-text h2,
+.clf-stream-assistant_message .clf-stream-text h3,
+.clf-stream-assistant_message .clf-stream-text h4,
+.clf-stream-assistant_message .clf-stream-text h5,
+.clf-stream-assistant_message .clf-stream-text h6 { margin: 0.6em 0; }
+.clf-stream-assistant_message .clf-stream-text ul,
+.clf-stream-assistant_message .clf-stream-text ol { padding-left: 1.55em; }
+.clf-stream-assistant_message .clf-stream-text blockquote {
+  margin-left: 0;
+  padding-left: 0.8em;
+  border-left: 2px solid color-mix(in srgb, currentColor 20%, transparent);
+  opacity: 0.86;
+}
+.clf-stream-assistant_message .clf-stream-text code {
+  padding: 0.08em 0.28em;
+  border-radius: 0.3rem;
+  background: color-mix(in srgb, currentColor 7%, transparent);
+  font-size: 0.92em;
+}
+.clf-stream-assistant_message .clf-stream-text pre {
+  overflow: auto;
+  padding: 0.65rem 0.75rem;
+  border: 1px solid color-mix(in srgb, currentColor 10%, transparent);
+  border-radius: 0.5rem;
+  background: color-mix(in srgb, currentColor 4%, transparent);
+  white-space: pre;
+}
+.clf-stream-assistant_message .clf-stream-text pre code { padding: 0; background: transparent; }
+.clf-stream-assistant_message .clf-stream-text table {
+  width: max-content;
+  min-width: 100%;
+  border-collapse: collapse;
+}
+.clf-stream-assistant_message .clf-stream-text th,
+.clf-stream-assistant_message .clf-stream-text td {
+  padding: 0.28rem 0.45rem;
+  border: 1px solid color-mix(in srgb, currentColor 12%, transparent);
+  text-align: left;
+  vertical-align: top;
 }
 
 .clf-stream-assistant_message .clf-agent,
@@ -636,39 +686,55 @@
 .clf-stream-tool_call {
   width: fit-content;
   max-width: 100%;
-  min-height: 1.85rem;
-  padding: 0.16rem 0.46rem 0.16rem 0.28rem;
-  border: 1px solid color-mix(in srgb, currentColor 8%, transparent);
-  border-radius: 0.55rem;
-  background: color-mix(in srgb, currentColor 2.5%, transparent);
-  opacity: 0.9;
+  min-height: 1.55rem;
+  padding: 0.06rem 0;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  opacity: 0.7;
 }
 
 .clf-stream-tool_call:hover {
-  background: color-mix(in srgb, currentColor 6%, transparent);
-  opacity: 1;
+  background: transparent;
+  opacity: 0.9;
 }
 
 .clf-stream-tool_call .clf-stream-text {
-  font-weight: 580;
+  font-weight: 500;
 }
 
 .clf-stream-tool_call .clf-stream-icon {
-  background: color-mix(in srgb, currentColor 7%, transparent);
-  opacity: 0.82;
+  width: 1.2rem;
+  height: 1.2rem;
+  background: transparent;
+  opacity: 0.72;
 }
 
 .clf-stream-tool_call .clf-metric {
   margin-left: 0.15rem;
-  padding: 0.02rem 0.32rem;
-  border-radius: 999px;
-  background: color-mix(in srgb, currentColor 6%, transparent);
+  padding: 0;
+  border-radius: 0;
+  background: transparent;
   font-size: 0.76rem;
-  opacity: 0.62;
+  opacity: 0.7;
 }
 
 .clf-stream-page_tool {
-  opacity: 0.65;
+  width: fit-content;
+  max-width: 100%;
+  min-height: 1.45rem;
+  padding: 0.04rem 0;
+  opacity: 0.62;
+}
+
+.clf-stream-page_tool .clf-stream-icon {
+  width: 1.2rem;
+  height: 1.2rem;
+  opacity: 0.68;
+}
+
+.clf-stream-page_tool .clf-stream-text {
+  font-weight: 480;
 }
 
 .clf-stream-chat_error .clf-stream-text,

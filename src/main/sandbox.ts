@@ -352,3 +352,35 @@ export async function validateNewRoot(folderPath: string, existing: readonly Roo
   }
   return real;
 }
+
+/**
+ * A virtual path written inside a shell command, which nothing will translate.
+ *
+ * `exec_command` resolves `cwd` and hands `cmd` to PowerShell verbatim — it has to, since
+ * a command is a program and not a path, and rewriting text inside one would corrupt
+ * quoting, regexes and URLs the moment it guessed wrong. But every other field of every
+ * other tool takes virtual paths, and the sandbox refuses native ones outright, so the
+ * model is taught exactly one path dialect and then meets one field that does not speak
+ * it. What it wrote was `/totec/whatsapp-ai-bridge/...`, and PowerShell reads a leading
+ * slash as the root of the current drive: the command ran against `C:\totec\...`, did not
+ * exist, and failed in a way that looks like a missing folder rather than a wrong dialect.
+ *
+ * So the one field that cannot translate says so instead of running. Only a `/name/…`
+ * whose first segment is an approved root is claimed — that is the form that is certainly
+ * a virtual path and certainly wrong here, while `de/totec/doppel` inside a regex or
+ * `https://host/totec` are left alone because neither starts at a boundary a virtual path
+ * can start at.
+ */
+export function strayVirtualPath(text: string, roots: readonly Root[]): string | null {
+  if (typeof text !== 'string' || roots.length === 0) return null;
+  const names = new Set(roots.map((root) => root.name.toLowerCase()));
+  // A candidate must start the string or follow whitespace or an opening quote/bracket:
+  // anything else in front of it means it is part of a longer token, not a path.
+  const candidate = /(^|[\s'"`(,=[{])(\/[A-Za-z0-9._-]+(?:\/[^\s'"`;|)\]}]*)?)/g;
+  for (let match = candidate.exec(text); match; match = candidate.exec(text)) {
+    const found = match[2]!;
+    const first = found.slice(1).split('/')[0]!.toLowerCase();
+    if (names.has(first)) return found;
+  }
+  return null;
+}
