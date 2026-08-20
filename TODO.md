@@ -9,12 +9,13 @@ Status: `[ ]` open · `[~]` in progress · `[x]` done · `[?]` needs a decision 
 into this list; do not create a second TODO. Screenshots and other raw proof may live under
 `docs/evidence/`, but every actionable item belongs here.
 
-**Installed build: v1.8.0.** Verified directly on 2026-08-19 from
-`%LOCALAPPDATA%\Programs\ChatGPT Local Files\ChatGPT Local Files.exe`: file version `1.8.0`,
-product version `1.8.0.0`. Its first fresh-chat live smoke found two deterministic regressions;
-v1.8.1 below is the source-verified patch and is not installed yet.
+**Installed build: v1.8.4.** Verified directly on 2026-08-20 from
+`%LOCALAPPDATA%\Programs\ChatGPT Local Files\ChatGPT Local Files.exe`: file version `1.8.4`,
+product version `1.8.4.0`, written 10:38. It carries the 2026-08-20 batch below. The 1.8.3
+that was installed before it was built on 2026-08-19 at 23:47, before those fixes existed;
+that is why they went out as their own version rather than a second 1.8.3.
 
-## 2026-08-20 — turn killer, reload identity, exec isolation — **CODE DONE, NOT PACKAGED**
+## v1.8.4 — turn killer, reload identity, exec isolation — **INSTALLED 2026-08-20**
 
 One live session reported chats dying on their own (`Error in message stream` → `Turn ended
 for an unknown reason`, no user action), a reloaded chat showing every message twice, and
@@ -103,6 +104,27 @@ below with what was fixed and what deliberately was not.
       · **`image_url` data URL duplicated in `structuredContent`** beside the image block,
         which roughly doubles the payload (up to ~22 MB at the cap). Left for parity; it is
         the item most likely to be worth revisiting if large images ever misbehave.
+
+**1.8.4 source verification before packaging:** `git diff --check` clean; `npm run verify`
+clean with **993 passed / 83 skipped / 0 failed across 34 test files**, TypeScript clean first.
+Bridge protocol is **5**, Fiber helper `VERSION = 8` and content `FIBER_VERSION = 8`; the wire
+shape did not change. `/activity` entries gained one additive field, `requestId`, which an
+older extension simply ignores.
+
+**1.8.4 package, installed:**
+- Installer: `release/ChatGPT-Local-Files-Setup-1.8.4.exe` — **137,642,387 bytes** — SHA-256
+  `E49A8CD6AAE80231D9533C56923C53FE3043BE3F0B01AE931CE491F11B696315`.
+- Blockmap: `release/ChatGPT-Local-Files-Setup-1.8.4.exe.blockmap` — **145,214 bytes**.
+- Unpacked executable reports file version `1.8.4`, product version `1.8.4.0`.
+- Packaged extension manifest is `1.8.4`; `manifest.json`, `background.js`, `content.js`,
+  `fiber.js`, `chatgpt-dom.js` and `overlay.css` hash-identically to the source extension,
+  before packaging and again from the installed `resources/extension`.
+- Installed silently with `/S`; exit code 0, app relaunched and running.
+
+**Live smoke still open.** Everything above is proven from the session files and the test
+suite, not from a fresh chat on this build. The three things to watch first: a `view_image`
+on a real image still renders, a reloaded chat shows each message once, and a reloaded chat
+still shows this app's tool names with durations rather than the quieter page-named rows.
 
 ## v1.8.1 — live-smoke attribution + streaming identity patch — **PACKAGED, NOT INSTALLED**
 
