@@ -56,6 +56,11 @@ Protocol: `FIBER_VERSION` / `RECORDER_VERSION` / `PAGE_RECORDER_VERSION` 8 -> 9,
 `fiber.js` left over from 1.9.1 is refused and re-injected rather than silently answering
 without `requests`. `BRIDGE_PROTOCOL` is unchanged at 6.
 
+- Installer: `release/ChatGPT-Local-Files-Setup-1.9.2.exe`, 144,153,105 bytes,
+  SHA-256 `BC4D1E8DB06261BB0BE253D5D7D672CE2C60DD4D301E1562534FDC2E4B02F4F1`.
+- `node scripts/smoke-packaged-runtime.mjs` passed: `{"version":"1.9.2","sharp":"0.35.3",
+  "libvips":"8.18.3","pngBytes":95,"ptySpawn":"function"}`.
+- All seven extension files under `resources/extension` hash-match the repo copies.
 - `npm run verify`: typecheck clean, 1088 passed / 83 skipped.
 - 10 new regression tests, each shown to fail against the reverted behaviour: 4 in
   `test/fiber.test.ts` (bare-id harvest, allowlist, dedupe, turn kept when the id is all it
