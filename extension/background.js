@@ -803,6 +803,52 @@ function tabKey(source) {
     : 'tab-unknown';
 }
 
+function reloadProvisionalKey(tab) {
+  return Number.isInteger(tab) ? `reload-tab-${tab}` : null;
+}
+
+async function carryFreshReloadProvisional(tab, documentId) {
+  if (!Number.isInteger(tab) || !documentId) return 0;
+  const from = `tab-${tab}:${documentId}`;
+  const to = reloadProvisionalKey(tab);
+  if (!to) return 0;
+  let moved = 0;
+  for (const entry of journal) {
+    if (!entry || entry.conversationId || entry.provisional !== from) continue;
+    entry.provisional = to;
+    sizeCache.delete(entry);
+    moved++;
+  }
+  if (moved > 0) await persistJournal();
+  return moved;
+}
+
+async function dropDocumentProvisional(tab, documentId) {
+  if (!Number.isInteger(tab) || !documentId) return 0;
+  const provisional = `tab-${tab}:${documentId}`;
+  const before = journal.length;
+  journal = journal.filter((entry) => entry.provisional !== provisional);
+  const dropped = before - journal.length;
+  if (dropped > 0) await persistJournal();
+  return dropped;
+}
+
+async function adoptFreshReloadProvisional(tab, documentId) {
+  if (!Number.isInteger(tab) || !documentId) return 0;
+  const from = reloadProvisionalKey(tab);
+  if (!from) return 0;
+  const to = `tab-${tab}:${documentId}`;
+  let moved = 0;
+  for (const entry of journal) {
+    if (!entry || entry.conversationId || entry.provisional !== from) continue;
+    entry.provisional = to;
+    sizeCache.delete(entry);
+    moved++;
+  }
+  if (moved > 0) await persistJournal();
+  return moved;
+}
+
 function tabId(sender) {
   return sender && sender.tab && typeof sender.tab.id === 'number' ? sender.tab.id : null;
 }
@@ -922,6 +968,7 @@ async function registerDocument(sender, message) {
   if (terminal && current === documentId && !(await terminalPredictionWrong(id, key, documentId))) {
     return { ok: false, error: 'tab_closed' };
   }
+  if (current && current !== documentId) await adoptFreshReloadProvisional(id, documentId);
   if (current && current !== documentId) retiredDocuments[key] = [...new Set([...retired, current])].slice(-8);
   tabDocuments[key] = documentId;
   tabEpochs[key] = requestedEpoch;
@@ -946,15 +993,10 @@ async function markTerminal(id) {
   const key = String(id);
   const documentId = typeof tabDocuments[key] === 'string' ? tabDocuments[key] : null;
   terminalDocuments[key] = documentId;
-  // A fresh-chat observation has no conversation id yet. Once its producing document is
-  // terminal it may never be rebound by the replacement document, even when both live in
-  // the same numeric tab.
-  if (documentId) {
-    const provisional = `tab-${id}:${documentId}`;
-    const before = journal.length;
-    journal = journal.filter((entry) => entry.provisional !== provisional);
-    if (journal.length !== before) await persistJournal();
-  }
+  // Do not purge provisional fresh-chat observations here. A full ChatGPT reload is a document
+  // boundary too, and onUpdated deliberately calls markTerminal() before it knows whether the
+  // replacement document is the same chat. releaseTab() owns the destructive purge because it
+  // runs only after the tab actually closes or concretely leaves ChatGPT.
   await persistLive();
   return documentId;
 }
@@ -1054,8 +1096,13 @@ async function releaseTab(tab, expected = null, expectedDocument = null, expecte
   // Once this browser tab concretely leaves ChatGPT (or closes), those observations cannot be
   // safely rebound to a later unrelated chat that happens to reuse the same tab id.
   const provisional = expectedDocument ? `tab-${tab}:${expectedDocument}` : null;
+  const reloadProvisional = reloadProvisionalKey(tab);
   const beforeJournal = journal.length;
-  journal = journal.filter((entry) => !provisional || entry.provisional !== provisional);
+  journal = journal.filter(
+    (entry) =>
+      (!provisional || entry.provisional !== provisional) &&
+      (!reloadProvisional || entry.provisional !== reloadProvisional)
+  );
   if (journal.length !== beforeJournal) await persistJournal();
   if (!stillOwned()) return { ok: true, closed: false };
   const current = cleanConversationId(tabConversations[key]);
@@ -1463,6 +1510,40 @@ chrome.tabs.onUpdated.addListener((id, changeInfo) => {
   // SPA pushState does not emit it. The replacement document must register with its own
   // MessageSender.documentId before any identity-sensitive IPC is accepted.
   void serializeTab(id, async () => {
+    // A brand-new chat can be reloaded before ChatGPT has assigned /c/<id>. Keep only that
+    // id-less root reload's provisional journal across the document swap. It is parked under
+    // a reload-only key and adopted by the replacement document when it registers. Known-chat
+    // navigations do not use this path, so chat A cannot hand its provisional observations to B.
+    if (fullNavigation && !leftChatGpt) {
+      const key = String(id);
+      const knownConversation = cleanConversationId(tabConversations[key]);
+      let targetUrl = typeof changeInfo.url === 'string' ? changeInfo.url : '';
+      if (!targetUrl) {
+        try {
+          const tab = await chrome.tabs.get(id);
+          targetUrl = typeof tab?.url === 'string' ? tab.url : '';
+        } catch {
+          targetUrl = '';
+        }
+      }
+      let rootReload = false;
+      try {
+        const url = new URL(targetUrl);
+        rootReload = isChatGptUrl(targetUrl) && (url.pathname === '/' || url.pathname === '');
+      } catch {
+        rootReload = false;
+      }
+      const documentId = typeof tabDocuments[key] === 'string' ? tabDocuments[key] : null;
+      const targetConversation = conversationFromUrl(targetUrl);
+      if (knownConversation && targetConversation && targetConversation !== knownConversation && documentId) {
+        // This is not an ambiguous reload: Chrome is replacing known chat A with concrete
+        // chat B. Anything still provisional in A's dying document is too old/unbound to be
+        // adopted by B and must be discarded before the replacement document can register.
+        await dropDocumentProvisional(id, documentId);
+      } else if (!knownConversation && rootReload && documentId) {
+        await carryFreshReloadProvisional(id, documentId);
+      }
+    }
     const documentId = await markTerminal(id);
     // A full ChatGPT navigation may be a normal reload of the same conversation. Block the
     // dying document immediately, but preserve the conversation until the replacement page

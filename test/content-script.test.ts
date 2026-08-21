@@ -2053,7 +2053,11 @@ describe('canonical Fiber transcript ingestion in 1.8', () => {
     await replyFiber([], [descriptor]);
     await live.hook.flush();
     await settle();
-    expect(emitted(live.sent, 'assistant_message').at(-1)!.event.turnId).toBeUndefined();
+    expect(emitted(live.sent, 'assistant_message').at(-1)!.event).toMatchObject({
+      turnId: undefined,
+      state: 'streaming',
+      final: false
+    });
     expect(emitted(live.sent, 'page_tool').at(-1)!.event.turnId).toBeUndefined();
     expect(emitted(live.sent, 'tool_evidence').at(-1)!.event.turnId).toBeUndefined();
 
@@ -5412,6 +5416,243 @@ describe('evidence from the page context', () => {
     expect(live.sent.filter((message) => message.type === 'correlate')).toHaveLength(1);
   });
 
+  it('confirms a live request when the virtualized renderer published no data-turn-id', async () => {
+    live = await harness();
+    const conversationId = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee';
+    const provisionalThread = '11111111-2222-3333-4444-555555555555';
+    const requestId = 'wfr_virtualized_turn/0';
+    live.reply.set('correlate', () => ({
+      ok: true,
+      data: { conversationId, sessionId: '2026-08-21-virtualized', confirmed: [requestId], complete: true }
+    }));
+
+    startGenerating(live.document);
+    // The live 2026-08-21 failure. ChatGPT's virtualized renderer omits `data-turn-id` from a
+    // perfectly readable assistant section, and every ownership decision used to be keyed on
+    // it: no page turn id meant no owned turn, no owned turn meant this handshake never ran,
+    // and the whole conversation's exact request ids were filed under Unattributed activity.
+    // fiber.js stamps the sections it scanned, and that stamp is the anchor that survives.
+    const section = assistantTurn(live.document, 'virtualized-live-turn', []);
+    section.removeAttribute('data-turn-id');
+    section.setAttribute('data-clf-fiber-turn', '0');
+    live.hook.observe();
+    await settle();
+
+    await replyFiber([], [{
+      turnId: null,
+      conversationId: provisionalThread,
+      calls: [{
+        messageId: 'virtualized-call',
+        tool: 'exec_command',
+        order: 0,
+        answered: false,
+        requestId,
+        createTime: 1_700_000_001
+      }],
+      messages: []
+    }]);
+    await settle();
+    await live.hook.flush();
+
+    expect(live.sent.filter((message) => message.type === 'correlate')).toEqual([
+      expect.objectContaining({
+        conversationId,
+        calls: [expect.objectContaining({ requestId, messageId: 'virtualized-call' })]
+      })
+    ]);
+    const evidence = emitted(live.sent, 'tool_evidence').map((entry) => entry.event);
+    const requestEvidence = evidence.find((entry) =>
+      Array.isArray(entry.calls) && entry.calls.some((call: any) => call.requestId === requestId)
+    );
+    expect(requestEvidence).toBeTruthy();
+    // The owned turn's provisional client thread is never sent as a contradiction, whether or
+    // not the page published an id for it.
+    expect(requestEvidence).not.toHaveProperty('fiberConversationId');
+  });
+
+  it('confirms request ids Fiber attributes to this chat with no live local turn at all', async () => {
+    const conversationId = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee';
+    const requestId = 'wfr_no_local_turn/2';
+    live = await harness();
+    live.reply.set('correlate', () => ({
+      ok: true,
+      data: { conversationId, confirmed: [requestId], complete: true }
+    }));
+
+    // Nothing is generating and no turn has settled, so there is no local turn binding to
+    // hang ownership on. The descriptor still names exactly the conversation this document
+    // is pinned to, which is the whole of what the handshake asserts.
+    await replyFiber([], [{
+      turnId: 'settled-turn',
+      conversationId,
+      calls: [{
+        messageId: 'settled-call',
+        tool: 'agents',
+        order: 0,
+        answered: true,
+        requestId,
+        createTime: 1_700_000_001
+      }],
+      messages: []
+    }]);
+    await settle();
+
+    expect(live.sent.filter((message) => message.type === 'correlate')).toEqual([
+      expect.objectContaining({ conversationId, calls: [expect.objectContaining({ requestId })] })
+    ]);
+  });
+
+  it('keeps a per-id confirmation the app could not call complete', async () => {
+    const conversationId = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee';
+    const confirmedId = 'wfr_partial_ok/0';
+    const pendingId = 'wfr_partial_pending/0';
+    live = await harness();
+    live.reply.set('correlate', () => ({
+      ok: true,
+      // The app placed one id and has not ingested the other yet, so the batch as a whole is
+      // not complete. That batch verdict used to discard the confirmation of the id it *did*
+      // place, which put both back in the retry queue for as long as the tab stayed open.
+      data: { conversationId, confirmed: [confirmedId], complete: false }
+    }));
+    const scan = () => [{
+      turnId: 'partial-turn',
+      conversationId,
+      calls: [
+        {
+          messageId: 'partial-call-a',
+          tool: 'agents',
+          order: 0,
+          answered: true,
+          requestId: confirmedId,
+          createTime: 1_700_000_001
+        },
+        {
+          messageId: 'partial-call-b',
+          tool: 'agents',
+          order: 1,
+          answered: false,
+          requestId: pendingId,
+          createTime: 1_700_000_002
+        }
+      ],
+      messages: []
+    }];
+
+    await replyFiber([], scan());
+    await settle();
+    expect(live.sent.filter((message) => message.type === 'correlate')).toHaveLength(1);
+
+    // Past the retry backoff: only the id the app never confirmed is asked about again.
+    live.advance(5000);
+    await replyFiber([], scan());
+    await settle();
+    const handshakes = live.sent.filter((message) => message.type === 'correlate');
+    expect(handshakes).toHaveLength(2);
+    expect(handshakes[1]!.calls.map((call: any) => call.requestId)).toEqual([pendingId]);
+  });
+
+  it('confirms a fresh-chat request after the turn ended when the real route id arrives late', async () => {
+    const conversationId = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee';
+    const provisionalThread = '11111111-2222-3333-4444-555555555555';
+    const requestId = 'wfr_post_terminal_fresh_chat';
+    live = await harness('https://chatgpt.com/');
+    live.reply.set('correlate', () => ({
+      ok: true,
+      data: {
+        conversationId,
+        sessionId: '2026-08-21-post-terminal',
+        confirmed: [requestId],
+        complete: true
+      }
+    }));
+
+    startGenerating(live.document);
+    assistantTurn(live.document, 'fresh-post-terminal', []);
+    live.hook.observe();
+    await settle();
+    const localTurnId = emitted(live.sent, 'turn_start').at(-1)!.event.turnId as string;
+
+    await replyFiber([], [{
+      turnId: 'fresh-post-terminal',
+      conversationId: provisionalThread,
+      endMessageId: 'fresh-post-terminal-answer',
+      calls: [{
+        messageId: 'fresh-post-terminal-call',
+        tool: 'agents',
+        order: 0,
+        answered: true,
+        requestId,
+        createTime: 1_700_000_001
+      }],
+      messages: [{
+        messageId: 'fresh-post-terminal-answer',
+        rawMessageId: 'fresh-post-terminal-answer',
+        role: 'assistant',
+        stable: true,
+        rawText: 'Done.',
+        renderedHtml: '<p>Done.</p>'
+      }]
+    }]);
+    await settle();
+    expect(live.sent.filter((message) => message.type === 'correlate')).toHaveLength(0);
+
+    live.window.history.pushState({}, '', `/c/${conversationId}`);
+    live.hook.observe();
+    await settle();
+
+    await replyFiber([], [{
+      turnId: 'fresh-post-terminal',
+      conversationId: provisionalThread,
+      endMessageId: 'fresh-post-terminal-answer',
+      calls: [{
+        messageId: 'fresh-post-terminal-call',
+        tool: 'agents',
+        order: 0,
+        answered: true,
+        requestId,
+        createTime: 1_700_000_001
+      }],
+      messages: []
+    }], { pageTurnId: 'fresh-post-terminal', localTurnId });
+    await settle();
+
+    expect(live.sent.filter((message) => message.type === 'correlate')).toContainEqual(
+      expect.objectContaining({
+        conversationId,
+        calls: [expect.objectContaining({ requestId, messageId: 'fresh-post-terminal-call' })]
+      })
+    );
+  });
+
+  it('drops a Fiber turn whose own branch carries contradictory conversation identities', async () => {
+    live = await harness();
+    await replyFiber([], [{
+      turnId: 'stale-conflicted-turn',
+      conversationId: null,
+      conversationConflict: true,
+      calls: [{
+        messageId: 'stale-conflicted-call',
+        tool: 'read',
+        order: 0,
+        answered: true,
+        requestId: 'wfr_stale_conflicted'
+      }],
+      messages: [{
+        messageId: 'stale-conflicted-answer',
+        rawMessageId: 'stale-conflicted-answer',
+        role: 'assistant',
+        stable: true,
+        rawText: 'This belongs to another mounted chat.',
+        renderedHtml: '<p>This belongs to another mounted chat.</p>'
+      }]
+    }]);
+    await live.hook.flush();
+    await settle();
+
+    expect(emitted(live.sent, 'tool_evidence')).toHaveLength(0);
+    expect(emitted(live.sent, 'assistant_message')).toHaveLength(0);
+  });
+
   it('refreshes request-id evidence during a live turn even when ChatGPT renders no connector row', async () => {
     live = await harness();
     assistantTurn(live.document, 'rowless-live-turn', []);
@@ -7288,5 +7529,53 @@ describe('binding the brief to the generation that wrote it', () => {
     // Not even a withdrawal: this tab has no business touching another chat's transaction.
     expect(delivered(live)).toEqual([]);
     expect(withdrawn(live)).toEqual([]);
+  });
+});
+
+/**
+ * One live recorder per document — and the ability to replace a dead one.
+ *
+ * Chrome keys the isolated world by extension id and leaves that JS context standing when the
+ * extension reloads; what it invalidates is `chrome.runtime`. The orphan therefore keeps its
+ * globals, and a guard that bailed out on a global marker made the recovery injection from
+ * runtime.onInstalled a no-op — leaving the document with a recorder that can never send.
+ */
+describe('one live isolated-world recorder per document', () => {
+  it('leaves a healthy incumbent recorder alone', async () => {
+    live = await harness();
+    const window = live.window as any;
+    window.chrome.runtime.id = 'clf-extension-id';
+    let successor: any = null;
+    window.CLF_TEST_HOOK = (api: any) => {
+      successor = api;
+    };
+
+    window.eval(contentSource);
+    await settle();
+
+    expect(successor).toBeNull();
+  });
+
+  it('supersedes a recorder orphaned by an extension reload', async () => {
+    live = await harness();
+    const window = live.window as any;
+    window.chrome.runtime.id = 'clf-extension-id';
+    // The extension reloads. The old script keeps running, and keeps its globals.
+    delete window.chrome.runtime.id;
+    let successor: any = null;
+    window.CLF_TEST_HOOK = (api: any) => {
+      successor = api;
+    };
+
+    window.eval(contentSource);
+    await settle();
+
+    expect(successor).toBeTruthy();
+    expect(successor).not.toBe(live.hook);
+    // And the replacement is the one that observes from here on.
+    const before = live.sent.length;
+    successor.observe();
+    await settle();
+    expect(live.sent.length).toBeGreaterThanOrEqual(before);
   });
 });

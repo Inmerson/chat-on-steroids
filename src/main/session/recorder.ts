@@ -622,9 +622,16 @@ function noteCallEvidence(
   at: number
 ): void {
   if (fiberConversationId && fiberConversationId !== conversationId) {
+    // Name the discarded ids. Without them this line says a batch was dropped but not
+    // *which* calls it cost, so a chat whose every call lands in Unattributed activity
+    // reads identically in the log to one that lost a single stale sighting — and the
+    // 2026-08-21 outage, where this branch swallowed an entire conversation's evidence
+    // because the page turn id was absent, was invisible here for exactly that reason.
+    const dropped = calls.map((call) => call.requestId).filter((id): id is string => !!id);
     logWarn(
       `request attribution: ignoring ${calls.length} sighting(s) — URL conversation ${conversationId} disagrees ` +
-        `with Fiber conversation ${fiberConversationId}. Later agreeing evidence can still prove these calls.`
+        `with Fiber conversation ${fiberConversationId}. Later agreeing evidence can still prove these calls.` +
+        (dropped.length > 0 ? ` Discarded request ids: ${dropped.join(', ')}.` : '')
     );
     return;
   }
@@ -641,8 +648,9 @@ function noteCallEvidence(
     });
     if (result === 'conflict') {
       logWarn(`request attribution conflict for ${call.requestId}; ownership will remain unattributed`);
-    } else if (result === 'stored' && unattributedSessionId) {
-      scheduleAttributionRepair();
+    } else if (result === 'stored') {
+      logInfo(`request attribution: ${call.requestId} -> conversation ${conversationId}`);
+      if (unattributedSessionId) scheduleAttributionRepair();
     }
   }
 }
@@ -1020,6 +1028,16 @@ export function recordToolCall(input: ToolCallInput): Promise<ToolCallRecord | n
   const attributing = input.requestId
     ? awaitRequestCorrelation(input.requestId, REQUEST_ID_GRACE_MS).then((correlation) => {
         const conversationId = correlation?.conversationId ?? null;
+        // Say which request id gave up, not just that something did. `unattributed` is the
+        // one outcome whose cause always lives in the browser half of the join, so the log
+        // has to carry the id that the page never confirmed — it is the only handle anyone
+        // has for matching this against what the extension believed it sent.
+        if (!conversationId) {
+          logWarn(
+            `request attribution: no page evidence for ${input.requestId} within ` +
+              `${REQUEST_ID_GRACE_MS}ms; filing ${input.tool} under Unattributed activity`
+          );
+        }
         if (input.bind && conversationId) bindAgentConversation(input.bind, conversationId);
         return {
           conversationId,

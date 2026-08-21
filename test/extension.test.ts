@@ -870,6 +870,28 @@ describe('extension observation journal', () => {
     ]);
   });
 
+  it('keeps a fresh chat provisional journal through a real ChatGPT page reload', async () => {
+    const local = new FakeStorageArea();
+    const session = new FakeStorageArea();
+    const worker = loadWorker({ local, session });
+    await worker.send(
+      {
+        type: 'events',
+        entries: [{ conversationId: null, event: { kind: 'user_message', time: Date.now(), text: 'fresh prompt' } }]
+      },
+      42
+    );
+    expect(journalOf(session)[0]).toMatchObject({ provisional: 'tab-42:document-42-0', conversationId: null });
+
+    await worker.navigateTab(42, 'https://chatgpt.com/');
+    expect(journalOf(session)[0]).toMatchObject({ provisional: 'tab-42:document-42-1', conversationId: null });
+
+    const conversationId = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee';
+    const bound = await worker.send({ type: 'bind', conversationId }, 42);
+    expect(bound).toMatchObject({ ok: true, bound: 1 });
+    expect(journalOf(session)[0]).toMatchObject({ provisional: null, conversationId });
+  });
+
   it('does not lose an observation when two tabs wake a cold service worker at once', async () => {
     // Chrome shuts the worker down after seconds of idling, so two tabs reporting at the
     // same moment after that is ordinary, not exotic. Both handlers used to walk the cold

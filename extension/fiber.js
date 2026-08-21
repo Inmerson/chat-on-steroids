@@ -204,8 +204,16 @@
     return null;
   }
 
-  /** ChatGPT's internal conversation identity attached to this Fiber branch. */
-  function conversationOf(fiber) {
+  /**
+   * ChatGPT's internal conversation identity attached to this Fiber branch.
+   *
+   * Absence and contradiction are deliberately different states. During navigation React can
+   * leave props from chat A and chat B mounted on one branch for a tick. Returning plain null
+   * for that shape used to make content.js treat the branch exactly like one that simply had
+   * no conversation metadata, which let stale assistant messages from another chat be recorded
+   * under the current URL. Preserve the conflict bit so the isolated world can fail closed.
+   */
+  function conversationEvidenceOf(fiber) {
     let found = null;
     let at = fiber;
     for (let up = 0; at && up < MAX_CLIMB; up++, at = at.return) {
@@ -216,11 +224,11 @@
       for (let index = 0; index < values.length; index++) {
         const value = str(values[index]);
         if (!value) continue;
-        if (found && found !== value) return null;
+        if (found && found !== value) return { conversationId: null, conflict: true };
         found = value;
       }
     }
-    return found;
+    return { conversationId: found, conflict: false };
   }
 
   /** An authored assistant message object, when a rendered prose node exposes one directly. */
@@ -1098,10 +1106,12 @@
         const activities = nativeActivitiesOf(group.sections, messages);
         if (calls.length === 0 && renderedMessages.length === 0 && activities.length === 0) continue;
         const index = out.length;
+        const conversation = conversationEvidenceOf(fiber);
         entry = {
           index,
           turnId: group.turnId,
-          conversationId: conversationOf(fiber),
+          conversationId: conversation.conversationId,
+          conversationConflict: conversation.conflict,
           endMessageId: turnEndMessageId(messages),
           calls,
           messages: renderedMessages,

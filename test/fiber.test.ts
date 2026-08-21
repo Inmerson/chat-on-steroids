@@ -212,14 +212,15 @@ function chain(props: Record<string, unknown> | null, depth = LIVE_DEPTH, above:
 }
 
 /** The turn-level node, which carries every message of the turn and must never be read. */
-function turnNode(messages: Message[]): Fiber {
+function turnNode(messages: Message[], conversationProps: Record<string, unknown> = {}): Fiber {
   return {
     memoizedProps: {
       allMessages: messages,
       allGroupedMessages: [messages],
       conversation: { id: THREAD },
       turn: { id: 'turn-1', messages },
-      turnIndex: 2
+      turnIndex: 2,
+      ...conversationProps
     },
     return: null
   };
@@ -241,6 +242,8 @@ interface TurnCall {
 interface TurnEvidence {
   index: number;
   turnId: string | null;
+  conversationId?: string | null;
+  conversationConflict?: boolean;
   endMessageId?: string | null;
   calls: TurnCall[];
   messages: Array<{
@@ -262,6 +265,7 @@ interface TurnFixture {
   messages: Message[];
   rendered?: string[];
   staleStamp?: string;
+  conversationProps?: Record<string, unknown>;
 }
 
 async function scan(
@@ -287,7 +291,10 @@ async function scan(
     section.setAttribute('data-testid', 'conversation-turn-2');
     section.setAttribute('data-turn-id', turn.id);
     if (turn.staleStamp !== undefined) section.setAttribute('data-clf-fiber-turn', turn.staleStamp);
-    (section as unknown as Record<string, unknown>)['__reactFiber$qlrmvxwbkkq'] = turnNode(turn.messages);
+    (section as unknown as Record<string, unknown>)['__reactFiber$qlrmvxwbkkq'] = turnNode(
+      turn.messages,
+      turn.conversationProps
+    );
     for (const text of turn.rendered ?? []) {
       const block = document.createElement('div');
       block.className = 'markdown';
@@ -545,6 +552,23 @@ describe('the calls a turn says it made', () => {
       'requestId',
       'tool'
     ]);
+  });
+
+  it('distinguishes contradictory conversation metadata from missing conversation metadata', async () => {
+    const other = '11111111-2222-3333-4444-555555555555';
+    const messages = [authored('assistant-conflicted-chat', 'Stale mounted answer.')];
+    const { turns } = await scan([], [{
+      id: 'turn-conflicted-chat',
+      messages,
+      rendered: ['Stale mounted answer.'],
+      conversationProps: { clientThreadId: THREAD, conversationId: other }
+    }]);
+
+    expect(turns).toHaveLength(1);
+    expect(turns[0]).toMatchObject({
+      conversationId: null,
+      conversationConflict: true
+    });
   });
 
   it('reads each visible turn separately rather than merging them', async () => {

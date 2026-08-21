@@ -27,11 +27,49 @@
   // Static content scripts are not re-run in an already-open tab when an unpacked
   // extension is reloaded/updated. background.js deliberately re-injects this file into
   // those tabs from runtime.onInstalled. The normal static injection can race that recovery
-  // on a freshly loaded page, so make one live isolated-world recorder the invariant.
-  // A real extension reload invalidates the old isolated world, so its marker disappears
-  // with it and the replacement script is not blocked.
-  if (globalThis.__CLF_CONTENT_RECORDER_ACTIVE__ === true) return;
-  globalThis.__CLF_CONTENT_RECORDER_ACTIVE__ = true;
+  // on a freshly loaded page, so one live isolated-world recorder stays the invariant.
+  //
+  // What that used to be, and why it was wrong: a bare `__CLF_CONTENT_RECORDER_ACTIVE__`
+  // boolean with the note that "a real extension reload invalidates the old isolated world,
+  // so its marker disappears with it". It does not. Chrome keys the isolated world by
+  // extension id and leaves that JS context standing when the extension reloads; what it
+  // invalidates is `chrome.runtime`. The orphan therefore keeps its globals — including
+  // this marker — and the recovery injection from runtime.onInstalled returned at this very
+  // line. The document was then left with a recorder that can never send again, which is
+  // precisely the state that produces a healthy MCP tunnel, a visibly alive MAIN-world
+  // fiber.js, and every single call filed under `Unattributed activity`.
+  //
+  // So: publish a handle instead of a flag and let a replacement supersede a dead one. A
+  // *healthy* incumbent still wins, so the ordinary static/recovery race is unchanged.
+  const RECORDER_VERSION = 8;
+  const recorderHandle = {
+    version: RECORDER_VERSION,
+    healthy: () => false,
+    stop: () => undefined
+  };
+  {
+    const incumbent = globalThis.__CLF_CONTENT_RECORDER__ || null;
+    let incumbentHealthy = false;
+    try {
+      incumbentHealthy =
+        !!incumbent && typeof incumbent.healthy === 'function' && incumbent.healthy() === true;
+    } catch {
+      // A handle that throws is not a working recorder.
+      incumbentHealthy = false;
+    }
+    if (incumbentHealthy && (incumbent.version || 0) >= RECORDER_VERSION) return;
+    if (incumbent && typeof incumbent.stop === 'function') {
+      try {
+        incumbent.stop();
+      } catch {
+        // Best effort. The orphan's loops are inert once its `chrome.runtime` is gone.
+      }
+    }
+    globalThis.__CLF_CONTENT_RECORDER__ = recorderHandle;
+    // Kept only so a recorder from before this handle existed is still visible as "a script
+    // ran here". It is never read as a reason to bail out any more.
+    globalThis.__CLF_CONTENT_RECORDER_ACTIVE__ = true;
+  }
 
   const OBSERVE_MS = 1000;
   /** Streaming mutations are bursty; never run a transcript-wide pass per token. */
@@ -917,6 +955,7 @@
     requestOwnersConfirmed.clear();
     requestOwnersPending.clear();
     requestOwnerRetryAt.clear();
+    requestOwnerAttempts.clear();
     messagesReported.clear();
     userAuthoredTimesReported.clear();
     // Fiber descriptors and per-call request evidence belong to the conversation whose
@@ -1239,11 +1278,15 @@
     // interrupted or failed turn is exactly the turn whose refused tool call most needs to be
     // placed in the chat that made it.
     if (endedTurnId) {
-      fiberSettled = { pageTurnId: ended?.id || null, localTurnId: endedTurnId };
+      // `pageTurn` is the live DOM node set, not an id. ChatGPT's virtualized renderer can
+      // omit `data-turn-id` entirely, and the post-turn settle window still has to be able
+      // to find this generation's Fiber descriptor; the node carries fiber.js's own
+      // `data-clf-fiber-turn` stamp, which is present whether or not the page id is.
+      fiberSettled = { pageTurnId: ended?.id || null, localTurnId: endedTurnId, pageTurn: ended || null };
       fiberSettleUntil = Date.now() + FIBER_SETTLE_MS;
     }
     if (endedTurnId && publishFinal && result.outcome === 'completed') {
-      void refreshFiber({ pageTurnId: ended?.id || null, localTurnId: endedTurnId });
+      void refreshFiber({ pageTurnId: ended?.id || null, localTurnId: endedTurnId, pageTurn: ended || null });
     }
     if (endedTurnId) emit({ kind: 'turn_end', turnId: endedTurnId, ...result });
     // The compaction turn settling is the moment the brief exists. Read here, from this
@@ -1813,6 +1856,9 @@
   const requestOwnersPending = new Set();
   /** Failed handshakes back off briefly instead of retrying on every Fiber mutation. */
   const requestOwnerRetryAt = new Map();
+  /** Failed handshake attempts per owner/request pair, so a permanently unplaceable id
+   *  cannot turn refreshFiber() into a 2-second retry pump for the life of the tab. */
+  const requestOwnerAttempts = new Map();
   /** Last canonical browser snapshot sent for each ChatGPT assistant message id. */
   const messagesReported = new Map();
   /** ChatGPT-authored create_time already emitted for each stable user-message occurrence. */
@@ -1975,6 +2021,7 @@
       index,
       turnId,
       conversationId: cap(raw.conversationId, 200),
+      conversationConflict: raw.conversationConflict === true,
       endMessageId: cap(raw.endMessageId, 200),
       calls: kept,
       messages: keptMessages,
@@ -2092,10 +2139,60 @@
    * conversation cross-check, so a stale mounted object from chat A can never be promoted into
    * chat B merely because B is the route currently open.
    */
-  function confirmLiveRequestOwners(turn, ownerConversation) {
-    if (!generating || !turn || !ownerConversation) return;
+  function backOffRequestOwner(key) {
+    const attempts = (requestOwnerAttempts.get(key) || 0) + 1;
+    requestOwnerAttempts.set(key, attempts);
+    requestOwnerRetryAt.set(key, Date.now() + Math.min(2000 * attempts, 60000));
+  }
+
+  /**
+   * The Fiber turn descriptor for a rendered page turn, resolved through fiber.js's own
+   * scan stamp rather than through ChatGPT's `data-turn-id`.
+   *
+   * `data-turn-id` is presentation metadata and the current virtualized renderer omits it
+   * from perfectly readable assistant sections (see the note in fiber.js turnsOf). Every
+   * ownership decision keyed on it therefore evaluates, silently, to `no owned turn` —
+   * which is exactly how a whole chat's exact request ids landed in `Unattributed
+   * activity` while the popup showed them as read: with no owned turn there is no
+   * request-id -> conversation handshake, and the Fiber-conversation fallback is then
+   * stamped onto every call and rejected by the recorder as a disagreement.
+   *
+   * fiber.js marks each section it scanned with `data-clf-fiber-turn` = that scan's
+   * descriptor index, so the stamp is an exact, non-positional DOM<->Fiber anchor that is
+   * present whether or not the page id is. Ambiguity (two nodes of one page turn pointing
+   * at different descriptors, or an index shared by two descriptors) still answers null;
+   * no positional or clock guess is involved. Ephemeral join only — the numeric stamp is
+   * never written into recorder evidence.
+   */
+  function stampedFiberTurn(pageTurn, turns) {
+    if (!pageTurn || !Array.isArray(turns) || turns.length === 0) return null;
+    const nodes = pageTurn.nodes || (pageTurn.node ? [pageTurn.node] : []);
+    if (nodes.length === 0) return null;
+    const byIndex = new Map();
+    for (const turn of turns) {
+      if (!turn || !Number.isInteger(turn.index)) continue;
+      if (byIndex.has(turn.index)) byIndex.set(turn.index, null);
+      else byIndex.set(turn.index, turn);
+    }
+    let found = null;
+    for (const node of nodes) {
+      if (!node || !node.getAttribute) continue;
+      const stamp = node.getAttribute('data-clf-fiber-turn');
+      if (stamp === null || stamp === '') continue;
+      const raw = Number(stamp);
+      if (!Number.isInteger(raw) || raw < 0) continue;
+      const descriptor = byIndex.get(raw) || null;
+      if (!descriptor) continue;
+      if (found && found !== descriptor) return null;
+      found = descriptor;
+    }
+    return found;
+  }
+
+  function confirmLiveRequestOwners(calls, ownerConversation) {
+    if (!Array.isArray(calls) || calls.length === 0 || !ownerConversation) return;
     const byRequest = new Map();
-    for (const call of turn.calls || []) {
+    for (const call of calls) {
       if (!call || !call.requestId || byRequest.has(call.requestId)) continue;
       if (requestOwnersConfirmed.get(call.requestId) === ownerConversation) continue;
       const key = `${ownerConversation}\u0000${call.requestId}`;
@@ -2103,22 +2200,27 @@
       byRequest.set(call.requestId, call);
       requestOwnersPending.add(key);
     }
-    const calls = [...byRequest.values()];
-    if (calls.length === 0) return;
+    const batch = [...byRequest.values()];
+    if (batch.length === 0) return;
     void ask({
       type: 'correlate',
       conversationId: ownerConversation,
-      calls
+      calls: batch
     }).then((reply) => {
       const data = reply && reply.ok === true && reply.data && typeof reply.data === 'object' ? reply.data : null;
       const confirmed = new Set(data && Array.isArray(data.confirmed) ? data.confirmed : []);
-      for (const call of calls) {
+      for (const call of batch) {
         const key = `${ownerConversation}\u0000${call.requestId}`;
-        if (!data || data.conversationId !== ownerConversation || data.complete !== true || !confirmed.has(call.requestId)) {
-          requestOwnerRetryAt.set(key, Date.now() + 2000);
+        // Judge each request id on its own read-back. This additionally required
+        // `data.complete === true`, which is a *batch* verdict: a single id the app could
+        // not place (a sticky conflict, or a call it has not ingested yet) threw away the
+        // confirmation of every other id in the same message and re-queued them all.
+        if (!data || data.conversationId !== ownerConversation || !confirmed.has(call.requestId)) {
+          backOffRequestOwner(key);
           continue;
         }
         requestOwnerRetryAt.delete(key);
+        requestOwnerAttempts.delete(key);
         requestOwnersConfirmed.set(call.requestId, ownerConversation);
         // `app` becomes green only after the app has read the exact mapping back. This is a
         // stronger diagnostic than the old "Fiber parser saw an id" indicator.
@@ -2126,9 +2228,9 @@
         traceStage(call.requestId, 'app', 'request_id');
       }
     }).catch(() => {
-      for (const call of calls) requestOwnerRetryAt.set(`${ownerConversation}\u0000${call.requestId}`, Date.now() + 2000);
+      for (const call of batch) backOffRequestOwner(`${ownerConversation}\u0000${call.requestId}`);
     }).finally(() => {
-      for (const call of calls) requestOwnersPending.delete(`${ownerConversation}\u0000${call.requestId}`);
+      for (const call of batch) requestOwnersPending.delete(`${ownerConversation}\u0000${call.requestId}`);
     });
   }
   async function refreshFiber(settled = null) {
@@ -2180,16 +2282,22 @@
     if (askedConversation && CLF_DOM.conversationId() !== askedConversation) return;
     const concreteConversation = (value) =>
       typeof value === 'string' && /^[0-9a-f-]{8,64}$/i.test(value) ? value : null;
-    // Capture the one live page turn before filtering by Fiber's own conversation field.
-    // On a freshly created chat that field can still be the provisional client thread even
-    // though the route has already become the real /c/<id>. Only this exact section, already
-    // bound to this document's local generation, is allowed through that temporary mismatch.
-    const livePageTurnId = generating ? generationTurn()?.id || null : null;
-    let livePageTurn = null;
-    if (livePageTurnId) {
+    // Capture the one page turn this document owns before filtering by Fiber's own conversation
+    // field. Ownership can be live *or just settled*: a fresh chat may publish the request id,
+    // finish, and only then receive its real /c/<id>. The local generation/settled tombstone is
+    // exact document evidence, so this one turn may survive that temporary provisional mismatch.
+    // Historical turns still get no exception.
+    // Resolve it from the DOM node, not from `data-turn-id`: the node is what this document
+    // actually owns, and its `data-clf-fiber-turn` stamp names the descriptor exactly even
+    // when the virtualized renderer published no page turn id at all. The page-id match
+    // stays as the fallback for a scan whose stamps have not been applied yet.
+    const ownedPageNode = generating ? generationTurn() : settled?.pageTurn || null;
+    const ownedPageTurnId = generating ? ownedPageNode?.id || null : settled?.pageTurnId || null;
+    let ownedPageTurn = stampedFiberTurn(ownedPageNode, answer.turns);
+    if (!ownedPageTurn && ownedPageTurnId) {
       for (let index = answer.turns.length - 1; index >= 0; index--) {
-        if (answer.turns[index].turnId === livePageTurnId) {
-          livePageTurn = answer.turns[index];
+        if (answer.turns[index].turnId === ownedPageTurnId) {
+          ownedPageTurn = answer.turns[index];
           break;
         }
       }
@@ -2214,8 +2322,9 @@
       // conservative behaviour. No clock, active-tab or tool-name fallback enters the decision.
       answer = {
         turns: answer.turns.filter((turn) => {
+          if (turn?.conversationConflict === true && turn !== ownedPageTurn) return false;
           const pageConversation = concreteConversation(turn.conversationId);
-          return !pageConversation || pageConversation === askedConversation || turn === livePageTurn;
+          return !pageConversation || pageConversation === askedConversation || turn === ownedPageTurn;
         }),
         rows: new Map(
           [...answer.rows].filter(([, row]) => {
@@ -2252,34 +2361,43 @@
     // identity. Only the *newest* Fiber turn matching the assistant section this local
     // generation is currently bound to may inherit `turnId`; historical/reused matches still
     // prove the conversation made the call, but carry no durable turn id.
-    const activePageTurnId = generating ? livePageTurnId : settled?.pageTurnId || null;
     const activeLocalTurnId = generating ? turnId : settled?.localTurnId || null;
-    let activeTurnIndex = -1;
-    if (activePageTurnId && activeLocalTurnId) {
-      for (let index = answer.turns.length - 1; index >= 0; index--) {
-        if (answer.turns[index].turnId === activePageTurnId) {
-          activeTurnIndex = index;
-          break;
+    const activeTurnIndex =
+      ownedPageTurn && activeLocalTurnId ? answer.turns.indexOf(ownedPageTurn) : -1;
+    if (askedConversation) {
+      // Ownership evidence is no longer gated on `activeTurnIndex`.
+      //
+      // Live failure, 2026-08-21: `activeTurnIndex` required a non-null page turn id, so on
+      // a virtualized render it stayed -1 for the whole conversation and this handshake —
+      // the only path that puts a request id into the app's durable correlation registry —
+      // simply never ran. Every call in the chat then fell to `Unattributed activity`.
+      //
+      // The handshake's own safety does not come from the local turn binding; it comes from
+      // `ownerConversation` being this document's pinned concrete route and from the app
+      // reading the exact pair back. So confirm every call whose Fiber descriptor names
+      // exactly this conversation, plus the one turn this document owns (which may still
+      // carry a fresh chat's provisional client thread). A descriptor naming a *different*
+      // concrete conversation is still never promoted. One batched message per scan.
+      const ownerCalls = [];
+      const ownerSeen = new Set();
+      for (const turn of answer.turns) {
+        const pageConversation = concreteConversation(turn.conversationId);
+        if (turn !== ownedPageTurn && pageConversation !== askedConversation) continue;
+        for (const call of turn.calls || []) {
+          if (!call || !call.requestId || ownerSeen.has(call.requestId)) continue;
+          ownerSeen.add(call.requestId);
+          ownerCalls.push(call);
         }
       }
-    }
-    if (generating && activeTurnIndex >= 0 && askedConversation) {
-      confirmLiveRequestOwners(answer.turns[activeTurnIndex], askedConversation);
+      confirmLiveRequestOwners(ownerCalls, askedConversation);
     }
     // A terminal message can finish the local turn before ChatGPT removes a stale Stop
     // control. While that latch is active, observe() keeps Fiber probing the newest visible
     // page turn. If Retry/Regenerate produces a newer public website message, the descriptor's
     // endMessageId changes (or becomes null) and the old terminal object no longer blocks a
     // genuine new generation. Exact page-model identity only; no timer/DOM-position guess.
-    if (!generating && settled?.terminalProbe && activePageTurnId) {
-      let probeIndex = -1;
-      for (let index = answer.turns.length - 1; index >= 0; index--) {
-        if (answer.turns[index].turnId === activePageTurnId) {
-          probeIndex = index;
-          break;
-        }
-      }
-      if (probeIndex >= 0 && answer.turns[probeIndex].endMessageId !== settled.terminalProbe) {
+    if (!generating && settled?.terminalProbe && ownedPageTurn) {
+      if (ownedPageTurn.endMessageId !== settled.terminalProbe) {
         fiberTerminalMessageId = null;
       }
     }
@@ -2298,8 +2416,7 @@
           kind: 'tool_evidence',
           ...(index === activeTurnIndex ? { turnId: activeLocalTurnId } : {}),
           ...(turn.conversationId && !(
-            generating &&
-            index === activeTurnIndex &&
+            turn === ownedPageTurn &&
             askedConversation &&
             concreteConversation(turn.conversationId) &&
             concreteConversation(turn.conversationId) !== askedConversation
@@ -2316,7 +2433,12 @@
       const awaitingRequestId = answer.turns.some((turn) =>
         (turn.calls || []).some((call) => !call.requestId)
       );
-      if (!awaitingRequestId) fiberSettleUntil = 0;
+      const awaitingOwner = answer.turns.some((turn) =>
+        (turn.calls || []).some((call) =>
+          call && call.requestId && (!askedConversation || requestOwnersConfirmed.get(call.requestId) !== askedConversation)
+        )
+      );
+      if (!awaitingRequestId && !awaitingOwner) fiberSettleUntil = 0;
     }
     // Assistant prose and ChatGPT-native thinking/activity are one interleaved page-model
     // stream. Fiber validates them separately, but each item carries its original model
@@ -2397,9 +2519,9 @@
           ? exactTerminal
             ? 'final'
             : 'streaming'
-          : !(generating && index === activeTurnIndex)
-            ? 'final'
-            : 'streaming';
+          : generating && (index === activeTurnIndex || (activeTurnIndex < 0 && index === answer.turns.length - 1))
+            ? 'streaming'
+            : 'final';
         // The transcript is independent of MCP correlation and must be durable as soon as
         // ChatGPT exposes a public message id. A thought parent is a stronger logical anchor
         // when available, but it is not permission to record: waiting for it dropped the
@@ -5510,6 +5632,35 @@
     });
   }
   every(STATUS_MS, checkStatus);
+
+  // Only now, with every binding above initialised, does this recorder answer for itself.
+  // `chrome.runtime.id` is the exact orphan test: an invalidated isolated world keeps its
+  // globals and its timers but loses that property, so a successor can tell a live
+  // recorder it must not disturb from a dead one it must replace.
+  recorderHandle.healthy = () => {
+    if (!alive) return false;
+    try {
+      return !!globalThis.chrome && !!chrome.runtime && typeof chrome.runtime.id === 'string';
+    } catch {
+      return false;
+    }
+  };
+  recorderHandle.stop = () => {
+    // `alive` gates sendToWorker(), so this is what actually silences the old recorder:
+    // no observation, evidence or command of its can reach the app afterwards. Its
+    // intervals drain themselves on their next tick through every().
+    alive = false;
+    if (activityTimer !== null) {
+      clearTimeout(activityTimer);
+      activityTimer = null;
+    }
+    try {
+      // Hand ChatGPT's own labels back before the successor paints its own.
+      unpaint();
+    } catch {
+      // A detached/rewritten DOM is not worth failing a handover over.
+    }
+  };
 
   /**
    * Handed to the extension regression tests, which run this file with a real DOM but no
