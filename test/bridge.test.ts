@@ -333,6 +333,7 @@ describe('authorisation', () => {
       ['GET', '/status'],
       ['GET', '/activity?conversationId=abcdabcd'],
       ['POST', '/events'],
+      ['POST', '/correlations'],
       ['POST', '/closed'],
       ['POST', '/commands/ack']
     ] as const) {
@@ -480,6 +481,119 @@ describe('activity feed', () => {
     expect(reply.body.entries).toHaveLength(1);
     expect(reply.body.entries[0]).toMatchObject({ tool: 'read', requestId: 'wfr_activity_restart' });
     expect(liveConversations().some((entry) => entry.conversationId === conversationId)).toBe(true);
+  });
+
+  it('atomically registers and verifies a live request id against its chat before the MCP call is filed', async () => {
+    await pair();
+    const conversationId = '13131313-3535-5757-7979-919191919191';
+    const requestId = '77186fb4-bdda-4849-8cd7-879bb08a1617';
+    const mapped = await request('POST', '/correlations', {
+      body: {
+        conversationId,
+        calls: [
+          {
+            messageId: 'page-request-live-handshake',
+            tool: 'exec_command',
+            order: 0,
+            answered: false,
+            requestId,
+            createTime: Date.now() / 1000
+          }
+        ]
+      }
+    });
+    expect(mapped.status).toBe(200);
+    expect(mapped.body).toMatchObject({
+      ok: true,
+      conversationId,
+      requestIds: [requestId],
+      confirmed: [requestId],
+      complete: true
+    });
+    expect(mapped.body.sessionId).toBeTruthy();
+
+    await recordToolCall({
+      tool: 'exec_command',
+      args: { command: 'echo exact' },
+      content: [{ type: 'text', text: 'exact' }],
+      outcome: 'ok',
+      durationMs: 1,
+      startedAt: Date.now(),
+      requestId,
+      evidence: {
+        changes: [],
+        assets: [],
+        count: null,
+        detail: null,
+        exitCode: 0,
+        timedOut: false,
+        durationMs: null,
+        running: null,
+        processSessionId: null
+      }
+    });
+
+    const calls = await readEvents(mapped.body.sessionId, { kinds: ['tool_call'] });
+    expect(calls).toHaveLength(1);
+    expect(calls[0]?.kind === 'tool_call' && calls[0].call).toMatchObject({
+      requestId,
+      conversationId,
+      attribution: 'request_id',
+      attributionMethod: 'request_id'
+    });
+  });
+  it('refuses a live handshake that contradicts an already-proven request owner without poisoning the original mapping', async () => {
+    await pair();
+    const firstConversation = '14141414-3636-5858-8080-929292929292';
+    const secondConversation = '15151515-3737-5959-8181-939393939393';
+    const requestId = 'wfr-live-owner-cannot-move';
+    const call = {
+      messageId: 'page-request-owner-fixed',
+      tool: 'exec_command',
+      order: 0,
+      answered: false,
+      requestId,
+      createTime: Date.now() / 1000
+    };
+
+    const first = await request('POST', '/correlations', {
+      body: { conversationId: firstConversation, calls: [call] }
+    });
+    expect(first.body).toMatchObject({ confirmed: [requestId], conflicts: [], complete: true });
+
+    const second = await request('POST', '/correlations', {
+      body: { conversationId: secondConversation, calls: [call] }
+    });
+    expect(second.status).toBe(200);
+    expect(second.body).toMatchObject({ confirmed: [], conflicts: [requestId], complete: false });
+
+    await recordToolCall({
+      tool: 'exec_command',
+      args: { command: 'echo owner-stays-first' },
+      content: [{ type: 'text', text: 'owner-stays-first' }],
+      outcome: 'ok',
+      durationMs: 1,
+      startedAt: Date.now(),
+      requestId,
+      evidence: {
+        changes: [],
+        assets: [],
+        count: null,
+        detail: null,
+        exitCode: 0,
+        timedOut: false,
+        durationMs: null,
+        running: null,
+        processSessionId: null
+      }
+    });
+
+    const firstCalls = await readEvents(first.body.sessionId, { kinds: ['tool_call'] });
+    expect(firstCalls.some((event) =>
+      event.kind === 'tool_call' && event.call.requestId === requestId && event.call.conversationId === firstConversation
+    )).toBe(true);
+    const secondCalls = await readEvents(second.body.sessionId, { kinds: ['tool_call'] });
+    expect(secondCalls).toEqual([]);
   });
 
   it('hands back an app-owned render stream plus legacy tool summaries, with no raw tool I/O', async () => {

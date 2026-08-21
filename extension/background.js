@@ -1303,6 +1303,30 @@ const HANDLERS = {
   async drain() {
     return drain();
   },
+  /**
+   * Registers exact request-id ownership for the currently live ChatGPT turn.
+   *
+   * Unlike normal transcript events this is an acknowledged identity operation: the app
+   * creates/reuses the conversation session, stores the request-id join, reads it back, and
+   * tells the page which ids are actually confirmed. content.js retries unconfirmed ids on a
+   * later Fiber scan, so a sleeping worker/app can delay attribution but cannot silently turn a
+   * known request into a permanent Unattributed call.
+   */
+  async correlate(message, _sender, source) {
+    await load();
+    if (!ownsDocument(source)) return { ok: false, error: 'stale_document' };
+    const conversationId = cleanConversationId(message.conversationId);
+    if (!conversationId) return { ok: false, error: 'bad_conversation_id' };
+    await noteTabConversation(source, conversationId);
+    if (!ownsDocument(source)) return { ok: false, error: 'stale_document' };
+    const calls = Array.isArray(message.calls) ? message.calls : [];
+    if (calls.length === 0) return { ok: false, error: 'bad_request_evidence' };
+    const result = await call('/correlations', {
+      method: 'POST',
+      body: JSON.stringify({ conversationId, calls })
+    });
+    return ownsDocument(source) ? result : { ok: false, error: 'stale_document' };
+  },
   async activity(message, _sender, source) {
     await load();
     if (!ownsDocument(source)) return { ok: false, error: 'stale_document' };
@@ -1392,6 +1416,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     'events',
     'bind',
     'activity',
+    'correlate',
     'closed',
     'compact',
     'auto_compact_claim',

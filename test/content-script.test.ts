@@ -5269,6 +5269,149 @@ describe('evidence from the page context', () => {
     expect(evidence.some((entry) => entry.turnId === 'reused-page-turn')).toBe(false);
   });
 
+  it('keeps exact current-chat request evidence when stale Fiber objects from another chat remain mounted', async () => {
+    live = await harness();
+    const currentConversation = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee';
+    const staleConversation = '11111111-2222-3333-4444-555555555555';
+
+    await replyFiber(
+      [
+        { ...GOOD, index: 7, messageId: 'stale-row', conversationId: staleConversation },
+        { ...GOOD, index: 8, messageId: 'current-row', conversationId: currentConversation }
+      ],
+      [
+        {
+          turnId: 'stale-turn',
+          conversationId: staleConversation,
+          calls: [
+            {
+              messageId: 'stale-request-message',
+              tool: 'read',
+              order: 0,
+              answered: true,
+              requestId: 'wfr_stale_other_chat',
+              createTime: 1_700_000_000
+            }
+          ],
+          messages: []
+        },
+        {
+          turnId: 'current-turn',
+          conversationId: currentConversation,
+          calls: [
+            {
+              messageId: 'current-request-message',
+              tool: 'exec_command',
+              order: 0,
+              answered: false,
+              requestId: 'wfr_current_exact',
+              createTime: 1_700_000_001
+            }
+          ],
+          messages: []
+        }
+      ]
+    );
+    await live.hook.flush();
+
+    const evidence = emitted(live.sent, 'tool_evidence').map((entry) => entry.event);
+    expect(evidence).toHaveLength(1);
+    expect(evidence[0]).toEqual(
+      expect.objectContaining({
+        fiberConversationId: currentConversation,
+        calls: [
+          expect.objectContaining({
+            messageId: 'current-request-message',
+            requestId: 'wfr_current_exact'
+          })
+        ]
+      })
+    );
+    expect(evidence.some((entry) => entry.fiberConversationId === staleConversation)).toBe(false);
+  });
+  it('explicitly confirms a live request against the real chat id while a fresh client thread is still provisional', async () => {
+    live = await harness();
+    const conversationId = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee';
+    const provisionalThread = '11111111-2222-3333-4444-555555555555';
+    const requestId = '77186fb4-bdda-4849-8cd7-879bb08a1617';
+    live.reply.set('correlate', (message) => ({
+      ok: true,
+      status: 200,
+      data: {
+        ok: true,
+        conversationId,
+        sessionId: '2026-08-21-test',
+        requestIds: [requestId],
+        confirmed: [requestId],
+        complete: true
+      }
+    }));
+
+    startGenerating(live.document);
+    assistantTurn(live.document, 'fresh-live-turn', []);
+    live.hook.observe();
+    await settle();
+
+    await replyFiber([], [
+      {
+        turnId: 'fresh-live-turn',
+        // This is the live first-turn race: the route is already /c/<real id>, while the
+        // React turn still carries the provisional client thread id.
+        conversationId: provisionalThread,
+        calls: [
+          {
+            messageId: 'fresh-request-message',
+            tool: 'exec_command',
+            order: 0,
+            answered: false,
+            requestId,
+            createTime: 1_700_000_001
+          }
+        ],
+        messages: []
+      }
+    ]);
+    await settle();
+    await live.hook.flush();
+
+    const handshakes = live.sent.filter((message) => message.type === 'correlate');
+    expect(handshakes).toHaveLength(1);
+    expect(handshakes[0]).toMatchObject({
+      conversationId,
+      calls: [expect.objectContaining({ requestId, messageId: 'fresh-request-message' })]
+    });
+    const evidence = emitted(live.sent, 'tool_evidence').map((entry) => entry.event);
+    const requestEvidence = evidence.find((entry) =>
+      Array.isArray(entry.calls) && entry.calls.some((call: any) => call.requestId === requestId)
+    );
+    expect(requestEvidence).toBeTruthy();
+    // Do not send the known-provisional Fiber id as a contradiction. The separate ACKed
+    // handshake is what owns this live request; historical turns remain strictly cross-checked.
+    expect(requestEvidence).not.toHaveProperty('fiberConversationId');
+
+    // The same Fiber object is reread constantly while streaming. An ACKed request id is a
+    // durable fact, so the second scan must not create another ownership request.
+    await replyFiber([], [
+      {
+        turnId: 'fresh-live-turn',
+        conversationId: provisionalThread,
+        calls: [
+          {
+            messageId: 'fresh-request-message',
+            tool: 'exec_command',
+            order: 0,
+            answered: false,
+            requestId,
+            createTime: 1_700_000_001
+          }
+        ],
+        messages: []
+      }
+    ]);
+    await settle();
+    expect(live.sent.filter((message) => message.type === 'correlate')).toHaveLength(1);
+  });
+
   it('refreshes request-id evidence during a live turn even when ChatGPT renders no connector row', async () => {
     live = await harness();
     assistantTurn(live.document, 'rowless-live-turn', []);

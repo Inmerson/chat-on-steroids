@@ -692,6 +692,25 @@ export function upsertMessageEvent(
                 : {})
             }
           : event;
+      // A canonical assistant message belongs to exactly one generation permanently. Ownership
+      // may still be *promoted* from "not known yet" to a durable generation id when the
+      // recorder learns it late, but a settled assistant answer may never move to another turn.
+      // User messages are different: their page-side turn marker is a boundary hint and can be
+      // revised as ChatGPT re-homes the same stable user object, so preserve that existing
+      // behaviour instead of freezing it under the first marker we happened to observe.
+      //
+      // Live 2026-08-21, session `ce135bff`: ChatGPT re-mounted its stop control for two
+      // seconds well after a page load, the extension minted generation `g-11kz85q585v4s-0-1`
+      // for it, and the re-observation of the already finished 08:40:34 answer re-filed that
+      // answer under a turn that started at 08:45:22. The consequences are not cosmetic — the
+      // answer is torn away from the eight tool calls that produced it, so the extension can
+      // no longer prove its reconstruction of that turn complete and drops the whole response
+      // back to ChatGPT's native rendering, and the desktop timeline draws an empty turn with
+      // a five-minute-old message inside it.
+      const settledTurnId =
+        previous?.kind === 'assistant_message' && nextEvent.kind === 'assistant_message'
+          ? previous.turnId ?? nextEvent.turnId ?? undefined
+          : nextEvent.turnId ?? undefined;
       if (
         previous &&
         previous.kind === nextEvent.kind &&
@@ -701,7 +720,7 @@ export function upsertMessageEvent(
             JSON.stringify(previous.renderedHtml ?? null) === JSON.stringify(nextEvent.renderedHtml ?? null) &&
             previous.state === nextEvent.state &&
             previous.final === nextEvent.final)) &&
-        (nextEvent.turnId === undefined || previous.turnId === nextEvent.turnId) &&
+        (previous.turnId ?? undefined) === settledTurnId &&
         (nextEvent.agent === undefined || previous.agent === nextEvent.agent) &&
         (!options.preferTime || previous.time === nextEvent.time)
       ) {
@@ -714,7 +733,7 @@ export function upsertMessageEvent(
         // recorder opts into that correction explicitly; ordinary revisions still keep the
         // original first-seen time forever.
         time: options.preferTime ? nextEvent.time : previous?.time ?? nextEvent.time,
-        ...(previous?.turnId && !nextEvent.turnId ? { turnId: previous.turnId } : {}),
+        ...(settledTurnId === undefined ? {} : { turnId: settledTurnId }),
         ...(previous?.agent && !nextEvent.agent ? { agent: previous.agent } : {}),
         ...(nextEvent.kind === 'assistant_message' || nextEvent.kind === 'user_message'
           ? { origin: previous?.kind === nextEvent.kind ? previous.origin ?? previous.seq : entry.nextSeq }

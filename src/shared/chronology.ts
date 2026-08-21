@@ -34,6 +34,43 @@ export interface Chronological {
   time: number;
   kind: string;
   turnId?: string | null;
+  /** ChatGPT's own terminal flag for the one message that ended a turn. See `closing()`. */
+  final?: boolean;
+  state?: string;
+}
+
+/** Where an entry sits in the log: its first appearance if it has revisions, else its seq. */
+function positionOf(entry: Chronological): number {
+  return typeof entry.origin === 'number' && Number.isFinite(entry.origin) ? entry.origin : entry.seq;
+}
+
+/**
+ * The assistant message that ended a turn, if this group holds one.
+ *
+ * A message carries the `create_time` ChatGPT stamped when it *opened* that message, and
+ * ChatGPT can open the final answer and still run another connector call before the prose is
+ * written. Session `2026-08-21-ce135bff` is the live case: the answer of turn `…-1-9` is
+ * stamped 08:40:34, with `write_stdin` at 08:40:37 and `git show` at 08:40:42 after it. Order
+ * that group by time alone and two tool rows are drawn *underneath* the finished answer —
+ * which is neither what ChatGPT itself shows nor a thing that can have happened.
+ *
+ * The message that ended a turn is the last thing in that turn by definition: nothing else in
+ * the turn can follow the message that closed it. So it is placed there, rather than trusted
+ * to a timestamp that describes when it was opened.
+ *
+ * Only one message per group moves, the one furthest along the log. A turn re-observed after a
+ * reload can have every message marked final, and interim prose must keep interleaving with
+ * the tool calls it ran between — the terminal message is the only one whose position is a
+ * matter of definition rather than observation.
+ */
+function closing<T extends Chronological>(group: readonly T[]): T | null {
+  let found: T | null = null;
+  for (const entry of group) {
+    if (entry.kind !== 'assistant_message') continue;
+    if (entry.final !== true && entry.state !== 'final') continue;
+    if (!found || positionOf(entry) > positionOf(found)) found = entry;
+  }
+  return found;
 }
 
 /**
@@ -44,8 +81,7 @@ export interface Chronological {
  * answer. Never mutates the input.
  */
 export function chronological<T extends Chronological>(entries: readonly T[]): T[] {
-  const position = (entry: T): number =>
-    typeof entry.origin === 'number' && Number.isFinite(entry.origin) ? entry.origin : entry.seq;
+  const position = (entry: T): number => positionOf(entry);
   const bySeq = [...entries].sort((a, b) => position(a) - position(b) || a.seq - b.seq);
   // Only turns this window actually opened. A tail delivered from a cursor can hold events of
   // a turn whose `turn_start` is far behind it, and a group with no anchor has no bounded
@@ -67,8 +103,10 @@ export function chronological<T extends Chronological>(entries: readonly T[]): T
 
   // Position within a turn. The boundaries are the boundaries whatever their timestamps say:
   // a turn cannot begin after its own first observation or end before its last, and the times
-  // on those two events are the moment the page noticed, not the moment the turn moved.
-  const rank = (entry: T): number => (entry.kind === 'turn_start' ? -1 : entry.kind === 'turn_end' ? 1 : 0);
+  // on those two events are the moment the page noticed, not the moment the turn moved. The
+  // message that ended the turn sits between the two for the same reason — see `closing()`.
+  const rank = (entry: T, ends: T | null): number =>
+    entry.kind === 'turn_start' ? -1 : entry.kind === 'turn_end' ? 1 : entry === ends ? 0.5 : 0;
 
   // An entry with no usable time is ordered by its stable position (`origin` for a mutable
   // canonical item, otherwise `seq`) rather than being flung to one end of its turn: a
@@ -112,7 +150,8 @@ export function chronological<T extends Chronological>(entries: readonly T[]): T
   const out: T[] = [];
   for (const anchor of [...groups.keys()].sort((a, b) => a - b)) {
     const group = groups.get(anchor)!;
-    group.sort((a, b) => rank(a) - rank(b) || byTime(a, b));
+    const ends = closing(group);
+    group.sort((a, b) => rank(a, ends) - rank(b, ends) || byTime(a, b));
     out.push(...group);
   }
   return out;

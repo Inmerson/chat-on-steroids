@@ -1350,6 +1350,49 @@ describe('extension connection', () => {
    * A `/hello` in front of every authenticated request doubled the traffic of a poll that
    * already runs every two seconds in every open tab, against a 900/min budget.
    */
+  it('forwards an exact live request ownership handshake and returns the app read-back', async () => {
+    const conversationId = 'abababab-cdcd-efef-1212-343434343434';
+    const requestId = '77186fb4-bdda-4849-8cd7-879bb08a1617';
+    let body: any = null;
+    const fetch = vi.fn(async (input: string, init: Record<string, unknown> = {}) => {
+      const url = new URL(input);
+      if (url.pathname === '/hello') return response(200, { app: 'chatgpt-local-files', paired: true });
+      if (url.pathname === '/correlations') {
+        body = JSON.parse(String(init.body));
+        return response(200, {
+          ok: true,
+          conversationId,
+          sessionId: '2026-08-21-live',
+          requestIds: [requestId],
+          confirmed: [requestId],
+          complete: true
+        });
+      }
+      return response(404, {});
+    });
+    const worker = loadWorker({
+      local: new FakeStorageArea({ port: 8765, token: 'paired-token' }),
+      session: new FakeStorageArea(),
+      fetch
+    });
+
+    const reply = await worker.send({
+      type: 'correlate',
+      conversationId,
+      calls: [{ messageId: 'request-message', tool: 'exec_command', order: 0, answered: false, requestId }]
+    });
+
+    expect(body).toMatchObject({
+      conversationId,
+      calls: [expect.objectContaining({ requestId, messageId: 'request-message' })]
+    });
+    expect(reply).toMatchObject({
+      ok: true,
+      status: 200,
+      data: { conversationId, confirmed: [requestId], complete: true }
+    });
+  });
+
   it('does not re-ask where the app is before every single request', async () => {
     const server = app();
     const local = new FakeStorageArea({ port: 8765, token: 'paired-token' });

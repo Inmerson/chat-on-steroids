@@ -51,6 +51,12 @@
    * which nothing downstream reads as anything but the turn having taken that much longer.
    */
   const TURN_SETTLE_MS = 4000;
+  // While ChatGPT is generating, keep the app-owned transcript close enough to feel like a
+  // stream rather than a two-second slideshow. This does not create duplicate rows: /activity
+  // is cursor-based, streamBySeq is keyed by canonical seq, and assistant messages additionally
+  // supersede their previous revision through streamMessageSeq. Session reloads are therefore
+  // allowed to make us poll sooner without being treated as new transcript content.
+  const LIVE_ACTIVITY_MS = 750;
   const ACTIVITY_MS = 2000;
   const IDLE_ACTIVITY_MS = 10_000;
   const HIDDEN_ACTIVITY_MS = 30_000;
@@ -908,6 +914,9 @@
     fiberSettled = null;
     pageToolsReported.clear();
     callsReported.clear();
+    requestOwnersConfirmed.clear();
+    requestOwnersPending.clear();
+    requestOwnerRetryAt.clear();
     messagesReported.clear();
     userAuthoredTimesReported.clear();
     // Fiber descriptors and per-call request evidence belong to the conversation whose
@@ -1798,6 +1807,12 @@
    * whole turn, so without this the same request would be re-sent on every poll.
    */
   const callsReported = new Map();
+  /** Exact request ids the app has ACKed as owned by a concrete conversation. */
+  const requestOwnersConfirmed = new Map();
+  /** One in-flight ownership handshake per conversation/request id. */
+  const requestOwnersPending = new Set();
+  /** Failed handshakes back off briefly instead of retrying on every Fiber mutation. */
+  const requestOwnerRetryAt = new Map();
   /** Last canonical browser snapshot sent for each ChatGPT assistant message id. */
   const messagesReported = new Map();
   /** ChatGPT-authored create_time already emitted for each stable user-message occurrence. */
@@ -1885,13 +1900,7 @@
       });
     }
     const kept = calls.filter((call) => !duplicated.has(call.messageId));
-    observed.calls = kept.length;
-    for (const call of kept) {
-      if (!call.requestId) continue;
-      observed.requestId = call.requestId;
-      traceStage(call.requestId, 'read');
-      traceStage(call.requestId, 'tool', call.tool);
-    }
+
     const messages = [];
     const messageIndex = new Map();
     const conflictingMessages = new Set();
@@ -2036,6 +2045,92 @@
    * belongs to this chat when ChatGPT drew no row for it, and reporting is cumulative and
    * idempotent by message id, so repeating a turn's evidence on every scan costs nothing.
    */
+  /**
+   * Which local generation a *settled* website turn belongs to, proved by its request id.
+   *
+   * Only the turn this document is currently generating gets its local id from the live
+   * lifecycle. Everything else used to be recorded with no turn at all, and that is a real
+   * gap rather than a tidy conservatism: ChatGPT does not always expose a turn's thinking
+   * headline in its message model while the turn is running, so the headline is first seen
+   * long afterwards — in session `2026-08-21-ce135bff`, three and a half minutes and one page
+   * load after the turn it describes. A row with no turn belongs to no group, and a group
+   * missing a row ChatGPT is visibly showing cannot be proven complete, so one late headline
+   * dropped that entire response back to ChatGPT's native rendering.
+   *
+   * The join is ChatGPT's own `metadata.request_id` on the turn's connector calls, matched
+   * against the calls the app has already recorded under a durable local turn. No time, DOM
+   * position or "nearest turn" guess takes part: the answer is a single turn id or nothing.
+   */
+  function settledTurnOwner(turn) {
+    const requests = new Set();
+    for (const call of (turn && turn.calls) || []) if (call && call.requestId) requests.add(call.requestId);
+    if (requests.size !== 1) return null;
+    const requestId = requests.values().next().value;
+    const owners = new Set();
+    for (const entry of streamEntries) {
+      if (!entry || entry.kind !== 'tool_call' || entry.requestId !== requestId) continue;
+      if (entry.turnId) owners.add(entry.turnId);
+    }
+    return owners.size === 1 ? owners.values().next().value : null;
+  }
+
+  /**
+   * Makes request ownership an explicit acknowledged operation for the current live turn.
+   *
+   * Fresh-chat ordering is the reason this exists. Live 2026-08-21, the real chat session
+   * `2026-08-21-e24b18f3` existed before the first call, while normalized request
+   * `77186fb4-bdda-4849-8cd7-879bb08a1617` still never reached the correlation registry and
+   * every call fell into `2026-08-21-9d5892a4` (Unattributed activity). ChatGPT can expose a
+   * connector request and its metadata.request_id while its internal clientThreadId still names the provisional
+   * thread, then assign the real /c/<conversation-id> a moment later. Transcript delivery can
+   * safely wait for that convergence; MCP attribution cannot, because the recorder has a finite
+   * evidence window. Once both facts are simultaneously true in this document — a concrete
+   * current route and the request id inside the assistant section this local generation owns —
+   * send the exact pair to the app and require a read-back ACK before considering it placed.
+   *
+   * This is intentionally live-turn-only. Historical/reloaded turns keep the stricter Fiber
+   * conversation cross-check, so a stale mounted object from chat A can never be promoted into
+   * chat B merely because B is the route currently open.
+   */
+  function confirmLiveRequestOwners(turn, ownerConversation) {
+    if (!generating || !turn || !ownerConversation) return;
+    const byRequest = new Map();
+    for (const call of turn.calls || []) {
+      if (!call || !call.requestId || byRequest.has(call.requestId)) continue;
+      if (requestOwnersConfirmed.get(call.requestId) === ownerConversation) continue;
+      const key = `${ownerConversation}\u0000${call.requestId}`;
+      if (requestOwnersPending.has(key) || (requestOwnerRetryAt.get(key) || 0) > Date.now()) continue;
+      byRequest.set(call.requestId, call);
+      requestOwnersPending.add(key);
+    }
+    const calls = [...byRequest.values()];
+    if (calls.length === 0) return;
+    void ask({
+      type: 'correlate',
+      conversationId: ownerConversation,
+      calls
+    }).then((reply) => {
+      const data = reply && reply.ok === true && reply.data && typeof reply.data === 'object' ? reply.data : null;
+      const confirmed = new Set(data && Array.isArray(data.confirmed) ? data.confirmed : []);
+      for (const call of calls) {
+        const key = `${ownerConversation}\u0000${call.requestId}`;
+        if (!data || data.conversationId !== ownerConversation || data.complete !== true || !confirmed.has(call.requestId)) {
+          requestOwnerRetryAt.set(key, Date.now() + 2000);
+          continue;
+        }
+        requestOwnerRetryAt.delete(key);
+        requestOwnersConfirmed.set(call.requestId, ownerConversation);
+        // `app` becomes green only after the app has read the exact mapping back. This is a
+        // stronger diagnostic than the old "Fiber parser saw an id" indicator.
+        traceStage(call.requestId, 'sent');
+        traceStage(call.requestId, 'app', 'request_id');
+      }
+    }).catch(() => {
+      for (const call of calls) requestOwnerRetryAt.set(`${ownerConversation}\u0000${call.requestId}`, Date.now() + 2000);
+    }).finally(() => {
+      for (const call of calls) requestOwnersPending.delete(`${ownerConversation}\u0000${call.requestId}`);
+    });
+  }
   async function refreshFiber(settled = null) {
     // A bound chat can briefly lose its /c/<id> route during React/router churn, and a real
     // navigation to a fresh composer has the exact same pathname until ChatGPT assigns the
@@ -2085,18 +2180,63 @@
     if (askedConversation && CLF_DOM.conversationId() !== askedConversation) return;
     const concreteConversation = (value) =>
       typeof value === 'string' && /^[0-9a-f-]{8,64}$/i.test(value) ? value : null;
-    if (
-      askedConversation &&
-      (answer.turns.some((turn) => {
-        const pageConversation = concreteConversation(turn.conversationId);
-        return pageConversation && pageConversation !== askedConversation;
-      }) ||
-        [...answer.rows.values()].some((row) => {
-          const pageConversation = concreteConversation(row.conversationId);
-          return pageConversation && pageConversation !== askedConversation;
-        }))
-    ) {
-      return;
+    // Capture the one live page turn before filtering by Fiber's own conversation field.
+    // On a freshly created chat that field can still be the provisional client thread even
+    // though the route has already become the real /c/<id>. Only this exact section, already
+    // bound to this document's local generation, is allowed through that temporary mismatch.
+    const livePageTurnId = generating ? generationTurn()?.id || null : null;
+    let livePageTurn = null;
+    if (livePageTurnId) {
+      for (let index = answer.turns.length - 1; index >= 0; index--) {
+        if (answer.turns[index].turnId === livePageTurnId) {
+          livePageTurn = answer.turns[index];
+          break;
+        }
+      }
+    }
+    if (askedConversation) {
+      // Validate ownership per Fiber object, not per scan.
+      //
+      // Live failure, 2026-08-21: the popup showed the exact request id for every call in this
+      // chat, yet all of those calls landed in `Unattributed activity`. readTurnCalls() had in
+      // fact read the ids correctly. The loss happened here: one stale React object left mounted
+      // from another conversation made this function reject the *entire* Fiber answer, including
+      // the current conversation's exact request messages. The recorder then waited its bounded
+      // request-id grace period for evidence we had deliberately thrown away and filed the call
+      // as unattributed. A reload/navigation artifact was therefore stronger than exact identity.
+      //
+      // The URL is already pinned across the async round-trip above. A descriptor carrying a
+      // different concrete conversation id is individually stale and is discarded, with one
+      // narrow exception: the newest turn already bound to this document's live generation may
+      // still carry the fresh chat's provisional client thread. That turn is retained only so
+      // confirmLiveRequestOwners() can perform the explicit request-id -> real-route handshake;
+      // historical mismatches are still discarded. An absent/non-concrete id keeps the old
+      // conservative behaviour. No clock, active-tab or tool-name fallback enters the decision.
+      answer = {
+        turns: answer.turns.filter((turn) => {
+          const pageConversation = concreteConversation(turn.conversationId);
+          return !pageConversation || pageConversation === askedConversation || turn === livePageTurn;
+        }),
+        rows: new Map(
+          [...answer.rows].filter(([, row]) => {
+            const pageConversation = concreteConversation(row.conversationId);
+            return !pageConversation || pageConversation === askedConversation;
+          })
+        )
+      };
+    }
+    // Diagnostics begin only after the scan has passed route/epoch validation and stale
+    // cross-conversation objects have been removed. readTurnCalls() is a validator, not proof
+    // that an object belongs to this tab: marking `read` while parsing was the reason the popup
+    // could show a request id as picked up even though refreshFiber() then discarded it before
+    // the app ever saw it.
+    const acceptedCalls = answer.turns.flatMap((turn) => turn.calls || []);
+    observed.calls = acceptedCalls.length;
+    for (const call of acceptedCalls) {
+      if (!call.requestId) continue;
+      observed.requestId = call.requestId;
+      traceStage(call.requestId, 'read');
+      traceStage(call.requestId, 'tool', call.tool);
     }
     fiberPresent = true;
     fiberRows = answer.rows;
@@ -2112,7 +2252,7 @@
     // identity. Only the *newest* Fiber turn matching the assistant section this local
     // generation is currently bound to may inherit `turnId`; historical/reused matches still
     // prove the conversation made the call, but carry no durable turn id.
-    const activePageTurnId = generating ? generationTurn()?.id || null : settled?.pageTurnId || null;
+    const activePageTurnId = generating ? livePageTurnId : settled?.pageTurnId || null;
     const activeLocalTurnId = generating ? turnId : settled?.localTurnId || null;
     let activeTurnIndex = -1;
     if (activePageTurnId && activeLocalTurnId) {
@@ -2122,6 +2262,9 @@
           break;
         }
       }
+    }
+    if (generating && activeTurnIndex >= 0 && askedConversation) {
+      confirmLiveRequestOwners(answer.turns[activeTurnIndex], askedConversation);
     }
     // A terminal message can finish the local turn before ChatGPT removes a stale Stop
     // control. While that latch is active, observe() keeps Fiber probing the newest visible
@@ -2154,7 +2297,13 @@
         emit({
           kind: 'tool_evidence',
           ...(index === activeTurnIndex ? { turnId: activeLocalTurnId } : {}),
-          fiberConversationId: turn.conversationId || undefined,
+          ...(turn.conversationId && !(
+            generating &&
+            index === activeTurnIndex &&
+            askedConversation &&
+            concreteConversation(turn.conversationId) &&
+            concreteConversation(turn.conversationId) !== askedConversation
+          ) ? { fiberConversationId: turn.conversationId } : {}),
           calls: fresh
         });
       }
@@ -2176,6 +2325,9 @@
     // and the paragraph after it always journalled the paragraph first.
     for (let index = 0; index < answer.turns.length; index++) {
       const turn = answer.turns[index];
+      // The live generation owns the turn it is writing; a settled one is claimed only by
+      // ChatGPT's own request id. See settledTurnOwner().
+      const localOwner = index === activeTurnIndex ? activeLocalTurnId : settledTurnOwner(turn);
       const items = [];
       let serial = 0;
       for (const message of turn.messages || []) {
@@ -2199,7 +2351,7 @@
       for (const item of items) {
         if (item.type === 'activity') {
           const activity = item.value;
-          const owner = index === activeTurnIndex ? activeLocalTurnId || '' : '';
+          const owner = localOwner || '';
           const signature = `${activity.label}\u0000${owner}`;
           if (pageToolsReported.get(activity.messageId) === signature) continue;
           pageToolsReported.set(activity.messageId, signature);
@@ -2208,7 +2360,7 @@
             kind: 'page_tool',
             text: activity.label,
             messageId: activity.messageId,
-            turnId: index === activeTurnIndex ? activeLocalTurnId : undefined
+            turnId: localOwner || undefined
           });
           continue;
         }
@@ -2259,7 +2411,7 @@
         // were the dedupe key, that first unowned snapshot permanently prevented the later
         // exact local turn id from reaching the recorder. The recorder upsert is expressly
         // able to promote the same canonical message when stronger ownership arrives.
-        const owner = index === activeTurnIndex ? activeLocalTurnId || '' : '';
+        const owner = localOwner || '';
         const signature =
           `${state}\u0000${message.rawText}\u0000${message.renderedHtml}\u0000${owner}` +
           `\u0000${message.createTime || ''}`;
@@ -2269,7 +2421,7 @@
         emit({
           kind: 'assistant_message',
           messageId: message.messageId,
-          turnId: index === activeTurnIndex ? activeLocalTurnId : undefined,
+          turnId: localOwner || undefined,
           text: message.rawText,
           renderedHtml: message.renderedHtml,
           ...(message.createTime ? { time: message.createTime, authoredTime: true } : {}),
@@ -3017,10 +3169,24 @@
       const end = ends.get(anchor);
       return end === undefined || entry.time <= end ? anchor : undefined;
     };
-    const rank = (entry) => (entry.kind === 'turn_start' ? -1 : entry.kind === 'turn_end' ? 1 : 0);
+    // The message that ended a turn is the last thing in that turn by definition, so it is
+    // placed there rather than by the `create_time` ChatGPT stamped when it *opened* the
+    // message — which can precede a connector call the same turn still had to make. See the
+    // long note on `closing()` in src/shared/chronology.ts; the two must not disagree.
+    const rank = (entry, ends) =>
+      entry.kind === 'turn_start' ? -1 : entry.kind === 'turn_end' ? 1 : entry === ends ? 0.5 : 0;
+    const closing = (group) => {
+      let found = null;
+      for (const entry of group) {
+        if (entry.kind !== 'assistant_message') continue;
+        if (entry.final !== true && entry.state !== 'final') continue;
+        if (!found || position(entry) > position(found)) found = entry;
+      }
+      return found;
+    };
     const byTime = (a, b) => {
       const apart = a.time - b.time;
-      return Number.isFinite(apart) && apart !== 0 ? apart : a.seq - b.seq;
+      return Number.isFinite(apart) && apart !== 0 ? apart : position(a) - position(b) || a.seq - b.seq;
     };
     const groups = new Map();
     for (const entry of bySeq) {
@@ -3032,7 +3198,8 @@
     const out = [];
     for (const anchor of [...groups.keys()].sort((a, b) => a - b)) {
       const group = groups.get(anchor);
-      group.sort((a, b) => rank(a) - rank(b) || byTime(a, b));
+      const ends = closing(group);
+      group.sort((a, b) => rank(a, ends) - rank(b, ends) || byTime(a, b));
       out.push(...group);
     }
     return out;
@@ -3103,9 +3270,28 @@
       if (owner) owner.entries.push(entry);
     }
 
-    const rank = (entry) => (entry.kind === 'turn_start' ? -1 : entry.kind === 'turn_end' ? 1 : 0);
-    const order = (a, b) => rank(a) - rank(b) || (Number(a.time) || 0) - (Number(b.time) || 0) || a.seq - b.seq;
-    for (const group of groups) group.entries.sort(order);
+    // Same reading order as chronological(): the message that ended the turn closes it,
+    // whatever `create_time` says, because a turn cannot continue past its own last message.
+    const closing = (entries) => {
+      let found = null;
+      for (const entry of entries) {
+        if (entry.kind !== 'assistant_message') continue;
+        if (entry.final !== true && entry.state !== 'final') continue;
+        const at = Number.isFinite(Number(entry.origin)) ? Number(entry.origin) : entry.seq;
+        const held = found === null ? -Infinity : Number.isFinite(Number(found.origin)) ? Number(found.origin) : found.seq;
+        if (at > held) found = entry;
+      }
+      return found;
+    };
+    const rank = (entry, ends) =>
+      entry.kind === 'turn_start' ? -1 : entry.kind === 'turn_end' ? 1 : entry === ends ? 0.5 : 0;
+    for (const group of groups) {
+      const ends = closing(group.entries);
+      group.entries.sort(
+        (a, b) =>
+          rank(a, ends) - rank(b, ends) || (Number(a.time) || 0) - (Number(b.time) || 0) || a.seq - b.seq
+      );
+    }
     return groups;
   }
 
@@ -3155,7 +3341,16 @@
     const candidates = groups.filter((group) => {
       const start = (group.entries || []).find((entry) => entry.kind === 'turn_start');
       const seq = Number(start && start.seq);
-      return Number.isFinite(seq) && seq > anchorSeq && seq < nextAnchorSeq;
+      if (!Number.isFinite(seq) || seq <= anchorSeq || seq >= nextAnchorSeq) return false;
+      // A generation that produced nothing is not a candidate reconstruction of a visible
+      // response. ChatGPT re-mounting its stop control for a couple of seconds — which a page
+      // load can do on its own — opens and closes a local generation with no message, no
+      // activity and no call in it. Counting that as a second candidate forces the request-id
+      // tie-break below, and a plain answer that called no tools has no request id to offer,
+      // so a phantom two-second turn could veto the reconstruction of the real one.
+      return (group.entries || []).some(
+        (entry) => entry.kind !== 'turn_start' && entry.kind !== 'turn_end'
+      );
     });
     if (candidates.length === 0) return null;
 
@@ -3632,11 +3827,23 @@
       // While generationTurn() cannot bind it yet, leave ChatGPT native. A stale Fiber stamp
       // or settled node tombstone can describe the previous turn during React reuse, so
       // website-id reconciliation is deliberately reserved for historical/reloaded turns.
-      const websiteRender = anchorRender || (activeNewest
+      const identityRender = activeNewest
         ? websiteRenderForTurn(turn, groups, localGroup, renderIndex)
         : localId !== null
           ? websiteRenderForTurn(turn, groups, localGroup, renderIndex)
-          : websiteRenderForTurn(turn, groups, null, renderIndex));
+          : websiteRenderForTurn(turn, groups, null, renderIndex);
+      // A user-message anchor is excellent at finding the right *window*, but it can include
+      // an orphan website row that has not yet been re-homed into the local group. Conversely,
+      // websiteRenderForTurn() deliberately promotes exact orphan rows into the chosen group's
+      // render copy. Preferring anchorRender unconditionally threw that recovery away: one
+      // late/reload-only thinking headline could make the anchor candidate incomplete and drop
+      // the entire turn back to native even though the identity reconstruction was provably
+      // complete. Pick the candidate that can actually replace every page-authored object.
+      const anchorComplete = Boolean(anchorRender && completeReplacementForTurn(turn, anchorRender.entries));
+      const identityComplete = Boolean(identityRender && completeReplacementForTurn(turn, identityRender.entries));
+      const websiteRender = identityComplete && !anchorComplete
+        ? identityRender
+        : anchorRender || identityRender;
       const group = websiteRender ? websiteRender.group : null;
       // Fallback for old/unit feeds that predate turn_start/turn_end in /activity.
       const raw = websiteRender
@@ -3869,6 +4076,10 @@
       // Before painting, not after: a row's fold count decides which call goes on it, and
       // painting first would label from a stale count and then have to move it.
       await refreshFiber();
+      // Push page observations immediately after the Fiber pass instead of waiting for the
+      // normal recorder debounce. The next fast live pull can then consume them; emit/flush is
+      // idempotent at the app boundary, so this tightens latency without manufacturing rows.
+      void flush();
       // Checked again: refreshFiber() talks to the page context, so the tab can move
       // between the check above and the painting below.
       if (!current()) return;
@@ -5149,7 +5360,7 @@
       // its callback in a microtask, which turned one background poll into an unbroken
       // microtask chain that starved the event loop. The next test then waited forever for a
       // window 'load' event that no macrotask could ever deliver.
-      if (!TEST_MODE) scheduleActivityPull(hidden ? HIDDEN_ACTIVITY_MS : active ? ACTIVITY_MS : IDLE_ACTIVITY_MS);
+      if (!TEST_MODE) scheduleActivityPull(hidden ? HIDDEN_ACTIVITY_MS : generating ? LIVE_ACTIVITY_MS : active ? ACTIVITY_MS : IDLE_ACTIVITY_MS);
     }, Math.max(0, delay));
   }
 

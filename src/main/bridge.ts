@@ -78,6 +78,7 @@ import {
 } from './session/continuation.js';
 import { readDurable, writeDurableSoon } from './durable.js';
 import { APP_VERSION, BRIDGE_PROTOCOL } from './version.js';
+import { requestCorrelation } from './session/correlation.js';
 
 /** Fixed candidates so the extension can find the app without being told a port. */
 export const DEFAULT_PORTS = [8765, 8766, 8767, 8768, 8769];
@@ -664,6 +665,62 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
     return json(res, 200, { ok: true, conversations: live, commands: commands.length }, origin);
   }
 
+  if (route === '/correlations' && req.method === 'POST') {
+    let body: Record<string, unknown>;
+    try {
+      body = (await readBody(req)) as Record<string, unknown>;
+    } catch (err) {
+      if ((err as Error).message === 'body_too_large') return tooLarge(res, origin);
+      return json(res, 400, { error: 'bad_request' }, origin);
+    }
+    const id = conversationId(body['conversationId']);
+    if (!id) return json(res, 400, { error: 'bad_conversation_id' }, origin);
+    const calls = parseCallEvidence(body['calls']);
+    if (calls.length === 0) return json(res, 400, { error: 'bad_request_evidence' }, origin);
+
+    // This is the live-turn ownership handshake, deliberately separate from transcript
+    // delivery. A fresh ChatGPT conversation can expose metadata.request_id before its
+    // internal clientThreadId has converged on the final /c/<id>. Piggybacking ownership on
+    // tool_evidence meant that harmless bootstrap mismatch could cause the recorder to throw
+    // away the exact join, wait fifteen seconds, and file every call under Unattributed.
+    //
+    // Live 2026-08-21: conversation `6a88144a-4434-83eb-b06c-5022b77af09e` already had local
+    // session `2026-08-21-e24b18f3` before its first MCP call, and every call carried normalized
+    // request `77186fb4-bdda-4849-8cd7-879bb08a1617`; nevertheless that id never entered the
+    // durable correlation registry and the calls accumulated in `2026-08-21-9d5892a4`
+    // (Unattributed activity). The missing fact was therefore browser -> app ownership, not MCP
+    // request-id parsing.
+    //
+    // The content script only invokes this for the *currently generating* page turn after the
+    // browser route itself is concrete. The app atomically ensures/reuses that chat's session,
+    // stores unresolved exact request-id correlations through the existing recorder path, then
+    // reads them back before ACKing. An id already proven for another conversation is refused
+    // here without feeding contradictory evidence into the sticky conflict registry. No tool
+    // name, clock, active-tab or nearest-turn fallback participates.
+    const requestIds = [...new Set(calls.map((call) => call.requestId).filter((value): value is string => Boolean(value)))];
+    const conflicts = requestIds.filter((requestId) => {
+      const held = requestCorrelation(requestId);
+      return held !== null && held.conversationId !== id;
+    });
+    const blocked = new Set(conflicts);
+    const unresolved = calls.filter((call) => call.requestId && !blocked.has(call.requestId) && requestCorrelation(call.requestId) === null);
+    const observations: ChatObservation[] = unresolved.length > 0
+      ? [{ kind: 'tool_evidence', time: Date.now(), calls: unresolved }]
+      : [];
+    // Even an already-confirmed mapping must ensure/reuse the chat session, matching /events'
+    // first-observation semantics and making this one atomic operation from the page's view.
+    const result = await recordChatObservations(id, observations, agentForConversation(id));
+    const confirmed = requestIds.filter((requestId) => requestCorrelation(requestId)?.conversationId === id);
+    return json(res, 200, {
+      ok: true,
+      conversationId: id,
+      sessionId: result.sessionId,
+      requestIds,
+      confirmed,
+      conflicts,
+      complete: conflicts.length === 0 && confirmed.length === requestIds.length
+    }, origin);
+  }
   if (route === '/events' && req.method === 'POST') {
     let body: Record<string, unknown>;
     try {

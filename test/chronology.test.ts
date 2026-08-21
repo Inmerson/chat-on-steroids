@@ -8,6 +8,8 @@ interface Row {
   time: number;
   kind: string;
   turnId?: string | null;
+  final?: boolean;
+  state?: string;
   label?: string;
 }
 
@@ -75,6 +77,30 @@ describe('the order a recorded turn is read in', () => {
     ]);
   });
 
+  it('puts the terminal assistant answer after every call even when ChatGPT opened its message earlier', () => {
+    // Live 2026-08-21 (`ce135bff`): ChatGPT stamped the final answer at 08:40:34 when it
+    // opened that message object, then ran tool calls at 08:40:37 and 08:40:42 before the
+    // prose actually closed the turn. The authored timestamp is useful chronology for ordinary
+    // messages, but it cannot mean the terminal answer happened before work the same turn still
+    // performed. Only the closing assistant moves; an earlier interim message keeps its place.
+    const rows: Row[] = [
+      row(1, 100, 'turn_start', 't1'),
+      { ...row(2, 115, 'assistant_message', 't1', 'interim'), state: 'streaming', final: false },
+      { ...row(5, 120, 'assistant_message', 't1', 'final answer'), state: 'final', final: true },
+      row(3, 130, 'tool_call', 't1', 'late tool one'),
+      row(4, 140, 'tool_call', 't1', 'late tool two'),
+      row(6, 160, 'turn_end', 't1')
+    ];
+
+    expect(reading(rows)).toEqual([
+      'turn_start@100',
+      'interim',
+      'late tool one',
+      'late tool two',
+      'final answer',
+      'turn_end@160'
+    ]);
+  });
   it('does not leave a call that outlived the turn_end stranded after it', () => {
     const rows = [
       row(1, 100, 'turn_start', 't1'),
