@@ -20,7 +20,7 @@ libvips 8.18.3 with a real PNG encode). It replaces v1.8.4, which had been the i
 build since 2026-08-20; the 1.8.7 that was running on 2026-08-21 came from a stale `out/`
 and is what T-174 below is about.
 
-## v1.9.2 — package and install record — **PENDING INSTALL**
+## v1.9.2 — package and install record — **INSTALLED 2026-08-21**
 
 The follow-up to 1.9.1. Attribution itself worked after 1.9.1 — every refused call in the
 2026-08-21 evidence carries `attribution: "request_id"` with the right conversation — but it
@@ -62,6 +62,11 @@ without `requests`. `BRIDGE_PROTOCOL` is unchanged at 6.
   "libvips":"8.18.3","pngBytes":95,"ptySpawn":"function"}`.
 - All seven extension files under `resources/extension` hash-match the repo copies.
 - `npm run verify`: typecheck clean, 1088 passed / 83 skipped.
+- Installed `ChatGPT Local Files.exe` reports FileVersion `1.9.2`, ProductVersion `1.9.2.0`,
+  written 13:57. All seven installed extension files hash-match the repo copies.
+- Live probe of the running build: `GET /hello` → `{"version":"1.9.2","bridge":6,
+  "compatible":true,"paired":true}`. Note for next time: `/hello` refuses an `Origin` that is
+  not `chrome-extension://` with a bare 403 — probe it with no Origin header at all.
 - 10 new regression tests, each shown to fail against the reverted behaviour: 4 in
   `test/fiber.test.ts` (bare-id harvest, allowlist, dedupe, turn kept when the id is all it
   has), 4 in `test/content-script.test.ts` (bare-id handshake, labelled row wins when both
