@@ -19,7 +19,7 @@ import { promises as fs } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { ensureUsablePath, normalizeEnvironment, setEnvValue } from '../env.js';
-import { findWindowsPowerShell } from '../exec.js';
+import { findWindowsPowerShell, terminateProcessTree } from '../exec.js';
 import { logWarn } from '../logger.js';
 import { HELPER_SCRIPT } from './helper.js';
 
@@ -131,6 +131,21 @@ let helperStarting: Promise<HelperRuntime> | null = null;
 let helperQueue: Promise<void> = Promise.resolve();
 let helperGeneration = 0;
 let findUiWarmGeneration = -1;
+let helperStopping = false;
+const helperRetirements = new Set<Promise<void>>();
+
+function retireHelper(runtime: HelperRuntime): Promise<void> {
+  if (helperRuntime === runtime) helperRuntime = null;
+  const task = (async () => {
+    if (runtime.child.exitCode !== null || runtime.child.pid === undefined) return;
+    const closed = new Promise<void>((resolve) => runtime.child.once('close', () => resolve()));
+    await terminateProcessTree(runtime.child.pid);
+    await Promise.race([closed, new Promise<void>((resolve) => setTimeout(resolve, 2_000))]);
+  })();
+  helperRetirements.add(task);
+  void task.finally(() => helperRetirements.delete(task));
+  return task;
+}
 
 function readableHelperFailure(stderr: string): string {
   const clean = stderr
@@ -142,6 +157,7 @@ function readableHelperFailure(stderr: string): string {
 }
 
 async function startHelper(): Promise<HelperRuntime> {
+  if (helperStopping) throw new ComputerError('The desktop helper is shutting down.');
   if (helperRuntime) return helperRuntime;
   if (helperStarting) return helperStarting;
 
@@ -239,6 +255,41 @@ async function startHelper(): Promise<HelperRuntime> {
   return helperStarting;
 }
 
+/**
+ * Stops the long-lived PowerShell/Win32 helper and waits for its process tree to exit.
+ *
+ * The helper is an app-owned process, not an implementation detail of one request: a
+ * timeout or Electron shutdown must therefore retire the whole tree before the process
+ * can be forgotten. Otherwise the compiled helper can survive the UI that owned it.
+ */
+export async function stopComputerHelper(): Promise<void> {
+  helperStopping = true;
+  const starting = helperStarting;
+  if (starting) await starting.catch(() => null);
+  const runtime = helperRuntime;
+  helperRuntime = null;
+  helperStarting = null;
+  uiRefs.clear();
+  if (!runtime) {
+    await Promise.allSettled([...helperRetirements]);
+    return;
+  }
+
+  const pending = runtime.pending;
+  runtime.pending = null;
+  if (pending) {
+    clearTimeout(pending.timer);
+    pending.reject(new ComputerError('The desktop helper was stopped because the app is shutting down.'));
+  }
+  try {
+    runtime.child.stdin.end();
+  } catch {
+    // The helper may already have closed its pipe.
+  }
+  await retireHelper(runtime);
+  await Promise.allSettled([...helperRetirements]);
+}
+
 async function sendHelperRequest(request: Record<string, unknown>): Promise<Record<string, any>> {
   const runtime = await startHelper();
   if (runtime.pending) throw new ComputerError('Desktop helper received overlapping requests.');
@@ -246,8 +297,7 @@ async function sendHelperRequest(request: Record<string, unknown>): Promise<Reco
   return new Promise<Record<string, any>>((resolve, reject) => {
     const timer = setTimeout(() => {
       if (runtime.pending) runtime.pending = null;
-      if (helperRuntime === runtime) helperRuntime = null;
-      runtime.child.kill();
+      void retireHelper(runtime);
       reject(new ComputerError('The desktop helper did not answer in time.'));
     }, HELPER_TIMEOUT_MS);
     runtime.pending = { resolve, reject, timer };
@@ -255,7 +305,7 @@ async function sendHelperRequest(request: Record<string, unknown>): Promise<Reco
       if (!error) return;
       clearTimeout(timer);
       runtime.pending = null;
-      if (helperRuntime === runtime) helperRuntime = null;
+      void retireHelper(runtime);
       reject(new ComputerError(`Could not send a desktop helper request: ${error.message}`));
     });
   });

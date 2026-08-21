@@ -7,7 +7,14 @@
 
 import { describe, expect, it } from 'vitest';
 import { ago, parseClientStatus, parsePollHealth, readMetric } from '../src/main/tunnel/health.js';
-import { describeNetworkError, isUnreachableError } from '../src/main/tunnel/index.js';
+import {
+  describeNetworkError,
+  isUnreachableError,
+  NO_OUTAGE,
+  outageConfirmed,
+  outageRecovered
+} from '../src/main/tunnel/index.js';
+import { describeRoute } from '../src/main/diagnostics.js';
 
 /** Verbatim lines seen in the field, with the tunnel up and the WLAN off. */
 const REAL_OUTAGE_LINES = [
@@ -172,5 +179,89 @@ describe('ago', () => {
 
   it('never reports a negative age from a clock skew', () => {
     expect(ago(now + 60_000, now)).toBe('just now');
+  });
+});
+
+/**
+ * The field log that prompted this: a poll timed out at 15:46:08, the app said
+ * "tunnel offline", and at 15:46:14 it said "tunnel connected" again. Six seconds.
+ * ChatGPT never noticed, but the user was told their connection had dropped, five
+ * times in one hour. A complaint is not an outage — an unanswered complaint is.
+ */
+describe('outage confirmation', () => {
+  const T = 1_000_000_000_000;
+
+  it('says nothing about a complaint that has only just arrived', () => {
+    const run = { since: T, handshakeBefore: T - 19_000 };
+    expect(outageConfirmed(run, T)).toBe(false);
+    expect(outageConfirmed(run, T + 6_000)).toBe(false);
+  });
+
+  it('ends the run as soon as a poll completes, so the blip is never shown', () => {
+    const run = { since: T, handshakeBefore: T - 19_000 };
+    // The client retried and won: the last-successful timestamp moved forward.
+    expect(outageRecovered(run, T + 6_000)).toBe(true);
+    // The same stale timestamp is not recovery, however many times it is read.
+    expect(outageRecovered(run, T - 19_000)).toBe(false);
+    expect(outageRecovered(run, null)).toBe(false);
+  });
+
+  it('confirms an outage once the complaints outlive a poll cycle', () => {
+    const run = { since: T, handshakeBefore: T - 19_000 };
+    expect(outageConfirmed(run, T + 35_000)).toBe(true);
+    expect(outageConfirmed(run, T + 120_000)).toBe(true);
+  });
+
+  it('treats the first success of any age as recovery for a client that never polled', () => {
+    // A run opened before the client ever completed a poll has no baseline to beat,
+    // so any success at all ends it rather than being compared against null.
+    expect(outageRecovered({ since: T, handshakeBefore: null }, T - 60_000)).toBe(true);
+  });
+
+  it('is inert when no run is open', () => {
+    expect(outageConfirmed(NO_OUTAGE, T + 10 * 60_000)).toBe(false);
+    expect(outageRecovered(NO_OUTAGE, T)).toBe(false);
+  });
+});
+
+/**
+ * The other half of the same log: every launch reported "1 problem: Route to OpenAI"
+ * three seconds after "tunnel connected", because the first long poll had not come
+ * back yet. The tunnel supervisor already gives that first poll a grace period; the
+ * self-test has to agree with it or it accuses a healthy connection of being broken.
+ */
+describe('self-test route check', () => {
+  const T = 1_000_000_000_000;
+  const health = (lastSuccessMs: number | null, errors = 0) => ({
+    lastSuccessMs,
+    polls: 1,
+    errors
+  });
+
+  it('does not call a client that has never polled yet broken', () => {
+    const check = describeRoute(health(null), 4, T);
+    expect(check.ok).toBeNull();
+    expect(check.detail).toMatch(/Still starting/);
+  });
+
+  it('does call it broken once it has had time and still has nothing', () => {
+    const check = describeRoute(health(null), 300, T);
+    expect(check.ok).toBe(false);
+    expect(check.detail).toMatch(/Not verified — last completed handshake never/);
+  });
+
+  it('gives no grace to a young client that polled once and then went quiet', () => {
+    // Uptime is short, but a completed poll proves the route worked and then stopped.
+    expect(describeRoute(health(T - 5 * 60_000), 20, T).ok).toBe(false);
+  });
+
+  it('verifies a route whose last poll is within the freshness window', () => {
+    const check = describeRoute(health(T - 19_000, 5), 900, T);
+    expect(check.ok).toBe(true);
+    expect(check.detail).toBe('Verified — last completed handshake 19s ago; 5 poll errors since start.');
+  });
+
+  it('reports unknown, not broken, when the tunnel serves no metrics', () => {
+    expect(describeRoute(null, null, T).ok).toBeNull();
   });
 });

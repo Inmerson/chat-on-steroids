@@ -57,7 +57,7 @@ Access is granted per folder. There is no "allow everything" switch.
 
 - Each approved folder becomes a **virtual root**: `C:\Users\you\code\my-app` might become `/my-app`.
 - Every path from ChatGPT is validated in code before any file is touched: `..`, absolute paths, `\` and `/` mixing, `:` (alternate data streams and drive-relative paths), reserved device names (`CON`, `NUL`, `COM1`, …), trailing dots and spaces, control characters and null bytes are all rejected.
-- Paths are then canonicalised with `realpath` and re-checked, which is what stops a **symlink, junction or other reparse point** inside an approved folder from reaching outside it. A link that stays inside the folder keeps working.
+- Paths are canonicalised with `realpath` and re-checked, which rejects a **symlink, junction or other reparse point** that already escapes an approved folder. This is a static namespace check: ordinary Node path APIs cannot close a same-user process swapping an ancestor after validation, so concurrent reparse mutation remains a documented Windows limitation until file operations are handle-relative.
 - Comparisons are case-insensitive on Windows, and a root named `C:\Root` never matches `C:\RootEvil`.
 - Network (UNC) paths and whole drives cannot be approved, and roots may not overlap each other.
 
@@ -67,12 +67,13 @@ None of this is left to the model to respect. It is enforced before every operat
 
 The tools are published across **two connectors**: **Core** (files, search, commands, sessions, agents) and **Desktop** (screen and input). Each is its own MCP server with its own URL, so a coding chat never pays for the desktop schemas. `docs/tool-surface.md` is the decision record for that split and for the shape of every tool below.
 
-There are at most **six** Core tools and **two** Desktop ones. Approved folders are described in the server instructions rather than by a tool, so nothing has to be called to discover them. On a fresh connection a tool appears only when a permission that uses it is on. During one running connector session the exposed tool surface is deliberately monotonic: if you later revoke a permission, an already-exposed tool stays registered but returns `TOOL_DISABLED`. This avoids stale ChatGPT tool caches turning a permission change into an `UNKNOWN` transport failure while still enforcing the live permission on every call.
+Core declares eight possible names but exposes at most **seven** at once; `find` and the `exec_command`/`write_stdin` pair are mutually exclusive. Desktop adds at most **two**, for a combined maximum of **nine**. Approved folders are described in the server instructions rather than by a tool, so nothing has to be called to discover them. On a fresh connection a tool appears only when a permission that uses it is on. During one running connector session the exposed tool surface is deliberately monotonic: if you later revoke a permission, an already-exposed tool stays registered but returns `TOOL_DISABLED`. This avoids stale ChatGPT tool caches turning a permission change into an `UNKNOWN` transport failure while still enforcing the live permission on every call.
 
 | Capability | Tool | Notes |
 | --- | --- | --- |
 | Browse folders | `read` | Lists a folder one level deep; recursion is a glob |
 | Read files | `read` | Bounded line ranges, up to 20 paths at once; PNG/JPEG/GIF/WebP come back as images |
+| View one image | `view_image` | Separate Codex-shaped image contract with structural decode and pixel/wire bounds |
 | File metadata | `read` | Size, timestamps and line count, without returning contents |
 | Search files | `read`, `find` | Globs expand inside `read`; `find` searches by name or by text and appears only while **Run commands** is off |
 | Create files | `apply_patch` | `*** Add File:` — parent folders are created as a side effect; an empty folder on its own needs **Run commands** |
@@ -141,7 +142,7 @@ That is still arbitrary code execution. Treat it as such.
 
 A long coding session in ChatGPT is hard to review: the tool calls collapse into identical `Called tool` rows, progress lines scroll away, and when the conversation finally runs out of room there is nothing to carry into the next one.
 
-Turning on **Chat → Record this session** fixes both halves of that. It is **off by default**, and while it is off nothing about your conversations is written to session history on disk. Multi-agent mode can still start the browser bridge when recording is off, but it does not silently enable session recording.
+**Chat → Record this session** fixes both halves of that. It is **on for a new config**; an existing config keeps the choice you already made. While it is off, nothing about conversations is written to session history on disk. Multi-agent mode can still start the browser bridge when recording is off, but it does not silently enable session recording.
 
 With it on:
 
@@ -155,12 +156,12 @@ The optional Chrome extension in [`extension/`](extension/) adds the browser hal
 
 It is not on the Chrome Web Store; load it directly.
 
-1. In the app, turn on **Chat → Record this session**. The local bridge also runs when experimental multi-agent mode is enabled, because workers need the extension even if session recording is off.
+1. Leave **Chat → Record this session** on, or enable it if your existing config has it off. The local bridge also runs when experimental multi-agent mode is enabled, because workers need the extension even if session recording is off.
 2. Open `chrome://extensions`, turn on **Developer mode**, press **Load unpacked** and pick the `extension` folder.
-3. In the app, press **Pair extension**. It shows a six-digit code, good for three minutes.
-4. Click the extension's toolbar icon and type the code.
+3. Click the extension's toolbar icon. It discovers the loopback bridge and pairs silently.
+4. If you previously chose **Disconnect browser**, use the popup's reconnect action once.
 
-The extension only runs on `chatgpt.com` and `chat.openai.com`, and only talks to `127.0.0.1` on the five ports the app may use (8765–8769). One wrong code cancels the pairing — you have to press **Pair extension** again — so the code cannot be guessed at.
+The extension only runs on `chatgpt.com` and `chat.openai.com`, and only talks to `127.0.0.1` on the five ports the app may use (8765–8769). Pairing provisions a bearer token directly between the extension service worker and the loopback app; no code or token enters the ChatGPT page.
 
 ### What is written, and where
 
@@ -168,6 +169,8 @@ Sessions live under `%APPDATA%\chatgpt-local-files\sessions\<id>\`:
 
 ```
 events.jsonl      one JSON event per line, appended and never rewritten
+messages/         canonical user/assistant messages, one replaceable shard per stable identity
+messages.json     legacy canonical map, read during lazy migration of older sessions
 meta.json         the summary the Chat tab lists (rewritten atomically)
 assets/<sha256>   large payloads — screenshots, images — stored once by content hash
 handoffs/<id>.json  compaction results
@@ -179,7 +182,7 @@ Recording is *more* revealing than the Activity log, because that is the point �
 
 ## Compaction and resuming a session
 
-When a session gets long, the Chat tab shows a local **estimate** of its size and starts advising a compaction around 180k tokens, urgently at 200k. That estimate is ours, computed from messages and tool input/output; transient live progress/reasoning captions are deliberately excluded because they frequently restate work that later appears again. ChatGPT's own context counter is private, so the app does not pretend to know it, and it does not label every unexplained stop as an output limit — a turn is reported as completed, failed, stopped by you, apparently interrupted, stalled, or simply unknown, according to what was actually observed.
+When a session gets long, the Chat tab shows a local **estimate** of its size. New configs warn around **300k** estimated tokens, treat **400k** as the observed limit, and arm automatic Compact & Resume on the completed turn that crosses **300k**; existing explicit settings are preserved. That estimate is ours, computed from messages and tool input/output; transient live progress/reasoning captions are deliberately excluded because they frequently restate work that later appears again. ChatGPT's own context counter is private, so the app does not pretend to know it, and it does not label every unexplained stop as an output limit — a turn is reported as completed, failed, stopped by you, apparently interrupted, stalled, or simply unknown, according to what was actually observed.
 
 **The chat writes its own handoff.** Compaction asks the ChatGPT conversation being compacted for a brief written for a coding agent rather than a reader: the original task and every later correction, exact paths and versions, what is definitely done versus only discussed, files changed, command and test results, unresolved failures, what remains, and what must not be repeated. It leans on tool evidence rather than on the assistant having said it planned to do something. Nothing is sent to any other model or service, and there is no API key to configure: the participant that did the work is the one that describes it.
 
@@ -209,7 +212,7 @@ Spawning opens a fresh ChatGPT tab per worker, **with that worker's task as the 
 - **One press opens one chat.** A bootstrap is delivered once, to the one page the app opened for it, under a 90-second deadline. If that page never reports back, the worker slot is failed and the prime is told, or the compaction stays in the chat it started in. There is no background retry loop and no periodic queue poll: work is never re-offered as a tab that opens minutes after everyone stopped expecting it.
 - `agents(action='join')` exists only to recover a worker chat whose binding never arrived. It needs a one-time key the app mints on an explicit click in the desktop window, for you to paste; the key is spent on use and cannot move a worker that is already bound. In a run that works, nobody ever calls it.
 - Authenticated recorded tool calls and Activity rows are attributed to their agent, and the Activity tab gains an All / Prime / per-worker filter. Calls that cannot be proven to belong to an agent stay explicitly unattributed rather than being guessed into the wrong worker. With no swarm running, that view is exactly as it was.
-- Workers are capped (three by default, eight maximum), and the app warns when two agents are working on the same file.
+- Multi-agent mode is off by default. When enabled, workers are capped at two by default and eight maximum, and the app warns when two agents are working on the same file.
 
 ## Privacy and security
 
@@ -217,10 +220,10 @@ Spawning opens a fresh ChatGPT tab per worker, **with that worker's task as the 
 - **The local server binds to `127.0.0.1` only**, never `0.0.0.0`, on a random port. Nothing on your network can reach it.
 - Requests must carry a **32-byte secret path token**, regenerated on every app start and compared in constant time. The `Host` and `Origin` headers must be loopback, so a web page cannot drive the endpoint, and oversized bodies are rejected.
 - **Credentials are stored with Windows DPAPI** through Electron's `safeStorage`, in a separate file from the settings — never in the JSON config, never in logs, never exposed to the UI process. The API key is passed to the tunnel through the environment, never on a command line.
-- **The extension bridge is a second loopback server with a deliberately tiny surface**, and it runs only while session recording or experimental multi-agent mode needs it. It binds `127.0.0.1`, offers no filesystem, command or configuration route at all, and every route except the identifying `/hello` and the code-gated `/pair` needs a bearer token issued by pairing. Pairing needs a six-digit code you can only get from the app window, and one wrong guess destroys it. It rejects every `http(s)` origin, so no web page — including chatgpt.com itself — can reach it; only an extension can. The token lives in the extension's service worker and is never handed to a content script or the page. Browser commands are narrowly limited to opening a fresh ChatGPT chat and inserting its first message, delivered to exactly one page under a deadline, so a failed tab ends the job visibly instead of silently consuming it.
+- **The extension bridge is a second loopback server with a deliberately tiny surface**, and it runs only while session recording or experimental multi-agent mode needs it. It binds `127.0.0.1`, offers no filesystem, command or configuration route at all, and every route except the identifying `/hello` and local provisioning `/pair` needs a bearer token. `/pair` silently provisions that token to the extension service worker; it is never handed to a content script or the page. The bridge rejects every `http(s)` origin, so no web page — including chatgpt.com itself — can reach it; only an extension can. Browser commands are narrowly limited to opening a fresh ChatGPT chat and inserting its first message, delivered to exactly one page under a deadline, so a failed tab ends the job visibly instead of silently consuming it.
 - **Logs stay in memory**, are capped at 500 entries and are never written to disk. File contents and command output are not logged, and anything shaped like a key or token is masked as a backstop. `CLF_DEBUG=1` echoes the same redacted lines to stderr for troubleshooting.
 - The UI runs with context isolation on, Node integration off, the sandbox on and a strict CSP. It has no filesystem or network access of its own and talks to the app through a fixed list of named IPC channels, each validated on arrival. External links are limited to a fixed allowlist of documentation URLs.
-- **Session recording is off until you turn it on**, and only then does anything about a conversation reach the disk. Nothing sends recorded content off this PC: compaction is written by the ChatGPT conversation itself, so there is no second provider and no API key for it.
+- **Session recording is on for new configs; existing configs keep their explicit choice.** Turning it off stops conversation history from reaching disk, although enabled multi-agent mode can still keep the loopback browser bridge running. Nothing sends recorded content off this PC: compaction is written by the ChatGPT conversation itself, so there is no second provider and no API key for it.
 - Settings live in a small JSON file in `%APPDATA%\chatgpt-local-files\` (Electron's `userData` folder for this package). It is re-validated on load, so a corrupted or hand-edited file cannot widen permissions, and it survives uninstalling and reinstalling the app.
 - The endpoint answers **JSON and nothing else**, including for 404s, so a client performing OAuth discovery against it never has to parse a plain-text body. It serves RFC 9728 protected resource metadata at `/.well-known/oauth-protected-resource<secret-path>` only — never at the bare well-known root, which would disclose the secret path to an unauthenticated caller.
 
@@ -234,7 +237,7 @@ Spawning opens a fresh ChatGPT tab per worker, **with that worker's task as the 
 
 **It says connected but ChatGPT cannot reach it.** The app watches the tunnel's own readiness endpoint every 15 seconds and restarts it with backoff when it stops answering, so a tunnel that dies quietly — after a sleep or a reboot, say — recovers on its own; the **Activity** tab shows the reason it reported. If ChatGPT itself answers `This conversation does not support developer MCPs`, that is ChatGPT-side and no request ever reaches this app (the **Activity** tab stays empty, which is how you can tell them apart): start a new conversation with the connector enabled.
 
-**ChatGPT does not show the new tools.** Permission changes take effect in the app immediately, but an existing ChatGPT conversation can keep an older tool snapshot. Start a new conversation to guarantee the new surface is loaded. The app itself does not need restarting.
+**ChatGPT does not show the new tools, or still shows one you disabled.** Permission changes take effect in the app immediately, but ChatGPT can cache an older MCP schema. Reconnect/reload that connector in ChatGPT, then start a new conversation so it discovers the current surface. This connector refresh is separate from reloading or pairing the browser extension; the desktop app itself does not need restarting.
 
 **ChatGPT cannot see a file.** Check the folder is approved on **Home**, and that the relevant read capability is on. Build and dependency folders (`node_modules`, `.git`, `dist`, `build`, …) are skipped by searches unless you ask for them explicitly — the model can pass its own exclude list, including an empty one.
 
@@ -244,7 +247,13 @@ Spawning opens a fresh ChatGPT tab per worker, **with that worker's task as the 
 
 **The extension says "app not found".** The bridge listens while **Chat → Record this session** or experimental multi-agent mode is on. Turn on the feature you intend to use, then reopen the extension popup.
 
+**Calls land in Unattributed or a worker says identity was lost.** The app did not receive exact ChatGPT request-id evidence for those calls. Reload the extension once so both the isolated recorder and MAIN-world Fiber helper are current; do not manually assign those calls to the active-looking chat. If it persists, capture the Activity/session evidence because timing or the active tab is intentionally never used as an ownership guess.
+
+**Reload makes the transcript jump, duplicate, or close the wrong chat.** Reload is not a conversation close. Update to the current extension files and reload the unpacked extension, then reload the ChatGPT page once. If it repeats, preserve the session and service-worker evidence: the relevant identity is the browser document/navigation generation, not merely the tab id or conversation URL.
+
 **The extension is paired but tool blocks are not relabelled.** Relabelling is deliberately all-or-nothing per logical turn: if the number of tool blocks ChatGPT rendered does not match the number of calls recorded for that `data-turn-id`, or a call could not be attributed to a turn with confidence, the original ChatGPT UI is left exactly as it is rather than guessing. The adapter groups split assistant sections that share one turn id, reads assistant prose from the current `.markdown` shape when no assistant `data-message-id` exists, and scans multiple progress/interruption sections. Multi-agent prime calls are rebound to the prime's ChatGPT conversation when that mapping is provable; a restored authenticated agent can also self-heal its recording target when exactly one conversation is generating. The Chat tab still shows the full timeline. ChatGPT can change this private markup at any time; an unrecognised shape should degrade by leaving the page alone rather than relabelling a guess.
+
+**Overwrite disappears, sticks, or shows stale activity.** Overwrite only replaces a turn when the local stream completely and exactly represents the page-model calls it would hide. A new unrecorded call, missing request correlation, or incomplete activity page deliberately restores ChatGPT's native UI instead of inventing a complete stream. Use the Chat tab to distinguish missing local activity from a presentation-only mismatch.
 
 **Compaction fails.** The button in the ChatGPT composer shows the actual error. The usual causes are the extension not being paired, the chat being interrupted while it was writing the brief, or the fresh tab never coming up. Nothing is deleted when it fails, no new chat is opened unless the handoff was saved, and the session stays in the chat it is already in.
 

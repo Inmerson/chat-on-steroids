@@ -34,6 +34,8 @@
   globalThis.__CLF_CONTENT_RECORDER_ACTIVE__ = true;
 
   const OBSERVE_MS = 1000;
+  /** Streaming mutations are bursty; never run a transcript-wide pass per token. */
+  const TRANSCRIPT_OBSERVE_MS = 250;
   /**
    * How long the stop button must stay gone before a turn is called finished.
    *
@@ -50,6 +52,10 @@
    */
   const TURN_SETTLE_MS = 4000;
   const ACTIVITY_MS = 2000;
+  const IDLE_ACTIVITY_MS = 10_000;
+  const HIDDEN_ACTIVITY_MS = 30_000;
+  /** Keep a previously proven full replacement through brief Fiber/feed disagreement. */
+  const REPLACEMENT_GRACE_MS = 8000;
   const STATUS_MS = 15_000;
   /** Longer than any honest tool call: past this a silent turn is called stalled. */
   const STALL_MS = 10 * 60 * 1000;
@@ -92,10 +98,80 @@
   let alive = true;
   let status = { connected: false, paired: false, disconnected: false };
 
+  /**
+   * Counters the popup reads and nothing else does.
+   *
+   * Deliberately inert: every field is written after the fact by code that would behave
+   * identically if this object did not exist. It is here so the popup can say "this chat
+   * is being observed, here is the last thing seen and the request id it carried" without
+   * anyone having to read the app's log to find out.
+   */
+  const observed = {
+    events: 0,
+    lastKind: null,
+    lastAt: 0,
+    requestId: null,
+    calls: 0,
+    sends: 0,
+    failures: 0,
+    session: null,
+    pulledAt: 0,
+    lastError: null,
+    /**
+     * Why the service worker last refused to take anything from this document, or null.
+     *
+     * The popup's queue counter only ever showed the worker's own journal, so a document the
+     * worker was rejecting outright reported "0 held" and the drawer concluded "Delivered —
+     * the app has not opened a session for this chat yet". Everything was in fact still in
+     * this script's own queue, and the one layer that knew said nothing.
+     */
+    blocked: null
+  };
+
+  /**
+   * Where each ChatGPT request id got to, for the popup's pipeline view.
+   *
+   * A tool call has to survive four hand-offs before the app can label its row: this
+   * script has to read the request id off the page, the service worker has to accept and
+   * journal the observation carrying it, the app has to receive that observation, and the
+   * app has to resolve the id to this conversation. Until now a failure at any one of them
+   * looked identical from the browser — the row simply never got relabelled — so the only
+   * way to tell them apart was to read the app's log beside the browser's. Each stage
+   * stamps its own time here as it happens, which is enough to name the hand-off that did
+   * not complete.
+   *
+   * Inert by construction: ids and timestamps only, written after the fact by code that
+   * would behave identically if this map did not exist.
+   */
+  const TRACE_MAX = 12;
+  const trace = new Map();
+
+  function traceStage(requestId, stage, value) {
+    if (!requestId) return;
+    let row = trace.get(requestId);
+    if (!row) {
+      if (trace.size >= TRACE_MAX) trace.delete(trace.keys().next().value);
+      row = { requestId, tool: null, read: 0, sent: 0, app: null, appAt: 0 };
+      trace.set(requestId, row);
+    }
+    if (stage === 'tool') row.tool = value || row.tool;
+    else if (stage === 'app') {
+      row.app = typeof value === 'string' ? value : 'unattributed';
+      row.appAt = Date.now();
+    } else if (!row[stage]) row[stage] = Date.now();
+  }
+
   let conversationId = null;
   let agent = null;
 
   const queue = [];
+  const queueSizes = new WeakMap();
+  let queueBytes = 0;
+  /** Keep page-local outage buffering small enough that it cannot crash the ChatGPT tab. */
+  const MAX_PAGE_QUEUE_BYTES = 8 * 1024 * 1024;
+  /** Page-local overflow markers, one per chat/agent bucket currently waiting for the worker. */
+  const queueGaps = new Map();
+  const queueGapKeys = new WeakMap();
   let flushing = false;
 
   /**
@@ -393,6 +469,7 @@
   let pendingTools = 0;
   let pressedAt = 0;
   let localError = '';
+  let retirementHandledFor = null;
 
   /**
    * How full this conversation is, and what the app intends to do about it.
@@ -405,28 +482,82 @@
    */
   let tokens = 0;
   let context = null;
-  /** One durable threshold crossing the app says this chat may consume automatically. */
+  /**
+   * The app's answer to "may this chat compact itself right now?", refreshed every poll.
+   *
+   * True while the chat is over the configured threshold, still holds its one automatic
+   * compaction, and has a turn open. It is a live reading rather than a remembered edge, so
+   * it goes false again on its own the moment the answer lands.
+   */
   let autoCompactReady = false;
 
 
   const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-  /** Talks to the service worker. Returns null once the extension is reloaded. */
-  async function ask(message) {
+  const utf8Bytes = (value) => {
+    const text = typeof value === 'string' ? value : String(value ?? '');
+    if (typeof TextEncoder === 'function') return new TextEncoder().encode(text).byteLength;
+    try {
+      return new Blob([text]).size;
+    } catch {
+      return text.length * 4;
+    }
+  };
+
+  const entryBytes = (entry) => {
+    try {
+      return utf8Bytes(JSON.stringify(entry));
+    } catch {
+      return MAX_PAGE_QUEUE_BYTES + 1;
+    }
+  };
+
+  function accountQueueEntry(entry) {
+    const previous = queueSizes.get(entry) || 0;
+    const next = entryBytes(entry);
+    queueSizes.set(entry, next);
+    queueBytes += next - previous;
+  }
+
+  function removeQueueEntry(index) {
+    const [entry] = queue.splice(index, 1);
+    if (entry) {
+      queueBytes = Math.max(0, queueBytes - (queueSizes.get(entry) || 0));
+      queueSizes.delete(entry);
+    }
+    return entry;
+  }
+
+  let documentReady = null;
+
+  async function sendToWorker(message) {
     if (!alive) return null;
     try {
       return await chrome.runtime.sendMessage(message);
     } catch (err) {
       const text = String(err && err.message ? err.message : err);
-      // Only Chrome explicitly invalidating this isolated world is terminal. A missing
-      // receiving end can be a service-worker startup/update race; treating that transient
-      // failure as death stops every observer/poll in the tab forever and makes Overwrite
-      // look randomly broken until ChatGPT itself is reloaded.
-      if (text.includes('Extension context invalidated')) {
-        alive = false;
-      }
+      if (text.includes('Extension context invalidated')) alive = false;
       return null;
     }
+  }
+
+  /** Talks to the service worker. Returns null once the extension is reloaded. */
+  async function ask(message) {
+    // A new/reloaded document claims its browser-supplied MessageSender.documentId before
+    // any observation or mutation. This is what lets the worker retain a terminal tombstone
+    // across external navigation and still admit the genuinely new page, without accepting
+    // delayed IPC from the dead one merely because both share a numeric tab id.
+    if (!documentReady) documentReady = sendToWorker({ type: 'register_document', navigationEpoch: epoch });
+    const registered = await documentReady;
+    if (!registered || registered.ok !== true) {
+      // A sleeping/reloading service worker is transient. Keep the document unregistered
+      // (and therefore fail closed) for this call, but let the next observer tick retry.
+      documentReady = null;
+      observed.blocked = (registered && registered.error) || 'worker_unreachable';
+      return registered;
+    }
+    observed.blocked = null;
+    return sendToWorker({ ...message, navigationEpoch: epoch });
   }
 
   // ------------------------------------------------------------- observing
@@ -440,12 +571,100 @@
    * silently, permanently, and with no way to tell afterwards which entries were real.
    */
   function emit(observation) {
-    queue.push({
+    const bounded = { ...observation };
+    // One browser observation must fit the bridge's bounded HTTP body even when JavaScript
+    // character counts badly understate UTF-8 (emoji/CJK). Share one byte budget between
+    // prose and rendered HTML; otherwise a single 413 can never be halved and blocks every
+    // later observation for this conversation.
+    let wireBudget = 400 * 1024;
+    const takeUtf8 = (value, budget) => {
+      if (typeof value !== 'string') return value;
+      if (utf8Bytes(value) <= budget) return value;
+      const marker = '\n\n[Local Files: browser observation truncated to fit transport.]';
+      const markerBytes = utf8Bytes(marker);
+      let low = 0;
+      let high = value.length;
+      while (low < high) {
+        const middle = Math.ceil((low + high) / 2);
+        if (utf8Bytes(value.slice(0, middle)) + markerBytes <= budget) low = middle;
+        else high = middle - 1;
+      }
+      return value.slice(0, low) + marker;
+    };
+    if (typeof bounded.text === 'string') {
+      bounded.text = takeUtf8(bounded.text, wireBudget);
+      wireBudget -= utf8Bytes(bounded.text);
+    }
+    if (typeof bounded.renderedHtml === 'string') {
+      bounded.renderedHtml = takeUtf8(bounded.renderedHtml, Math.max(0, wireBudget));
+    }
+    const queued = {
       conversationId,
       agent,
-      event: { time: Date.now(), ...observation }
-    });
-    if (queue.length > 400) queue.splice(0, queue.length - 400);
+      event: { time: Date.now(), ...bounded }
+    };
+    // Streaming canonical messages replace their older unsent snapshot. Keeping every
+    // revision multiplies one growing answer into quadratic memory during an outage.
+    const messageId = typeof queued.event.messageId === 'string' ? queued.event.messageId : '';
+    if (queued.event.kind === 'assistant_message' && messageId) {
+      const prior = queue.findIndex(
+        (entry) =>
+          !queueGapKeys.has(entry) &&
+          entry.conversationId === queued.conversationId &&
+          entry.agent === queued.agent &&
+          entry.event?.kind === 'assistant_message' &&
+          entry.event?.messageId === messageId
+      );
+      if (prior >= 0) removeQueueEntry(prior);
+    }
+    queue.push(queued);
+    observed.events += 1;
+    if (queued.event.kind === 'chat_error' && typeof queued.event.text === 'string') {
+      observed.lastError = { text: queued.event.text.slice(0, 300), at: queued.event.time };
+    }
+    observed.lastKind = typeof queued.event.kind === 'string' ? queued.event.kind : null;
+    observed.lastAt = queued.event.time;
+    accountQueueEntry(queued);
+    // The service-worker journal already records an explicit gap when *its* durable queue has
+    // to evict data. Do the same one layer earlier. Silently splicing the oldest observation
+    // here made a long service-worker outage look like a complete transcript even though item
+    // 401 had already erased item 1 before the durable journal ever saw it.
+    while (queue.length > 400 || queueBytes > MAX_PAGE_QUEUE_BYTES) {
+      const index = queue.findIndex((entry) => !queueGapKeys.has(entry));
+      if (index < 0) break;
+      const dropped = removeQueueEntry(index);
+      const key = `${dropped.conversationId || ''}\u0000${dropped.agent || ''}`;
+      let held = queueGaps.get(key);
+      if (!held) {
+        held = {
+          entry: {
+            conversationId: dropped.conversationId,
+            agent: dropped.agent,
+            event: {
+              time: dropped.event.time,
+              kind: 'chat_error',
+              text: ''
+            }
+          },
+          count: 0,
+          kinds: Object.create(null)
+        };
+        queueGaps.set(key, held);
+        queueGapKeys.set(held.entry, key);
+        queue.splice(Math.min(index, queue.length), 0, held.entry);
+        accountQueueEntry(held.entry);
+      }
+      held.count += 1;
+      const kind = typeof dropped.event.kind === 'string' ? dropped.event.kind : 'observation';
+      held.kinds[kind] = (held.kinds[kind] || 0) + 1;
+      const detail = Object.entries(held.kinds)
+        .map(([name, count]) => `${count} ${name}`)
+        .join(', ');
+      held.entry.event.text =
+        `⚠ ${held.count} observation(s) (${detail}) were lost before the extension service worker accepted them ` +
+        'because the page-local queue hit its count or byte budget. This part of the history is incomplete.';
+      accountQueueEntry(held.entry);
+    }
   }
 
   /**
@@ -466,17 +685,34 @@
     flushing = true;
     try {
       const batch = queue.slice(0, 200);
+      // Freeze overflow markers that enter this delivery attempt. New observations can
+      // arrive while the service worker is answering. If they overflow too, they need a
+      // new marker; mutating one already in flight and then removing that batch would erase
+      // losses the service worker never received.
+      for (const entry of batch) {
+        const gapKey = queueGapKeys.get(entry);
+        if (gapKey && queueGaps.get(gapKey)?.entry === entry) queueGaps.delete(gapKey);
+      }
       const reply = await ask({
         type: 'events',
         entries: batch,
         conversationId: conversationId || undefined
       });
-      // The worker accepting means it is journalled, not that the app has it. Only then
-      // is it safe to forget here.
-      if (reply && reply.ok === true) {
+      // `ok` means the service worker handled the message, not necessarily that its journal
+      // reached chrome.storage.session. Release page ownership only when the worker says the
+      // batch is durable, or pending=0 proves the local app already accepted it all. Keeping
+      // an ambiguous batch can replay it, which downstream is designed to tolerate; dropping
+      // it here cannot be repaired after a service-worker restart.
+      observed.sends += 1;
+      if (!reply || reply.ok !== true) observed.failures += 1;
+      if (reply && reply.ok === true && (reply.durable === true || reply.pending === 0)) {
+        for (const entry of batch) {
+          if (entry?.event?.kind !== 'tool_evidence') continue;
+          for (const call of entry.event.calls || []) traceStage(call && call.requestId, 'sent');
+        }
         const sent = new Set(batch);
         for (let index = queue.length - 1; index >= 0; index--) {
-          if (sent.has(queue[index])) queue.splice(index, 1);
+          if (sent.has(queue[index])) removeQueueEntry(index);
         }
       }
     } finally {
@@ -491,10 +727,15 @@
    * renamed may have been journalled by a previous page load of this same tab.
    */
   let boundId = null;
+  let bindRetryAt = 0;
   async function bindConversation(id) {
     if (!id || boundId === id) return;
-    boundId = id;
-    await ask({ type: 'bind', conversationId: id });
+    // Latch on the worker's answer, never on the attempt. Marking the id bound up front made
+    // a single refused `bind` permanent: the worker kept the tab pointed at the *previous*
+    // conversation, and nothing ever asked again. That is what left the popup showing the
+    // old chat's id beside the new chat's URL while the app had no session for either.
+    const reply = await ask({ type: 'bind', conversationId: id });
+    if (reply && reply.ok === true) boundId = id;
   }
 
   /**
@@ -646,6 +887,7 @@
     nativePhase = '';
     pressedAt = 0;
     localError = '';
+    retirementHandledFor = null;
     generating = false;
     quietSince = 0;
     quietTurn = null;
@@ -660,9 +902,14 @@
     userStopped = false;
     stallReported = false;
     fiberTerminalMessageId = null;
+    // The settle window names a turn in the conversation being left behind. Carrying it
+    // across would re-read chat B's tree and attribute what it finds to chat A's turn.
+    fiberSettleUntil = 0;
+    fiberSettled = null;
     pageToolsReported.clear();
     callsReported.clear();
     messagesReported.clear();
+    userAuthoredTimesReported.clear();
     // Fiber descriptors and per-call request evidence belong to the conversation whose
     // React tree they were read from. Never carry that cache across an SPA navigation.
     fiberRows = new Map();
@@ -839,7 +1086,12 @@
       return (errorFirstSeen.get(error.node) ?? turnId) === turnId;
     });
     if (failures.length > 0) return { outcome: 'failed', detail: failures[0].text };
-    if (answerText(turn).length > 0) return { outcome: 'completed' };
+    // Degraded fallback only. If the MAIN-world Fiber helper has ever answered on this page,
+    // its end_turn bit is the authority on successful completion and mere visible prose is
+    // never enough to close a quiet turn: interim commentary is public assistant prose too.
+    // A browser where Fiber genuinely is unavailable still needs a usable lifecycle, so the
+    // old DOM rule remains there behind this capability check.
+    if (!fiberPresent && answerText(turn).length > 0) return { outcome: 'completed' };
     if (turnStartedAt > 0 && Date.now() - lastChangeAt > STALL_MS) {
       return { outcome: 'stalled', detail: 'no visible output and no progress for ten minutes' };
     }
@@ -973,6 +1225,14 @@
     // that snapshot as `final:true` made a reload recovery synthesize a *completed* turn when
     // the explicit interrupted end was lost. Their prose is already captured as progress;
     // only a completed generation publishes a final answer.
+    // Open the request-id settle window for every outcome, not only a completed one. The
+    // publish below is about prose and stays gated; ownership evidence is not prose, and an
+    // interrupted or failed turn is exactly the turn whose refused tool call most needs to be
+    // placed in the chat that made it.
+    if (endedTurnId) {
+      fiberSettled = { pageTurnId: ended?.id || null, localTurnId: endedTurnId };
+      fiberSettleUntil = Date.now() + FIBER_SETTLE_MS;
+    }
     if (endedTurnId && publishFinal && result.outcome === 'completed') {
       void refreshFiber({ pageTurnId: ended?.id || null, localTurnId: endedTurnId });
     }
@@ -1062,7 +1322,11 @@
       const ended = quietTurn || generationTurn();
       const fresh = endOutcome(ended);
       const result = quietOutcome && quietOutcome.outcome !== 'unknown' ? quietOutcome : fresh;
-      finishGeneration(ended, result.outcome === 'unknown' ? { outcome: 'unknown' } : result, false);
+      // A new user message is an actual boundary, unlike a disappearing Stop control. Once
+      // that boundary is proven, authored prose is enough to classify the old turn as a
+      // completed answer when no stronger failure/interruption/stall outcome exists.
+      const bounded = result.outcome === 'unknown' && answerText(ended).length > 0 ? { outcome: 'completed' } : result;
+      finishGeneration(ended, bounded.outcome === 'unknown' ? { outcome: 'unknown' } : bounded, false);
     }
 
     if (nowGenerating && !generating && !fiberTerminalMessageId && !resumeIdentityPending) {
@@ -1147,6 +1411,14 @@
     // worker calls into Unattributed. Scan whenever a generation is live. If ChatGPT's
     // message model is not available yet the helper simply returns no evidence, and the next
     // observation tries again while the exact MCP request waits in the recorder grace window.
+    // A refused `bind` is not a decision, it is an outage — a sleeping worker, or a tab whose
+    // ownership was wrongly retired. Keep asking until the worker agrees, throttled so a real
+    // outage costs one message every few seconds rather than one per tick.
+    if (conversationId && boundId !== conversationId && Date.now() - bindRetryAt >= 5000) {
+      bindRetryAt = Date.now();
+      void bindConversation(conversationId);
+    }
+
     if (generating) {
       void refreshFiber();
     } else if (fiberTerminalMessageId && nowGenerating) {
@@ -1154,6 +1426,20 @@
       void refreshFiber({
         pageTurnId: terminalTurn?.id || null,
         terminalProbe: fiberTerminalMessageId
+      });
+    } else if (fiberSettleUntil > Date.now()) {
+      // ChatGPT does not always have `metadata.request_id` on a connector request by the time
+      // the turn it belongs to ends — sometimes it appears seconds later, sometimes only when
+      // the conversation is next synced. Until 1.8.8 the only reader of that field ran while
+      // `generating` was true, so an id that landed a second after the stop button vanished
+      // was never read at all: the call stayed in Unattributed activity until the *next* turn
+      // started, or the user reloaded. Keep scanning after the turn, but only while a call is
+      // actually still missing its id, and never past the ceiling — see `fiberSettleUntil`.
+      // Flushed straight away rather than on the idle 10-second cadence: the app is usually
+      // already blocked waiting for exactly this id, and the wait is measured in seconds.
+      void refreshFiber(fiberSettled).then(() => {
+        if (!alive || !sameChat()) return;
+        void flush();
       });
     }
 
@@ -1344,7 +1630,7 @@
         timer = null;
         if (!alive) return;
         observe();
-      }, 50);
+      }, TRANSCRIPT_OBSERVE_MS);
     }).observe(document.body, { childList: true, subtree: true, characterData: true });
   }
 
@@ -1489,6 +1775,24 @@
   let fiberAsking = null;
   /** Off until the helper answers once, so a browser without it behaves exactly as before. */
   let fiberPresent = false;
+  /** Avoid turning a missing MAIN-world helper into one script injection per observer tick. */
+  let fiberRepairAt = -Infinity;
+  let fiberRepairing = null;
+  /**
+   * How long a finished turn keeps being re-read for request ids that were not there yet.
+   *
+   * `metadata.request_id` is the only ownership evidence there is, and ChatGPT publishes it
+   * on its own schedule — usually while the turn runs, sometimes seconds after it ends. The
+   * window is a ceiling, not a schedule: scanning stops the moment every call on screen has
+   * an id, so a normal turn pays nothing for it. Ninety seconds is chosen against the live
+   * failures, where the id landed twenty seconds after the turn completed and, in one case,
+   * only when the page was reloaded two minutes later; anything unresolved by then is not
+   * coming without a reload, and the deterministic repair pass will place it if it ever does.
+   */
+  const FIBER_SETTLE_MS = 90_000;
+  let fiberSettleUntil = 0;
+  /** The turn identity to attribute a settled-window scan to, from finishGeneration. */
+  let fiberSettled = null;
   /**
    * Message ids whose per-call evidence has already been reported. Every scan re-reads the
    * whole turn, so without this the same request would be re-sent on every poll.
@@ -1496,6 +1800,8 @@
   const callsReported = new Map();
   /** Last canonical browser snapshot sent for each ChatGPT assistant message id. */
   const messagesReported = new Map();
+  /** ChatGPT-authored create_time already emitted for each stable user-message occurrence. */
+  const userAuthoredTimesReported = new Map();
 
   const cap = (value, max) => (typeof value === 'string' && value.length > 0 ? value.slice(0, max) : null);
 
@@ -1579,6 +1885,13 @@
       });
     }
     const kept = calls.filter((call) => !duplicated.has(call.messageId));
+    observed.calls = kept.length;
+    for (const call of kept) {
+      if (!call.requestId) continue;
+      observed.requestId = call.requestId;
+      traceStage(call.requestId, 'read');
+      traceStage(call.requestId, 'tool', call.tool);
+    }
     const messages = [];
     const messageIndex = new Map();
     const conflictingMessages = new Set();
@@ -1684,6 +1997,7 @@
         const data = event.data;
         if (!data || typeof data !== 'object') return;
         if (data.source !== FIBER_REPLY || data.nonce !== nonce || data.v !== FIBER_VERSION) return;
+        if (data.scanOk !== true) return finish(null);
         const turns = [];
         if (Array.isArray(data.turns)) {
           for (const raw of data.turns.slice(0, FIBER_MAX_TURNS)) {
@@ -1735,13 +2049,55 @@
     // never be emitted under chat B's conversation id.
     const askedEpoch = epoch;
     const askedConversation = conversationId;
-    const answer = await askFiber();
-    if (answer === null) return;
+    let answer = await askFiber();
+    if (answer === null) {
+      // One missed reply is not proof the helper is gone: a busy main thread can outlive this
+      // bounded poll. Keep the last proven state while the worker attempts a repair. Only a
+      // completed repair attempt that still cannot round-trip (or an explicit repair failure)
+      // downgrades health; otherwise a transient timeout would flicker Overwrite and could
+      // falsely complete interim prose through the degraded DOM fallback.
+      const now = Date.now();
+      if (!fiberRepairing && now - fiberRepairAt >= 5000) {
+        fiberRepairAt = now;
+        fiberRepairing = ask({ type: 'repair_fiber' }).finally(() => {
+          fiberRepairing = null;
+        });
+      }
+      const repair = fiberRepairing ? await fiberRepairing : null;
+      if (repair && repair.ok === true) answer = await askFiber();
+      if (answer === null) {
+        // `unknown_message` is compatibility with an older service worker during extension
+        // update. It has not actually tested the helper, so preserve the last proof until the
+        // update recovery path installs the matching worker. Every current worker returns a
+        // definitive success/failure for repair_fiber.
+        if (repair && (repair.ok === true || repair.error !== 'unknown_message')) {
+          fiberPresent = false;
+          fiberRows = new Map();
+          fiberTurns = new Map();
+        }
+        return;
+      }
+    }
     if (epoch !== askedEpoch || conversationId !== askedConversation) return;
     // The route can move before observe() has had a chance to update our local conversation
     // state. Epoch/conversation checks alone therefore are not enough: in that window they
     // still both say A while the Fiber tree already belongs to B.
     if (askedConversation && CLF_DOM.conversationId() !== askedConversation) return;
+    const concreteConversation = (value) =>
+      typeof value === 'string' && /^[0-9a-f-]{8,64}$/i.test(value) ? value : null;
+    if (
+      askedConversation &&
+      (answer.turns.some((turn) => {
+        const pageConversation = concreteConversation(turn.conversationId);
+        return pageConversation && pageConversation !== askedConversation;
+      }) ||
+        [...answer.rows.values()].some((row) => {
+          const pageConversation = concreteConversation(row.conversationId);
+          return pageConversation && pageConversation !== askedConversation;
+        }))
+    ) {
+      return;
+    }
     fiberPresent = true;
     fiberRows = answer.rows;
     fiberTurns = new Map();
@@ -1803,6 +2159,16 @@
         });
       }
     }
+    // What the settle window is waiting for, decided from the scan itself rather than from a
+    // timer: a connector request the page model has not yet stamped with its request id. When
+    // every visible call has one there is nothing left to re-read, so the window closes now
+    // and an ordinary turn costs no scans at all after it ends.
+    if (fiberSettleUntil > Date.now()) {
+      const awaitingRequestId = answer.turns.some((turn) =>
+        (turn.calls || []).some((call) => !call.requestId)
+      );
+      if (!awaitingRequestId) fiberSettleUntil = 0;
+    }
     // Assistant prose and ChatGPT-native thinking/activity are one interleaved page-model
     // stream. Fiber validates them separately, but each item carries its original model
     // ordinal so we can restore the exact order before recording. Keeping two independent
@@ -1850,13 +2216,19 @@
         const message = item.value;
         if (message.role === 'user') {
           const key = occurrenceKey(message.messageId, message.rawText);
-          if (seenMessages.has(key)) continue;
-          markSeen(key);
+          if (message.createTime) {
+            if (userAuthoredTimesReported.get(key) === message.createTime) continue;
+            userAuthoredTimesReported.set(key, message.createTime);
+            markSeen(key);
+          } else {
+            if (seenMessages.has(key)) continue;
+            markSeen(key);
+          }
           emit({
             kind: 'user_message',
             messageId: message.messageId,
             text: message.rawText,
-            ...(message.createTime ? { time: message.createTime } : {})
+            ...(message.createTime ? { time: message.createTime, authoredTime: true } : {})
           });
           continue;
         }
@@ -1888,7 +2260,9 @@
         // exact local turn id from reaching the recorder. The recorder upsert is expressly
         // able to promote the same canonical message when stronger ownership arrives.
         const owner = index === activeTurnIndex ? activeLocalTurnId || '' : '';
-        const signature = `${state}\u0000${message.rawText}\u0000${message.renderedHtml}\u0000${owner}`;
+        const signature =
+          `${state}\u0000${message.rawText}\u0000${message.renderedHtml}\u0000${owner}` +
+          `\u0000${message.createTime || ''}`;
         if (messagesReported.get(message.messageId) === signature) continue;
         messagesReported.set(message.messageId, signature);
         if (state === 'streaming') lastChangeAt = Date.now();
@@ -1898,7 +2272,7 @@
           turnId: index === activeTurnIndex ? activeLocalTurnId : undefined,
           text: message.rawText,
           renderedHtml: message.renderedHtml,
-          ...(message.createTime ? { time: message.createTime } : {}),
+          ...(message.createTime ? { time: message.createTime, authoredTime: true } : {}),
           state,
           final: state === 'final'
         });
@@ -1924,6 +2298,7 @@
     if (callsReported.size > 4000) callsReported.clear();
     if (messagesReported.size > 4000) messagesReported.clear();
     if (pageToolsReported.size > 4000) pageToolsReported.clear();
+    if (userAuthoredTimesReported.size > 4000) userAuthoredTimesReported.clear();
   }
 
   /** What the page says about this block, or null. */
@@ -2995,6 +3370,25 @@
    * renderer: an incomplete local transcript is useful in the app, but it is never sufficient
    * evidence to hide the source transcript the user is currently reading.
    */
+  /**
+   * Whether Fiber has already exposed a connector call that the local replacement cannot show.
+   *
+   * This is different from an ordinary transient incomplete scan: an exact new request appears
+   * in ChatGPT's page model before the MCP handler can return and before recordToolCall() can
+   * append it to /activity. Keeping the previous overwrite mounted in that window hides the only
+   * current representation of the call. A newly observed unidentifiable call is equally unsafe.
+   */
+  function hasUnrepresentedFiberCall(turn, entries) {
+    const descriptor = fiberTurnFor(turn);
+    if (!descriptor) return false;
+    for (const call of descriptor.calls || []) {
+      const key = websiteKey('request', call && call.requestId);
+      if (!key) return true;
+      if (!(entries || []).some((entry) => entryHasWebsiteKey(entry, key))) return true;
+    }
+    return false;
+  }
+
   function completeReplacementForTurn(turn, entries) {
     const descriptor = fiberTurnFor(turn);
     if (!descriptor) return false;
@@ -3252,7 +3646,28 @@
           );
       const rendered = visibleStream(raw, group ? group.id : localId || turn.id);
 
-      if (!enabled || rendered.length === 0 || !completeReplacementForTurn(turn, rendered)) {
+      if (!enabled) {
+        if (existing) existing.remove();
+        CLF_DOM.replaceTurn(turn, null, false);
+        CLF_DOM.hideProgress(turn, false);
+        for (const block of CLF_DOM.toolBlocks(turn)) block.removeAttribute('data-clf-native-hidden');
+        continue;
+      }
+
+      if (rendered.length === 0 || !completeReplacementForTurn(turn, rendered)) {
+        const lastComplete = existing ? Number(existing.dataset.clfCompleteAt) : 0;
+        // A one-second observer and a two-second activity pull race each other by design.
+        // Once this exact section has already been proven complete, do not tear ownership
+        // down just because one transient Fiber scan or feed page is a beat behind. That
+        // produced the visible full-overwrite -> native -> full-overwrite snap on reload and
+        // during tool phases. Persistent incompleteness still falls back after the grace.
+        const currentCallMissing = hasUnrepresentedFiberCall(turn, rendered);
+        if (
+          !currentCallMissing &&
+          existing &&
+          Number.isFinite(lastComplete) &&
+          Date.now() - lastComplete < REPLACEMENT_GRACE_MS
+        ) continue;
         if (existing) existing.remove();
         CLF_DOM.replaceTurn(turn, null, false);
         CLF_DOM.hideProgress(turn, false);
@@ -3262,6 +3677,7 @@
 
       const root = existing || document.createElement('div');
       root.className = 'clf-stream';
+      root.dataset.clfCompleteAt = String(Date.now());
       root.dataset.clfTurn = turn.id || (group && group.id) || localId || 'anchored';
       // Commentary text is part of the signature: one caption grows in place under the same
       // seq, so a signature made of seq and kind alone would never notice it had changed.
@@ -3321,6 +3737,35 @@
       }
       if (!current()) return;
       const data = reply.data;
+      // Popup-only. `sessionId` is the app saying it has a session for this exact chat,
+      // which is the difference between "delivered" and "the app is actually recording it".
+      observed.session = typeof data.sessionId === 'string' ? data.sessionId : null;
+      observed.pulledAt = Date.now();
+      if (data.retiredWorker && typeof data.retiredWorker === 'object') {
+        const worker = String(data.retiredWorker.id || 'worker');
+        const reason = String(data.retiredWorker.reason || 'its sub-agent run ended');
+        autoCompactReady = false;
+        localError = `${worker} was retired because ${reason}. This chat can no longer use local tools.`;
+        if (retirementHandledFor !== forId) {
+          retirementHandledFor = forId;
+          const stop = CLF_DOM.stopButton();
+          if (stop && typeof stop.click === 'function') stop.click();
+          emit({ kind: 'chat_error', text: localError });
+        }
+        renderControl();
+        return;
+      }
+      if (data.resetActivity === true) {
+        // The app deliberately bounded an old/reload cursor to its newest presentation
+        // window. Replace, never merge, or stale rows from before the gap would survive
+        // beside the authoritative tail and appear to jump across turns.
+        bySeq.clear();
+        streamBySeq.clear();
+        streamMessageSeq.clear();
+        userAnchorByMessage.clear();
+        const truncatedFrom = Number(data.truncatedFrom);
+        if (Number.isFinite(truncatedFrom) && truncatedFrom >= 0) since = truncatedFrom;
+      }
       for (const anchor of Array.isArray(data.userAnchors) ? data.userAnchors : []) {
         const seq = Number(anchor && anchor.seq);
         const messageId = typeof (anchor && anchor.messageId) === 'string' ? anchor.messageId : '';
@@ -3347,6 +3792,13 @@
         const seq = Number(entry && entry.seq);
         if (!Number.isFinite(seq)) continue;
         if (seq >= since) since = seq + 1;
+        // The app's own verdict on a request id, arriving on the feed this page already
+        // polls. `request_id` means it resolved the call to this conversation; anything
+        // else means the call reached the app but could not be placed by its id.
+        if (entry.kind === 'tool_call' && entry.requestId) {
+          traceStage(entry.requestId, 'app', entry.attribution);
+          traceStage(entry.requestId, 'tool', entry.tool);
+        }
         if (entry && entry.kind === 'assistant_message' && entry.messageId) {
           const messageId = String(entry.messageId);
           const priorSeq = streamMessageSeq.get(messageId);
@@ -3431,7 +3883,7 @@
     // Outside the guard, and last: startCompact runs for tens of seconds and polls this
     // same endpoint while it works, so firing it with `pulling` still set would deadlock
     // the run against the poll that started it.
-    await maybeAutoCompact();
+    if (current() && CLF_DOM.conversationId() === forId) await maybeAutoCompact(forId, forEpoch);
   }
 
   // ------------------------------------------------------- composer control
@@ -3448,12 +3900,12 @@
 
     if (job && job.busy) {
       if (job.stage === 'opening') {
-        return { mode: 'busy', label: 'Opening fresh chat…', hint: 'Handoff saved', action: 'cancel' };
+        return { mode: 'busy', label: 'Opening…', hint: 'Handoff saved, opening the fresh chat', action: 'cancel' };
       }
       if (job.stage === 'waiting-for-browser') {
         return {
           mode: 'waiting',
-          label: 'Waiting for Chrome…',
+          label: 'Waiting…',
           hint: job.error || 'The app is trying to open the fresh chat.',
           action: 'cancel'
         };
@@ -3463,7 +3915,7 @@
       // right now; `handoff-pending` is the app saying it has asked and is waiting.
       return {
         mode: 'busy',
-        label: NATIVE_PHASE_LABELS[phase] || 'Asking ChatGPT…',
+        label: NATIVE_PHASE_LABELS[phase] || 'Asking…',
         hint: 'ChatGPT is writing the handoff',
         action: 'cancel'
       };
@@ -3476,22 +3928,22 @@
      * is a button that is missing whenever it is wanted.
      */
     if (job && job.stage === 'done') {
-      return { mode: 'done', label: 'Fresh chat opened', hint: '', action: 'start' };
+      return { mode: 'done', label: 'Opened', hint: 'The fresh chat is open', action: 'start' };
     }
     if (job && job.stage === 'failed') {
       if (job.error === 'cancelled') {
-        return { mode: 'idle', label: 'Compact & resume', hint: 'Resume cancelled', action: 'start' };
+        return { mode: 'idle', label: 'Compact', hint: 'Resume cancelled', action: 'start' };
       }
-      return { mode: 'error', label: 'Compaction failed', hint: job.error || '', action: 'start' };
+      return { mode: 'error', label: 'Failed', hint: job.error || 'Compaction failed', action: 'start' };
     }
     if (pressedAt > 0 && now - pressedAt < PRESS_GRACE_MS) {
       return { mode: 'busy', label: 'Starting…', hint: '', action: 'none' };
     }
-    if (error) return { mode: 'error', label: 'Could not start', hint: error, action: 'start' };
+    if (error) return { mode: 'error', label: 'Failed', hint: error, action: 'start' };
     if (disconnected) {
       return {
         mode: 'off',
-        label: 'Compact & resume',
+        label: 'Compact',
         hint: 'Browser connection is disconnected in ChatGPT Local Files.',
         action: 'none'
       };
@@ -3499,15 +3951,15 @@
     if (!connected) {
       return {
         mode: 'off',
-        label: 'Compact & resume',
+        label: 'Compact',
         hint: 'ChatGPT Local Files is not running on this PC.',
         action: 'none'
       };
     }
     if (!conversationId) {
-      return { mode: 'off', label: 'Compact & resume', hint: 'Send a message first.', action: 'none' };
+      return { mode: 'off', label: 'Compact', hint: 'Send a message first.', action: 'none' };
     }
-    return { mode: 'idle', label: 'Compact & resume', hint: '', action: 'start' };
+    return { mode: 'idle', label: 'Compact', hint: '', action: 'start' };
   }
 
   /**
@@ -3670,42 +4122,57 @@
   }
 
   /**
-   * Starts automatic compaction only after the app reports one durable threshold crossing.
+   * Starts automatic compaction in the middle of the work, which is the only place it helps.
    *
-   * The page does not compare `tokens >= threshold` any more. That level check is what made
-   * every old 350k chat compact the instant it was opened, and every later poll was another
-   * opportunity to start it again. The store now detects the edge (`below -> at/above`),
-   * waits for the crossing turn to finish, and exposes exactly one claimable bit here.
+   * The page does not compare `tokens >= threshold` itself — the app owns the number and
+   * says, per poll, whether this chat is over it and still has its one trigger. What the
+   * page adds is the half only it can see: ChatGPT is answering *right now*.
+   *
+   * That condition is the exact inverse of what this used to demand, and the inversion is
+   * the point. Waiting for the turn to end meant every automatic compaction landed on a
+   * finished answer — the one moment where a handoff carries nothing across, because the
+   * job is already done. Interrupting is what the user is asking for at 300k: stop here,
+   * write the brief, carry on in a fresh chat. Mid-tool-call counts as mid-turn, and is
+   * handled by the same settle barrier a manual press goes through.
    */
-  async function maybeAutoCompact() {
+  async function maybeAutoCompact(expectedConversation = conversationId, expectedEpoch = epoch) {
+    const current = () =>
+      alive &&
+      conversationId === expectedConversation &&
+      epoch === expectedEpoch &&
+      CLF_DOM.conversationId() === expectedConversation;
+    if (!current()) return;
     if (!conversationId || !context || !context.auto || !autoCompactReady) return;
     // Anything already running owns this chat, including a run started by hand.
     if (nativeBusy || pressedAt > 0) return;
     if (job && job.busy) return;
-    if (pendingTools > 0) return;
-    // Three independent views of liveness, all must say idle. `CLF_DOM.generating()` can
-    // flicker false between phases; the local generation state and the recorder's durable
-    // activeTurnId keep that transient gap from stopping a live answer.
-    if (generating || appActiveTurnId || CLF_DOM.generating()) return;
+    // Three views of liveness, and any of them is enough. `CLF_DOM.generating()` flickers
+    // false between phases of one answer, so demanding all three would miss long turns at
+    // exactly their busiest moments; the local generation flag and the app's durable
+    // activeTurnId cover that gap. An idle or stale chat has none of the three, which is
+    // what lets an old 500k conversation be opened and read without being compacted.
+    if (!generating && !appActiveTurnId && !CLF_DOM.generating()) return;
 
     // Consume before touching ChatGPT. If the tab vanishes or the barrier fails after this,
-    // the same crossing is finished forever and the user can retry manually.
+    // this chat's automatic compaction is spent and the user can still press the button.
     const claimed = await ask({ type: 'auto_compact_claim', conversationId });
+    if (!current()) return;
     if (!claimed || claimed.ok !== true || claimed.data?.claimed !== true) {
       autoCompactReady = false;
       return;
     }
     autoCompactReady = false;
-    await startCompact({ automatic: true });
+    if (!current()) return;
+    await startCompact();
   }
 
   /** Local phases of a ChatGPT-native compaction, as the button says them. */
   const NATIVE_PHASE_LABELS = {
     requested: 'Starting…',
-    interrupting: 'Stopping this turn…',
-    settling: 'Finishing local tools…',
-    prompting: 'Asking ChatGPT…',
-    waiting: 'ChatGPT is writing…'
+    interrupting: 'Stopping…',
+    settling: 'Settling…',
+    prompting: 'Asking…',
+    waiting: 'Writing…'
   };
 
   const ICON =
@@ -3849,7 +4316,13 @@
     control.button.setAttribute('data-clf-tip', meter ? `${tip}\n${meter.tip}` : tip);
     control.pill.hidden = state.mode === 'idle' && !state.hint;
     control.cancel.hidden = state.action !== 'cancel';
-    const shown = state.hint && !busy ? `${state.label} · ${state.hint}` : state.label;
+    // One word, always. The pill sits inside ChatGPT's composer and has a button's width
+    // to work with; `label · hint` spent all of it on a sentence that then got ellipsed
+    // halfway through, so it read as neither. The hint is on the hover tip, in full.
+    //
+    // The one exception is a failure, where the identifying detail *is* the message and a
+    // one-word "Failed" would send the reader hunting for a tooltip to find out why.
+    const shown = state.mode === 'error' && state.hint ? state.hint : state.label;
     if (control.text.textContent !== shown) control.text.textContent = shown;
   }
 
@@ -3991,9 +4464,8 @@
     stagePanel.body.hidden = view.body === '';
   }
 
-  async function startCompact(options = {}) {
+  async function startCompact() {
     if (!conversationId) return;
-    const automatic = options && options.automatic === true;
     // One press, one run. The native path spends tens of seconds interrupting and typing,
     // and a second press inside that window would submit the instruction twice — which is
     // the one thing the app cannot fix afterwards, because the second prompt is a second
@@ -4013,7 +4485,9 @@
     // Asking first and stopping afterwards would cut the brief from a conversation whose
     // last turn was still being written and whose tool calls were still running — a
     // summary of a machine state that had already moved on.
-    const barrier = await stopAndSettle({ interrupt: !automatic });
+    // Automatic runs stop the turn exactly like a press does. They are *started* by a turn
+    // being in flight, so refusing to interrupt one would refuse every automatic run.
+    const barrier = await stopAndSettle();
     if (barrier) {
       pressedAt = 0;
       nativeBusy = false;
@@ -4067,12 +4541,11 @@
    * not hear about it, and the handoff would describe a machine that no longer exists by
    * the time the fresh chat reads it.
    */
-  async function stopAndSettle(options = {}) {
-    const interrupt = options.interrupt !== false;
-    // INTERRUPTING — stop the turn rather than wait it out. That is the whole request: the
-    // user presses this because the turn is long, not because it is nearly done.
+  async function stopAndSettle() {
+    // INTERRUPTING — stop the turn rather than wait it out. That is the whole request, by
+    // hand or automatically: this happens because the turn is long, not because it is
+    // nearly done.
     if (CLF_DOM.generating()) {
-      if (!interrupt) return 'Automatic compaction was skipped because another turn started.';
       nativePhase = 'interrupting';
       renderControl();
       const stop = CLF_DOM.stopButton();
@@ -4576,21 +5049,26 @@
     let composer = CLF_DOM.composer();
     // Compared with whitespace squeezed out of both sides. The composer is a rich-text
     // editor: a blank line in the bootstrap becomes a paragraph break, and `textContent`
-    // stitches the paragraphs back together with no separator at all — so a literal
-    // comparison against the first 80 characters failed for every task short enough that
-    // the wrapper's blank line landed inside them, and reported a healthy insert as
-    // React having replaced the composer. What this check is actually for is proving our
-    // text is still there, and squeezing whitespace proves exactly that.
+    // stitches the paragraphs back together with no separator at all. Compare the entire
+    // whitespace-normalized value: a prefix proves insertion happened, but it would also
+    // approve user text appended after focus moved into this tab.
     const squeeze = (value) => (value || '').replace(/\s+/g, '');
-    const expectedHead = squeeze(boot.text).slice(0, 80);
-    if (!composer || !squeeze(composer.textContent).includes(expectedHead)) {
+    const expectedText = squeeze(boot.text);
+    if (!composer || squeeze(composer.textContent) !== expectedText) {
       if (composer && !(composer.textContent || '').trim() && CLF_DOM.insertPrompt(boot.text)) {
         await sleep(100);
         composer = CLF_DOM.composer();
       }
-      if (!composer || !squeeze(composer.textContent).includes(expectedHead)) {
+      if (!composer || squeeze(composer.textContent) !== expectedText) {
         return void (await fail('ChatGPT replaced the composer while inserting the bootstrap'));
       }
+    }
+    // The browser opener can focus this fresh tab while the user is typing elsewhere. The
+    // point-in-time empty check above is not enough: any edit after insertion must preserve
+    // the user's draft and abort, never submit a bootstrap/user-text mixture as a worker task.
+    composer = CLF_DOM.composer();
+    if (!composer || squeeze(composer.textContent) !== expectedText) {
+      return void (await fail('the composer changed before bootstrap send; the draft was preserved'));
     }
     if (!CLF_DOM.send()) return void (await fail('the send button never became usable'));
     agent = boot.agent || null;
@@ -4651,6 +5129,30 @@
     }, ms);
   }
 
+  let activityTimer = null;
+  function scheduleActivityPull(delay = 0) {
+    if (activityTimer !== null) return;
+    activityTimer = setTimeout(async () => {
+      activityTimer = null;
+      if (!alive) return;
+      try {
+        await pullActivity();
+      } catch {
+        // The next scheduled pass retries after worker/app recovery.
+      }
+      const hidden = typeof document !== 'undefined' && document.visibilityState === 'hidden';
+      const active = generating || nativeBusy || Boolean(job && job.busy) || pendingTools > 0;
+      // Re-arming is a periodic loop, and periodic loops belong to the live page, exactly as
+      // for every(): the harness stubs setInterval out so every() never ticks, and drives each
+      // behaviour through the test hook instead. This pull re-arms with setTimeout rather than
+      // setInterval, so it walked straight past that seam — and the harness's setTimeout runs
+      // its callback in a microtask, which turned one background poll into an unbroken
+      // microtask chain that starved the event loop. The next test then waited forever for a
+      // window 'load' event that no macrotask could ever deliver.
+      if (!TEST_MODE) scheduleActivityPull(hidden ? HIDDEN_ACTIVITY_MS : active ? ACTIVITY_MS : IDLE_ACTIVITY_MS);
+    }, Math.max(0, delay));
+  }
+
   // Re-attach immediately when React swaps the composer out, rather than up to a second
   // later. Cheap because it does nothing unless our node has actually been detached.
   function watchComposer() {
@@ -4696,6 +5198,28 @@
       // ChatGPT document stays open. No page/session data crosses in this health check.
       if (message.type === 'clf-recorder-ping') {
         sendResponse({ ok: true, recorderVersion: FIBER_VERSION });
+        return false;
+      }
+      // Popup diagnostics. Ids and counters only — no prose, no transcript, no page text.
+      if (message.type === 'clf-page-status') {
+        sendResponse({
+          ok: true,
+          recorderVersion: FIBER_VERSION,
+          runId: RUN_ID,
+          conversationId,
+          agent,
+          epoch,
+          generating,
+          turnId,
+          generations: genCount,
+          queued: queue.length,
+          queueBytes,
+          trace: [...trace.values()].slice(-8).reverse(),
+          overwrite: RENDER_STREAM === true,
+          painted,
+          bridge: { connected: status.connected === true, paired: status.paired === true },
+          ...observed
+        });
         return false;
       }
       if (message.type === 'clf-render-stream') {
@@ -4765,7 +5289,15 @@
     renderStreams();
     foldBootstrap();
   });
-  every(ACTIVITY_MS, pullActivity);
+  scheduleActivityPull(ACTIVITY_MS);
+  if (typeof document !== 'undefined' && document.addEventListener) {
+    document.addEventListener('visibilitychange', () => {
+      if (document.visibilityState !== 'visible') return;
+      if (activityTimer !== null) clearTimeout(activityTimer);
+      activityTimer = null;
+      scheduleActivityPull(0);
+    });
+  }
   every(STATUS_MS, checkStatus);
 
   /**

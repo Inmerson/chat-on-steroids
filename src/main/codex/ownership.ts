@@ -7,16 +7,16 @@
  * one manager, so the same session ids are in scope everywhere, and `write_stdin(session_id)`
  * on a numeric id from another chat would otherwise reach that chat's shell.
  *
- * The rule is deliberately one-sided: a call is refused only when this app can *prove* the
- * process belongs to a different conversation. Identity here comes from ChatGPT's own request
- * correlation, which is not always resolved by the time a command runs, and an unproven guess
- * must never take a working terminal away from the chat that opened it.
+ * This is an authorization boundary. A proven owner can only be continued by that same proven
+ * conversation. Legacy/single-chat calls that carry no request identity are kept in a separate
+ * anonymous bucket so existing terminal semantics still work, but a later proven chat cannot
+ * adopt such a session and an anonymous call cannot touch a proven-owned session.
  */
 
 import { requestCorrelation } from '../session/correlation.js';
 
 /** Owners, keyed by the process id `exec_command` handed back as `session_id`. */
-const owners = new Map<number, string>();
+const owners = new Map<number, string | null>();
 
 /**
  * The conversation behind an in-flight MCP request, when it is already proven.
@@ -32,7 +32,7 @@ export function provenConversation(requestId: string | null, conversationId: str
 
 /** Records the conversation that opened a still-running exec session. */
 export function noteExecOwner(processId: number | null, conversationId: string | null): void {
-  if (processId === null || !conversationId) return;
+  if (processId === null) return;
   owners.set(processId, conversationId);
 }
 
@@ -50,12 +50,16 @@ export function execOwner(processId: number): string | null {
 /**
  * Whether `conversationId` may write to `processId`.
  *
- * Unknown on either side is allowed. Only two known and different conversations are a refusal.
+ * Proven sessions require the same proven caller. Anonymous sessions can only be continued by
+ * anonymous callers; they are never adoptable by a later identified conversation. A process
+ * with no registry entry at all is refused.
  */
 export function execOwnershipDenied(processId: number, conversationId: string | null): boolean {
-  if (!conversationId) return false;
+  if (!owners.has(processId)) return true;
   const owner = owners.get(processId);
-  return owner !== undefined && owner !== conversationId;
+  if (owner === null) return conversationId !== null;
+  if (!conversationId) return true;
+  return owner !== conversationId;
 }
 
 /** Test seam: the registry is process-global state with no natural lifetime boundary. */

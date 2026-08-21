@@ -47,6 +47,7 @@ import {
   listSessions,
   readAsset,
   readEvents,
+  readRecentEvents,
   renameSession,
   reopenSession,
   rewriteUnattributedToolCalls,
@@ -58,7 +59,6 @@ import {
 import {
   awaitRequestCorrelation,
   observeRequestCorrelation,
-  rejectRequestCorrelation,
   requestCorrelation,
   resetCorrelationRegistryForTests,
 } from './correlation.js';
@@ -85,6 +85,9 @@ interface LiveConversation {
    * app restart and not only for a page that stayed open.
    */
   openTurns: Set<string>;
+  /** Every local turn boundary already made durable, so at-least-once browser replay is idempotent. */
+  knownTurnStarts: Set<string>;
+  knownTurnEnds: Set<string>;
   /** Visible ChatGPT-native activity rows, updated by the page's stable row identity. */
   pageTools: Map<string, ProgressRecord>;
 }
@@ -197,6 +200,23 @@ export async function sessionForConversation(
   }
 }
 
+/**
+ * Reattaches an already-recorded ChatGPT conversation after process-memory loss.
+ *
+ * A browser `/activity` poll is first-hand evidence that the page is open, but it must not
+ * create a brand-new session for a conversation this app has never recorded. Check durable
+ * history first, then use the ordinary reopen path so live turn/session state is rebuilt from
+ * the existing log exactly as if the page had just reported an observation.
+ */
+export async function restoreRecordedConversation(conversationId: string): Promise<string | null> {
+  if (!recordingEnabled() || !conversationId) return null;
+  const existing = conversations.get(conversationId);
+  if (existing) return existing.sessionId;
+  const known = await findSessionByConversation(conversationId);
+  if (!known) return null;
+  return sessionForConversation(conversationId);
+}
+
 async function initializeSessionForConversation(
   conversationId: string | null,
   title?: string
@@ -242,6 +262,8 @@ async function initializeSessionForConversation(
     ? await storedHistory(summary.id)
     : {
         openTurns: new Set<string>(),
+        knownTurnStarts: new Set<string>(),
+        knownTurnEnds: new Set<string>(),
         activeTurnId: null,
         activeTurnStartedAt: null,
         pageTools: new Map<string, ProgressRecord>()
@@ -255,6 +277,8 @@ async function initializeSessionForConversation(
     turnStartedAt: history.activeTurnStartedAt,
     turnId: history.activeTurnId,
     openTurns: history.openTurns,
+    knownTurnStarts: history.knownTurnStarts,
+    knownTurnEnds: history.knownTurnEnds,
     pageTools: history.pageTools
   });
   if (!known) {
@@ -366,6 +390,10 @@ async function applyOrigin(sessionId: string, conversationId: string): Promise<v
 interface StoredHistory {
   /** Turns this log started and never ended — the only ones a recovery may close. */
   openTurns: Set<string>;
+  /** Every durable turn start, including starts whose turn has already ended. */
+  knownTurnStarts: Set<string>;
+  /** Every durable turn end, used to make at-least-once browser replay idempotent. */
+  knownTurnEnds: Set<string>;
   /** Newest still-open local generation, so a reloaded page can adopt it after app restart. */
   activeTurnId: string | null;
   /** Durable start time of activeTurnId. */
@@ -387,20 +415,27 @@ interface StoredHistory {
  */
 async function storedHistory(sessionId: string): Promise<StoredHistory> {
   const openTurns = new Set<string>();
+  const knownTurnStarts = new Set<string>();
+  const knownTurnEnds = new Set<string>();
   const turnStarts = new Map<string, number>();
   const pageTools = new Map<string, ProgressRecord>();
   try {
-    const events = await readEvents(sessionId, {
-      kinds: ['turn_start', 'turn_end', 'page_tool']
+    const events = await readRecentEvents(sessionId, 4096, {
+      kinds: ['turn_start', 'turn_end', 'page_tool'],
+      maxBytes: 2 * 1024 * 1024
     });
     for (const event of events) {
       if (event.kind === 'turn_start') {
         if (event.turnId) {
+          knownTurnStarts.add(event.turnId);
           openTurns.add(event.turnId);
           turnStarts.set(event.turnId, event.time);
         }
       } else if (event.kind === 'turn_end') {
-        if (event.turnId) openTurns.delete(event.turnId);
+        if (event.turnId) {
+          knownTurnEnds.add(event.turnId);
+          openTurns.delete(event.turnId);
+        }
       } else if (event.kind === 'page_tool' && event.messageId) {
         const held = pageTools.get(event.messageId);
         if (!held) {
@@ -431,7 +466,7 @@ async function storedHistory(sessionId: string): Promise<StoredHistory> {
       activeTurnStartedAt = startedAt;
     }
   }
-  return { openTurns, activeTurnId, activeTurnStartedAt, pageTools };
+  return { openTurns, knownTurnStarts, knownTurnEnds, activeTurnId, activeTurnStartedAt, pageTools };
 }
 
 async function ensureUnattributedSession(): Promise<string | null> {
@@ -494,13 +529,32 @@ export function liveConversations(): Array<{
 }
 
 /**
+ * Shortens the evidence waits for the test suite, and only for it.
+ *
+ * These windows exist because a real browser reports a request id up to several seconds
+ * after the connector already answered. The suite has no browser: it hands the recorder its
+ * evidence in the same process, microseconds later, or deliberately never. So every test
+ * that asserts "this ends up unattributed" paid the full fifteen seconds to prove a
+ * negative, and a handful of them dominated the whole run.
+ *
+ * Never set outside the test runner, so production keeps the measured windows. The value is
+ * also clamped to the production one, so this can only ever make a wait shorter.
+ */
+export function evidenceWindow(production: number): number {
+  const raw = process.env.CLF_EVIDENCE_MS;
+  if (raw === undefined) return production;
+  const parsed = Number.parseInt(raw, 10);
+  return Number.isSafeInteger(parsed) && parsed >= 0 ? Math.min(parsed, production) : production;
+}
+
+/**
  * How long a completed MCP call may wait for its exact page-side request id observation.
  *
  * This wait is request-specific: only the identical normalized x-request-id can satisfy it.
  * Chrome-off, conflicting, or missing evidence ends in Unattributed activity rather than a
  * tool/time/generation guess.
  */
-const REQUEST_ID_GRACE_MS = 15_000;
+const REQUEST_ID_GRACE_MS = evidenceWindow(15_000);
 
 /**
  * Late exact request-id evidence can arrive after a call already fell into Unattributed.
@@ -548,6 +602,17 @@ function scheduleAttributionRepair(): void {
  * The outer conversation id comes from the tab URL. `fiberConversationId` comes from the
  * React tree that also supplied these request messages. When both exist and disagree, none
  * of the batch is ownership evidence: choosing either side would silently cross-attribute.
+ *
+ * Disagreement discards the batch and nothing else. It used to mark every request id in it
+ * as contradictory, which is a permanent verdict — `requestCorrelation` answers null for a
+ * conflicted id forever, and the deterministic repair pass skips it — and the premise was
+ * wrong. Two conversations both claiming one request id is a contradiction, and merge()
+ * still calls that one; a page whose URL and React tree disagree is a page caught in the
+ * middle of something, which is the common case rather than the corrupt one: a chat being
+ * switched, a model still mounted from the conversation before it, a fresh chat whose
+ * client-side thread id is not yet the server's. Every one of those resolves a moment
+ * later, and the old rule spent that moment condemning perfectly provable calls to
+ * Unattributed activity for good.
  */
 function noteCallEvidence(
   conversationId: string,
@@ -558,9 +623,9 @@ function noteCallEvidence(
 ): void {
   if (fiberConversationId && fiberConversationId !== conversationId) {
     logWarn(
-      `request attribution rejected: URL conversation ${conversationId} disagrees with Fiber conversation ${fiberConversationId}`
+      `request attribution: ignoring ${calls.length} sighting(s) — URL conversation ${conversationId} disagrees ` +
+        `with Fiber conversation ${fiberConversationId}. Later agreeing evidence can still prove these calls.`
     );
-    for (const call of calls) if (call.requestId) rejectRequestCorrelation(call.requestId);
     return;
   }
   const observedAt = Math.min(at, Date.now());
@@ -936,7 +1001,17 @@ export function recordToolCall(input: ToolCallInput): Promise<ToolCallRecord | n
       turnId: live?.turnId ?? null
     };
     if (input.bind) bindAgentConversation(input.bind, input.conversationId);
-    return fileToolCall(input, target);
+    // Exact attribution skips the browser wait, not the write-order/quit-flush barrier. The
+    // old fast path called fileToolCall() directly, so a large first result could finish its
+    // asset/text work after a tiny second call and be appended second despite being invoked
+    // first; flushRecorder() also had no promise covering it. Queue the write like every other
+    // call while keeping attribution itself immediate.
+    const filed = recordChain.then(() => fileToolCall(input, target));
+    recordChain = filed.then(
+      () => undefined,
+      () => undefined
+    );
+    return filed;
   }
 
   // Late browser evidence is the only wait left in attribution. It can prove this exact
@@ -1154,6 +1229,8 @@ export interface ChatObservation {
     | 'chat_error'
     | 'tool_evidence';
   time: number;
+  /** True when `time` is ChatGPT's own authored create_time, not local observation time. */
+  authoredTime?: boolean;
   text?: string;
   /** ChatGPT's already-rendered authored markup for this same logical message. */
   renderedHtml?: string;
@@ -1239,7 +1316,27 @@ async function recordPageTool(
   return true;
 }
 
-export async function recordChatObservations(
+const observationChains = new Map<string, Promise<void>>();
+
+export function recordChatObservations(
+  conversationId: string,
+  observations: readonly ChatObservation[],
+  agent?: string | null
+): Promise<{ sessionId: string | null; stored: number }> {
+  const prior = observationChains.get(conversationId) ?? Promise.resolve();
+  const work = prior.then(() => recordChatObservationsNow(conversationId, observations, agent));
+  const tracked = work.then(
+    () => undefined,
+    () => undefined
+  );
+  observationChains.set(conversationId, tracked);
+  void tracked.finally(() => {
+    if (observationChains.get(conversationId) === tracked) observationChains.delete(conversationId);
+  });
+  return work;
+}
+
+async function recordChatObservationsNow(
   conversationId: string,
   observations: readonly ChatObservation[],
   agent?: string | null
@@ -1299,7 +1396,7 @@ export async function recordChatObservations(
           kind: 'user_message',
           message: await storeText(sessionId, item.text ?? '', MAX_USER_MESSAGE_CHARS),
           messageId: item.messageId
-        });
+        }, { preferTime: item.authoredTime === true });
         if (!written.changed) continue;
         break;
       }
@@ -1318,18 +1415,9 @@ export async function recordChatObservations(
           messageId: item.messageId,
           state,
           final: state === 'final'
-        });
+        }, { preferTime: item.authoredTime === true });
         if (!written.changed && item !== recoveredFinal) continue;
         if (item === recoveredFinal && item.turnId) {
-          if (live) {
-            live.openTurns.delete(item.turnId);
-            // Only if this is the turn the page is still holding open. A recovery for an
-            // earlier turn says nothing about what is generating now.
-            if (live.turnId === item.turnId) {
-              live.turnStartedAt = null;
-              live.turnId = null;
-            }
-          }
           await appendEvent(sessionId, {
             time: item.time,
             source: 'extension',
@@ -1339,6 +1427,18 @@ export async function recordChatObservations(
             detail: 'recovered from a final assistant message after the ChatGPT page reloaded',
             ...(agent ? { agent } : {})
           });
+          // The durable append is the dedupe fact. Mutating this projection first made a
+          // transient disk failure suppress the service worker's at-least-once retry.
+          if (live) {
+            live.openTurns.delete(item.turnId);
+            // Only if this is the turn the page is still holding open. A recovery for an
+            // earlier turn says nothing about what is generating now.
+            if (live.turnId === item.turnId) {
+              live.turnStartedAt = null;
+              live.turnId = null;
+            }
+          }
+          if (live) live.knownTurnEnds.add(item.turnId);
           stored++;
         }
         break;
@@ -1363,14 +1463,21 @@ export async function recordChatObservations(
         // always mints/adopts a local id before announcing a start, so an unnamed boundary is
         // stale/legacy noise and must fail closed here as well.
         if (!item.turnId) continue;
+        // /events is intentionally at-least-once. A response can be lost after commit, so the
+        // service worker may replay the exact same local lifecycle id. Never turn that transport
+        // retry into a second durable boundary or reopen a turn that already ended.
+        if (live?.knownTurnStarts.has(item.turnId) || live?.knownTurnEnds.has(item.turnId)) continue;
+        await appendEvent(sessionId, { ...base, kind: 'turn_start' });
+        // Commit before publishing the lifecycle projection. If append rejects, the same
+        // browser event remains eligible for its normal at-least-once retry.
         if (live) {
+          live.knownTurnStarts.add(item.turnId);
           // Turn lifecycle is presentation/recovery state only in 1.8. It is never consulted
           // for MCP ownership, so a replayed journal timestamp cannot misattribute a call.
           live.turnStartedAt = item.time;
           live.turnId = item.turnId;
           live.openTurns.add(item.turnId);
         }
-        await appendEvent(sessionId, { ...base, kind: 'turn_start' });
         break;
       // Also not stored, and for the same reason: this is the page describing which calls
       // it made, which is a fact about attribution rather than something that happened in
@@ -1385,19 +1492,22 @@ export async function recordChatObservations(
         // turn happened to be live. Ignore it. A stale named end is still useful history for
         // the turn it names, but it must not tear down a newer active generation.
         if (!item.turnId) continue;
-        if (live) {
-          live.openTurns.delete(item.turnId);
-          if (live.turnId === item.turnId) {
-            live.turnStartedAt = null;
-            live.turnId = null;
-          }
-        }
+        if (live?.knownTurnEnds.has(item.turnId)) continue;
         await appendEvent(sessionId, {
           ...base,
           kind: 'turn_end',
           outcome: item.outcome ?? 'unknown',
           ...(item.detail ? { detail: item.detail } : {})
         });
+        // As above, durable journal state owns idempotency; in-memory state follows it.
+        if (live) {
+          live.knownTurnEnds.add(item.turnId);
+          live.openTurns.delete(item.turnId);
+          if (live.turnId === item.turnId) {
+            live.turnStartedAt = null;
+            live.turnId = null;
+          }
+        }
         break;
     }
     stored++;
@@ -1526,6 +1636,8 @@ export function rebindConversation(sessionId: string, fromConversationId: string
     turnStartedAt: null,
     turnId: null,
     openTurns: new Set<string>(),
+    knownTurnStarts: new Set<string>(),
+    knownTurnEnds: new Set<string>(),
     pageTools: new Map()
   });
   lastActiveSessionId = sessionId;
@@ -1571,6 +1683,7 @@ export function estimate(text: string): number {
 export function resetRecorderForTests(): void {
   resetCorrelationRegistryForTests();
   conversations.clear();
+  observationChains.clear();
   sessionInitializations.clear();
   pendingOrigins.clear();
   assetBytes.clear();

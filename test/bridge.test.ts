@@ -36,6 +36,7 @@ const {
   resumeJobFor,
   setBrowserOpener,
   STALE_SWARM_MS,
+  DEFAULT_PORTS,
   startBridge,
   stopBridge,
   sweepStaleSwarm,
@@ -45,7 +46,7 @@ const { flushDurable, initDurableStore, readDurable, writeDurableSoon } = await 
 const { createSession, getSession, initSessionStore, readEvents, resetSessionStoreForTests } = await import(
   '../src/main/session/store.js'
 );
-const { closeConversation, noteChatOrigin, recordChatObservations, recordToolCall, resetRecorderForTests } = await import('../src/main/session/recorder.js');
+const { closeConversation, liveConversations, noteChatOrigin, recordChatObservations, recordToolCall, resetRecorderForTests } = await import('../src/main/session/recorder.js');
 const { abortContinuation, attachSummary, continuationByToken, openContinuation } = await import(
   '../src/main/session/continuation.js'
 );
@@ -122,6 +123,11 @@ function request(
   const url = new URL(path, base);
   const payload = options.raw ?? (options.body === undefined ? null : JSON.stringify(options.body));
   const headers: Record<string, string> = {};
+  // Every extension request carries its protocol generation. Pairing must fail closed
+  // across incompatible app/extension builds instead of provisioning a token that can
+  // only produce confusing downstream failures.
+  headers['x-extension-version'] = APP_VERSION;
+  headers['x-extension-protocol'] = String(BRIDGE_PROTOCOL);
   if (payload !== null) {
     headers['content-type'] = 'application/json';
     headers['content-length'] = String(Buffer.byteLength(payload));
@@ -229,8 +235,14 @@ beforeEach(async () => {
 
 describe('who is allowed to talk to it', () => {
   it('binds a loopback port only', () => {
-    expect(bridgePort()).toBeGreaterThanOrEqual(8765);
+    expect(bridgePort()).toBeGreaterThan(0);
     expect(base.startsWith('http://127.0.0.1:')).toBe(true);
+  });
+
+  // The suite binds ephemeral ports so it can never collide with the installed app, so the
+  // shipped range has to be asserted directly or a typo in it would ship unnoticed.
+  it('ships the fixed candidate range the extension scans', () => {
+    expect(DEFAULT_PORTS).toEqual([8765, 8766, 8767, 8768, 8769]);
   });
 
   it('identifies itself to an extension without any credential', async () => {
@@ -243,7 +255,8 @@ describe('who is allowed to talk to it', () => {
     expect(reply.body.bridge).toBe(BRIDGE_PROTOCOL);
     expect(reply.body.paired).toBe(false);
     // Identification must not double as a status leak.
-    expect(Object.keys(reply.body)).toEqual(['app', 'version', 'bridge', 'paired']);
+    expect(Object.keys(reply.body)).toEqual(['app', 'version', 'bridge', 'compatible', 'paired']);
+    expect(reply.body.compatible).toBe(true);
   });
 
   it('refuses every web page origin, chatgpt.com included', async () => {
@@ -434,6 +447,41 @@ describe('observations', () => {
 // ---------------------------------------------------------------- activity
 
 describe('activity feed', () => {
+  it('reopens a durable still-open chat after recorder memory is lost', async () => {
+    await pair();
+    const conversationId = '98989898-7777-6666-5555-444444444444';
+    const opened = await request('POST', '/events', {
+      body: {
+        conversationId,
+        events: [{ kind: 'turn_start', time: Date.now(), turnId: 'before-restart' }]
+      }
+    });
+    const sessionId = opened.body.sessionId as string;
+    expect(sessionId).toBeTruthy();
+
+    resetRecorderForTests();
+    expect(liveConversations()).toHaveLength(0);
+    await recordToolCall({
+      tool: 'read',
+      args: { paths: ['/project/after-restart.ts'] },
+      content: [{ type: 'text', text: 'ok' }],
+      outcome: 'ok',
+      durationMs: 1,
+      startedAt: Date.now(),
+      requestId: 'wfr_activity_restart',
+      conversationId
+    });
+    // Exact request ownership can append durably without recreating the page-liveness map.
+    expect(liveConversations()).toHaveLength(0);
+
+    const reply = await request('GET', `/activity?conversationId=${conversationId}&since=0`);
+    expect(reply.status).toBe(200);
+    expect(reply.body.sessionId).toBe(sessionId);
+    expect(reply.body.entries).toHaveLength(1);
+    expect(reply.body.entries[0]).toMatchObject({ tool: 'read', requestId: 'wfr_activity_restart' });
+    expect(liveConversations().some((entry) => entry.conversationId === conversationId)).toBe(true);
+  });
+
   it('hands back an app-owned render stream plus legacy tool summaries, with no raw tool I/O', async () => {
     await pair();
     const conversationId = '99999999-8888-7777-6666-555555555555';
@@ -660,6 +708,97 @@ describe('activity feed', () => {
  * page holding the marker redeems it, and the page reports which conversation it became —
  * which for a worker is the moment that worker starts existing.
  */
+/**
+ * When a chat may compact itself.
+ *
+ * Two halves, deliberately kept apart. The session store knows the level — this chat is
+ * over the configured threshold and has not used its one automatic compaction — and the
+ * bridge knows the thing only an open connection can know: whether ChatGPT is answering
+ * right now. Both must be true, and the second is the one that keeps an old, enormous chat
+ * silent when it is merely opened and read.
+ */
+describe('automatic compaction', () => {
+  const over = (): unknown[] => [
+    { kind: 'user_message', time: Date.now(), text: 'x'.repeat(44_000), messageId: 'over-the-line' }
+  ];
+
+  async function withThreshold(tokens: number, run: () => Promise<void>): Promise<void> {
+    const base = getConfig();
+    await saveConfig({ ...base, compaction: { ...base.compaction, auto: true, autoTokens: tokens } });
+    try {
+      await run();
+    } finally {
+      await saveConfig(base);
+    }
+  }
+
+  it('offers the trigger mid-turn and takes it back the moment the answer lands', async () => {
+    await pair();
+    const conversationId = 'a1a1a1a1-0000-4000-8000-00000000ac01';
+    await withThreshold(10_000, async () => {
+      await request('POST', '/events', {
+        body: {
+          conversationId,
+          events: [{ kind: 'turn_start', time: Date.now(), turnId: 'turn-live' }, ...over()]
+        }
+      });
+      const working = await request('GET', `/activity?conversationId=${conversationId}`);
+      expect(working.body.autoCompactReady).toBe(true);
+
+      await request('POST', '/events', {
+        body: {
+          conversationId,
+          events: [{ kind: 'turn_end', time: Date.now(), turnId: 'turn-live', outcome: 'completed' }]
+        }
+      });
+      const settled = await request('GET', `/activity?conversationId=${conversationId}`);
+      // Still far over the line, and deliberately not offered: there is nothing left to
+      // carry into a fresh chat once the answer has been written.
+      expect(settled.body.tokens).toBeGreaterThan(10_000);
+      expect(settled.body.autoCompactReady).toBe(false);
+    });
+  });
+
+  it('refuses a claim from an idle chat without spending its trigger', async () => {
+    await pair();
+    const conversationId = 'a1a1a1a1-0000-4000-8000-00000000ac02';
+    await withThreshold(10_000, async () => {
+      await request('POST', '/events', {
+        body: {
+          conversationId,
+          events: [
+            { kind: 'turn_start', time: Date.now(), turnId: 'turn-done' },
+            ...over(),
+            { kind: 'turn_end', time: Date.now(), turnId: 'turn-done', outcome: 'completed' }
+          ]
+        }
+      });
+      const refused = await request('POST', '/compact/claim-auto', { body: { conversationId } });
+      expect(refused.status).toBe(200);
+      expect(refused.body.claimed).toBe(false);
+
+      // Nothing was consumed by that refusal: the next turn this chat opens still has it.
+      await request('POST', '/events', {
+        body: { conversationId, events: [{ kind: 'turn_start', time: Date.now(), turnId: 'turn-next' }] }
+      });
+      const granted = await request('POST', '/compact/claim-auto', { body: { conversationId } });
+      expect(granted.body.claimed).toBe(true);
+      // And exactly once.
+      expect((await request('POST', '/compact/claim-auto', { body: { conversationId } })).body.claimed).toBe(false);
+      expect((await request('GET', `/activity?conversationId=${conversationId}`)).body.autoCompactReady).toBe(false);
+    });
+  });
+
+  it('says nothing is claimable in a chat it has never recorded', async () => {
+    await pair();
+    const reply = await request('POST', '/compact/claim-auto', {
+      body: { conversationId: 'a1a1a1a1-0000-4000-8000-00000000ac03' }
+    });
+    expect(reply.status).toBe(409);
+    expect(reply.body.error).toBe('session_not_recorded');
+  });
+});
+
 describe('delivering a bootstrap', () => {
   it('opens the chat, hands the brief to the page that redeems it, and forgets it on success', async () => {
     await pair();
@@ -1198,6 +1337,15 @@ describe('delivering a bootstrap', () => {
     expect(reply.status).toBe(200);
   });
 
+  it('rejects a current page acknowledgement after its command has gone away', async () => {
+    await pair();
+    const reply = await request('POST', '/commands/ack', {
+      body: { id: 'expired-command', client: 'current-document', status: 'sent', conversationId: PRIME_CHAT }
+    });
+    expect(reply.status).toBe(404);
+    expect(reply.body).toMatchObject({ error: 'no_such_command' });
+  });
+
   /** There is no listing route left for a tab to poll, and nothing behind one. */
   it('has no queue for a tab to poll', async () => {
     await pair();
@@ -1230,7 +1378,7 @@ describe('targeted open', () => {
     expect(resumeJobFor('session-open')).toBeNull();
   });
 
-  it('reports a browser that refused to open, rather than looking busy', async () => {
+  it('ends a browser-open rejection immediately rather than blocking the command queue', async () => {
     setBrowserOpener(async () => {
       throw new Error('no browser');
     });
@@ -1238,9 +1386,7 @@ describe('targeted open', () => {
     // The rejection is handled asynchronously, as it is in the app.
     await new Promise((resolve) => setTimeout(resolve, 0));
 
-    const queued = pendingCommands();
-    expect(queued).toHaveLength(1);
-    expect(queued[0]!.lastError).toContain('the browser could not be opened');
+    expect(pendingCommands()).toEqual([]);
   });
 
   /**
@@ -1451,6 +1597,16 @@ describe('a worker chat that never opens', () => {
  * ever done — including by handlers belonging to a bridge that no longer exists.
  */
 describe('restarting the bridge', () => {
+  it('coalesces concurrent starts into one listener', async () => {
+    await stopBridge();
+    const [first, second] = await Promise.all([startBridge(), startBridge()]);
+    expect(first).not.toBeNull();
+    expect(second).toBe(first);
+    base = `http://127.0.0.1:${first}`;
+    await pair();
+    expect((await request('GET', '/hello', { auth: null })).status).toBe(200);
+  });
+
   it('cancels an ended run’s queued worker chats exactly once, however often it has restarted', async () => {
     for (let restart = 0; restart < 2; restart++) {
       await stopBridge();

@@ -21,16 +21,17 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { effectiveCapabilities, defaultConfig } from '../src/main/config.js';
 import { lastRequestAt, selfTestHeaders, startMcpServer, tunnelProbeHeaders, type McpEndpoint } from '../src/main/mcp/server.js';
 import { lastToolCallAt, type ToolContext } from '../src/main/mcp/tools.js';
+import { friendlyError } from '../src/main/mcp/kernel.js';
 import { SURFACE_LIST, surfaceDefinition, type SurfaceId } from '../src/main/mcp/surfaces.js';
 import { listManagedProcesses, stopManagedProcess } from '../src/main/process-manager.js';
-import { createSession, initSessionStore } from '../src/main/session/store.js';
+import { appendEvent, createSession, initSessionStore, writeOverflowText } from '../src/main/session/store.js';
 import { createHandoff } from '../src/main/session/handoff.js';
 import { resetWorkspaces, setWorkspaceFor, workspaceEntries } from '../src/main/workspace.js';
 import { DEFAULT_CAPABILITIES, type Capabilities, type Root } from '../src/shared/types.js';
 import { emptyEvidence, noteExec, noteOutcome, runInCallContext, type CallContext } from '../src/main/mcp/call-context.js';
 import { observeRequestCorrelation } from '../src/main/session/correlation.js';
 import { resetExecOwnershipForTests } from '../src/main/codex/ownership.js';
-import { makeTempDir, removeTempDir, writeTree } from './helpers.js';
+import { IS_WINDOWS, makeTempDir, removeTempDir, writeTree } from './helpers.js';
 
 // ---------------------------------------------------------------- transport
 
@@ -273,6 +274,17 @@ beforeEach(async () => {
 // ------------------------------------------------------------------- tests
 
 describe('endpoint hardening', () => {
+  it('does not expose native paths from uncommon filesystem errors', () => {
+    const error = Object.assign(new Error(`ELOOP: too many symbolic links, realpath '${approved}\\loop\\file.txt'`), {
+      code: 'ELOOP',
+      path: path.join(approved, 'loop', 'file.txt'),
+      syscall: 'realpath'
+    });
+    const text = friendlyError(error);
+    expect(text).toBe('Filesystem error (ELOOP)');
+    expect(text).not.toContain(approved);
+  });
+
   it('binds to loopback only, and gives every surface its own path', () => {
     for (const surface of SURFACE_LIST) {
       const url = endpoint.urls[surface.id];
@@ -493,6 +505,36 @@ describe('endpoint hardening', () => {
       req.write('{"jsonrpc":"2.0"');
     });
     expect(status).toBe(413);
+  });
+
+  it('enforces the same body cap on chunked requests with no content-length', async () => {
+    const url = new URL(endpoint.urls.core);
+    const status = await new Promise<number>((resolve, reject) => {
+      let answered = false;
+      const req = http.request(
+        {
+          hostname: url.hostname,
+          port: url.port,
+          path: url.pathname,
+          method: 'POST',
+          headers: { 'content-type': 'application/json' }
+        },
+        (res) => {
+          answered = true;
+          resolve(res.statusCode ?? 0);
+          res.resume();
+        }
+      );
+      req.on('error', (error) => {
+        if (!answered) reject(error);
+      });
+      req.write('{"jsonrpc":"2.0","id":1,"method":"tools/list","padding":"');
+      const chunk = Buffer.alloc(64 * 1024, 0x78);
+      for (let index = 0; index < 129; index++) req.write(chunk);
+      req.end('"}');
+    });
+    expect(status).toBe(413);
+    expect(toolNames(await core('tools/list'))).toContain('read');
   });
 
   it('survives a malformed body and keeps serving', async () => {
@@ -941,6 +983,106 @@ describe('capability gating', () => {
     expect(names).toContain('agents');
   });
 
+  it('makes session history recent by default and reconstructs context around search hits', async () => {
+    ctx.sessionTools = true;
+    const recorded = await createSession({ title: 'smart history', conversationId: null });
+    for (let index = 1; index <= 5; index++) {
+      await appendEvent(recorded.id, {
+        time: 1_000 + index,
+        source: 'app',
+        kind: 'note',
+        message: { text: `old-note-${index}`, truncated: false, chars: 10 }
+      });
+    }
+    await appendEvent(recorded.id, { time: 2_000, source: 'extension', kind: 'turn_start' });
+    await appendEvent(recorded.id, {
+      time: 2_001,
+      source: 'extension',
+      kind: 'chat_error',
+      message: {
+        text: 'agents status returned successfully; much later this turn was interrupted',
+        truncated: false,
+        chars: 72
+      }
+    });
+    await appendEvent(recorded.id, {
+      time: 2_002,
+      source: 'extension',
+      kind: 'assistant_message',
+      message: { text: 'after-the-marker', truncated: false, chars: 16 },
+      final: true
+    });
+    const overflow = 'ordinary prefix followed by the deep overflow needle only in the spilled payload';
+    const overflowId = await writeOverflowText(recorded.id, overflow);
+    expect(overflowId).not.toBeNull();
+    await appendEvent(recorded.id, {
+      time: 2_003,
+      source: 'mcp',
+      kind: 'tool_call',
+      call: {
+        callId: 'smart-history-call',
+        tool: 'read',
+        attribution: 'unattributed',
+        requestId: null,
+        conversationId: null,
+        attributionMethod: 'unattributed',
+        args: { text: '{}', truncated: false, chars: 2 },
+        result: {
+          text: 'ordinary prefix',
+          truncated: true,
+          chars: overflow.length,
+          assetId: overflowId!
+        },
+        outcome: 'ok',
+        durationMs: 7,
+        summary: { kind: 'read', tone: 'neutral', title: 'Read hidden payload' }
+      }
+    });
+    await appendEvent(recorded.id, {
+      time: 2_004,
+      source: 'app',
+      kind: 'note',
+      message: { text: 'after-the-tool-call', truncated: false, chars: 19 }
+    });
+
+    const recent = await core('tools/call', {
+      name: 'session',
+      arguments: { action: 'history', session_id: recorded.id, limit: 3 }
+    });
+    expect(textOf(recent)).toContain('3 latest entries');
+    expect(textOf(recent)).toContain('after-the-marker');
+    expect(textOf(recent)).toContain('smart-history-call');
+    expect(textOf(recent)).toContain('after-the-tool-call');
+    expect(textOf(recent)).not.toContain('old-note-1');
+    expect(textOf(recent)).not.toContain('turn started');
+
+    const searched = await core('tools/call', {
+      name: 'session',
+      arguments: { action: 'history', session_id: recorded.id, query: 'status interrupted', limit: 5 }
+    });
+    const searchText = textOf(searched);
+    expect(searchText).toContain('1 match');
+    expect(searchText).toContain('>> #7');
+    expect(searchText).toContain('turn started');
+    expect(searchText).toContain('after-the-marker');
+
+    const deepSearch = await core('tools/call', {
+      name: 'session',
+      arguments: { action: 'history', session_id: recorded.id, query: 'deep overflow needle', limit: 5 }
+    });
+    expect(textOf(deepSearch)).toContain('smart-history-call');
+
+    const expanded = await core('tools/call', {
+      name: 'session',
+      arguments: { action: 'history', session_id: recorded.id, call_id: 'smart-history-call' }
+    });
+    const expandedText = textOf(expanded);
+    expect(expandedText).toContain('nearby timeline:');
+    expect(expandedText).toContain('>> #9');
+    expect(expandedText).toContain('after-the-tool-call');
+    expect(expandedText).toContain('deep overflow needle');
+  });
+
   it('is off by default', () => {
     const config = defaultConfig();
     expect(config.readOnly).toBe(true);
@@ -1146,6 +1288,50 @@ describe('sandbox enforcement through the tool layer', () => {
       expect(text, attempt).toContain('ERROR');
       expect(text, attempt).not.toContain('hunter2');
     }
+  });
+
+  it.runIf(IS_WINDOWS)('accepts a native Windows path when it is inside an approved root', async () => {
+    const reply = await core('tools/call', {
+      name: 'read',
+      arguments: { paths: [path.join(approved, 'notes.txt')] }
+    });
+    expect(reply.body.result?.isError).not.toBe(true);
+    expect(textOf(reply)).toContain('note line 1');
+    expect(textOf(reply)).toContain('/workspace/notes.txt');
+    expect(textOf(reply)).not.toContain(approved);
+  });
+
+  it.runIf(IS_WINDOWS)('accepts native Windows globs through read', async () => {
+    const reply = await core('tools/call', {
+      name: 'read',
+      arguments: { paths: [path.join(approved, 'src', '**', '*.ts')] }
+    });
+    expect(reply.body.result?.isError, textOf(reply)).not.toBe(true);
+    expect(textOf(reply)).toContain('/workspace/src/app.ts');
+    expect(textOf(reply)).toContain('/workspace/src/lib/util.ts');
+    expect(textOf(reply)).not.toContain(approved);
+  });
+
+  it.runIf(IS_WINDOWS)('accepts a native Windows search scope through find', async () => {
+    ctx.caps = withCaps({ search: true });
+    const reply = await core('tools/call', {
+      name: 'find',
+      arguments: { query: 'helper', mode: 'content', path: path.join(approved, 'src') }
+    });
+    expect(reply.body.result?.isError, textOf(reply)).not.toBe(true);
+    expect(textOf(reply)).toContain('/workspace/src/lib/util.ts');
+    expect(textOf(reply)).not.toContain(approved);
+  });
+
+  it.runIf(IS_WINDOWS)('accepts a native Windows image path through view_image', async () => {
+    ctx.caps = withCaps({ read: true });
+    const reply = await core('tools/call', {
+      name: 'view_image',
+      arguments: { path: path.join(approved, 'pixel.png') }
+    });
+    expect(reply.body.result?.isError).not.toBe(true);
+    const content = reply.body.result?.content as Array<Record<string, unknown>>;
+    expect(content.find((item) => item.type === 'image')?.mimeType).toBe('image/png');
   });
 
   it('refuses escape attempts on find', async () => {
@@ -1586,6 +1772,74 @@ describe('apply_patch', () => {
     expect(textOf(reply)).toContain('M /workspace/rewrite.txt');
     expect(textOf(reply)).not.toContain('(~+');
   });
+
+  it('applies the read byte budget to images instead of using the standalone image ceiling', async () => {
+    const reply = await core('tools/call', {
+      name: 'read',
+      arguments: { paths: ['/workspace/pixel.png'], max_bytes: 32 }
+    });
+    expect(textOf(reply)).toContain('ERROR');
+    expect(textOf(reply)).toContain('image is too large to return');
+    const content = reply.body.result?.content as Array<Record<string, unknown>>;
+    expect(content.some((item) => item.type === 'image')).toBe(false);
+  });
+
+  it.runIf(IS_WINDOWS)('accepts a native Windows file path inside apply_patch', async () => {
+    const target = path.join(approved, 'native-patch.txt');
+    const patch = [
+      '*** Begin Patch',
+      `*** Add File: ${target}`,
+      '+native-patch-ok',
+      '*** End Patch'
+    ].join('\n');
+    const reply = await core('tools/call', { name: 'apply_patch', arguments: { patch } });
+    expect(reply.body.result?.isError, textOf(reply)).toBeFalsy();
+    expect(await fs.readFile(target, 'utf8')).toBe('native-patch-ok\n');
+    expect(textOf(reply)).toContain('A /workspace/native-patch.txt');
+    expect(textOf(reply)).not.toContain(approved);
+  });
+
+  it.runIf(IS_WINDOWS)('normalizes native Windows update, move and delete paths inside apply_patch', async () => {
+    const source = path.join(approved, 'native-patch-source.txt');
+    const moved = path.join(approved, 'native-patch-moved.txt');
+    await fs.writeFile(source, 'before\n', 'utf8');
+
+    const movePatch = [
+      '*** Begin Patch',
+      `*** Update File: ${source}`,
+      `*** Move to: ${moved}`,
+      '@@',
+      '-before',
+      '+after',
+      '*** End Patch'
+    ].join('\n');
+    const movedReply = await core('tools/call', { name: 'apply_patch', arguments: { patch: movePatch } });
+    expect(movedReply.body.result?.isError, textOf(movedReply)).toBeFalsy();
+    await expect(fs.stat(source)).rejects.toMatchObject({ code: 'ENOENT' });
+    expect(await fs.readFile(moved, 'utf8')).toBe('after\n');
+    expect(textOf(movedReply)).toContain('/workspace/native-patch-moved.txt');
+    expect(textOf(movedReply)).not.toContain(approved);
+
+    const deletePatch = ['*** Begin Patch', `*** Delete File: ${moved}`, '*** End Patch'].join('\n');
+    const deletedReply = await core('tools/call', { name: 'apply_patch', arguments: { patch: deletePatch } });
+    expect(deletedReply.body.result?.isError, textOf(deletedReply)).toBeFalsy();
+    await expect(fs.stat(moved)).rejects.toMatchObject({ code: 'ENOENT' });
+    expect(textOf(deletedReply)).toContain('D /workspace/native-patch-moved.txt');
+    expect(textOf(deletedReply)).not.toContain(approved);
+  });
+
+  it('does not leak the resolved real path when apply_patch fails after validation', async () => {
+    const patch = [
+      '*** Begin Patch',
+      '*** Add File: /workspace/notes.txt/child.txt',
+      '+cannot-land-under-a-file',
+      '*** End Patch'
+    ].join('\n');
+    const reply = await core('tools/call', { name: 'apply_patch', arguments: { patch } });
+    expect(reply.body.result?.isError).toBe(true);
+    expect(textOf(reply)).toContain('/workspace/notes.txt/child.txt');
+    expect(textOf(reply)).not.toContain(approved);
+  });
 });
 
 describe('exec_command and write_stdin', () => {
@@ -1663,6 +1917,36 @@ describe('exec_command and write_stdin', () => {
     });
     expect(reply.body.result?.isError).not.toBe(true);
     expect(textOf(reply)).toContain('/workspace/src');
+  });
+
+  it('does not intercept through a missing cd target that the shell would have rejected', async () => {
+    const missing = path.join(approved, 'missing-intercept-cwd');
+    const patch = [
+      '*** Begin Patch',
+      '*** Add File: landed.txt',
+      '+must-not-land',
+      '*** End Patch'
+    ].join('\n');
+    const reply = await core('tools/call', {
+      name: 'exec_command',
+      arguments: {
+        cmd: `cd missing-intercept-cwd && apply_patch <<'PATCH'\n${patch}\nPATCH`,
+        workdir: '/workspace'
+      }
+    });
+
+    expect(reply.body.result?.isError).toBe(true);
+    expect(textOf(reply)).toMatch(/not found/i);
+    await expect(fs.stat(missing)).rejects.toMatchObject({ code: 'ENOENT' });
+  });
+
+  it.runIf(IS_WINDOWS)('accepts a native Windows workdir inside an approved root', async () => {
+    const reply = await core('tools/call', {
+      name: 'exec_command',
+      arguments: { cmd: 'Write-Output native-workdir-ok', workdir: approved, yield_time_ms: 5_000 }
+    });
+    expect(reply.body.result?.isError).not.toBe(true);
+    expect(textOf(reply)).toContain('native-workdir-ok');
   });
 
   it('advertises the current Codex exec_command and write_stdin schemas', async () => {
@@ -1883,19 +2167,20 @@ describe('exec sessions belong to the chat that opened them', () => {
     });
     expect(stranger.body.result?.isError).toBe(true);
     expect(textOf(stranger)).toContain(
-      `write_stdin failed: session ${sessionId} belongs to a different ChatGPT conversation.`
+      `write_stdin failed: session ${sessionId} is not proven to belong to this ChatGPT conversation.`
     );
     expect(textOf(stranger)).not.toContain('echo=stolen');
 
-    // A caller this app cannot identify is not proven to be someone else, and taking a working
-    // terminal away on a guess would be the worse failure.
+    // Caller identity is the authorization boundary. An unattributed call must not inherit
+    // the owner's authority merely because it can guess the small numeric session id.
     const unproven = await asChat(null, 'write_stdin', {
       session_id: sessionId,
       chars: 'anon\r',
       yield_time_ms: 1_000
     });
-    expect(unproven.body.result?.isError).not.toBe(true);
-    expect(textOf(unproven)).toContain('echo=anon');
+    expect(unproven.body.result?.isError).toBe(true);
+    expect(textOf(unproven)).toContain('is not proven to belong to this ChatGPT conversation');
+    expect(textOf(unproven)).not.toContain('echo=anon');
 
     // The stranger must not even learn the session id exists.
     const strangerStatus = await asChat('wfr_execown_stranger', 'session', { action: 'status' });

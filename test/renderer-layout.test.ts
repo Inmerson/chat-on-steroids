@@ -212,6 +212,56 @@ describe('an expanded tool call', () => {
  * Checked against the union in the shared types rather than a hand-kept list here, so the
  * next kind is covered the moment it is declared.
  */
+describe('the settings sheet', () => {
+  /**
+   * Three rows, and each one is a label, a number, a unit and — where it has one — a
+   * switch, side by side. The sheet shipped broken once: `.num` sets the field's width,
+   * but the shared `input[type='number']` rule sets `width: 100%`, and a bare class loses
+   * that specificity tie. The field stretched across the whole row, squeezed the label to
+   * a couple of characters, and pushed the unit and the switch out of the window.
+   */
+  it('gives the number field a width the shared input rule cannot beat', () => {
+    expect(rule('input.num')).toContain('width: 92px');
+    expect(rule('.num')).toBe('');
+    expect(css.indexOf('input.num {')).toBeGreaterThan(css.indexOf("input[type='number'],"));
+  });
+
+  it('is three settings and nothing else to read', () => {
+    const pane = document.querySelector('.view[data-view="settings"] .pane')!;
+    expect(pane.querySelectorAll('.setting')).toHaveLength(3);
+    expect(pane.querySelectorAll('h3')).toHaveLength(0);
+    expect(pane.querySelectorAll('p.hint')).toHaveLength(0);
+    // One explanation per row, one clause long.
+    for (const row of pane.querySelectorAll('.setting')) {
+      expect(row.querySelectorAll('.setting-text em')).toHaveLength(1);
+    }
+  });
+
+  /** One threshold. Three inputs for the same number is three ways to disagree. */
+  it('asks for a single compaction threshold', () => {
+    const pane = document.querySelector('.view[data-view="settings"] .pane')!;
+    const numbers = [...pane.querySelectorAll('input[type="number"]')].map((input) => input.id);
+    expect(numbers).toEqual(['sessRetain', 'autoCompactTokens', 'maWorkers']);
+    for (const id of ['sessAdvisory', 'sessLimit']) {
+      expect(document.getElementById(id), `#${id} is back`).toBeNull();
+    }
+  });
+
+  /**
+   * Every input on the sheet has to be in the change-listener list or it silently does not
+   * save. `autoCompactTokens` was missing from it, so the one number the automatic trigger
+   * fires on kept whatever was typed until the pane was repainted, and then dropped it.
+   */
+  it('saves every field it shows', () => {
+    const pane = document.querySelector('.view[data-view="settings"] .pane')!;
+    const listened = /const CHAT_INPUTS[^=]*=\s*\[([^\]]*)\]/.exec(chatSource);
+    expect(listened, 'CHAT_INPUTS is gone or renamed').not.toBeNull();
+    for (const input of pane.querySelectorAll('input')) {
+      expect(listened![1], `#${input.id} never saves`).toContain(`'${input.id}'`);
+    }
+  });
+});
+
 describe('the session timeline', () => {
   it('renders every event kind the recorder can write', async () => {
     const [shared, chat] = await Promise.all([

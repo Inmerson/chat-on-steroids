@@ -26,13 +26,28 @@ import { z } from 'zod';
 import type { Capabilities, Root } from '../../shared/types.js';
 import { FsOpError, formatBytes, type FileInfo } from '../fsops.js';
 import { logInfo, logWarn } from '../logger.js';
-import { SandboxError, isAbsoluteVirtualPath, resolvePath, type Resolved } from '../sandbox.js';
+import {
+  SandboxError,
+  isAbsoluteVirtualPath,
+  isNativeWindowsPath,
+  resolvePath,
+  type Resolved
+} from '../sandbox.js';
 import { currentWorkspace, learnWorkspace } from '../workspace.js';
 import { ExecError, MAX_ENV_KEY_CHARS, MAX_ENV_VALUE_CHARS, MAX_ENV_VARS } from '../exec.js';
 import { ProcessError, type ManagedProcessStatus } from '../process-manager.js';
 import { ComputerError } from '../computer/index.js';
 import { getConfig } from '../config.js';
-import { AgentError, acknowledgeOffers, agentForCaller, offerMessages, releaseQuiescentRun, swarmRunning } from '../agents.js';
+import {
+  AgentError,
+  acknowledgeOffers,
+  agentForCaller,
+  hasRetiredWorkerLeases,
+  offerMessages,
+  releaseQuiescentRun,
+  retiredWorkerForConversation,
+  swarmRunning
+} from '../agents.js';
 import type { SurfaceId } from './surfaces.js';
 import {
   currentCall,
@@ -43,7 +58,13 @@ import {
   trackMcpRequest,
   type CallContext
 } from './call-context.js';
-import { awaitFreshCallOrigin, freshCallOrigin, recordAgentMessage, recordToolCall } from '../session/recorder.js';
+import {
+  awaitFreshCallOrigin,
+  evidenceWindow,
+  freshCallOrigin,
+  recordAgentMessage,
+  recordToolCall
+} from '../session/recorder.js';
 import { readOverflowText } from '../session/store.js';
 import type { SessionEvent, StoredText } from '../../shared/session.js';
 
@@ -119,6 +140,11 @@ export function friendlyError(err: unknown): string {
   if (code === 'EBUSY') return 'The file is in use by another program';
   if (code === 'ENOTEMPTY') return 'Directory is not empty';
   if (code === 'EEXIST') return 'Already exists';
+  // Node filesystem errors routinely embed the absolute host path in `err.message`.
+  // Unknown errno values (ELOOP, ENAMETOOLONG, EINVAL, ENOSPC, …) used to fall through
+  // verbatim and violate the model-facing virtual-path contract. Keep the errno useful
+  // without echoing the path Windows supplied.
+  if (typeof code === 'string' && code.length > 0) return `Filesystem error (${code})`;
   return err instanceof Error ? err.message : String(err);
 }
 
@@ -369,11 +395,46 @@ async function dispatchTracked(
   // no explicit base really do consume caller state, so they wait for their exact request-id
   // mate while a swarm is active. Use the full exact-id window, not the shorter prime window:
   // the live worker failure that motivated IDENTITY_EVIDENCE_MS arrived ~8 seconds late.
-  if (!context.caller.conversationId && needsWorkspaceIdentity(name, args) && swarmRunning() && requestId) {
+  const identitySensitive = needsWorkspaceIdentity(name, args);
+  if (!context.caller.conversationId && identitySensitive && swarmRunning() && requestId) {
+    context.caller.conversationId = await awaitFreshCallOrigin(name, startedAt, IDENTITY_EVIDENCE_MS, { requestId });
+  }
+  // A run that ended leaves an explicit short-lived lease tombstone for each open worker
+  // chat. Resolve exact request identity before ordinary tools too while such leases exist;
+  // otherwise an explicit-workdir exec could keep mutating after its worker was retired.
+  if (!context.caller.conversationId && hasRetiredWorkerLeases() && requestId) {
     context.caller.conversationId = await awaitFreshCallOrigin(name, startedAt, IDENTITY_EVIDENCE_MS, { requestId });
   }
   context.agent = agentForCaller(context.caller);
-  const result = await trackInFlight(() => runInCallContext(context, run));
+  const retiredWorker = retiredWorkerForConversation(context.caller.conversationId);
+  const retiredLeaseAmbiguous = hasRetiredWorkerLeases() && !context.caller.conversationId;
+  // In a swarm, a relative/defaulted filesystem operation is not safe to execute after the
+  // exact caller lookup timed out: its workspace is part of the requested operation. Falling
+  // back to the first approved root turns an attribution outage into wrong-project mutation.
+  // Refuse and let the model retry once page evidence is healthy instead.
+  const result = await trackInFlight(() =>
+    runInCallContext(context, () =>
+      retiredWorker
+        ? Promise.resolve(
+            fail(
+              `WORKER_RETIRED: ${retiredWorker.id} was retired because ${retiredWorker.reason}. This chat can no longer use local tools. Stop working and return to the prime chat.`
+            )
+          )
+        : retiredLeaseAmbiguous
+        ? Promise.resolve(
+            fail(
+              'CALLER_IDENTITY_REQUIRED: a recently retired worker tab may still be open, and the connector could not prove this call belongs to a different chat. No local tool was run. Reload the extension evidence path or wait for the retired lease to expire.'
+            )
+          )
+        : swarmRunning() && identitySensitive && !context.caller.conversationId
+        ? Promise.resolve(
+            fail(
+              'CALLER_IDENTITY_REQUIRED: this operation needs this chat’s exact workspace, but the connector could not prove which ChatGPT conversation made the call. Retry after the extension reconnects; no file or command was changed.'
+            )
+          )
+        : run()
+    )
+  );
   // Identity, once, from this call's own evidence — see callerConversation. `agents` has
   // already established its own inside the call and adopted it, and re-reading here would
   // only be able to disagree with the stronger answer it waited for.
@@ -399,10 +460,14 @@ async function dispatchTracked(
   // its own lifetime is process evidence; letting that number overwrite ToolCallRecord's
   // duration is what made a 10s yield read like a command that had completed in 10s.
   const durationMs = Date.now() - startedAt;
+  // Inbox messages are part of the MCP result ChatGPT actually receives. Build the delivered
+  // result before recording so session(call_id=...) is genuine wire forensics rather than a
+  // subtly earlier internal value that omits the worker report most likely to matter later.
+  const delivered = withInbox(context.agent, result, isFinish);
   const recording = recordToolCall({
     tool: name,
     args,
-    content: result.content,
+    content: delivered.content,
     outcome: context.outcome ?? (result.isError ? 'rejected' : 'ok'),
     durationMs,
     startedAt,
@@ -418,7 +483,6 @@ async function dispatchTracked(
   // fire-and-forget because it may still spend a grace window waiting for page evidence.
   if (context.caller.conversationId) await recording;
   else void recording;
-  const delivered = withInbox(context.agent, result, isFinish);
   // Retire a completed run only after this call has had every chance to acknowledge and
   // receive its inbox. Doing it inside acknowledgeOffers would let `agents status` destroy
   // the run halfway through identifying itself; here the handler and result are already done.
@@ -429,7 +493,8 @@ async function dispatchTracked(
 /** Whether this handler must know which chat it is before resolving its paths. */
 function needsWorkspaceIdentity(name: string, args: unknown): boolean {
   const input = args && typeof args === 'object' ? (args as Record<string, unknown>) : {};
-  const relative = (value: unknown): boolean => typeof value === 'string' && !isAbsoluteVirtualPath(value);
+  const relative = (value: unknown): boolean =>
+    typeof value === 'string' && !isAbsoluteVirtualPath(value) && !isNativeWindowsPath(value);
   if (name === 'read') {
     const paths = Array.isArray(input['paths']) ? input['paths'] : [];
     return paths.some(relative);
@@ -441,9 +506,10 @@ function needsWorkspaceIdentity(name: string, args: unknown): boolean {
     return true;
   }
   if (name === 'exec_command') {
-    // Omitting workdir means "this chat's folder" first, then the first approved root.
+    // Every exec in a swarm also needs caller identity so a long-running session can be
+    // owned by the right chat even when the cwd itself was explicit.
     const workdir = input['workdir'];
-    return workdir === undefined || relative(workdir);
+    return swarmRunning() || workdir === undefined || relative(workdir);
   }
   return false;
 }
@@ -507,7 +573,7 @@ export async function resolveIn(
   });
   // Absolute only: a workspace learned from a relative path would let one loose resolution
   // decide where the next loose resolution points. See workspace.ts.
-  if (isAbsoluteVirtualPath(requested)) await learnWorkspace(resolved);
+  if (isAbsoluteVirtualPath(requested) || isNativeWindowsPath(requested)) await learnWorkspace(resolved);
   return resolved;
 }
 
@@ -533,6 +599,11 @@ export async function resolveCwd(ctx: ToolContext, virtualPath: string | undefin
   const workspace = currentWorkspace();
   // Codex treats an explicitly empty workdir exactly like an omitted one.
   const provided = virtualPath !== undefined && virtualPath !== '';
+  if (!provided && !workspace && swarmRunning()) {
+    throw new SandboxError(
+      'WORKSPACE_REQUIRED: this multi-agent chat has no proven workspace. Supply an explicit approved workdir before running a command.'
+    );
+  }
   const target = provided ? virtualPath : (workspace?.virtual ?? (ctx.roots[0] ? `/${ctx.roots[0].name}` : ''));
   if (!target) throw new SandboxError('No folder is approved, so there is nowhere to run');
   const resolved = await resolveIn(ctx.roots, target);
@@ -700,7 +771,7 @@ export const MAX_HANDOFF_CHARS = 400_000;
  * and a join happens once, but long enough that a page reporting on its own tick lands
  * inside it. Nothing falls back to "the only chat that has been active lately".
  */
-export const PRIME_EVIDENCE_MS = 2_500;
+export const PRIME_EVIDENCE_MS = evidenceWindow(2_500);
 
 /**
  * The same window for a call ChatGPT gave a request id, which is waiting for one exact
@@ -712,7 +783,21 @@ export const PRIME_EVIDENCE_MS = 2_500;
  * at 16:34:04. The wait is event-driven and ends the instant the mate lands, so the extra
  * seconds are only ever spent by a call that was going to be refused anyway.
  */
-export const IDENTITY_EVIDENCE_MS = 15_000;
+export const IDENTITY_EVIDENCE_MS = evidenceWindow(15_000);
+
+/**
+ * The same window again for the two `agents` actions whose refusal cannot be retried cheaply.
+ *
+ * Everything else that waits for identity is asking about work it can decline and be asked
+ * for again a moment later. `spawn` and `join` are not: a refused `spawn` ends the turn with
+ * no run, and the model's own retry costs the user another full generation — on 2026-08-21 it
+ * cost two, and the run still never started. The wait is event-driven and returns the instant
+ * the page's request-id mate lands, so a longer ceiling is only ever spent by a call that was
+ * going to be refused anyway; against that, the live evidence shows ids arriving twenty
+ * seconds after the window that refused them. Kept well inside ChatGPT's own connector
+ * timeout, so a slow proof still comes back as a spawned run rather than as a dead call.
+ */
+export const JOIN_EVIDENCE_MS = evidenceWindow(30_000);
 
 /**
  * Recovers the complete text behind a stored field.

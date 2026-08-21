@@ -9,11 +9,180 @@ Status: `[ ]` open · `[~]` in progress · `[x]` done · `[?]` needs a decision 
 into this list; do not create a second TODO. Screenshots and other raw proof may live under
 `docs/evidence/`, but every actionable item belongs here.
 
-**Installed build: v1.8.4.** Verified directly on 2026-08-20 from
-`%LOCALAPPDATA%\Programs\ChatGPT Local Files\ChatGPT Local Files.exe`: file version `1.8.4`,
-product version `1.8.4.0`, written 10:38. It carries the 2026-08-20 batch below. The 1.8.3
-that was installed before it was built on 2026-08-19 at 23:47, before those fixes existed;
-that is why they went out as their own version rather than a second 1.8.3.
+**Installed build: v1.8.8.** Verified directly on 2026-08-21 from
+`%LOCALAPPDATA%\Programs\ChatGPT Local Files\ChatGPT Local Files.exe`: file version `1.8.8`,
+product version `1.8.8.0`, written 07:14. Packaged-runtime smoke passed (version agreement,
+extension scripts, tunnel-client, cloudflared, ripgrep, app.asar, node-pty, Sharp 0.35.3 /
+libvips 8.18.3 with a real PNG encode). It replaces v1.8.4, which had been the installed
+build since 2026-08-20; the 1.8.7 that was running on 2026-08-21 came from a stale `out/`
+and is what T-174 below is about.
+
+## Test suite — 10+ minutes / hangs — **ALL FIXED 2026-08-21**
+
+Full suite before: minutes, often never finishing, 17+ spurious failures.
+After: `36 passed (36)`, `1063 passed | 83 skipped`, **29.4s wall**.
+
+- [x] **T-183 — `scheduleActivityPull` starved the event loop under the test harness.**
+      It re-arms itself with `setTimeout`, and the content-script harness replaces
+      `window.setTimeout` with `(fn, ms) => { clock += ms; Promise.resolve().then(fn); }`.
+      That turned one background poll into an unbroken microtask chain: the second test in
+      `content-script.test.ts` waited forever for a window `load` event no macrotask could
+      deliver. `every()` escapes this because the harness stubs `setInterval` to a no-op;
+      the pull re-arms with `setTimeout` and walked past that seam. Fixed by gating the
+      re-arm on the existing `TEST_MODE` flag, matching what the harness already does to
+      `every()`. Production is untouched — `TEST_MODE` is only true when `CLF_TEST_HOOK`
+      exists. `content-script.test.ts`: hung -> **5.6s**.
+
+- [x] **T-184 — the suite could talk to the installed app.** `src/main/bridge.ts` hardcoded
+      `PORTS = [8765..8769]`. The developer’s own app holds 8765 while the suite runs, so
+      with 16 forks racing for 5 ports a test whose bind lost fell through to the *real*
+      bridge with a test token — `TIME_WAIT` sockets to 8765 from the test run proved it.
+      The list is now overridable (`CLF_BRIDGE_PORTS`) and `vitest.config.ts` sets `0`, so
+      every test bridge takes an ephemeral port. The shipped range is still asserted, in
+      `bridge.test.ts`, against the exported `DEFAULT_PORTS`.
+
+- [x] **T-185 — `resume.test.ts` never sent `x-extension-protocol`.** Every route past
+      `/hello`, `/pair` included, refuses a caller that does not declare its protocol. So
+      pairing answered 426, the token came back `undefined`, and all 17 tests failed on the
+      *next* request with `expected 401 to be 202`. The helper now sends `BRIDGE_PROTOCOL`
+      like the shipped extension does.
+
+- [x] **T-186 — tests waited out real 15-second evidence windows.**
+      `session.test.ts > rejects URL/Fiber conversation conflicts` sat in
+      `awaitRequestCorrelation` for the whole `REQUEST_ID_GRACE_MS` to prove a negative.
+      Added `evidenceWindow()` in `recorder.ts`, clamped so it can only ever shorten, driven
+      by `CLF_EVIDENCE_MS: 1500` in test config; `PRIME/IDENTITY/JOIN_EVIDENCE_MS` use it
+      too. Production keeps the measured 2.5s / 15s / 30s. `session.test.ts`: 18.8s -> 4.2s.
+
+- [x] **T-187 — `continuation.test.ts > survives a deadline crossed while the durable write
+      is in flight` was timing-fragile.** It jumped the clock from the caller after one
+      `await Promise.resolve()`, but `commitContinuation` does a real durable write *before*
+      the preflight, so the jump landed before `freezePrimeTransfer` — testing plain expiry,
+      which is a different case two tests down. The jump now happens inside the mocked
+      `rebindSession`, which is where the comment always said it happened.
+
+- [x] **T-188 — five stale expectations in `content-script.test.ts`.** `closed` and two
+      `ack` messages gained `navigationEpoch`, and the page-local overflow marker was
+      reworded from "page-local queue filled" to naming the budget it hit. Expectations
+      updated; no product change.
+
+- [ ] **T-189 — `computer.test.ts` flakes under a full parallel run.** Three tests
+      (`returns a Codex-style window state`, `pairs window state element centres`,
+      `refuses a ref minted before the desktop helper restarted`) failed in one 16-fork run
+      and pass alone and alongside `process-manager`/`exec`. They read the *real* foreground
+      window, and the suite spawns dozens of transient consoles. Not reproduced since the
+      orphan cleanup below; re-check before treating it as real.
+
+- [ ] **T-190 — killing a `vitest run` leaves its whole worker tree alive.** Eight orphaned
+      runs were found on 2026-08-21, the oldest holding 3502 CPU-seconds, together pegging
+      ~9 of 16 cores and making every subsequent run slower than the last. Nothing in the
+      repo causes this — it is how the runs were being cancelled — but a `npm run test:kill`
+      helper that reaps `node.exe` whose command line contains `vitest` would stop it
+      costing an afternoon again.
+
+## v1.8.8 — post-implementation review + live attribution root cause — **INSTALLED 2026-08-21**
+
+Full write-up with evidence:
+`bughunt-2026-08-21/09-post-1.8.8-review-and-live-attribution-rootcause.md`.
+
+Context: on 2026-08-21 a live `agents action=spawn` was refused four times with
+`UNIDENTIFIED_CALLER` while the extension popup showed `Chat ID ✓`, `Request ID ✓`,
+`Sent to app ✓`. Two separate causes. One is closed; the other is not.
+
+- [x] **T-174 — the running app was 1.8.7 while the extension was 1.8.8. FIXED (built).**
+      `src/main/version.ts` said `1.8.8` but `out/main/index.js` still carried
+      `APP_VERSION = "1.8.7"` (built 2026-08-20 16:22). `FIXES-1.8.8.md` had recorded
+      `npm run build` as "environment-blocked"; that was a Codex sandbox limit, not a source
+      problem — it builds here in under a second. `restoreRecordedConversation()` is
+      1.8.8-only, so the 1.8.7 bridge could never reattach a chat whose live session was
+      lost, which is exactly the popup string *"the app has not opened a session for this
+      chat yet"*. Rebuilt, repackaged and installed as 1.8.8 on 2026-08-21.
+
+- [ ] **T-175 — request-id evidence arrives after the 15 s identity window, so the first
+      `agents spawn` in a chat is refused. SURVIVES THE VERSION BUMP — still open.**
+      Proven from `state/request-correlations.json` on the live machine: four refused
+      `agents` calls produced only **two** correlation entries, at 20 s and ~2 min after the
+      refusal (the 2-min one only because the page was reloaded). `IDENTITY_EVIDENCE_MS` is
+      15 s (`kernel.ts:780`); all four missed it.
+      Mechanism: `refreshFiber()` — the only thing that reads a connector call's
+      `request_id` out of ChatGPT's message model — runs on a 1 Hz tick **only while
+      `generating` is true** (`content.js:1386`), plus once at turn end (`content.js:1209`)
+      and on connector-row mutations (`content.js:1544`). **Once generating goes false there
+      is no further read at all.** If ChatGPT materialises the request id after that single
+      turn-end read, nothing emits it until the next turn or a reload.
+      Structural aggravator: `spawn` is the one call that cannot tolerate eventual
+      attribution, and it gets the *least* help — the kernel's extra identity wait only fires
+      when `swarmRunning()` (`kernel.ts:393`), which is false for the call that creates the
+      run. The whole burden sits on `callerNow`'s 15 s.
+      Fix order: (1) keep reading Fiber at 1 Hz for ~30 s after `generating` clears — turns
+      "never, until you reload" into "a second or two", and is the highest-leverage change;
+      (2) give `spawn` its own longer window (`SPAWN_EVIDENCE_MS`, 30–45 s) — the wait is
+      event-driven so it costs nothing on success; (3) hold the spawn intent and complete it
+      when the request id resolves, instead of refusing terminally.
+
+- [ ] **T-176 — HTTP 426 makes the extension permanently delete queued observations.**
+      `background.js` `drain()` treats any 4xx outside `[401,408,409,429]` as "permanently
+      malformed": the entry is dropped and replaced with a gap marker. V-18's new 426 falls
+      through that filter, so the moment app and extension disagree on protocol the extension
+      destroys the journal instead of waiting for a reload. Worse, `call()` can 426 itself
+      from a **cached** `portCompatible` trusted for `PORT_TRUST_MS` (30 s) without
+      rechecking. Fix: 426 (and 403) belong in the retryable list — a protocol mismatch is a
+      transient configuration error, not a bad observation.
+
+- [ ] **T-177 — `BRIDGE_PROTOCOL` is still 5, so the 426 gate is blind to the mismatch it
+      was built for.** 1.8.7's extension already sent protocol 5, so app 1.8.7 + extension
+      1.8.8 passes the gate cleanly while the wire has changed underneath it
+      (`resetActivity`/`truncatedFrom`, `authoredTime`, `retiredWorker`, the new
+      `no_such_command` ack semantics). Bump to 6 and extend the changelog comment in
+      `version.ts`. Release-gated: it will 426-reject every currently-loaded 1.8.7 extension
+      until reloaded — do it with the release, not before, and fix T-176 first or the bump
+      itself will eat transcript.
+
+- [ ] **T-178 — late-arriving rows can never reach their correct time slot.** Observed live:
+      a `CHATGPT` message stamped 06:57:44 rendered below a `YOU` message stamped 06:58:18.
+      `chronological()` is deliberately turn-local — sorted by `time` inside a turn, by
+      `seq`/`origin` across turns — which was sound while `time` always meant "when this page
+      observed it". 1.8.8's `authoredTime`/`preferTime` (`store.ts:714`) now rewrites `time`
+      **backwards** to ChatGPT's own `create_time`, so a backfilled message carries an early
+      timestamp and a late `origin` and gets pinned to the bottom anyway. Fix: propagate
+      `authoredTime` onto the stored event and let authored items sort across group
+      boundaries; observed-time items must keep the current rule.
+
+- [ ] **T-179 — `activeTurnId` can wedge permanently and freeze orphan cleanup.**
+      `store.ts:526` sets `activeTurnId` to `event.turnId` or, when that is absent, a
+      synthetic `seq-<n>` — but `turn_end` only clears it when the ids match or the end is
+      unnamed, so a `seq-` value is never cleared. `durableQuiescence()` short-circuits on it
+      (`bridge.ts:1238`) and `sweepStaleSwarm()` can then never retire that worker. The
+      extension path fails closed on a missing `turnId` today, so the fallback is currently
+      unreachable dead code that exists only to create a permanent wedge later — drop it.
+      Separately, `activeTurnId` has no timeout: a tab closed mid-turn leaves it set forever.
+      Same class: `rewriteUnattributedToolCalls` (`store.ts:1279`) resets `lastTurnOutcome`,
+      `agents`, counters — but not `activeTurnId`, which survives the spread and can then
+      never be cleared.
+
+- [ ] **T-180 — asset quota is enforced twice, inconsistently, with a double-counting
+      counter.** V-17 moved durable accounting into `store.ts` and exported the limits;
+      `recorder.ts:68,70` still declares private copies of the same two constants and
+      pre-checks against its own `assetBytes` map. That map also increments unconditionally
+      after `writeAsset()`, which is content-addressed and writes nothing for a repeat — so
+      identical screenshots inflate it and can cut off asset storage well before the real
+      192 MiB. Delete the recorder's constants and pre-check; let the store be authoritative.
+
+- [ ] **T-181 — the failure state is also the most expensive state.** On every `/activity`
+      poll with no live session, `bridge.ts:757` calls `restoreRecordedConversation()` →
+      `findSessionByConversation()` → `readAllSummaries()`, which reads **every** session's
+      `meta.json`. With 60 recorded sessions that is ~60 file reads every 2 s per open tab,
+      indefinitely, in exactly the state a user is most likely to be stuck in. Fix: a
+      conversation-id → session-id index, or a short negative-result cache invalidated on
+      session create/rebind. Related, cheaper: `readRecentEvents()` calls `flushSessions()`
+      (all open sessions) on every call despite now being on the `/activity` hot path
+      (`store.ts:853`); flushing only the session being read is enough.
+
+- [ ] **T-182 — `rebuildSummaryFromHistory()` reads the whole journal with no byte bound**
+      (`store.ts:~400`), despite `FIXES-1.8.8.md` describing V-13 as an "explicit bounded
+      history rebuild" and despite `MAX_RECENT_READ_BYTES` existing for it. Only runs when
+      both `meta.json` and `meta.backup.json` are unreadable — which is also exactly when the
+      session is large and damaged. Bound it, or correct the release record.
 
 ## v1.8.4 — turn killer, reload identity, exec isolation — **INSTALLED 2026-08-20**
 

@@ -27,13 +27,19 @@ beforeAll(async () => {
 describe('extension release metadata', () => {
   it('keeps the app package, bundled extension and bridge protocol on the same release', async () => {
     const pkg = JSON.parse(await fs.readFile(path.join(process.cwd(), 'package.json'), 'utf8')) as { version: string };
+    const lock = JSON.parse(await fs.readFile(path.join(process.cwd(), 'package-lock.json'), 'utf8')) as {
+      version: string;
+      packages?: Record<string, { version?: string }>;
+    };
     const manifest = JSON.parse(
       await fs.readFile(path.join(process.cwd(), 'extension', 'manifest.json'), 'utf8')
     ) as { version: string };
     expect(pkg.version).toBe(APP_VERSION);
+    expect(lock.version).toBe(APP_VERSION);
+    expect(lock.packages?.['']?.version).toBe(APP_VERSION);
     expect(manifest.version).toBe(APP_VERSION);
-    expect(BRIDGE_PROTOCOL).toBe(5);
-    expect(backgroundSource).toContain('const BRIDGE_PROTOCOL = 5;');
+    expect(BRIDGE_PROTOCOL).toBe(6);
+    expect(backgroundSource).toContain('const BRIDGE_PROTOCOL = 6;');
   });
 
   /**
@@ -365,6 +371,9 @@ class FakeStorageArea {
    * can be answered after it, and then it carries stale data into live state.
    */
   lagMs = 0;
+  /** Per-write completion delay; the snapshot is taken before waiting, like an async IPC write. */
+  setDelays: number[] = [];
+  private setCount = 0;
 
   constructor(initial: Record<string, unknown> = {}) {
     this.data = structuredClone(initial);
@@ -384,16 +393,22 @@ class FakeStorageArea {
     if (this.maxBytes !== null && Buffer.byteLength(JSON.stringify(next), 'utf8') > this.maxBytes) {
       throw new Error('QUOTA_BYTES exceeded');
     }
+    const delay = this.setDelays[this.setCount++] ?? 0;
+    if (delay > 0) await new Promise((resolve) => setTimeout(resolve, delay));
     this.data = next;
   }
 }
 
 interface WorkerHarness {
-  send(message: Record<string, unknown>, tabId?: number): Promise<any>;
+  send(message: Record<string, unknown>, tabId?: number, documentId?: string): Promise<any>;
   /** Fires Chrome's real tab-close lifecycle event. */
   closeTab(tabId: number): Promise<void>;
+  /** Fires Chrome's tab URL-change lifecycle event. */
+  navigateTab(tabId: number, url: string): Promise<void>;
   /** Fires the extension install/update lifecycle event. */
   installed(reason?: string): Promise<void>;
+  /** Registers the browser document that owns subsequent tab-scoped messages. */
+  registerTab(tabId: number, documentId?: string): Promise<any>;
   tabsCreate: ReturnType<typeof vi.fn>;
   tabsQuery: ReturnType<typeof vi.fn>;
   tabsUpdate: ReturnType<typeof vi.fn>;
@@ -403,11 +418,15 @@ interface WorkerHarness {
 }
 
 function response(status: number, data: unknown) {
+  const body =
+    data && typeof data === 'object' && (data as Record<string, unknown>).app === 'chatgpt-local-files'
+      ? { bridge: BRIDGE_PROTOCOL, compatible: true, ...structuredClone(data as Record<string, unknown>) }
+      : structuredClone(data);
   return {
     ok: status >= 200 && status < 300,
     status,
     async json() {
-      return structuredClone(data);
+      return structuredClone(body);
     }
   };
 }
@@ -419,6 +438,7 @@ function loadWorker(options: {
 }): WorkerHarness {
   let listener: ((message: any, sender: any, sendResponse: (value: any) => void) => boolean) | null = null;
   const tabRemovedListeners: Array<(tabId: number) => void> = [];
+  const tabUpdatedListeners: Array<(tabId: number, changeInfo: { url?: string; status?: string }) => void> = [];
   const installedListeners: Array<(details: { reason: string }) => void> = [];
   const tabsCreate = vi.fn(async () => ({ id: 99 }));
   const tabsQuery = vi.fn(async () => [] as Array<{ id?: number }>);
@@ -427,6 +447,16 @@ function loadWorker(options: {
   const scriptingExecuteScript = vi.fn(async () => []);
   const scriptingInsertCSS = vi.fn(async () => undefined);
   const windowsUpdate = vi.fn(async () => ({ id: 7 }));
+  const documentNumbers = new Map<number, number>();
+  const currentDocuments = new Map<number, string>();
+  const documentFor = (tabId: number): string => {
+    const current = currentDocuments.get(tabId);
+    if (current) return current;
+    const created = `document-${tabId}-0`;
+    currentDocuments.set(tabId, created);
+    documentNumbers.set(tabId, 0);
+    return created;
+  };
   const event = () => ({ addListener: () => undefined });
   const chrome = {
     storage: { local: options.local, session: options.session },
@@ -458,6 +488,11 @@ function loadWorker(options: {
         addListener(fn: (tabId: number) => void) {
           tabRemovedListeners.push(fn);
         }
+      },
+      onUpdated: {
+        addListener(fn: (tabId: number, changeInfo: { url?: string; status?: string }) => void) {
+          tabUpdatedListeners.push(fn);
+        }
       }
     }
   };
@@ -469,6 +504,7 @@ function loadWorker(options: {
     setTimeout,
     clearTimeout,
     URL,
+    TextEncoder,
     console
   }, { filename: 'background.js' });
   if (!listener) throw new Error('background.js did not register a message listener');
@@ -490,10 +526,54 @@ function loadWorker(options: {
       await new Promise((resolve) => setTimeout(resolve, 0));
       await new Promise((resolve) => setTimeout(resolve, 0));
     },
-    send(message, tabId = 1) {
+    registerTab(tabId, documentId = documentFor(tabId)) {
       return new Promise((resolve, reject) => {
         try {
-          const keep = listener!(message, { tab: { id: tabId } }, resolve);
+          const keep = listener!(
+            { type: 'register_document' },
+            { tab: { id: tabId }, documentId, frameId: 0 },
+            resolve
+          );
+          if (keep !== true) reject(new Error('listener did not keep the response channel open'));
+        } catch (err) {
+          reject(err);
+        }
+      });
+    },
+    async navigateTab(tabId: number, url: string) {
+      const chatGpt = /^https:\/\/(?:chatgpt\.com|chat\.openai\.com)(?:\/|$)/i.test(url);
+      for (const fn of tabUpdatedListeners) fn(tabId, { url, ...(chatGpt ? { status: 'loading' } : {}) });
+      let newDocument: string | null = null;
+      if (chatGpt) {
+        const next = (documentNumbers.get(tabId) ?? 0) + 1;
+        documentNumbers.set(tabId, next);
+        newDocument = `document-${tabId}-${next}`;
+        currentDocuments.set(tabId, newDocument);
+      }
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      // Static content injection registers the new ChatGPT document before its normal page
+      // traffic. Model that handshake here rather than letting a later bind implicitly clear
+      // a terminal lease.
+      if (newDocument) {
+        await new Promise((resolve, reject) => {
+          try {
+            const keep = listener!(
+              { type: 'register_document' },
+              { tab: { id: tabId }, documentId: newDocument, frameId: 0 },
+              resolve
+            );
+            if (keep !== true) reject(new Error('listener did not keep the response channel open'));
+          } catch (err) {
+            reject(err);
+          }
+        });
+      }
+    },
+    send(message, tabId = 1, documentId = documentFor(tabId)) {
+      return new Promise((resolve, reject) => {
+        try {
+          const keep = listener!(message, { tab: { id: tabId }, documentId, frameId: 0 }, resolve);
           if (keep !== true) reject(new Error('listener did not keep the response channel open'));
         } catch (err) {
           reject(err);
@@ -575,8 +655,9 @@ describe('extension command delivery', () => {
    * not open a second chat for the same job. Every part of that could act on a run the app
    * had already finished with, and every part of it was a clock. The app opens the chat now,
    * in the same transaction that creates the command, so the extension has nothing to poll
-   * and nothing to remember. `chrome.alarms` is not even in the manifest — and it is absent
-   * from the fake Chrome here, so reaching for it would throw rather than quietly pass.
+   * and nothing to remember. The only alarm now is a delivery retry for observations and
+   * close notices already accepted into durable session storage; it never discovers work
+   * and never opens a tab.
    */
   it('opens no tabs and holds no alarm of its own', async () => {
     const local = new FakeStorageArea(paired);
@@ -596,7 +677,8 @@ describe('extension command delivery', () => {
 
     // There is no listing route left to ask, so nothing here ever asks for one.
     expect(fetch.mock.calls.every(([input]) => new URL(String(input)).pathname !== '/commands')).toBe(true);
-    expect(backgroundSource).not.toContain('chrome.alarms');
+    expect(backgroundSource).toContain("const RETRY_ALARM = 'clf-bridge-drain'");
+    expect(backgroundSource).not.toContain("call('/commands'");
   });
 
   it('re-injects the recorder into already-open ChatGPT tabs after an extension reload', async () => {
@@ -624,7 +706,7 @@ describe('extension command delivery', () => {
     ]);
   });
 
-  it('leaves an already-live v8 recorder alone instead of stacking another content script', async () => {
+  it('keeps a live recorder but revalidates the idempotent MAIN-world Fiber helper', async () => {
     const local = new FakeStorageArea(paired);
     const session = new FakeStorageArea();
     const worker = loadWorker({ local, session });
@@ -634,8 +716,28 @@ describe('extension command delivery', () => {
     await worker.installed('update');
 
     expect(worker.tabsSendMessage).toHaveBeenCalledWith(41, { type: 'clf-recorder-ping' });
-    expect(worker.scriptingExecuteScript).not.toHaveBeenCalled();
+    expect(worker.scriptingExecuteScript.mock.calls).toEqual([
+      [{ target: { tabId: 41 }, world: 'MAIN', files: ['fiber.js'] }]
+    ]);
     expect(worker.scriptingInsertCSS).not.toHaveBeenCalled();
+  });
+
+  it('repairs a missing MAIN-world Fiber helper on demand for the sending tab only', async () => {
+    const local = new FakeStorageArea(paired);
+    const session = new FakeStorageArea();
+    const worker = loadWorker({ local, session });
+
+    const repaired = await worker.send({ type: 'repair_fiber' }, 73);
+
+    expect(repaired).toMatchObject({ ok: true });
+    expect(worker.scriptingExecuteScript).toHaveBeenCalledWith({
+      target: { tabId: 73, documentIds: ['document-73-0'] },
+      world: 'MAIN',
+      files: ['fiber.js']
+    });
+
+    await worker.navigateTab(73, 'https://example.com/left');
+    expect(await worker.send({ type: 'repair_fiber' }, 73)).toMatchObject({ ok: false, error: 'tab_closed' });
   });
 
   it('has no way to ask the app for work at all', async () => {
@@ -745,7 +847,11 @@ describe('extension observation journal', () => {
     );
 
     expect(journalOf(session)).toMatchObject([
-      { conversationId: null, provisional: 'tab-42', event: { kind: 'user_message', text: 'opening requirement' } }
+      {
+        conversationId: null,
+        provisional: 'tab-42:document-42-0',
+        event: { kind: 'user_message', text: 'opening requirement' }
+      }
     ]);
 
     // Same Chrome tab after the page and service worker have both been recreated.
@@ -792,6 +898,43 @@ describe('extension observation journal', () => {
 
     for (const answer of answers) expect(answer).toMatchObject({ ok: true, durable: true });
     expect(journalOf(session).map((entry) => entry.event.text)).toEqual(['from tab one', 'from tab two']);
+  });
+
+  it('serializes durable journal snapshots so an older slow write cannot erase a newer event', async () => {
+    const local = new FakeStorageArea();
+    const session = new FakeStorageArea();
+    session.setDelays = [60, 0];
+    const worker = loadWorker({ local, session });
+
+    const first = worker.send(
+      { type: 'events', entries: [{ conversationId: null, event: { kind: 'user_message', time: 1, text: 'A' } }] },
+      1
+    );
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    const second = worker.send(
+      { type: 'events', entries: [{ conversationId: null, event: { kind: 'user_message', time: 2, text: 'B' } }] },
+      2
+    );
+    const replies = await Promise.all([first, second]);
+
+    for (const reply of replies) expect(reply).toMatchObject({ ok: true, durable: true });
+    expect(journalOf(session).map((entry) => entry.event.text)).toEqual(['A', 'B']);
+  });
+
+  it('serializes live tab snapshots so a slow older write cannot forget a newer tab owner', async () => {
+    const local = new FakeStorageArea();
+    const session = new FakeStorageArea();
+    session.setDelays = [60, 0];
+    const worker = loadWorker({ local, session });
+    const a = '11111111-2222-3333-4444-555555555555';
+    const b = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee';
+
+    const first = worker.send({ type: 'activity', conversationId: a, since: 0 }, 10);
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    const second = worker.send({ type: 'activity', conversationId: b, since: 0 }, 11);
+    await Promise.all([first, second]);
+
+    expect(session.data.tabConversations).toEqual({ '10': a, '11': b });
   });
 
   it('drains each conversation separately so navigation cannot file chat A observations into chat B', async () => {
@@ -861,6 +1004,209 @@ describe('extension observation journal', () => {
     expect(closed).toEqual([conversationId]);
   });
 
+  it('closes a conversation when its tab survives but navigates away from ChatGPT', async () => {
+    const local = new FakeStorageArea({ port: 8765, token: 'paired-token' });
+    const session = new FakeStorageArea();
+    const closed: string[] = [];
+    const fetch = vi.fn(async (input: string, init: Record<string, unknown> = {}) => {
+      const url = new URL(input);
+      if (url.pathname === '/hello') return response(200, { app: 'chatgpt-local-files', paired: true });
+      if (url.pathname === '/events') return response(200, { sessionId: 'session', stored: 1 });
+      if (url.pathname === '/closed') {
+        closed.push(JSON.parse(String(init.body)).conversationId);
+        return response(200, { ok: true });
+      }
+      return response(404, {});
+    });
+    const worker = loadWorker({ local, session, fetch });
+    const conversationId = '11111111-2222-3333-4444-555555555555';
+
+    await worker.send(
+      {
+        type: 'events',
+        conversationId,
+        entries: [{ conversationId, event: { kind: 'progress', time: Date.now(), text: 'still here' } }]
+      },
+      12
+    );
+    await worker.navigateTab(12, 'https://example.com/elsewhere');
+
+    expect(closed).toEqual([conversationId]);
+    expect(session.data.tabConversations).toEqual({});
+  });
+
+  it('lets terminal navigation beat a delayed message from the dying document', async () => {
+    const conversationId = '11111111-2222-3333-4444-555555555555';
+    const local = new FakeStorageArea({ port: 8765, token: 'paired-token' });
+    const session = new FakeStorageArea({ tabConversations: { '12': conversationId } });
+    // Force both handlers through the same cold-worker load window. The browser event is
+    // delivered first; stale content IPC arrives while storage is still resolving.
+    session.lagMs = 40;
+    const closed: string[] = [];
+    const fetch = vi.fn(async (input: string, init: Record<string, unknown> = {}) => {
+      const url = new URL(input);
+      if (url.pathname === '/hello') return response(200, { app: 'chatgpt-local-files', paired: true });
+      if (url.pathname === '/closed') {
+        closed.push(JSON.parse(String(init.body)).conversationId);
+        return response(200, { ok: true });
+      }
+      if (url.pathname === '/activity') return response(200, { sessionId: 'should-not-be-called', stream: [] });
+      return response(200, {});
+    });
+    const worker = loadWorker({ local, session, fetch });
+
+    const leaving = worker.navigateTab(12, 'https://example.com/elsewhere');
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    const stale = await worker.send({ type: 'activity', conversationId, since: 0 }, 12);
+    await leaving;
+    await new Promise((resolve) => setTimeout(resolve, 100));
+
+    expect(stale).toMatchObject({ ok: false, error: 'tab_closed' });
+    expect(closed).toEqual([conversationId]);
+    expect(session.data.tabConversations).toEqual({});
+    expect(fetch.mock.calls.some(([input]) => new URL(String(input)).pathname === '/activity')).toBe(false);
+  });
+
+  it('rejects the old document after an external round trip and lets only the new document own the tab', async () => {
+    const a = '11111111-2222-3333-4444-555555555555';
+    const b = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee';
+    const local = new FakeStorageArea({ port: 8765, token: 'paired-token' });
+    const session = new FakeStorageArea();
+    const closed: string[] = [];
+    const fetch = vi.fn(async (input: string, init: Record<string, unknown> = {}) => {
+      const url = new URL(input);
+      if (url.pathname === '/hello') return response(200, { app: 'chatgpt-local-files', paired: true });
+      if (url.pathname === '/closed') {
+        closed.push(JSON.parse(String(init.body)).conversationId);
+        return response(200, { ok: true });
+      }
+      if (url.pathname === '/activity') return response(200, { sessionId: 'session', stream: [] });
+      return response(200, {});
+    });
+    const worker = loadWorker({ local, session, fetch });
+    const oldDocument = 'document-12-0';
+
+    await worker.send({ type: 'bind', conversationId: a }, 12, oldDocument);
+    await worker.navigateTab(12, 'https://example.com/away');
+    await worker.navigateTab(12, `https://chatgpt.com/c/${b}`);
+
+    expect(await worker.send({ type: 'activity', conversationId: a, since: 0 }, 12, oldDocument)).toMatchObject({
+      ok: false,
+      error: 'stale_document'
+    });
+    expect(await worker.send({ type: 'bind', conversationId: b }, 12)).toMatchObject({ ok: true });
+    expect(session.data.tabConversations).toEqual({ '12': b });
+    expect(closed).toEqual([a]);
+  });
+
+  it('tombstones a direct ChatGPT document navigation before the replacement document registers', async () => {
+    const a = '11111111-2222-3333-4444-555555555555';
+    const b = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee';
+    const local = new FakeStorageArea({ port: 8765, token: 'paired-token' });
+    const session = new FakeStorageArea();
+    const calls: string[] = [];
+    const fetch = vi.fn(async (input: string) => {
+      const url = new URL(input);
+      calls.push(url.pathname);
+      if (url.pathname === '/hello') return response(200, { app: 'chatgpt-local-files', paired: true });
+      if (url.pathname === '/activity') return response(200, { sessionId: 'session', stream: [] });
+      return response(200, { ok: true });
+    });
+    const worker = loadWorker({ local, session, fetch });
+    const oldDocument = 'document-19-0';
+
+    await worker.send(
+      {
+        type: 'events',
+        conversationId: null,
+        entries: [{ conversationId: null, event: { kind: 'user_message', time: 1, text: 'belongs only to A' } }]
+      },
+      19,
+      oldDocument
+    );
+    await worker.send({ type: 'bind', conversationId: a }, 19, oldDocument);
+
+    const navigating = worker.navigateTab(19, `https://chatgpt.com/c/${b}`);
+    const dying = await worker.send({ type: 'activity', conversationId: a, since: 0 }, 19, oldDocument);
+    await navigating;
+
+    expect(dying).toMatchObject({ ok: false, error: 'tab_closed' });
+    expect(calls).not.toContain('/activity');
+    expect(await worker.send({ type: 'bind', conversationId: b }, 19)).toMatchObject({ ok: true, bound: 0 });
+    expect(journalOf(session)).toEqual([]);
+    expect(session.data.tabConversations).toEqual({ '19': b });
+    expect(calls).toContain('/closed');
+  });
+
+  it('blocks the dying reload document without closing the same conversation', async () => {
+    const conversationId = '11111111-2222-3333-4444-555555555555';
+    const local = new FakeStorageArea({ port: 8765, token: 'paired-token' });
+    const session = new FakeStorageArea();
+    const closed: string[] = [];
+    const fetch = vi.fn(async (input: string, init: Record<string, unknown> = {}) => {
+      const url = new URL(input);
+      if (url.pathname === '/hello') return response(200, { app: 'chatgpt-local-files', paired: true });
+      if (url.pathname === '/closed') closed.push(JSON.parse(String(init.body)).conversationId);
+      return response(200, { ok: true });
+    });
+    const worker = loadWorker({ local, session, fetch });
+    const oldDocument = 'document-27-0';
+
+    await worker.send({ type: 'bind', conversationId }, 27, oldDocument);
+    const reloading = worker.navigateTab(27, `https://chatgpt.com/c/${conversationId}`);
+    const dying = await worker.send({ type: 'activity', conversationId, since: 0 }, 27, oldDocument);
+    await reloading;
+    expect(dying).toMatchObject({ ok: false, error: 'tab_closed' });
+
+    expect(await worker.send({ type: 'bind', conversationId }, 27)).toMatchObject({ ok: true });
+    expect(session.data.tabConversations).toEqual({ '27': conversationId });
+    expect(closed).toEqual([]);
+  });
+
+  it('keeps a terminal document tombstone across service-worker restart', async () => {
+    const conversationId = '11111111-2222-3333-4444-555555555555';
+    const local = new FakeStorageArea();
+    const session = new FakeStorageArea();
+    const oldDocument = 'document-44-old';
+    const first = loadWorker({ local, session });
+    await first.send({ type: 'bind', conversationId }, 44, oldDocument);
+    await first.navigateTab(44, 'https://example.com/away');
+
+    const restarted = loadWorker({ local, session });
+    expect(
+      await restarted.send({ type: 'compact', conversationId, resume: true }, 44, oldDocument)
+    ).toMatchObject({ ok: false, error: 'tab_closed' });
+
+    const newDocument = 'document-44-new';
+    expect(await restarted.registerTab(44, newDocument)).toMatchObject({ ok: true });
+    expect(await restarted.send({ type: 'bind', conversationId }, 44, newDocument)).toMatchObject({ ok: true });
+  });
+
+  it('does not bind an abandoned fresh chat into a later chat that reuses the tab', async () => {
+    const local = new FakeStorageArea();
+    const session = new FakeStorageArea();
+    const worker = loadWorker({ local, session });
+
+    await worker.send(
+      {
+        type: 'events',
+        entries: [{ conversationId: null, event: { kind: 'user_message', time: Date.now(), text: 'chat A opening' } }]
+      },
+      12
+    );
+    expect(journalOf(session)).toHaveLength(1);
+
+    await worker.navigateTab(12, 'https://example.com/abandoned');
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(journalOf(session)).toEqual([]);
+
+    // A later real ChatGPT navigation is a new document and clears the terminal tombstone.
+    await worker.navigateTab(12, 'https://chatgpt.com/');
+    const bound = await worker.send({ type: 'bind', conversationId: 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee' }, 12);
+    expect(bound).toMatchObject({ ok: true, bound: 0 });
+    expect(journalOf(session)).toEqual([]);
+  });
+
   it('stays inside the count budget and leaves an explicit gap when progress has to be discarded', async () => {
     const local = new FakeStorageArea();
     const session = new FakeStorageArea();
@@ -882,7 +1228,9 @@ describe('extension observation journal', () => {
     const session = new FakeStorageArea();
     const worker = loadWorker({ local, session });
     const conversationId = '99999999-8888-7777-6666-555555555555';
-    const blob = 'x'.repeat(5000);
+    // Four UTF-8 bytes but only two UTF-16 code units each. The old string-length budget
+    // undercounted this journal by half and could acknowledge more than Chrome could store.
+    const blob = '🧠'.repeat(2500);
     const entries = Array.from({ length: 1200 }, (_, index) => ({
       conversationId,
       event: { kind: 'progress', time: Date.now(), text: `${index}:${blob}` }
@@ -892,6 +1240,42 @@ describe('extension observation journal', () => {
     const journal = journalOf(session);
     expect(Buffer.byteLength(JSON.stringify(journal), 'utf8')).toBeLessThanOrEqual(4 * 1024 * 1024);
     expect(journal.some((entry) => entry.gap === true)).toBe(true);
+  });
+
+  it('replaces a single unhalvable 413 observation with an explicit durable gap', async () => {
+    const local = new FakeStorageArea({ port: 8765, token: 'paired-token' });
+    const session = new FakeStorageArea();
+    const received: any[] = [];
+    let rejected = false;
+    const fetch = vi.fn(async (input: string, init: Record<string, unknown> = {}) => {
+      const url = new URL(input);
+      if (url.pathname === '/hello') return response(200, { app: 'chatgpt-local-files', paired: true });
+      if (url.pathname === '/events') {
+        const body = JSON.parse(String(init.body));
+        if (!rejected) {
+          rejected = true;
+          return response(413, { error: 'body_too_large' });
+        }
+        received.push(...body.events);
+        return response(200, { ok: true });
+      }
+      return response(200, {});
+    });
+    const worker = loadWorker({ local, session, fetch });
+
+    await worker.send({
+      type: 'events',
+      conversationId: '11111111-2222-3333-4444-555555555555',
+      entries: [{
+        conversationId: '11111111-2222-3333-4444-555555555555',
+        event: { kind: 'assistant_message', time: 1, text: 'x'.repeat(600_000) }
+      }]
+    });
+
+    expect(journalOf(session)).toEqual([]);
+    expect(received).toHaveLength(1);
+    expect(received[0]).toMatchObject({ kind: 'chat_error' });
+    expect(received[0].text).toMatch(/too large.*explicit gap/i);
   });
 
   it('tightens and retries when Chrome rejects a session-storage write', async () => {

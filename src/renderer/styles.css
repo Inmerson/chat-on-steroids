@@ -1,44 +1,66 @@
 /* ---------------------------------------------------------------------------
-   Two themes, light and dark, chosen in the app and remembered — never taken
-   from what Windows happens to be set to, because a desktop tool that changes
-   colour under you is a tool you distrust.
+   One monochrome design, in two weights of the same idea.
 
-   Grey carries the structure — borders, labels, secondary text. Blue is the
-   contrast colour and appears only on things that matter: section titles, the
-   two live numbers, folder names, a switch that is on, the selected tab, and
-   the dot that says the link to OpenAI is verified. Red only on real failures,
-   green only on Connect. Everything else is ink on page.
+   There is no brand colour. Structure is carried by tone alone — the page, a card
+   lifted a step off it, a hairline, and three levels of grey text — so the only
+   things that ever gain colour are the two that mean something is wrong or
+   something is alive: red for a failure, green for a running tunnel. Everything
+   else is ink on paper, or paper on ink.
 
-   The window is a fixed 1080x700 frame (see createWindow), so the layout is
-   built as a grid that fits exactly and scrolls inside its own panes rather
-   than growing the page.
+   Dark is the default and the one the app was drawn for: near-black ground,
+   charcoal cards, white as the accent. Light is the same geometry inverted.
+
+   Corners are generous and consistent — every surface picks one of five radii and
+   nothing invents its own — because a window this dense reads as calmer when the
+   shapes agree with each other.
+
+   The window is a fixed 1080x700 frame (see createWindow), so the layout is a grid
+   that fits exactly and scrolls inside its own panes rather than growing the page.
    --------------------------------------------------------------------------- */
 
 :root {
-  --page: #fff;
+  --page: #f4f4f5;
   --card: #fff;
-  --ink: #0a0a0a;
-  --soft: #55555b;
-  --faint: #9a9aa0;
-  --line: #e6e6e9;
-  --hover: #f5f6f8;
-  --sunk: #fafafb;
+  --ink: #0c0c0e;
+  --soft: #56565e;
+  --faint: #8b8b94;
+  --line: #e7e7ea;
+  --hover: #f0f0f2;
+  --sunk: #f7f7f8;
   /* Switch track, control outline, and the raised knob / selected segment. */
-  --track: #dcdce0;
-  --edge: #d5d5db;
+  --track: #d7d7dc;
+  --edge: #dcdce1;
   --raise: #fff;
 
-  --blue: #2563eb;
-  --wash: #eff4ff;
-  --blue-line: #cfdefb;
+  /* The accent is ink. Kept under the old name so every rule below is one design. */
+  --blue: #0c0c0e;
+  --wash: #eeeef0;
+  --blue-line: #d9d9de;
 
-  --green: #15803d;
-  --green-wash: #f2faf5;
-  --green-line: #c2e5cd;
+  --green: #1f7a4d;
+  --green-wash: #eef6f1;
+  --green-line: #cfe4d8;
 
-  --red: #dc2626;
-  --red-wash: #fdf3f3;
-  --red-line: #f2c8c8;
+  --red: #b4262c;
+  --red-wash: #fbf0f0;
+  --red-line: #eccdcd;
+
+  /* Card lift. Barely there on paper, absent in the dark theme below. */
+  --lift: 0 1px 1px rgb(12 12 14 / 3%), 0 10px 26px -18px rgb(12 12 14 / 22%);
+  /* The switch knob has to read against its own track in both states, and the track
+     flips from grey to full ink when it is on - so the knob needs two values, not one. */
+  --knob-off: #fff;
+  --knob-on: #fff;
+  /* Focus ring, derived from the ink so it is one rule in both themes. */
+  --ring: color-mix(in srgb, var(--ink) 16%, transparent);
+
+  /* Five radii, and nothing else. */
+  --r-xs: 6px;
+  --r-sm: 10px;
+  --r-md: 14px;
+  --r-lg: 18px;
+  --r-xl: 24px;
+  --pill: 999px;
 
   --mono: "Cascadia Mono", Consolas, "Courier New", monospace;
 }
@@ -49,29 +71,35 @@
  * colour used anywhere below is correct in both themes without a second rule.
  */
 :root[data-theme='dark'] {
-  --page: #0e0e11;
-  --card: #16161a;
-  --ink: #f1f1f4;
-  --soft: #a6a6ae;
-  --faint: #74747d;
-  --line: #26262c;
-  --hover: #1e1e24;
-  --sunk: #1a1a20;
-  --track: #3a3a44;
-  --edge: #3a3a44;
-  --raise: #2a2a32;
+  --page: #09090b;
+  --card: #121216;
+  --ink: #f4f4f6;
+  --soft: #b1b1ba;
+  --faint: #7c7c88;
+  --line: #25252c;
+  --hover: #1b1b21;
+  --sunk: #0d0d10;
+  --track: #34343d;
+  --edge: #303039;
+  --raise: #292932;
 
-  --blue: #6f9dff;
-  --wash: #17203a;
-  --blue-line: #2f4270;
+  --blue: #f4f4f6;
+  --wash: #1c1c22;
+  --blue-line: #34343d;
 
-  --green: #4ade80;
-  --green-wash: #12241a;
-  --green-line: #2b5236;
+  --green: #63c795;
+  --green-wash: #10201a;
+  --green-line: #24402f;
 
-  --red: #f87171;
-  --red-wash: #2a1618;
-  --red-line: #58282c;
+  --red: #ef8a8a;
+  --red-wash: #241416;
+  --red-line: #4a262a;
+
+  /* No drop shadow in the dark: the hairline is the edge, and a black shadow on a
+     black page is only mud. */
+  --lift: none;
+  --knob-off: #74747e;
+  --knob-on: #0c0c0e;
 }
 
 * {
@@ -88,7 +116,8 @@ body {
 body {
   background: var(--page);
   color: var(--ink);
-  font: 14px/1.45 "Segoe UI Variable Text", "Segoe UI", system-ui, sans-serif;
+  font: 13.5px/1.5 "Segoe UI Variable Text", "Segoe UI", system-ui, sans-serif;
+  letter-spacing: -0.004em;
   -webkit-font-smoothing: antialiased;
 }
 
@@ -131,7 +160,8 @@ code {
 header {
   display: flex;
   align-items: center;
-  gap: 11px;
+  gap: 12px;
+  min-height: 60px;
   padding: 11px 18px;
   border-bottom: 1px solid var(--line);
 }
@@ -139,17 +169,17 @@ header {
 .mark {
   display: grid;
   place-items: center;
-  width: 30px;
-  height: 30px;
-  border-radius: 8px;
-  background: var(--blue);
-  color: #fff;
+  width: 32px;
+  height: 32px;
+  border-radius: var(--r-md);
+  background: var(--ink);
+  color: var(--page);
 }
 
 .title {
   font-size: 14px;
-  font-weight: 650;
-  letter-spacing: -0.01em;
+  font-weight: 600;
+  letter-spacing: -0.015em;
 }
 
 .title span {
@@ -191,11 +221,11 @@ header {
 }
 
 .live.is-connected .dot {
-  background: var(--blue);
+  background: var(--green);
 }
 
 .live.is-busy .dot {
-  background: var(--blue);
+  background: var(--soft);
   animation: blink 1.1s ease-in-out infinite;
 }
 
@@ -220,11 +250,12 @@ header {
   align-items: center;
   gap: 7px;
   border: 1px solid var(--green-line);
-  border-radius: 8px;
-  padding: 8px 15px;
+  border-radius: var(--pill);
+  padding: 8px 17px;
   font: inherit;
-  font-size: 13px;
+  font-size: 12.5px;
   font-weight: 600;
+  letter-spacing: -0.005em;
   cursor: pointer;
   background: var(--green-wash);
   color: var(--green);
@@ -269,13 +300,13 @@ main {
 
 /* Home: three cards over the log, both sized so nothing ever reflows. */
 [data-panel='home'] {
-  grid-template-rows: minmax(0, 1fr) 218px;
-  gap: 13px;
-  padding: 13px;
+  grid-template-rows: 258px minmax(0, 1fr);
+  gap: 12px;
+  padding: 12px 14px 14px;
 }
 
 [data-panel='activity'] {
-  padding: 13px;
+  padding: 12px 14px 14px;
   grid-template-rows: minmax(0, 1fr);
 }
 
@@ -287,7 +318,7 @@ main {
 .top {
   display: grid;
   grid-template-columns: 1.15fr 1fr 1fr;
-  gap: 13px;
+  gap: 12px;
   min-height: 0;
 }
 
@@ -296,7 +327,8 @@ main {
 .card {
   background: var(--card);
   border: 1px solid var(--line);
-  border-radius: 11px;
+  border-radius: var(--r-md);
+  box-shadow: var(--lift);
   display: grid;
   grid-template-rows: auto minmax(0, 1fr);
   min-height: 0;
@@ -307,12 +339,13 @@ main {
   display: flex;
   align-items: center;
   gap: 8px;
-  padding: 11px 14px 9px;
-  font-size: 11px;
-  font-weight: 700;
-  letter-spacing: 0.07em;
+  min-height: 45px;
+  padding: 12px 15px 9px;
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: 0.11em;
   text-transform: uppercase;
-  color: var(--blue);
+  color: var(--faint);
 }
 
 /* Everything after the title lives in one right-aligned cluster.
@@ -339,7 +372,7 @@ main {
   display: flex;
   align-items: center;
   gap: 8px;
-  padding: 0 14px 9px;
+  padding: 0 16px 10px;
   min-width: 0;
 }
 
@@ -393,12 +426,13 @@ main {
   border: 0;
   background: none;
   color: var(--faint);
-  border-radius: 7px;
-  padding: 4px 8px;
+  border-radius: var(--pill);
+  padding: 5px 10px;
   font: inherit;
   font-size: 12px;
   font-weight: 550;
   cursor: pointer;
+  transition: background 0.14s, color 0.14s;
 }
 
 .btn:hover:not(:disabled) {
@@ -417,15 +451,15 @@ main {
 }
 
 .btn.is-on {
-  background: var(--wash);
-  color: var(--blue);
+  background: var(--ink);
+  color: var(--page);
 }
 
 .btn-solid {
   background: var(--sunk);
   border: 1px solid var(--line);
   color: var(--ink);
-  padding: 6px 11px;
+  padding: 7px 13px;
   font-size: 12.5px;
 }
 
@@ -445,16 +479,17 @@ main {
 .seg {
   display: inline-flex;
   gap: 2px;
-  padding: 2px;
-  border-radius: 8px;
+  padding: 3px;
+  border-radius: var(--pill);
   background: var(--sunk);
+  border: 1px solid var(--line);
 }
 
 .seg button {
   border: 0;
   background: none;
-  border-radius: 6px;
-  padding: 3px 9px;
+  border-radius: var(--pill);
+  padding: 4px 11px;
   font: inherit;
   font-size: 11px;
   font-weight: 600;
@@ -469,9 +504,8 @@ main {
 }
 
 .seg button.is-sel {
-  background: var(--raise);
-  color: var(--blue);
-  box-shadow: 0 1px 2px rgb(0 0 0 / 8%);
+  background: var(--ink);
+  color: var(--page);
 }
 
 .problems {
@@ -481,7 +515,7 @@ main {
   text-transform: none;
   color: var(--red);
   background: var(--red-wash);
-  border-radius: 999px;
+  border-radius: var(--pill);
   padding: 2px 8px;
 }
 
@@ -496,8 +530,8 @@ main {
 .perm-head {
   display: flex;
   align-items: center;
-  gap: 11px;
-  padding: 9px 14px;
+  gap: 12px;
+  padding: 10px 16px;
 }
 
 .perm-head:hover {
@@ -546,7 +580,7 @@ main {
 .perm-main .chev {
   width: 13px;
   height: 13px;
-  color: #c8c8ce;
+  color: var(--faint);
   transition: transform 0.15s;
 }
 
@@ -578,7 +612,7 @@ main {
 .sw i {
   position: absolute;
   inset: 0;
-  border-radius: 999px;
+  border-radius: var(--pill);
   background: var(--track);
   transition: background 0.15s;
   pointer-events: none;
@@ -590,9 +624,9 @@ main {
   inset: 2px auto 2px 2px;
   width: 16px;
   border-radius: 50%;
-  background: #fff;
+  background: var(--knob-off);
   box-shadow: 0 1px 2px rgb(0 0 0 / 22%);
-  transition: transform 0.15s;
+  transition: transform 0.15s, background 0.15s;
 }
 
 .sw input:checked + i {
@@ -601,6 +635,7 @@ main {
 
 .sw input:checked + i::after {
   transform: translateX(14px);
+  background: var(--knob-on);
 }
 
 .sw input:indeterminate + i {
@@ -612,7 +647,7 @@ main {
 }
 
 .sw input:focus-visible + i {
-  outline: 2px solid var(--blue);
+  outline: 2px solid var(--ink);
   outline-offset: 2px;
 }
 
@@ -626,7 +661,7 @@ main {
    instead of being pushed against its right edge. */
 .tools {
   display: none;
-  padding: 2px 14px 9px;
+  padding: 2px 16px 10px;
 }
 
 .perm.is-open .tools {
@@ -655,9 +690,9 @@ main {
      column of ticks read as ragged even though every row was the same width. */
   align-items: center;
   gap: 10px;
-  padding: 7px 10px 7px 28px;
+  padding: 8px 12px 8px 30px;
   border: 0;
-  border-radius: 8px;
+  border-radius: var(--r-sm);
   font-size: 12.5px;
   color: var(--soft);
   cursor: pointer;
@@ -676,7 +711,7 @@ main {
   height: 14px;
   flex: 0 0 auto;
   border: 1.5px solid var(--edge);
-  border-radius: 4px;
+  border-radius: var(--r-xs);
   background: var(--card);
   display: grid;
   place-items: center;
@@ -695,7 +730,7 @@ main {
   content: '';
   width: 7px;
   height: 4px;
-  border: 1.6px solid #fff;
+  border: 1.6px solid var(--page);
   border-top: 0;
   border-right: 0;
   transform: rotate(-45deg);
@@ -732,6 +767,24 @@ main {
 
 .tools .tool.is-static:hover {
   background: none;
+}
+
+/* The tools this group actually publishes, named as the model sees them. Set apart from
+   the rows above because it is a fact about the connector, not another thing to tick. */
+.tool-names {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+  margin: 5px 0 1px 30px;
+}
+
+.tool-names code {
+  padding: 2px 8px;
+  border-radius: var(--pill);
+  background: var(--sunk);
+  border: 1px solid var(--line);
+  color: var(--faint);
+  font-size: 10.5px;
 }
 
 /* ----------------------------------------------------------------- folders */
@@ -907,6 +960,13 @@ main {
   color: var(--red);
 }
 
+.check.is-skipped .check-mark,
+.check.is-not-run .check-mark {
+  border: 1px solid var(--line);
+  background: transparent;
+  color: var(--faint);
+}
+
 .check strong {
   font-weight: 600;
   display: block;
@@ -926,17 +986,20 @@ main {
    something actually failed — so a red line is always worth looking at. */
 
 .feed {
-  padding: 2px 10px 10px;
-  font-size: 12px;
+  padding: 4px 10px 10px;
+  font-size: 11.5px;
   color: var(--soft);
   font-family: var(--mono);
 }
 
 .feed p {
-  display: flex;
-  gap: 12px;
-  padding: 3px 6px;
-  border-radius: 5px;
+  display: grid;
+  grid-template-columns: 82px 132px minmax(0, 1fr);
+  gap: 10px;
+  min-height: 26px;
+  align-items: baseline;
+  padding: 4px 8px;
+  border-radius: var(--r-xs);
 }
 
 .feed p:hover {
@@ -952,7 +1015,7 @@ main {
 /* A fixed column, so the subjects line up however long they are. */
 .feed .what {
   color: var(--ink);
-  flex: 0 0 132px;
+  font-weight: 600;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -1076,9 +1139,9 @@ main {
 }
 
 .step.is-done .step-mark {
-  background: var(--blue);
-  border-color: var(--blue);
-  color: #fff;
+  background: var(--ink);
+  border-color: var(--ink);
+  color: var(--page);
 }
 
 .step.is-current .step-mark {
@@ -1160,9 +1223,9 @@ input[type='password'],
 input[type='number'],
 select {
   width: 100%;
-  padding: 7px 10px;
-  border: 1px solid var(--line);
-  border-radius: 8px;
+  padding: 8px 12px;
+  border: 1px solid var(--edge);
+  border-radius: var(--r-sm);
   background: var(--card);
   font: inherit;
   font-size: 13px;
@@ -1174,8 +1237,8 @@ input[type='password']:focus,
 input[type='number']:focus,
 select:focus {
   outline: 0;
-  border-color: var(--blue);
-  box-shadow: 0 0 0 3px var(--wash);
+  border-color: var(--ink);
+  box-shadow: 0 0 0 3px var(--ring);
 }
 
 input[readonly] {
@@ -1212,7 +1275,7 @@ input[readonly] {
 
 .connector {
   border: 1px solid var(--line);
-  border-radius: 11px;
+  border-radius: var(--r-lg);
   padding: 12px 14px 14px;
 }
 
@@ -1243,7 +1306,7 @@ input[readonly] {
 .pill {
   font-size: 11px;
   font-weight: 600;
-  border-radius: 999px;
+  border-radius: var(--pill);
   padding: 1px 8px;
   border: 1px solid var(--line);
   color: var(--soft);
@@ -1263,7 +1326,7 @@ input[readonly] {
 .advanced {
   margin-top: 20px;
   border: 1px solid var(--line);
-  border-radius: 11px;
+  border-radius: var(--r-lg);
   padding: 0 14px;
 }
 
@@ -1307,9 +1370,9 @@ input[readonly] {
    neither. */
 
 [data-panel='chat'] {
-  padding: 13px;
-  gap: 13px;
-  grid-template-columns: 288px minmax(0, 1fr);
+  padding: 12px 14px 14px;
+  gap: 12px;
+  grid-template-columns: 310px minmax(0, 1fr);
   grid-template-rows: minmax(0, 1fr);
 }
 
@@ -1334,7 +1397,7 @@ input[readonly] {
   font-size: 12.5px;
   font-weight: 600;
   color: var(--ink);
-  max-width: 28%;
+  max-width: 72%;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -1344,7 +1407,7 @@ input[readonly] {
 
 .sess {
   position: relative;
-  padding: 9px 12px;
+  padding: 10px 13px;
   cursor: pointer;
   border-left: 2px solid transparent;
 }
@@ -1358,8 +1421,8 @@ input[readonly] {
 }
 
 .sess.is-sel {
-  background: var(--wash);
-  border-left-color: var(--blue);
+  background: var(--hover);
+  border-left-color: var(--ink);
 }
 
 .sess-top {
@@ -1427,7 +1490,7 @@ input[readonly] {
 .bar {
   height: 3px;
   margin-top: 7px;
-  border-radius: 999px;
+  border-radius: var(--pill);
   background: var(--track);
   overflow: hidden;
 }
@@ -1457,14 +1520,24 @@ input[readonly] {
 /* ---------------------------------------------------------- timeline */
 
 #timeline {
-  padding: 6px 0 8px;
+  padding: 8px 0 10px;
+}
+
+.timeline-window-note {
+  margin: 2px 16px 10px 86px;
+  padding: 7px 10px;
+  border: 1px solid var(--line);
+  border-radius: var(--r-sm);
+  background: var(--sunk);
+  color: var(--faint);
+  font-size: 11px;
 }
 
 .ev {
   display: grid;
   grid-template-columns: 62px minmax(0, 1fr);
   gap: 10px;
-  padding: 3px 14px;
+  padding: 4px 16px;
 }
 
 .ev > time {
@@ -1522,8 +1595,8 @@ input[readonly] {
 }
 
 .said {
-  padding: 6px 10px;
-  border-radius: 8px;
+  padding: 8px 11px;
+  border-radius: var(--r-md);
   background: var(--sunk);
 }
 
@@ -1587,14 +1660,14 @@ input[readonly] {
   margin-left: 0;
   padding-left: 0.8em;
   border-left: 2px solid var(--line);
-  color: var(--muted);
+  color: var(--soft);
 }
 
 .msg.rich code {
   font-family: var(--mono);
   font-size: 0.94em;
   padding: 0.08em 0.28em;
-  border-radius: 4px;
+  border-radius: var(--r-xs);
   background: var(--wash);
 }
 
@@ -1602,7 +1675,7 @@ input[readonly] {
   overflow: auto;
   padding: 8px 10px;
   border: 1px solid var(--line);
-  border-radius: 6px;
+  border-radius: var(--r-sm);
   background: var(--wash);
   white-space: pre;
 }
@@ -1644,15 +1717,22 @@ input[readonly] {
 .tool {
   display: block;
   border: 0;
-  border-radius: 0;
-  opacity: 0.76;
+  border-radius: var(--r-md);
+  color: var(--soft);
+}
+
+/* An open call is a surface of its own, so the arguments and the result read as
+   belonging to the row that was clicked rather than to the timeline around it. */
+.tool[open] {
+  background: var(--sunk);
 }
 
 .tool > summary {
   display: flex;
   align-items: center;
   gap: 8px;
-  padding: 4px 0;
+  padding: 5px 9px;
+  border-radius: var(--r-md);
   font-size: 12.5px;
   cursor: pointer;
   list-style: none;
@@ -1664,7 +1744,6 @@ input[readonly] {
 
 .tool > summary:hover {
   background: var(--hover);
-  border-radius: 4px;
 }
 
 .tool summary b {
@@ -1715,7 +1794,7 @@ input[readonly] {
 
 .raw {
   border-top: 1px solid var(--line);
-  padding: 8px 9px 10px;
+  padding: 9px 11px 11px;
   display: grid;
   gap: 4px;
 }
@@ -1758,7 +1837,7 @@ input[readonly] {
   font-size: 11px;
   color: var(--soft);
   background: var(--sunk);
-  border-radius: 6px;
+  border-radius: var(--r-sm);
   padding: 6px 8px;
   max-height: 260px;
   overflow: hidden auto;
@@ -1775,7 +1854,7 @@ input[readonly] {
   display: inline-block;
   margin-right: 6px;
   padding: 1px 7px;
-  border-radius: 999px;
+  border-radius: var(--pill);
   background: var(--sunk);
   color: var(--faint);
   font-size: 10px;
@@ -1812,10 +1891,70 @@ input[readonly] {
   gap: 8px;
   margin-top: 12px;
   font-size: 10.5px;
-  font-weight: 700;
-  letter-spacing: 0.07em;
+  font-weight: 600;
+  letter-spacing: 0.11em;
   text-transform: uppercase;
-  color: var(--blue);
+  color: var(--faint);
+}
+
+/* One setting per row: what it does on the left, its number and its switch on the
+   right. The rows are the whole settings sheet now, so they carry the separators
+   instead of a stack of headings, and the explanation is one clause rather than a
+   paragraph — anything longer than that was documentation filed in the wrong place. */
+.setting {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 13px 2px;
+}
+
+.setting + .setting {
+  border-top: 1px solid var(--line);
+}
+
+.setting-text {
+  flex: 1;
+  min-width: 0;
+}
+
+.setting-text b {
+  display: block;
+  font-size: 13px;
+  font-weight: 550;
+}
+
+.setting-text em {
+  display: block;
+  font-style: normal;
+  font-size: 11.5px;
+  color: var(--faint);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Numbers are read against each other down the column, so they are fixed width,
+   right-aligned and tabular. The selector carries the element on purpose: the shared
+   `input[type='number']` rule above sets width 100%, and a bare class would lose the
+   specificity tie and stretch the field across the whole row. */
+input.num {
+  flex: 0 0 auto;
+  width: 92px;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+.unit {
+  flex: 0 0 auto;
+  width: 42px;
+  font-size: 11px;
+  color: var(--faint);
+}
+
+/* Inside a settings row the switch is one of several controls, not the thing the
+   row pushes to the far end. */
+.setting .sw {
+  margin-left: 0;
 }
 
 .pane h3:first-child {
@@ -1834,7 +1973,7 @@ input[readonly] {
 
 .stage {
   padding: 3px 9px;
-  border-radius: 999px;
+  border-radius: var(--pill);
   background: var(--sunk);
   color: var(--faint);
   font-size: 11px;
@@ -1847,8 +1986,8 @@ input[readonly] {
 }
 
 .stage.is-now {
-  background: var(--blue);
-  color: #fff;
+  background: var(--ink);
+  color: var(--page);
 }
 
 /* Which pass of a staged compaction is running. */
@@ -1865,7 +2004,7 @@ input[readonly] {
 .errbox {
   padding: 8px 10px;
   border: 1px solid var(--red-line);
-  border-radius: 8px;
+  border-radius: var(--r-md);
   background: var(--red-wash);
   color: var(--red);
   font-size: 12px;
@@ -1896,7 +2035,7 @@ input[readonly] {
 .model,
 .agent {
   padding: 6px 9px;
-  border-radius: 8px;
+  border-radius: var(--r-md);
   border: 1px solid transparent;
 }
 
@@ -1965,27 +2104,30 @@ input[readonly] {
 
 nav {
   display: flex;
-  gap: 4px;
-  padding: 6px 12px 8px;
+  justify-content: center;
+  gap: 3px;
+  padding: 7px 16px 9px;
   border-top: 1px solid var(--line);
+  background: color-mix(in srgb, var(--page) 92%, transparent);
 }
 
 nav button {
-  flex: 1;
+  flex: 0 0 132px;
   position: relative;
   display: flex;
   align-items: center;
   justify-content: center;
   gap: 8px;
-  padding: 9px 0;
+  padding: 8px 14px;
   border: 0;
-  border-radius: 8px;
+  border-radius: var(--pill);
   background: none;
   color: var(--faint);
   font: inherit;
   font-size: 12.5px;
-  font-weight: 600;
+  font-weight: 550;
   cursor: pointer;
+  transition: background 0.14s, color 0.14s;
 }
 
 nav button:hover {
@@ -1994,8 +2136,21 @@ nav button:hover {
 }
 
 nav button.is-sel {
-  color: var(--blue);
-  background: var(--wash);
+  color: var(--ink);
+  background: var(--hover);
+  box-shadow: inset 0 0 0 1px var(--line);
+}
+
+nav button.is-sel::after {
+  content: '';
+  position: absolute;
+  left: 50%;
+  bottom: 3px;
+  width: 18px;
+  height: 2px;
+  border-radius: var(--pill);
+  background: var(--ink);
+  transform: translateX(-50%);
 }
 
 .badge {
@@ -2015,8 +2170,8 @@ nav button.is-sel {
   background: var(--ink);
   color: var(--page);
   font-size: 12.5px;
-  padding: 8px 14px;
-  border-radius: 8px;
+  padding: 9px 16px;
+  border-radius: var(--pill);
   box-shadow: 0 8px 24px -8px rgb(0 0 0 / 45%);
   z-index: 10;
 }

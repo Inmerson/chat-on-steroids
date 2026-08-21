@@ -14,7 +14,7 @@
 
 import type { AppApi } from '../preload/index.js';
 import type { AppState, Capability, LogEntry, SurfaceStatus } from '../shared/types.js';
-import { CAPABILITY_DETAILS, CAPABILITY_LABELS, WRITE_CAPABILITIES } from '../shared/types.js';
+import { CAPABILITY_DETAILS, CAPABILITY_LABELS, CAPABILITY_TOOLS, WRITE_CAPABILITIES } from '../shared/types.js';
 import type { SwarmState } from '../shared/session.js';
 import { $, ago, el, icon, run, shortAgo, toast } from './dom.js';
 import { chatApply, chatSettingsPatch, chatVisible, initChat } from './chat.js';
@@ -42,10 +42,10 @@ interface Group {
 /**
  * Every tool both connectors can advertise at once.
  *
- * Six on Core and two on Desktop. `find` never coexists with the exec pair — it exists
- * only when running commands is switched off — so no configuration reaches nine.
+ * Seven on Core and two on Desktop. `find` never coexists with the exec pair — it exists
+ * only when running commands is switched off — so nine is the reachable maximum.
  */
-const MAX_TOOL_COUNT = 8;
+const MAX_TOOL_COUNT = 9;
 
 const GROUPS: Group[] = [
   {
@@ -81,6 +81,24 @@ const GROUPS: Group[] = [
 let state: AppState | null = null;
 /** Guards against saving while we are writing values into the controls. */
 let applying = false;
+
+/**
+ * Applies persisted form state without erasing a value the user is currently editing.
+ *
+ * `state:changed` is primarily a live status push, but it carries the whole config object. A
+ * focused field can therefore differ from the last persisted config for several seconds before
+ * its `change` event saves it. Only that exact dirty case is protected; an idle/focused-but-clean
+ * field still follows persisted state normally.
+ */
+function applyValue(control: HTMLInputElement | HTMLSelectElement, next: string, previous?: string): void {
+  const dirty = document.activeElement === control && previous !== undefined && control.value !== previous;
+  if (!dirty) control.value = next;
+}
+
+function applyChecked(control: HTMLInputElement, next: boolean, previous?: boolean): void {
+  const dirty = document.activeElement === control && previous !== undefined && control.checked !== previous;
+  if (!dirty) control.checked = next;
+}
 /** The one expanded permission group, or null. One at a time keeps the layout still. */
 let openGroup: string | null = null;
 /** Whether the finished setup steps are unfolded again. Reset on every app start. */
@@ -98,6 +116,10 @@ function showTab(name: string): void {
   // The Chat panel is the only one that costs anything to keep fresh, so it only
   // reloads while it is on screen.
   chatVisible(name === 'chat');
+  // A feed that was appended to while its panel was hidden could not be scrolled then —
+  // a hidden element has no scroll height. Pin it now that it has one, so a panel always
+  // opens on the newest line rather than on whatever was oldest in the buffer.
+  for (const id of FEEDS) stickToNewest(id);
 }
 
 $('tabs').addEventListener('click', (event) => {
@@ -112,24 +134,48 @@ $('tabs').addEventListener('click', (event) => {
  * turns the whole group on or off. Expanding scrolls the row just into view rather
  * than pushing the cards below it, because the window cannot grow.
  */
+/** The head of a permission row: the expander, its title, and its switch. */
+function groupShell(id: string, title: string, iconId: string, box: HTMLInputElement): HTMLElement {
+  const root = el('div', 'perm');
+  root.dataset.group = id;
+
+  const main = document.createElement('button');
+  main.className = 'perm-main';
+  main.type = 'button';
+  const text = el('span');
+  text.append(el('b', '', title), el('em', 'group-count'));
+  main.append(icon('i-chev', 'ico chev'), icon(iconId), text);
+  main.addEventListener('click', () => {
+    openGroup = openGroup === id ? null : id;
+    paintGroups();
+    if (openGroup === id) root.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+  });
+
+  const sw = el('span', 'sw');
+  sw.append(box, el('i'));
+
+  const head = el('div', 'perm-head');
+  head.append(main, sw);
+  root.append(head);
+  return root;
+}
+
+/**
+ * The tools this group hands ChatGPT, named exactly as the model sees them.
+ *
+ * The permission copy used to carry the tool names inside its prose, which is where they
+ * went stale: the surface was consolidated to `read` / `apply_patch` / `exec_command` and
+ * a sentence in a different file kept describing the old one. Here the names come from
+ * CAPABILITY_TOOLS, so a renamed tool is renamed once.
+ */
+function toolNames(names: readonly string[]): HTMLElement {
+  const row = el('div', 'tool-names');
+  for (const name of names) row.append(el('code', '', name));
+  return row;
+}
+
 function buildGroups(): void {
   const permissionGroups = GROUPS.map((group) => {
-    const root = el('div', 'perm');
-    root.dataset.group = group.id;
-
-    const main = document.createElement('button');
-    main.className = 'perm-main';
-    main.type = 'button';
-    const text = el('span');
-    text.append(el('b', '', group.title), el('em', 'group-count'));
-    main.append(icon('i-chev', 'ico chev'), icon(group.icon), text);
-    main.addEventListener('click', () => {
-      openGroup = openGroup === group.id ? null : group.id;
-      paintGroups();
-      if (openGroup === group.id) root.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
-    });
-
-    const sw = el('span', 'sw');
     const box = document.createElement('input');
     box.type = 'checkbox';
     box.className = 'group-box';
@@ -141,10 +187,7 @@ function buildGroups(): void {
       }
       void save();
     });
-    sw.append(box, el('i'));
-
-    const head = el('div', 'perm-head');
-    head.append(main, sw);
+    const root = groupShell(group.id, group.title, group.icon, box);
 
     const tools = el('div', 'tools');
     for (const cap of group.caps) {
@@ -158,40 +201,45 @@ function buildGroups(): void {
       label.append(input, body);
       tools.append(label);
     }
+    tools.append(toolNames([...new Set(group.caps.flatMap((cap) => CAPABILITY_TOOLS[cap]))]));
 
-    root.append(head, tools);
+    root.append(tools);
     return root;
   });
 
-  // Multi-agent is a tool surface just like file/desktop permissions, but it used to be
-  // buried three clicks deep in Chat settings. Keep the detailed worker-count knob there;
-  // put the actual expose/hide switch where every other ChatGPT tool switch already lives.
-  const agents = el('div', 'perm');
-  agents.dataset.group = 'agents';
-  const main = document.createElement('button');
-  main.className = 'perm-main';
-  main.type = 'button';
-  const text = el('span');
-  text.append(el('b', '', 'Sub-agents'), el('em', 'group-count'));
-  main.append(icon('i-chev', 'ico chev'), icon('i-bolt'), text);
-  main.addEventListener('click', () => {
-    openGroup = openGroup === 'agents' ? null : 'agents';
-    paintGroups();
-    if (openGroup === 'agents') agents.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
-  });
+  // Recording and sub-agents are tool surfaces exactly like the file and desktop
+  // permissions — `session` and `agents` are two of the nine tools ChatGPT can discover —
+  // and they used to be checkboxes buried in a settings pane behind a gear. Every switch
+  // that decides what ChatGPT can reach now lives in this one list. Chat settings keeps
+  // only the numbers that tune them.
+  const record = document.createElement('input');
+  record.type = 'checkbox';
+  record.id = 'sessRecord';
+  record.title = 'Record this chat locally, and expose the session tool in ChatGPT';
+  record.addEventListener('change', () => void save());
+  const recording = groupShell('recording', 'Session recording', 'i-steps', record);
+  const recordTools = el('div', 'tools');
+  for (const [name, detail] of [
+    ['history', 'Re-read this chat’s own timeline, and search what was recorded.'],
+    ['status', 'How much has accumulated, and what is still running.']
+  ] as Array<[string, string]>) {
+    const row = el('div', 'tool is-static');
+    const body = el('span');
+    body.append(el('strong', '', name), el('em', '', detail));
+    row.append(body);
+    recordTools.append(row);
+  }
+  recordTools.append(toolNames(['session']));
+  recording.append(recordTools);
 
-  const sw = el('span', 'sw');
   const enabled = document.createElement('input');
   enabled.type = 'checkbox';
   enabled.id = 'homeMaEnabled';
   enabled.title = 'Expose or hide the sub-agent tools in ChatGPT';
-  enabled.addEventListener('change', () => {
-    $<HTMLInputElement>('maEnabled').checked = enabled.checked;
-    void save();
-  });
-  sw.append(enabled, el('i'));
-  const head = el('div', 'perm-head');
-  head.append(main, sw);
+  // The only multi-agent exposure control there is. Chat settings used to carry a second
+  // checkbox for the same flag, which this one had to mirror by hand.
+  enabled.addEventListener('change', () => void save());
+  const agents = groupShell('agents', 'Sub-agents', 'i-bolt', enabled);
 
   const tools = el('div', 'tools');
   const agentTools: Array<[string, string]> = [
@@ -208,9 +256,10 @@ function buildGroups(): void {
     row.append(body);
     tools.append(row);
   }
-  agents.append(head, tools);
+  tools.append(toolNames(['agents']));
+  agents.append(tools);
 
-  $('groups').replaceChildren(...permissionGroups, agents);
+  $('groups').replaceChildren(...permissionGroups, recording, agents);
 }
 
 function capInput(cap: Capability): HTMLInputElement {
@@ -240,7 +289,7 @@ function paintGroups(): void {
         : on.length === 0
           ? 'off'
           : on.length === group.caps.length
-            ? `${on.length} permissions`
+            ? `${on.length} permission${on.length === 1 ? '' : 's'}`
             : `${on.length} of ${group.caps.length} permissions`;
 
     root.classList.toggle('is-on', on.length > 0);
@@ -249,13 +298,20 @@ function paintGroups(): void {
 
   for (const cap of WRITE_CAPABILITIES) capInput(cap).disabled = readOnly;
 
-  const agents = document.querySelector<HTMLElement>('[data-group="agents"]');
-  if (agents) {
-    const enabled = $<HTMLInputElement>('homeMaEnabled');
-    enabled.checked = state.config.multiAgent.enabled;
-    agents.classList.toggle('is-open', openGroup === 'agents');
-    agents.classList.toggle('is-on', enabled.checked);
-    agents.querySelector<HTMLElement>('.group-count')!.textContent = enabled.checked ? '6 tools exposed' : 'off';
+  // The two feature groups. apply() already passed both switches through the
+  // focused/dirty-field guard. Recopying state here undid that protection and visibly
+  // flipped a user's just-clicked toggle back when an unsolicited stale state push
+  // arrived before save completed, so this only reads them.
+  for (const [id, onText] of [
+    ['recording', 'session tool exposed'],
+    ['agents', 'agents tool exposed']
+  ] as Array<[string, string]>) {
+    const root = document.querySelector<HTMLElement>(`[data-group="${id}"]`);
+    if (!root) continue;
+    const box = root.querySelector<HTMLInputElement>('.sw input')!;
+    root.classList.toggle('is-open', openGroup === id);
+    root.classList.toggle('is-on', box.checked);
+    root.querySelector<HTMLElement>('.group-count')!.textContent = box.checked ? onText : 'off';
   }
 }
 
@@ -388,6 +444,7 @@ function missingStep(next: AppState): { step: string; text: string } | null {
 // ----------------------------------------------------------------- render
 
 function apply(next: AppState): void {
+  const previousState = state;
   state = next;
   applying = true;
   const { config, status } = next;
@@ -433,9 +490,21 @@ function apply(next: AppState): void {
   // ---- permissions
   $('readOnlyBtn').classList.toggle('is-on', config.readOnly);
   for (const input of document.querySelectorAll<HTMLInputElement>('[data-cap]')) {
-    input.checked = config.capabilities[input.dataset.cap as Capability];
+    const cap = input.dataset.cap as Capability;
+    applyChecked(input, config.capabilities[cap], previousState?.config.capabilities[cap]);
   }
-  $<HTMLInputElement>('homeMaEnabled').checked = config.multiAgent.enabled;
+  applyChecked(
+    $<HTMLInputElement>('homeMaEnabled'),
+    config.multiAgent.enabled,
+    previousState?.config.multiAgent.enabled
+  );
+  // Recording is a tool switch like the rest of this list, so it goes through the same
+  // dirty-field guard rather than being assigned outright from the Chat panel.
+  applyChecked(
+    $<HTMLInputElement>('sessRecord'),
+    config.sessions.record,
+    previousState?.config.sessions.record
+  );
   paintGroups();
 
   // ---- folders
@@ -463,14 +532,30 @@ function apply(next: AppState): void {
   $('setupBadge').hidden = missing === null;
 
   // ---- wizard
-  $<HTMLSelectElement>('tunnelKind').value = config.tunnel.kind;
+  applyValue(
+    $<HTMLSelectElement>('tunnelKind'),
+    config.tunnel.kind,
+    previousState?.config.tunnel.kind
+  );
   $('methodHint').textContent = METHOD_HINT[config.tunnel.kind] ?? '';
-  $<HTMLInputElement>('tunnelId').value = config.tunnel.tunnelId;
-  $<HTMLInputElement>('desktopTunnelId').value = config.tunnel.desktopTunnelId;
-  $<HTMLInputElement>('binaryPath').value = config.tunnel.binaryPath;
-  $<HTMLInputElement>('autoConnect').checked = config.ui.autoConnect;
-  $<HTMLInputElement>('minimizeToTray').checked = config.ui.minimizeToTray;
-  $<HTMLInputElement>('privacyScreenshots').checked = config.ui.privacyScreenshots;
+  applyValue($<HTMLInputElement>('tunnelId'), config.tunnel.tunnelId, previousState?.config.tunnel.tunnelId);
+  applyValue(
+    $<HTMLInputElement>('desktopTunnelId'),
+    config.tunnel.desktopTunnelId,
+    previousState?.config.tunnel.desktopTunnelId
+  );
+  applyValue($<HTMLInputElement>('binaryPath'), config.tunnel.binaryPath, previousState?.config.tunnel.binaryPath);
+  applyChecked($<HTMLInputElement>('autoConnect'), config.ui.autoConnect, previousState?.config.ui.autoConnect);
+  applyChecked(
+    $<HTMLInputElement>('minimizeToTray'),
+    config.ui.minimizeToTray,
+    previousState?.config.ui.minimizeToTray
+  );
+  applyChecked(
+    $<HTMLInputElement>('privacyScreenshots'),
+    config.ui.privacyScreenshots,
+    previousState?.config.ui.privacyScreenshots
+  );
 
   const openai = config.tunnel.kind === 'openai';
   step('tunnel').hidden = !openai;
@@ -533,7 +618,7 @@ function apply(next: AppState): void {
   cards.replaceChildren(...connectorCards(next));
 
   // Step marks: everything before the first unfinished step counts as done.
-  const order = ['folder', 'tunnel', 'key', 'connect', 'chatgpt'];
+  const order = ['folder', 'tunnel', 'key', 'connect', 'chatgpt', 'browser'];
   const done = new Set<string>();
   if (config.roots.length > 0 || missingStep(next)?.step !== 'folder') done.add('folder');
   if (!openai || TUNNEL_ID_PATTERN.test(config.tunnel.tunnelId)) done.add('tunnel');
@@ -548,6 +633,10 @@ function apply(next: AppState): void {
     (surface) => surface.available && !surface.optional && surface.lastRequestAt === null
   );
   if (status.lastRequestAt !== null && !requiredUnverified) done.add('chatgpt');
+  // The browser half of the product. A paired extension is the only proof it is installed
+  // and talking, and without it the timeline, Compact & resume and sub-agents are all dark
+  // — which is why this is a setup step now rather than a paragraph inside a settings pane.
+  if (next.bridge.paired) done.add('browser');
   const current = order.find((name) => !done.has(name)) ?? null;
   for (const name of order) {
     const node = step(name);
@@ -818,11 +907,47 @@ function logRow(entry: LogEntry): HTMLElement {
   return line;
 }
 
+const FEEDS = ['homeFeed', 'fullFeed'];
+
+/**
+ * Whether each feed is following the newest line.
+ *
+ * Remembered rather than measured on every append, because a feed inside a panel that is
+ * not on screen has no geometry to measure: `clientHeight` and `scrollHeight` are both 0,
+ * every arriving line looks like it was appended at the bottom, and the pin is written as
+ * `scrollTop = 0`. That is exactly what the Activity panel did — every line of a session
+ * arrived while Home was showing, so opening Activity landed on the oldest line in the
+ * buffer and stayed there. A feed is pinned until the user scrolls it up themselves, and
+ * scrolling back to the bottom re-pins it.
+ */
+const pinned = new Map<string, boolean>(FEEDS.map((id) => [id, true]));
+
+function atBottom(view: HTMLElement): boolean {
+  return view.scrollTop + view.clientHeight >= view.scrollHeight - 24;
+}
+
+/** Puts a feed back on its newest line. Safe on a hidden panel: it is re-applied on show. */
+function stickToNewest(id: string): void {
+  if (pinned.get(id) === false) return;
+  const view = $(id);
+  view.scrollTop = view.scrollHeight;
+}
+
+for (const id of FEEDS) {
+  // Only a real user scroll may unpin. `scroll` also fires for the programmatic pin
+  // above, which is harmless: that one always lands at the bottom and re-pins.
+  $(id).addEventListener('scroll', () => {
+    const view = $(id);
+    // A hidden panel reports zeroes; never let that be read as "scrolled away".
+    if (view.clientHeight === 0) return;
+    pinned.set(id, atBottom(view));
+  });
+}
+
 function addLogLine(entry: LogEntry): void {
   let evicted = false;
-  for (const id of ['homeFeed', 'fullFeed']) {
+  for (const id of FEEDS) {
     const view = $(id);
-    const atBottom = view.scrollTop + view.clientHeight >= view.scrollHeight - 24;
     const row = logRow(entry);
     // Home always shows everything; only the Activity panel has the agent filter.
     if (id === 'fullFeed' && agentFilter !== null) row.hidden = entry.agent !== agentFilter;
@@ -831,7 +956,7 @@ function addLogLine(entry: LogEntry): void {
       if (id === 'fullFeed' && view.firstElementChild?.classList.contains('bad')) evicted = true;
       view.firstElementChild?.remove();
     }
-    if (atBottom) view.scrollTop = view.scrollHeight;
+    stickToNewest(id);
   }
   // After the eviction above, so the badge counts what is there rather than what arrived.
   // A quiet run of 500 info lines retires old problems just as surely as a new one adds
@@ -846,6 +971,9 @@ $('logFilter').addEventListener('click', (event) => {
     other.classList.toggle('is-sel', other === button);
   }
   $('fullFeed').classList.toggle('only-bad', button.dataset.filter === 'bad');
+  // Hiding most of the rows changes what "the bottom" is, so re-pin rather than leaving
+  // the view parked at an offset that now belongs to a line the filter removed.
+  stickToNewest('fullFeed');
 });
 
 /**
@@ -924,9 +1052,17 @@ async function runChecks(): Promise<void> {
       ...result.checks.map((check) => {
         const li = el(
           'li',
-          check.ok === true ? 'check is-ok' : check.ok === false ? 'check is-bad' : 'check'
+          check.status === 'pass'
+            ? 'check is-ok'
+            : check.status === 'fail'
+              ? 'check is-bad'
+              : `check is-${check.status}`
         );
-        const mark = el('span', 'check-mark', check.ok === true ? '✓' : check.ok === false ? '!' : '·');
+        const mark = el(
+          'span',
+          'check-mark',
+          check.status === 'pass' ? '✓' : check.status === 'fail' ? '!' : check.status === 'skipped' ? '–' : '…'
+        );
         const body = el('div');
         body.append(el('strong', '', check.name), el('p', '', check.detail));
         li.append(mark, body);

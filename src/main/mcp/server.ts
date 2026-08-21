@@ -78,6 +78,58 @@ function jsonError(res: http.ServerResponse, status: number, error: string): voi
 }
 
 /**
+ * Buffers an HTTP body only when its size is not already bounded by Content-Length.
+ *
+ * The MCP Node adapter otherwise concatenates a chunked/missing-length request to an
+ * unbounded JS string before parsing it. Stop retaining bytes at the same 8 MiB limit the
+ * header guard advertises, answer immediately, and drain the remaining socket bytes without
+ * keeping them in memory.
+ */
+function readBoundedJsonBody(
+  req: http.IncomingMessage
+): Promise<{ body?: unknown; error?: 'payload_too_large' | 'invalid_json' }> {
+  return new Promise((resolve) => {
+    const chunks: Buffer[] = [];
+    let total = 0;
+    let done = false;
+
+    const finish = (value: { body?: unknown; error?: 'payload_too_large' | 'invalid_json' }): void => {
+      if (done) return;
+      done = true;
+      req.off('data', onData);
+      req.off('end', onEnd);
+      req.off('error', onError);
+      resolve(value);
+    };
+    const onData = (chunk: Buffer | string): void => {
+      const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+      total += bytes.length;
+      if (total > MAX_BODY_BYTES) {
+        finish({ error: 'payload_too_large' });
+        // Do not leave the unread request applying backpressure to this connection. Its
+        // remaining bytes are discarded by Node rather than accumulated by us.
+        req.resume();
+        return;
+      }
+      chunks.push(bytes);
+    };
+    const onEnd = (): void => {
+      try {
+        const text = Buffer.concat(chunks, total).toString('utf8');
+        finish({ body: text.length === 0 ? undefined : JSON.parse(text) });
+      } catch {
+        finish({ error: 'invalid_json' });
+      }
+    };
+    const onError = (): void => finish({ error: 'invalid_json' });
+
+    req.on('data', onData);
+    req.on('end', onEnd);
+    req.on('error', onError);
+  });
+}
+
+/**
  * RFC 9728 protected resource metadata.
  *
  * This server is not protected by OAuth — the unguessable path token is what
@@ -320,7 +372,8 @@ export async function startMcpServer(getContext: () => ToolContext): Promise<Mcp
       surfaceRequestAt.set(route.id, requestSeenAt);
     }
 
-    const declared = Number(req.headers['content-length'] ?? 0);
+    const declaredHeader = req.headers['content-length'];
+    const declared = Number(declaredHeader ?? 0);
     if (Number.isFinite(declared) && declared > MAX_BODY_BYTES) {
       jsonError(res, 413, 'payload_too_large');
       return;
@@ -328,7 +381,22 @@ export async function startMcpServer(getContext: () => ToolContext): Promise<Mcp
 
     // The tool dispatch reads this back to join the call to the page request that issued
     // it; see inbound.ts for why it cannot be taken from the MCP call context.
-    withInboundRequestId(requestIdFromHeader(req.headers['x-request-id']), () => void route.handler(req, res));
+    const requestId = requestIdFromHeader(req.headers['x-request-id']);
+    if (req.method === 'POST' && declaredHeader === undefined) {
+      void readBoundedJsonBody(req).then((parsed) => {
+        if (parsed.error === 'payload_too_large') {
+          jsonError(res, 413, 'payload_too_large');
+          return;
+        }
+        if (parsed.error === 'invalid_json') {
+          jsonError(res, 400, 'invalid_json');
+          return;
+        }
+        withInboundRequestId(requestId, () => void route.handler(req, res, parsed.body));
+      });
+      return;
+    }
+    withInboundRequestId(requestId, () => void route.handler(req, res));
   });
 
   // Reject slow or oversized bodies rather than holding sockets open indefinitely.
@@ -363,8 +431,22 @@ export async function startMcpServer(getContext: () => ToolContext): Promise<Mcp
     urls,
     stop: () =>
       new Promise<void>((resolve) => {
-        server.closeAllConnections();
+        // Stop accepting new work, but let requests already accepted by the MCP adapter
+        // finish and deliver their result. Destroying active sockets here created ambiguous
+        // commits: the caller saw `fetch failed` and could retry while the original mutation
+        // continued in this process. `server.close()` drains active connections; a bounded
+        // fallback prevents a wedged client from blocking app shutdown forever.
+        let settled = false;
+        const force = setTimeout(() => {
+          if (settled) return;
+          logWarn('server drain timed out after 30s; forcing remaining connections closed');
+          server.closeAllConnections();
+        }, 30_000);
+        force.unref?.();
+        server.closeIdleConnections?.();
         server.close(() => {
+          settled = true;
+          clearTimeout(force);
           logInfo('server stopped');
           resolve();
         });

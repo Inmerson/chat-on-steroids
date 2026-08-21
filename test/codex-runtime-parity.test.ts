@@ -5,7 +5,10 @@ import { afterEach, describe, expect, it } from 'vitest';
 import {
   UnifiedExecError,
   UnifiedExecProcessManager,
-  applyUnifiedExecEnv
+  applyUnifiedExecEnv,
+  execCommandResponseText,
+  execCommandStructuredOutput,
+  type ExecCommandToolOutput
 } from '../src/main/codex/unified-exec.js';
 import {
   DEFAULT_MAX_BACKGROUND_TERMINAL_TIMEOUT_MS,
@@ -104,6 +107,25 @@ describe('Codex unified exec runtime parity', () => {
     expect(env.TERM).toBe('dumb');
     expect(env.PAGER).toBe('cat');
     expect(env.CODEX_CI).toBe('1');
+  });
+
+  it('keeps structured exec output under the same model budget as the text representation', () => {
+    const output: ExecCommandToolOutput = {
+      chunkId: 'cap-test',
+      wallTimeMs: 1,
+      rawOutput: Buffer.from('x'.repeat(240_000), 'utf8'),
+      truncationPolicy,
+      maxOutputTokens: undefined,
+      processId: null,
+      exitCode: 0,
+      originalTokenCount: 60_000,
+      outputOmittedBytes: null
+    };
+    const text = execCommandResponseText(output);
+    const structured = execCommandStructuredOutput(output) as { output: string };
+    expect(structured.output.length).toBeLessThan(output.rawOutput.length);
+    expect(structured.output).toContain('truncated');
+    expect(text).toContain(structured.output);
   });
 
   it('matches Codex initial yield clamping, including the Windows 10s floor', () => {

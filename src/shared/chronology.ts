@@ -65,33 +65,6 @@ export function chronological<T extends Chronological>(entries: readonly T[]): T
     }
   }
 
-  /**
-   * The turn an event that names none belongs to.
-   *
-   * The app writes some events itself — a message handed from one agent to another is the
-   * one that matters — and those carry no generation id, because the app is not the page and
-   * does not have one. Left in their own group they were anchored at their own `seq`, which
-   * put a message delivered *during* a turn underneath the whole of it: live, prime's
-   * message to worker-1 was drawn below a refusal that happened 32 seconds later.
-   *
-   * They are placed by time into the turn that was open when they happened. That is sound
-   * for exactly these events and for no others: the time on them is this machine's own
-   * clock at the moment the app did the thing, so it is directly comparable with the live
-   * observations in that turn — unlike a page event, whose time is when the extension saw
-   * it and may be a re-report of something said days ago. An event after its turn's end
-   * keeps its own position, since nothing in that group is a neighbour of it any more.
-   */
-  const openTurnAt = (entry: T): number | undefined => {
-    let anchor: number | undefined;
-    for (const candidate of bySeq) {
-      if (position(candidate) >= position(entry)) break;
-      if (candidate.kind === 'turn_start' && candidate.turnId) anchor = anchors.get(candidate.turnId);
-    }
-    if (anchor === undefined) return undefined;
-    const end = ends.get(anchor);
-    return end === undefined || entry.time <= end ? anchor : undefined;
-  };
-
   // Position within a turn. The boundaries are the boundaries whatever their timestamps say:
   // a turn cannot begin after its own first observation or end before its last, and the times
   // on those two events are the moment the page noticed, not the moment the turn moved.
@@ -108,11 +81,32 @@ export function chronological<T extends Chronological>(entries: readonly T[]): T
   };
 
   const groups = new Map<number, T[]>();
+  // The previous implementation found the open turn for every untagged event by rescanning
+  // `bySeq` from the beginning. A long session with many app-authored/untagged rows therefore
+  // became O(n²) and could freeze Electron's main process for tens of seconds. `bySeq` is
+  // already ordered, so carry the latest start from strictly earlier positions forward once.
+  // Starts sharing the same canonical position are intentionally activated only when the
+  // position advances, matching the old `position(candidate) >= position(entry)` boundary.
+  let activeAnchor: number | undefined;
+  let pendingAnchor: number | undefined;
+  let currentPosition: number | undefined;
   for (const entry of bySeq) {
-    const anchor = (entry.turnId ? anchors.get(entry.turnId) : openTurnAt(entry)) ?? position(entry);
+    const entryPosition = position(entry);
+    if (currentPosition === undefined || entryPosition !== currentPosition) {
+      if (pendingAnchor !== undefined) activeAnchor = pendingAnchor;
+      pendingAnchor = undefined;
+      currentPosition = entryPosition;
+    }
+    let inferredAnchor: number | undefined;
+    if (!entry.turnId && activeAnchor !== undefined) {
+      const end = ends.get(activeAnchor);
+      if (end === undefined || entry.time <= end) inferredAnchor = activeAnchor;
+    }
+    const anchor = (entry.turnId ? anchors.get(entry.turnId) : inferredAnchor) ?? entryPosition;
     const held = groups.get(anchor);
     if (held) held.push(entry);
     else groups.set(anchor, [entry]);
+    if (entry.kind === 'turn_start' && entry.turnId) pendingAnchor = anchors.get(entry.turnId);
   }
 
   const out: T[] = [];

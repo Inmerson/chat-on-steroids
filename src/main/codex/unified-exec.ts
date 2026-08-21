@@ -459,6 +459,11 @@ class UnifiedExecProcess {
       // Node's SIGINT is the closest available equivalent for a pipe session.
       process.kill(pid, 'SIGINT');
     } catch (error) {
+      // The managed session can outlive the OS process for the tiny window before Node's
+      // ChildProcess `exit` event reaches us. Ctrl+C in that window used to turn a successful
+      // natural exit into `kill ESRCH`, while the next empty poll immediately returned DONE.
+      // "Already gone" is exactly the terminal state the interrupt was trying to reach.
+      if ((error as NodeJS.ErrnoException).code === 'ESRCH') return;
       throw UnifiedExecError.processFailed(error instanceof Error ? error.message : String(error));
     }
   }
@@ -546,10 +551,10 @@ export function execCommandStructuredOutput(output: ExecCommandToolOutput): Reco
     ...(output.exitCode === null ? {} : { exit_code: output.exitCode }),
     ...(output.processId === null ? {} : { session_id: output.processId }),
     ...(output.originalTokenCount === null ? {} : { original_token_count: output.originalTokenCount }),
-    output:
-      output.maxOutputTokens === undefined
-        ? output.rawOutput.toString('utf8')
-        : truncatedOutput(output, output.maxOutputTokens)
+    // This adapter emits structuredContent beside the text result, so both representations
+    // must obey the same policy/default budget. Returning the retained raw buffer here made
+    // the schema path bypass the model-visible truncation entirely.
+    output: truncatedOutput(output, modelOutputMaxTokens(output))
   };
 }
 
@@ -624,6 +629,12 @@ export class UnifiedExecProcessManager {
   async execCommand(request: ExecCommandRequest): Promise<ExecCommandToolOutput> {
     let process: UnifiedExecProcess;
     try {
+      this.ensureProcessCapacity(request.processId);
+    } catch (error) {
+      this.releaseProcessId(request.processId);
+      throw error;
+    }
+    try {
       // `UnifiedExecRuntime::run` prefixes every PowerShell script before it reaches the
       // process launcher so pipe-mode output is UTF-8 just like PTY output.
       const command =
@@ -647,7 +658,6 @@ export class UnifiedExecProcessManager {
     // Stored before the yield wait, so interrupting the call cannot drop the session.
     const processStartedAlive = !process.hasExited() && process.exitCode() === null;
     if (processStartedAlive) {
-      this.pruneProcessesIfNeeded();
       this.processes.set(request.processId, {
         process,
         processId: request.processId,
@@ -865,29 +875,29 @@ export class UnifiedExecProcessManager {
    * never evicts one whose interaction lock is held — that lock is what a concurrent
    * `write_stdin` holds, and evicting under it would delete a session mid-call.
    */
-  private pruneProcessesIfNeeded(): void {
-    if (this.processes.size < MAX_UNIFIED_EXEC_PROCESSES) return;
-    let meta = [...this.processes.values()].map((entry) => ({
-      processId: entry.processId,
-      lastUsed: entry.lastUsed,
-      exited: entry.process.hasExited()
-    }));
-    let foundLockedExitedProcess = false;
-
-    for (;;) {
-      const processId = processIdToPruneFromMeta(meta);
-      if (processId === null) return;
-      const candidate = this.processes.get(processId);
-      const candidateHasExited = candidate?.process.hasExited() === true;
-      if (foundLockedExitedProcess && !candidateHasExited) return;
-      const release = candidate?.process.interactionLock.tryLock() ?? null;
-      if (release) {
+  private ensureProcessCapacity(requestProcessId: number): void {
+    // Reservations participate in the hard cap, so concurrent exec_command calls cannot
+    // each observe one free slot and collectively insert a 65th live process.
+    while (this.reservedProcessIds.size > MAX_UNIFIED_EXEC_PROCESSES) {
+      const exited = [...this.processes.values()]
+        .filter((entry) => entry.process.hasExited())
+        .sort((left, right) => left.lastUsed - right.lastUsed);
+      let removed = false;
+      for (const candidate of exited) {
+        const release = candidate.process.interactionLock.tryLock();
+        if (!release) continue;
         release();
-        this.releaseProcessId(processId);
-        return;
+        this.releaseProcessId(candidate.processId);
+        removed = true;
+        break;
       }
-      foundLockedExitedProcess ||= candidateHasExited;
-      meta = meta.filter((item) => item.processId !== processId);
+      if (removed) continue;
+      throw UnifiedExecError.createProcess(
+        `too many active terminal sessions (limit ${MAX_UNIFIED_EXEC_PROCESSES}); close or terminate one before starting another`
+      );
+    }
+    if (!this.reservedProcessIds.has(requestProcessId)) {
+      throw UnifiedExecError.createProcess('terminal session reservation was lost before launch');
     }
   }
 }
@@ -896,18 +906,6 @@ type ProcessStatus =
   | { kind: 'alive'; exitCode: number | null; processId: number }
   | { kind: 'exited'; exitCode: number | null }
   | { kind: 'unknown' };
-
-function processIdToPruneFromMeta(
-  meta: ReadonlyArray<{ processId: number; lastUsed: number; exited: boolean }>
-): number | null {
-  if (meta.length === 0) return null;
-  const byRecency = [...meta].sort((left, right) => right.lastUsed - left.lastUsed);
-  const protectedIds = new Set(byRecency.slice(0, 8).map((item) => item.processId));
-  const lru = [...meta].sort((left, right) => left.lastUsed - right.lastUsed);
-  const exited = lru.find((item) => !protectedIds.has(item.processId) && item.exited);
-  if (exited) return exited.processId;
-  return lru.find((item) => !protectedIds.has(item.processId))?.processId ?? null;
-}
 
 /**
  * `collect_output_until_deadline`, port for port.

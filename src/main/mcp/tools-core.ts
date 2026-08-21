@@ -26,10 +26,10 @@ import {
   viewImage
 } from '../codex/view-image.js';
 import { logInfo, logWarn } from '../logger.js';
-import { SandboxError, resolvePath } from '../sandbox.js';
+import { SandboxError, isNativeWindowsPath, resolvePath } from '../sandbox.js';
 import { currentWorkspace, setCurrentWorkspace } from '../workspace.js';
 import type { Capabilities, Root } from '../../shared/types.js';
-import type { FileChange } from '../../shared/session.js';
+import type { FileChange, SessionEvent, StoredText } from '../../shared/session.js';
 import { DEFAULT_EXCLUDES, globToRegExp, search, searchOneFile } from '../search.js';
 import {
   ApplyPatchError,
@@ -90,6 +90,7 @@ import {
   PRIME_ID,
   sendMessage,
   spawn,
+  swarmRunning,
   swarmState,
   type Caller
 } from '../agents.js';
@@ -107,7 +108,7 @@ import {
   sessionIdForConversation,
   sessionTokens
 } from '../session/recorder.js';
-import { readEvents } from '../session/store.js';
+import { getSession, readEvents, readRecentEvents } from '../session/store.js';
 import { getConfig } from '../config.js';
 import { tokenPressure } from '../../shared/session.js';
 import {
@@ -122,6 +123,7 @@ import {
   MAX_HISTORY_CALL_CHARS,
   numberReadLines,
   IDENTITY_EVIDENCE_MS,
+  JOIN_EVIDENCE_MS,
   PRIME_EVIDENCE_MS,
   ok,
   pathArg,
@@ -200,7 +202,9 @@ export function registerCoreTools(reg: SurfaceRegistrar): void {
             .array(pathArg)
             .min(1)
             .max(20)
-            .describe('Virtual paths, e.g. /project/src/main.ts, /project/src, /project/**/*.test.ts'),
+            .describe(
+              'Paths inside approved roots. Use virtual paths such as /project/src/main.ts or paste native Windows paths such as C:\\work\\project\\src\\main.ts; native paths are normalized to the same virtual sandbox. Globs are supported in either spelling.'
+            ),
           start_line: lineNumberArg.optional().describe('First line, 1-based. Only when the call reads exactly one file; otherwise it is refused.'),
           end_line: lineNumberArg.optional().describe('Last line, inclusive. Only when the call reads exactly one file; otherwise it is refused.'),
           max_bytes: z
@@ -354,7 +358,9 @@ export function registerCoreTools(reg: SurfaceRegistrar): void {
           'Content matches come back as path:line: text. Build and dependency folders are skipped unless you pass your own exclude list.',
         inputSchema: z.object({
           query: z.string().max(1000).describe('Text to look for'),
-          path: pathArg.optional().describe('File or folder to search. Defaults to every approved root.'),
+          path: pathArg
+            .optional()
+            .describe('File or folder to search. Virtual and native Windows paths inside approved roots are accepted. Defaults to every approved root.'),
           mode: z.enum(['name', 'content']).optional().describe('Default name.'),
           include: z.string().max(200).optional().describe('Glob filter such as **/*.ts'),
           exclude: z
@@ -371,6 +377,7 @@ export function registerCoreTools(reg: SurfaceRegistrar): void {
       async ({ query, path: p, mode, include, exclude, case_sensitive, regex, max_results }) =>
         reg.guarded('search', 'find', async () => {
           const limit = Math.min(500, Math.max(1, Math.floor(max_results ?? 50)));
+          const deadline = Date.now() + 10_000;
           const scopes: Array<{ real: string; virtual: string }> = [];
           if (p) {
             const resolved = await resolveIn(ctx.roots, p);
@@ -382,7 +389,8 @@ export function registerCoreTools(reg: SurfaceRegistrar): void {
                 include,
                 caseSensitive: case_sensitive === true,
                 regex: regex === true,
-                maxResults: limit
+                maxResults: limit,
+                deadline
               });
               const hits = outcome.hits.map((hit) =>
                 hit.line === undefined ? hit.path : `${hit.path}:${hit.line}: ${hit.text}`
@@ -405,6 +413,10 @@ export function registerCoreTools(reg: SurfaceRegistrar): void {
           let scanned = 0;
           let elapsedMs = 0;
           for (const scope of scopes) {
+            if (Date.now() >= deadline) {
+              stopReasons.add('time');
+              break;
+            }
             if (hits.length >= limit) break;
             const outcome = await search({
               realDir: scope.real,
@@ -415,7 +427,8 @@ export function registerCoreTools(reg: SurfaceRegistrar): void {
               exclude: exclude ?? DEFAULT_EXCLUDES,
               caseSensitive: case_sensitive === true,
               regex: regex === true,
-              maxResults: limit - hits.length
+              maxResults: limit - hits.length,
+              deadline
             });
             scanned += outcome.filesScanned;
             elapsedMs += outcome.elapsedMs;
@@ -467,7 +480,13 @@ export function registerCoreTools(reg: SurfaceRegistrar): void {
           if (args.environmentId !== null) {
             return fail('apply_patch environment selection is unavailable for this turn');
           }
-          const baseVirtual = currentWorkspace()?.virtual ?? (ctx.roots[0] ? `/${ctx.roots[0].name}` : null);
+          const workspace = currentWorkspace();
+          if (!workspace && swarmRunning()) {
+            return fail(
+              'WORKSPACE_REQUIRED: this multi-agent chat has no proven workspace. Use an absolute path in another tool first so the approved project can be learned.'
+            );
+          }
+          const baseVirtual = workspace?.virtual ?? (ctx.roots[0] ? `/${ctx.roots[0].name}` : null);
           if (baseVirtual === null) {
             return fail('No folder is approved, so there is nowhere to apply the patch.');
           }
@@ -556,8 +575,19 @@ export function registerCoreTools(reg: SurfaceRegistrar): void {
             });
             // Which chat may later write to this session id. Codex gets this for free from a
             // per-conversation manager; see codex/ownership.ts for why one is needed here.
-            if (output.processId === null) forgetExecOwner(processId);
-            else noteExecOwner(output.processId, provenConversation(currentCaller().requestId, currentCaller().conversationId));
+            if (output.processId === null) {
+              forgetExecOwner(processId);
+            } else {
+              let owner = provenConversation(currentCaller().requestId, currentCaller().conversationId);
+              const call = currentCall();
+              if (!owner && call?.caller.requestId) {
+                owner = await awaitFreshCallOrigin('exec_command', call.startedAt, IDENTITY_EVIDENCE_MS, {
+                  requestId: call.caller.requestId
+                });
+                if (owner) call.caller.conversationId = owner;
+              }
+              noteExecOwner(output.processId, owner);
+            }
             noteExec({
               ...(output.processId === null ? {} : { id: String(output.processId) }),
               running: output.processId !== null,
@@ -597,9 +627,17 @@ export function registerCoreTools(reg: SurfaceRegistrar): void {
           // A session id is a small integer that means nothing outside the chat that was given
           // it, and every chat reaches the same manager here. Refuse only what is proven to
           // belong elsewhere; an unproven caller keeps working exactly as before.
-          if (execOwnershipDenied(input.session_id, provenConversation(currentCaller().requestId, currentCaller().conversationId))) {
+          let asking = provenConversation(currentCaller().requestId, currentCaller().conversationId);
+          const call = currentCall();
+          if (!asking && call?.caller.requestId) {
+            asking = await awaitFreshCallOrigin('write_stdin', call.startedAt, IDENTITY_EVIDENCE_MS, {
+              requestId: call.caller.requestId
+            });
+            if (asking) call.caller.conversationId = asking;
+          }
+          if (execOwnershipDenied(input.session_id, asking)) {
             return fail(
-              `write_stdin failed: session ${input.session_id} belongs to a different ChatGPT conversation. Start your own with exec_command.`
+              `write_stdin failed: session ${input.session_id} is not proven to belong to this ChatGPT conversation. Start your own with exec_command or retry after the extension reconnects.`
             );
           }
           try {
@@ -659,7 +697,7 @@ function registerSessionTool(reg: SurfaceRegistrar): void {
       title: 'Session recording',
       description:
         'Work with this app’s local recording of the current and previous sessions. ' +
-        'history — search the raw recording (user messages, tool calls, errors) for detail the conversation no longer holds; pass call_id to get one recorded call in full. ' +
+        'history — read the recent timeline by default, search full recorded text with nearby context, or pass call_id to expand one recorded call with its surrounding timeline. ' +
         'status — how much of the recorded session has accumulated, and which commands are still running.',
       inputSchema: z.object({
         action: z.enum(['history', 'status']).describe('What to do.'),
@@ -740,19 +778,30 @@ function registerSessionTool(reg: SurfaceRegistrar): void {
         // history
         const id = input.session_id ?? (await callerSession());
         if (!id) return fail('No recorded session is available.');
-        const events = await readEvents(id, input.kind ? { kinds: [input.kind] } : {});
+        const cap = Math.min(100, Math.max(1, Math.floor(input.limit ?? 40)));
+        const recentOnly = !input.call_id && !input.query && input.from === undefined;
+        const events = recentOnly
+          ? await readRecentEvents(id, cap, input.kind ? { kinds: [input.kind] } : {})
+          : await readEvents(id, input.call_id ? {} : input.kind ? { kinds: [input.kind] } : {});
         if (events.length === 0) return fail(`Session ${id} has no recorded events.`);
 
         if (input.call_id) {
-          const found = events.find((event) => event.kind === 'tool_call' && event.call.callId === input.call_id);
+          const foundIndex = events.findIndex(
+            (event) => event.kind === 'tool_call' && event.call.callId === input.call_id
+          );
+          const found = foundIndex >= 0 ? events[foundIndex] : undefined;
           if (!found || found.kind !== 'tool_call') return fail(`No recorded tool call with id ${input.call_id}.`);
           const call = found.call;
           // Anything too long for the log line was written beside it in full, so the exact
           // payload is genuinely recoverable rather than described as exact and quietly cut.
           const args = await expandStored(id, call.args);
           const result = await expandStored(id, call.result);
+          const nearby = historyNeighborhood(events, foundIndex, 3)
+            .map(({ event, focus }) => `${focus ? '>>' : '  '} ${describeEvent(event)}`)
+            .join('\n');
           const whole =
             `#${found.seq} ${call.tool} — ${call.outcome} in ${call.durationMs} ms\n` +
+            `nearby timeline:\n${nearby}\n\n` +
             `arguments (${call.args.chars} chars${args.complete ? '' : ', partial'}):\n${args.text}\n\n` +
             `result (${call.result.chars} chars${result.complete ? '' : ', partial'}):\n${result.text}`;
           const parts = chunkText(whole, MAX_HISTORY_CALL_CHARS);
@@ -764,25 +813,116 @@ function registerSessionTool(reg: SurfaceRegistrar): void {
           );
         }
 
-        const needle = input.query?.toLowerCase() ?? null;
-        const cap = Math.min(100, Math.max(1, Math.floor(input.limit ?? 40)));
-        const lines: string[] = [];
-        for (const event of events) {
-          if (input.from !== undefined && event.seq < input.from) continue;
-          const line = describeEvent(event);
-          if (needle && !line.toLowerCase().includes(needle)) continue;
-          lines.push(line);
-          if (lines.length >= cap) break;
+        const eligible = input.from === undefined ? events : events.filter((event) => event.seq >= input.from!);
+
+        if (input.query) {
+          const matches: number[] = [];
+          for (let index = 0; index < eligible.length; index++) {
+            if (await historyEventMatches(id, eligible[index]!, input.query)) matches.push(index);
+          }
+          if (matches.length === 0) {
+            noteCount(0);
+            return ok(`No matching entries in session ${id}.`);
+          }
+          const selected = historyContext(eligible, matches, cap);
+          const lines = selected.map(({ event, focus }) => `${focus ? '>>' : '  '} ${describeEvent(event)}`);
+          noteCount(matches.length);
+          return ok(
+            `Session ${id} — ${matches.length} match${matches.length === 1 ? '' : 'es'}, ${lines.length} context entr${
+              lines.length === 1 ? 'y' : 'ies'
+            } of ${events.length} recorded\n` +
+              lines.join('\n') +
+              '\n\n(>> marks a direct match; pass call_id to expand a tool call)'
+          );
         }
+
+        const window = recentOnly
+          ? eligible
+          : input.from === undefined
+            ? eligible.slice(Math.max(0, eligible.length - cap))
+            : eligible.slice(0, cap);
+        const lines = window.map((event) => describeEvent(event));
         noteCount(lines.length);
         if (lines.length === 0) return ok(`No matching entries in session ${id}.`);
+        const total = recentOnly ? (await getSession(id))?.events ?? events.length : events.length;
         return ok(
-          `Session ${id} — ${lines.length} entr${lines.length === 1 ? 'y' : 'ies'} of ${events.length} recorded\n` +
+          `Session ${id} — ${lines.length} ${input.from === undefined ? 'latest ' : ''}entr${
+            lines.length === 1 ? 'y' : 'ies'
+          } of ${total} recorded\n` +
             lines.join('\n') +
-            '\n\n(pass call_id to expand a tool call, or from/limit to page)'
+            '\n\n(pass call_id to expand a tool call, or from/limit to page forward)'
         );
       })
   );
+}
+
+function historyStoredTexts(event: SessionEvent): StoredText[] {
+  switch (event.kind) {
+    case 'user_message':
+    case 'progress':
+    case 'chat_error':
+    case 'note':
+      return [event.message];
+    case 'assistant_message':
+      return [event.message, ...(event.renderedHtml ? [event.renderedHtml] : [])];
+    case 'tool_call':
+      return [event.call.args, event.call.result];
+    case 'agent_message':
+      return [event.message];
+    default:
+      return [];
+  }
+}
+
+function normaliseHistoryText(value: string): string {
+  return value.toLowerCase().replace(/\s+/g, ' ').trim();
+}
+
+function historyTextMatches(haystack: string, query: string): boolean {
+  const text = normaliseHistoryText(haystack);
+  const wanted = normaliseHistoryText(query);
+  if (!wanted) return true;
+  if (text.includes(wanted)) return true;
+  const terms = [...new Set(wanted.split(' ').filter((term) => term.length > 1))];
+  return terms.length > 1 && terms.every((term) => text.includes(term));
+}
+
+async function historyEventMatches(sessionId: string, event: SessionEvent, query: string): Promise<boolean> {
+  if (historyTextMatches(JSON.stringify(event), query)) return true;
+  for (const stored of historyStoredTexts(event)) {
+    if (!stored.truncated || !stored.assetId) continue;
+    const expanded = await expandStored(sessionId, stored);
+    if (historyTextMatches(expanded.text, query)) return true;
+  }
+  return false;
+}
+
+function historyNeighborhood(
+  events: readonly SessionEvent[],
+  focusIndex: number,
+  radius: number
+): Array<{ event: SessionEvent; focus: boolean }> {
+  const from = Math.max(0, focusIndex - radius);
+  const to = Math.min(events.length, focusIndex + radius + 1);
+  return events.slice(from, to).map((event, offset) => ({ event, focus: from + offset === focusIndex }));
+}
+
+function historyContext(
+  events: readonly SessionEvent[],
+  matches: readonly number[],
+  cap: number
+): Array<{ event: SessionEvent; focus: boolean }> {
+  const picked = new Map<number, boolean>();
+  for (const match of matches) {
+    for (let index = Math.max(0, match - 2); index <= Math.min(events.length - 1, match + 2); index++) {
+      if (!picked.has(index) && picked.size >= cap) break;
+      picked.set(index, picked.get(index) === true || index === match);
+    }
+    if (picked.size >= cap) break;
+  }
+  return [...picked.entries()]
+    .sort(([a], [b]) => a - b)
+    .map(([index, focus]) => ({ event: events[index]!, focus }));
 }
 
 // ---------------------------------------------------------------------------
@@ -828,7 +968,7 @@ function registerAgentsTool(reg: SurfaceRegistrar): void {
                 .string()
                 .min(1)
                 .max(4000)
-                .describe('Self-contained brief sufficient to execute without any prior conversation or project context. The worker sees only this.')
+                .describe('The worker sees this task rather than the prime conversation. Write the assignment itself from the ground up with project/location, objective, relevant context/files, constraints, allowed changes, validation and expected handoff; avoid boilerplate about having no prior context.')
             })
           )
           .min(1)
@@ -841,7 +981,7 @@ function registerAgentsTool(reg: SurfaceRegistrar): void {
           .max(200)
           .optional()
           .describe(
-            'join: the recovery key, from the ChatGPT Local Files log. Only for a worker chat whose binding was lost — there is no ordinary reason to send this.'
+            'join: the one-time recovery key copied from that worker’s row in the ChatGPT Local Files Chat/Swarm UI. Only for a worker chat whose binding was lost — there is no ordinary reason to send this.'
           ),
         to: z.string().min(1).max(40).optional().describe('message: recipient, e.g. prime or worker-2.'),
         text: z.string().min(1).max(4000).optional().describe('message: what to say.'),
@@ -981,9 +1121,13 @@ function registerAgentsTool(reg: SurfaceRegistrar): void {
  */
 async function callerNow(startedAt: number, options: { exact?: boolean } = {}): Promise<Caller> {
   const base = currentCaller();
+  // `exact` marks the two actions that bind a run — spawn and join. They are the calls whose
+  // refusal the model cannot absorb, so they get the longer ceiling; every other `agents`
+  // action can be declined and asked again on the next tool call.
+  const window = base.requestId ? (options.exact ? JOIN_EVIDENCE_MS : IDENTITY_EVIDENCE_MS) : PRIME_EVIDENCE_MS;
   const resolved =
     base.conversationId ??
-    (await awaitFreshCallOrigin('agents', startedAt, base.requestId ? IDENTITY_EVIDENCE_MS : PRIME_EVIDENCE_MS, {
+    (await awaitFreshCallOrigin('agents', startedAt, window, {
       ...options,
       // ChatGPT's own id for this request, when it sent one. It names the conversation
       // outright, so two workers calling at the same moment are no longer a hard case.
@@ -1044,7 +1188,14 @@ async function runParsedPatch(
   let effectiveArgs = args;
   if (args.workdir !== null) {
     try {
-      effectiveBase = await resolveIn(roots, args.workdir, { base: base.virtual, allowMissing: true });
+      // Preserve the shell gate from `cd dir && apply_patch`: interception must not execute a
+      // patch that the submitted shell command would never have reached. The cwd must already
+      // exist and be a directory; patch-created parents apply only to paths *inside* it.
+      effectiveBase = await resolveIn(roots, args.workdir, { base: base.virtual });
+      const stat = await fs.stat(effectiveBase.real);
+      if (!stat.isDirectory()) {
+        return { result: fail('apply_patch workdir must be an existing folder'), content: null, exitCode: null };
+      }
     } catch (error) {
       return { result: fail(friendlyError(error)), content: null, exitCode: null };
     }
@@ -1069,7 +1220,7 @@ async function runParsedPatch(
     );
   } catch (error) {
     return {
-      result: fail(`apply_patch verification failed: ${applyPatchErrorText(error)}`),
+      result: fail(`apply_patch verification failed: ${safePatchOutput(applyPatchErrorText(error), resolution)}`),
       content: null,
       exitCode: null
     };
@@ -1081,12 +1232,15 @@ async function runParsedPatch(
     updateFileMode: DEFAULT_APPLY_PATCH_FILE_UPDATE_MODE,
     resolvePath: resolution.resolve
   });
+  const stdout = safePatchOutput(execution.stdout, resolution);
+  const stderr = safePatchOutput(execution.stderr, resolution);
+  const aggregatedOutput = safePatchOutput(execution.aggregatedOutput, resolution);
   const content = formatExecOutputForModel(
     {
       exitCode: execution.exitCode,
-      stdout: newStreamOutput(execution.stdout),
-      stderr: newStreamOutput(execution.stderr),
-      aggregatedOutput: newStreamOutput(execution.aggregatedOutput),
+      stdout: newStreamOutput(stdout),
+      stderr: newStreamOutput(stderr),
+      aggregatedOutput: newStreamOutput(aggregatedOutput),
       durationMs: execution.durationMs,
       timedOut: false
     },
@@ -1138,6 +1292,18 @@ interface PatchResolution {
   resolve: PatchPathResolver;
   /** Real path -> safe virtual path, used only for recorder change evidence. */
   virtualPaths: Map<string, string>;
+  /** Exact model-visible/real spellings that must never be echoed back as native paths. */
+  displayRewrites: Map<string, string>;
+}
+
+function safePatchOutput(text: string, resolution: PatchResolution): string {
+  let safe = text;
+  const rewrites = [...resolution.displayRewrites].sort(([a], [b]) => b.length - a.length);
+  for (const [from, to] of rewrites) {
+    if (from === '' || from === to || !safe.includes(from)) continue;
+    safe = safe.split(from).join(to);
+  }
+  return safe;
 }
 
 /**
@@ -1154,11 +1320,14 @@ async function resolvePatchPaths(
 ): Promise<PatchResolution> {
   const realBySpelling = new Map<string, string>();
   const virtualPaths = new Map<string, string>();
+  const displayRewrites = new Map<string, string>();
 
   const add = async (spelledPath: string, allowMissing: boolean): Promise<void> => {
     const resolved = await resolveIn(roots, spelledPath, { base: baseVirtual, allowMissing });
     realBySpelling.set(spelledPath, resolved.real);
     virtualPaths.set(resolved.real, resolved.virtual);
+    displayRewrites.set(resolved.real, resolved.virtual);
+    if (isNativeWindowsPath(spelledPath)) displayRewrites.set(spelledPath, resolved.virtual);
   };
 
   for (const hunk of hunks) {
@@ -1173,7 +1342,7 @@ async function resolvePatchPaths(
     }
     return resolved;
   };
-  return { resolve, virtualPaths };
+  return { resolve, virtualPaths, displayRewrites };
 }
 
 function patchFileChanges(delta: AppliedPatchDelta, virtualPaths: ReadonlyMap<string, string>): FileChange[] {
@@ -1320,7 +1489,7 @@ async function readOne(
     // decoded identically. `view_image` still exists in its own right: it is Codex's tool, with
     // Codex's name, schema and errors, and this branch is only `read` continuing to answer "what
     // is at this path" for a path that happens to be a picture.
-    const image = await viewImage(resolved.real, null, undefined, resolved.virtual);
+    const image = await viewImage(resolved.real, null, undefined, resolved.virtual, options.maxBytes);
     logInfo(`tool read image ${resolved.virtual} (${formatBytes(image.bytes)})`);
     return {
       text: `--- ${resolved.virtual} — ${formatBytes(image.bytes)} ${image.mimeType} ---`,

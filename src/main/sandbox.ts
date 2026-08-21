@@ -1,9 +1,10 @@
 /**
  * Path sandbox. Every filesystem tool goes through here.
  *
- * The model only ever sees virtual paths like "/project/src/main.ts". This module
- * maps them onto real Windows paths and refuses anything that would land outside an
- * approved root. Containment is decided by canonicalising with fs.realpath and then
+ * Model-facing filesystem results use virtual paths like "/project/src/main.ts". This module
+ * maps them onto real Windows paths and also accepts native Windows input copied from command
+ * output when it names the same approved tree. Anything outside an approved root is refused.
+ * Containment is decided by canonicalising with fs.realpath and then
  * comparing against the canonicalised root, which is what defeats symlinks, NTFS
  * junctions and other reparse points planted inside an approved tree: following them
  * is fine as long as the destination is still inside the root.
@@ -194,8 +195,14 @@ export function isAbsoluteVirtualPath(input: string): boolean {
 /** A drive-letter path or a UNC share — what Windows itself prints and the model copies. */
 const NATIVE_PATH = /^(?:[A-Za-z]:[\\/]|\\\\)/;
 
+/** True when a model-supplied path is an absolute native Windows path. */
+export function isNativeWindowsPath(input: unknown): input is string {
+  return IS_WINDOWS && typeof input === 'string' && NATIVE_PATH.test(input.trim());
+}
+
 /**
- * Turns down a native Windows path, saying what to write instead.
+ * Converts a native Windows path inside an approved root to the virtual spelling used by
+ * the rest of the sandbox. Native paths outside the approved roots are still refused.
  *
  * Paths here are virtual on purpose: `/root/...` names an approved folder and nothing else
  * can be addressed. But the model spends its time reading command output, stack traces and
@@ -203,14 +210,22 @@ const NATIVE_PATH = /^(?:[A-Za-z]:[\\/]|\\\\)/;
  * sentence about a colon — true, unhelpful, and about the wrong thing. It reads as the
  * sandbox rejecting a path it can plainly see is inside an approved folder.
  *
- * So the answer names the path it wants. The refusal is unchanged — nothing is resolved
- * from a native path, because one canonical form is what makes the rest of this file's
- * checks mean anything — but a refusal that includes the correction costs a retry instead
- * of a guessing game.
+ * Keeping two independent resolution paths would be dangerous, so this does not bypass any
+ * sandbox validation. It performs only a lexical approved-root lookup and returns the
+ * equivalent virtual path; resolvePath then runs that through the exact same realpath,
+ * symlink/junction and allowMissing checks as an originally-virtual path.
  */
-async function rejectNativePath(roots: readonly Root[], input: string): Promise<void> {
-  if (typeof input !== 'string' || !NATIVE_PATH.test(input.trim())) return;
-  const native = path.resolve(input.trim());
+async function normaliseNativePath(roots: readonly Root[], input: string): Promise<string | null> {
+  if (!isNativeWindowsPath(input)) return null;
+  const trimmed = input.trim();
+  // Preserve the same lexical invariant virtual paths get. `path.resolve()` erases `..`
+  // (and `.`) before `splitVirtualPath()` can see it, which meant a native spelling copied
+  // from command output could take a different validation path from the equivalent virtual
+  // spelling. Strip only the native root prefix, then validate the user-supplied segments
+  // before any normalization happens.
+  const withoutNativeRoot = trimmed.replace(/^[A-Za-z]:[\\/]+/, '').replace(/^\\\\[^\\/]+[\\/]+[^\\/]+[\\/]*/, '');
+  for (const segment of withoutNativeRoot.split(/[/\\]+/).filter((part) => part.length > 0)) checkSegment(segment);
+  const native = path.resolve(trimmed);
   for (const root of roots) {
     let rootReal: string;
     try {
@@ -219,13 +234,11 @@ async function rejectNativePath(roots: readonly Root[], input: string): Promise<
       continue;
     }
     if (!isContained(rootReal, native)) continue;
-    throw new SandboxError(
-      `Paths are virtual, not drive paths. Use "${toVirtualPath(root, rootReal, native)}" instead of "${input.trim()}".`
-    );
+    return toVirtualPath(root, rootReal, native);
   }
   const names = roots.map((r) => `/${r.name}`).join(', ') || '(none approved)';
   throw new SandboxError(
-    `Paths are virtual, not drive paths, and "${input.trim()}" is not inside an approved folder. ` +
+    `Native path "${input.trim()}" is not inside an approved folder. ` +
       `Approved roots: ${names} — call list_roots to see what each one maps to.`
   );
 }
@@ -241,16 +254,17 @@ export async function resolvePath(
   virtualPath: string,
   options: ResolveOptions = {}
 ): Promise<Resolved> {
-  await rejectNativePath(roots, virtualPath);
+  const normalisedNative = await normaliseNativePath(roots, virtualPath);
+  const suppliedPath = normalisedNative ?? virtualPath;
   // A relative path is shorthand for one absolute path, and is turned into that path here,
   // before anything is validated — so there stays exactly one piece of code deciding what
   // may be reached. `..` is still refused segment by segment below, because nothing
   // normalises a traversal away first: shorthand cannot climb out of the workspace, and
   // certainly not out of the root.
   const requested =
-    isAbsoluteVirtualPath(virtualPath) || !options.base
-      ? virtualPath
-      : `${options.base.replace(/[/\\]+$/, '')}/${String(virtualPath).replace(/^[/\\]+/, '')}`;
+    isAbsoluteVirtualPath(suppliedPath) || !options.base
+      ? suppliedPath
+      : `${options.base.replace(/[/\\]+$/, '')}/${String(suppliedPath).replace(/^[/\\]+/, '')}`;
   if (typeof requested === 'string' && requested.trim() !== '' && !isAbsoluteVirtualPath(requested)) {
     // Not "Unknown root src": the caller was using shorthand, and being told their first
     // folder is not a root explains nothing about what to do instead.
@@ -361,7 +375,8 @@ export async function validateNewRoot(folderPath: string, existing: readonly Roo
  * quoting, regexes and URLs the moment it guessed wrong. But every other field of every
  * other tool takes virtual paths, and the sandbox refuses native ones outright, so the
  * model is taught exactly one path dialect and then meets one field that does not speak
- * it. What it wrote was `/totec/whatsapp-ai-bridge/...`, and PowerShell reads a leading
+ * it. Path-taking fields can normalize a native path, but command text is an opaque program
+ * and cannot be rewritten safely. What the model wrote was `/totec/whatsapp-ai-bridge/...`, and PowerShell reads a leading
  * slash as the root of the current drive: the command ran against `C:\totec\...`, did not
  * exist, and failed in a way that looks like a missing folder rather than a wrong dialect.
  *

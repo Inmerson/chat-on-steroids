@@ -151,7 +151,10 @@ const configSchema = z.object({
     minimizeToTray: z.boolean(),
     autoConnect: z.boolean(),
     privacyScreenshots: z.boolean().optional().default(false),
-    theme: z.enum(['light', 'dark']).optional().default('light')
+    // Dark is the design the app is drawn for, and a config written before the theme
+    // existed has no stored answer to override — so it is the default rather than the
+    // fallback. An explicit `light` is somebody's own choice and is never touched.
+    theme: z.enum(['light', 'dark']).optional().default('dark')
   }),
   // Whole sections are optional, so a config written by an older build keeps working
   // and simply gains the new features switched off. The default object is spelled out
@@ -201,7 +204,7 @@ export function defaultConfig(): Config {
     capabilities: { ...DEFAULT_CAPABILITIES },
     readOnly: true,
     tunnel: { kind: 'openai', tunnelId: '', desktopTunnelId: '', binaryPath: '' },
-    ui: { minimizeToTray: true, autoConnect: false, privacyScreenshots: false, theme: 'light' },
+    ui: { minimizeToTray: true, autoConnect: false, privacyScreenshots: false, theme: 'dark' },
     sessions: { ...DEFAULT_SESSIONS },
     compaction: { ...DEFAULT_COMPACTION },
     multiAgent: { ...DEFAULT_MULTI_AGENT }

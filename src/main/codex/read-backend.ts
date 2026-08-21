@@ -26,6 +26,7 @@ import {
   MAX_WALK_DEPTH,
   MAX_WALK_DIRECTORIES,
   MAX_WALK_ENTRIES,
+  MAX_READ_FILE_BYTES,
   getMetadata,
   readDirectory,
   readFileStream,
@@ -47,6 +48,8 @@ const BINARY_SNIFF_BYTES = 8192;
 
 /** Above this a file is reported without a line count rather than read end to end for one. */
 const MAX_LINE_COUNT_BYTES = MAX_READ_BYTES * 8;
+/** A single decoded line is not allowed to become an unbounded V8 string. */
+const MAX_DECODED_LINE_CHARS = 2 * 1024 * 1024;
 
 interface TextFormat {
   encoding: 'utf-8' | 'utf-16le' | 'utf-16be';
@@ -243,6 +246,9 @@ export async function readTextFile(
 ): Promise<ReadTextResult> {
   const metadata = await getMetadata(realPath);
   if (!metadata.isFile) throw new FsOpError('Not a file');
+  if (metadata.size > MAX_READ_FILE_BYTES) {
+    throw new FsOpError(`File is too large to read safely (${formatBytes(metadata.size)}; limit ${formatBytes(MAX_READ_FILE_BYTES)}).`);
+  }
 
   const maxBytes = clamp(opts.maxBytes ?? DEFAULT_READ_BYTES, 1, MAX_READ_BYTES);
   const startLine = opts.startLine === undefined ? 1 : Math.max(1, Math.floor(opts.startLine));
@@ -295,6 +301,11 @@ export async function readTextFile(
         break;
       }
       index = carry.indexOf('\n');
+    }
+    if (carry.length > MAX_DECODED_LINE_CHARS) {
+      throw new FsOpError(
+        `A line exceeds the safe decoded-line limit (${formatBytes(MAX_DECODED_LINE_CHARS)}). Narrow or transform the file before reading it.`
+      );
     }
     if (!sawAllLines) break;
   }

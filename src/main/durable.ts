@@ -83,6 +83,26 @@ export function writeDurableSoon(name: string, value: unknown): void {
   timers.set(name, timer);
 }
 
+/**
+ * Atomically writes one named state before returning.
+ *
+ * Used for transaction intent immediately before another durable commit: a debounced
+ * snapshot is correct for ordinary progress, but cannot close a crash window between two
+ * files when recovery needs to know which side of the boundary the process reached.
+ */
+export async function writeDurableNow(name: string, value: unknown): Promise<void> {
+  if (!root) return;
+  const timer = timers.get(name);
+  if (timer) {
+    clearTimeout(timer);
+    timers.delete(name);
+  }
+  pending.set(name, value);
+  const write = inFlight.then(() => flushOne(name));
+  inFlight = write.catch(() => undefined);
+  await write;
+}
+
 /** Writes everything queued right now. Called before the app quits, and by tests. */
 export async function flushDurable(): Promise<void> {
   for (const [name, timer] of timers) {

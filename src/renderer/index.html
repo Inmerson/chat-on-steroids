@@ -177,7 +177,7 @@
           <div class="sheet">
             <div class="lede">
               <p>
-                Five steps, once. Custom connectors need ChatGPT <strong>Developer mode</strong>, on
+                Six steps, once. Custom connectors need ChatGPT <strong>Developer mode</strong>, on
                 Pro, Plus, Business, Enterprise and Edu, on the web.
               </p>
               <button class="btn" id="wizExpand" type="button" hidden>Show all steps</button>
@@ -340,6 +340,35 @@
                   </div>
                 </div>
               </li>
+
+              <!-- 6 -->
+              <!--
+                The extension is setup, not settings. It is what lets this app see which chat a
+                tool call came from, so the timeline, Compact & resume and sub-agents are all
+                dark without it — which made "buried in a settings pane behind a gear" exactly
+                the wrong place for the one-time instructions.
+              -->
+              <li class="step" data-step="browser">
+                <div class="step-mark">
+                  <svg class="ico tick" viewBox="0 0 24 24"><use href="#i-check" /></svg>
+                </div>
+                <div class="step-body">
+                  <h3>Add the Chrome extension</h3>
+                  <p>
+                    Open <code>chrome://extensions</code>, turn on <strong>Developer mode</strong>,
+                    choose <strong>Load unpacked</strong> and pick the folder the button opens. It
+                    pairs with this app by itself — there is no code to type.
+                  </p>
+                  <div class="step-actions">
+                    <button class="btn btn-solid" id="bridgeFolder" type="button">
+                      <svg class="ico" viewBox="0 0 24 24"><use href="#i-folder" /></svg>Open extension folder
+                    </button>
+                    <button class="btn" id="bridgeUnpair" type="button">Disconnect browser</button>
+                    <span class="chosen" id="bridgeState"></span>
+                  </div>
+                  <p class="hint" id="extensionPath"></p>
+                </div>
+              </li>
             </ol>
 
             <details class="advanced">
@@ -461,91 +490,51 @@
                 </div>
               </div>
 
-              <!-- settings -->
+              <!--
+                Settings, and only settings that change behaviour.
+
+                Three rows. Everything that used to be explained in six paragraphs here is
+                either a fact about where files go - which belongs in the docs, not in a
+                property sheet - or a threshold that now has exactly one number instead of
+                three overlapping ones. The pairing instructions moved into Setup, where
+                the rest of the once-only work already lives.
+              -->
               <div class="view" data-view="settings" hidden>
                 <div class="pane">
-                  <h3>Recording</h3>
-                  <p class="hint">
-                    On by default, because the timeline, Compact &amp; resume and the agent
-                    features all read from it. This app writes a full local record of the
-                    session — every message you send, what ChatGPT showed, and the exact tool
-                    calls — to <code>sessions\</code> in its own data folder. Nothing is
-                    uploaded. The same switch starts the loopback bridge the Chrome extension
-                    talks to, so turning it off disconnects the extension as well.
-                  </p>
-                  <div class="field">
-                    <label class="inline">
-                      <input type="checkbox" id="sessRecord" /> Record sessions to disk
-                    </label>
+                  <div class="setting">
+                    <span class="setting-text">
+                      <b>Keep recordings</b>
+                      <em>Then delete them. 0 keeps everything. Recording itself is a permission.</em>
+                    </span>
+                    <input id="sessRetain" class="num" type="number" min="0" max="3650" step="1" />
+                    <span class="unit">days</span>
                   </div>
-                  <div class="grid3">
-                    <div class="field">
-                      <label for="sessRetain">Keep for (days, 0 = forever)</label>
-                      <input id="sessRetain" type="number" min="0" max="3650" step="1" />
-                    </div>
-                    <div class="field">
-                      <label for="sessAdvisory">Suggest compaction at</label>
-                      <input id="sessAdvisory" type="number" min="10000" max="2000000" step="10000" />
-                    </div>
-                    <div class="field">
-                      <label for="sessLimit">Urgent at</label>
-                      <input id="sessLimit" type="number" min="10000" max="4000000" step="10000" />
-                    </div>
-                  </div>
-                  <p class="hint">
-                    Both numbers are a rough context estimate from messages and tool input/output.
-                    Transient progress/reasoning captions are excluded because they often restate the
-                    same work. ChatGPT's hidden/system context is not visible from here.
-                  </p>
 
-                  <h3>Chrome extension</h3>
-                  <p class="hint" id="bridgeState"></p>
-                  <div class="step-actions">
-                    <button class="btn btn-solid" id="bridgeFolder" type="button">
-                      <svg class="ico" viewBox="0 0 24 24"><use href="#i-folder" /></svg>Open extension folder
-                    </button>
-                    <button class="btn" id="bridgeUnpair" type="button">Disconnect browser</button>
+                  <!--
+                    One number, not three. "Suggest at", "urgent at" and "compact at" were
+                    separate inputs measuring the same estimate, so the meter could turn red
+                    somewhere the trigger would never fire. This is the threshold; the meter
+                    is derived from it.
+                  -->
+                  <div class="setting">
+                    <span class="setting-text">
+                      <b>Compact automatically</b>
+                      <em id="autoCompactHint"></em>
+                    </span>
+                    <input id="autoCompactTokens" class="num" type="number" min="10000" max="4000000" step="10000" />
+                    <span class="unit">tokens</span>
+                    <span class="sw"><input type="checkbox" id="autoCompact" /><i></i></span>
                   </div>
-                  <p class="hint">
-                    Open <code>chrome://extensions</code>, turn Developer mode on, choose
-                    <b>Load unpacked</b> and pick the folder the button above opens. It connects to
-                    this app on its own — there is no code to type.
-                  </p>
-                  <p class="hint" id="extensionPath"></p>
 
-                  <h3>Automatic compaction</h3>
-                  <p class="hint">
-                    Compacting ends the chat you are working in and opens a fresh one carrying the
-                    brief the old chat wrote about its own work — worth it when the alternative is
-                    hitting the ceiling mid-thought.
-                  </p>
-                  <label class="inline">
-                    <input type="checkbox" id="autoCompact" /> Compact automatically past the
-                    threshold below
-                  </label>
-                  <div class="field">
-                    <label for="autoCompactTokens">Compact at (estimated tokens)</label>
-                    <input type="number" id="autoCompactTokens" min="10000" max="4000000" step="10000" />
+                  <div class="setting">
+                    <span class="setting-text">
+                      <b>Sub-agent workers</b>
+                      <em>Most worker chats one run may open. The tools themselves are a permission.</em>
+                    </span>
+                    <input id="maWorkers" class="num" type="number" min="1" max="8" step="1" />
+                    <span class="unit">max</span>
                   </div>
-                  <p class="hint" id="autoCompactHint"></p>
 
-                  <h3>Multi-agent mode (experimental)</h3>
-                  <p class="hint">
-                    Lets one ChatGPT chat create worker chats and message them through this app.
-                    Off by default: several chats driving the same files at once is a real risk.
-                    Workers can only talk to the prime agent, never to each other.
-                  </p>
-                  <div class="grid2">
-                    <div class="field">
-                      <label class="inline">
-                        <input type="checkbox" id="maEnabled" /> Enable multi-agent tools
-                      </label>
-                    </div>
-                    <div class="field">
-                      <label for="maWorkers">Maximum workers</label>
-                      <input id="maWorkers" type="number" min="1" max="8" step="1" />
-                    </div>
-                  </div>
                   <div id="swarmList"></div>
                   <div class="step-actions">
                     <button class="btn" id="swarmReset" type="button">Clear swarm</button>

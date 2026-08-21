@@ -70,6 +70,7 @@ export const DEFAULT_EXCLUDES: readonly string[] = [
 
 const MAX_CONTENT_FILE_BYTES = 2 * 1024 * 1024;
 const MAX_FILES_SCANNED = 40_000;
+const MAX_DIRECTORIES_SCANNED = 10_000;
 const TIME_BUDGET_MS = 10_000;
 const CONTENT_CONCURRENCY = 12;
 const MAX_LINE_CHARS = 300;
@@ -101,6 +102,8 @@ export interface SearchRequest {
   caseSensitive: boolean;
   regex?: boolean;
   maxResults: number;
+  /** Absolute whole-tool deadline shared by every approved root. */
+  deadline?: number;
 }
 
 /** Translates a glob into a regex. Supports *, ?, ** and nothing else, on purpose. */
@@ -146,6 +149,10 @@ async function searchWithRipgrep(
   targetIsFile = false
 ): Promise<SearchOutcome> {
   const started = Date.now();
+  const deadline = Math.min(started + TIME_BUDGET_MS, req.deadline ?? Number.POSITIVE_INFINITY);
+  if (deadline <= started) {
+    return { hits: [], filesScanned: 0, truncated: true, stoppedBecause: 'time', elapsedMs: 0 };
+  }
   const args = [
     '--json',
     '--line-number',
@@ -260,7 +267,7 @@ async function searchWithRipgrep(
     const timer = setTimeout(() => {
       if (stoppedBecause === null) stoppedBecause = 'time';
       child.kill();
-    }, TIME_BUDGET_MS);
+    }, Math.max(1, deadline - Date.now()));
   });
 }
 
@@ -268,11 +275,13 @@ export async function search(req: SearchRequest): Promise<SearchOutcome> {
   if (req.mode === 'content') {
     const ripgrep = locateRipgrep();
     if (ripgrep) return searchWithRipgrep(ripgrep, req, req.realDir, req.virtualDir);
+    if (req.regex) throw new Error('Regex content search requires the bundled ripgrep runtime.');
   }
   const started = Date.now();
-  const deadline = started + TIME_BUDGET_MS;
+  const deadline = Math.min(started + TIME_BUDGET_MS, req.deadline ?? Number.POSITIVE_INFINITY);
   const hits: SearchHit[] = [];
   let filesScanned = 0;
+  let directoriesScanned = 0;
   let stoppedBecause: SearchOutcome['stoppedBecause'] = null;
 
   const needle = req.caseSensitive ? req.query : req.query.toLowerCase();
@@ -290,43 +299,51 @@ export async function search(req: SearchRequest): Promise<SearchOutcome> {
     return false;
   };
 
-  const walk = async (dir: string, rel: string): Promise<boolean> => {
-    if (outOfBudget()) return false;
-    let dirents;
+  const pendingDirectories: Array<{ dir: string; rel: string }> = [{ dir: req.realDir, rel: '' }];
+  while (pendingDirectories.length > 0 && !outOfBudget()) {
+    if (directoriesScanned >= MAX_DIRECTORIES_SCANNED) {
+      stoppedBecause = 'files';
+      break;
+    }
+    const current = pendingDirectories.shift()!;
+    directoriesScanned++;
+    let directory;
     try {
-      dirents = await fs.readdir(dir, { withFileTypes: true });
+      directory = await fs.opendir(current.dir);
     } catch {
-      return true; // Unreadable directory: skip it, keep searching elsewhere.
+      continue;
     }
-    for (const dirent of dirents) {
-      if (outOfBudget()) return false;
-      const childRel = rel ? `${rel}/${dirent.name}` : dirent.name;
-      if (dirent.isDirectory()) {
-        if (isExcludedFolderName(dirent.name, req.exclude)) continue;
-        if (!(await walk(path.join(dir, dirent.name), childRel))) return false;
-        continue;
-      }
-      if (!dirent.isFile()) continue;
-      filesScanned++;
-      if (req.include && !matchesInclude(childRel, req.include, req.caseSensitive)) continue;
-
-      if (req.mode === 'name') {
-        const haystack = req.caseSensitive ? dirent.name : dirent.name.toLowerCase();
-        if (needle === '' || haystack.includes(needle)) {
-          hits.push({ path: `${req.virtualDir}/${childRel}` });
-          if (hits.length >= req.maxResults) {
-            stoppedBecause = 'limit';
-            return false;
+    try {
+      for await (const dirent of directory) {
+        if (outOfBudget()) break;
+        const childRel = current.rel ? `${current.rel}/${dirent.name}` : dirent.name;
+        if (dirent.isDirectory()) {
+          if (!isExcludedFolderName(dirent.name, req.exclude)) {
+            pendingDirectories.push({ dir: path.join(current.dir, dirent.name), rel: childRel });
           }
+          continue;
         }
-      } else {
-        candidates.push({ real: path.join(dir, dirent.name), rel: childRel });
+        if (!dirent.isFile()) continue;
+        filesScanned++;
+        if (req.include && !matchesInclude(childRel, req.include, req.caseSensitive)) continue;
+        if (req.mode === 'name') {
+          const haystack = req.caseSensitive ? dirent.name : dirent.name.toLowerCase();
+          if (needle === '' || haystack.includes(needle)) {
+            hits.push({ path: `${req.virtualDir}/${childRel}` });
+            if (hits.length >= req.maxResults) {
+              stoppedBecause = 'limit';
+              break;
+            }
+          }
+        } else {
+          candidates.push({ real: path.join(current.dir, dirent.name), rel: childRel });
+        }
       }
+    } finally {
+      await directory.close().catch(() => undefined);
     }
-    return true;
-  };
-
-  await walk(req.realDir, '');
+    if (stoppedBecause === 'limit') break;
+  }
 
   if (req.mode === 'content' && stoppedBecause !== 'limit') {
     await scanContents(req, candidates, hits, deadline, (reason) => {
@@ -388,7 +405,7 @@ async function scanContents(
 export async function searchOneFile(
   realPath: string,
   virtualPath: string,
-  req: Pick<SearchRequest, 'query' | 'mode' | 'include' | 'caseSensitive' | 'regex' | 'maxResults'>
+  req: Pick<SearchRequest, 'query' | 'mode' | 'include' | 'caseSensitive' | 'regex' | 'maxResults' | 'deadline'>
 ): Promise<SearchOutcome> {
   if (req.mode === 'content') {
     const ripgrep = locateRipgrep();
@@ -401,6 +418,7 @@ export async function searchOneFile(
         true
       );
     }
+    if (req.regex) throw new Error('Regex content search requires the bundled ripgrep runtime.');
   }
   const started = Date.now();
   const rel = path.basename(virtualPath);

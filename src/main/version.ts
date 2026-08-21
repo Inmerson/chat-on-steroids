@@ -12,7 +12,7 @@
  * extension does nothing" into a diagnosable mismatch.
  */
 
-export const APP_VERSION = '1.8.4';
+export const APP_VERSION = '1.8.9';
 
 /**
  * 1 — original observations/activity bridge.
@@ -24,5 +24,11 @@ export const APP_VERSION = '1.8.4';
  *     provisions silently.
  * 5 — canonical Fiber message/request observations, exact request-id attribution metadata,
  *     automatic-compaction edge/claim state, and the 1.8 activity payload contract.
+ * 6 — 1.8.8 reshaped the wire in ways a 1.8.7 peer mishandles silently rather than loudly:
+ *     /activity carries resetActivity and truncatedFrom so a page that merged from a cursor
+ *     predating the truncated window resyncs instead of projecting stale turns, /activity
+ *     carries retiredWorker, /commands/ack answers 404 no_such_command when the caller names
+ *     a client, and observations carry authoredTime, which now drives message ordering. None
+ *     of those degrade gracefully, so the 426 gate has to be able to see the mismatch.
  */
-export const BRIDGE_PROTOCOL = 5;
+export const BRIDGE_PROTOCOL = 6;

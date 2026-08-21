@@ -34,6 +34,7 @@ import {
   getSession,
   listSessions,
   readEvents,
+  readRecentEvents,
   readHandoff,
   latestHandoff
 } from './session/store.js';
@@ -301,12 +302,16 @@ export function registerIpc(getWindow: () => BrowserWindow | null): void {
       })
       .parse(payload);
     const summary = await getSession(id);
+    if (!summary) throw new Error('Session not found');
     // The renderer draws a timeline, not the whole log: the tail is what matters and
     // the rest stays one click away rather than being pushed over IPC every refresh.
-    const all = await readEvents(id, from === undefined ? {} : { from });
     const cap = limit ?? 300;
-    const events = all.length > cap ? all.slice(all.length - cap) : all;
-    return { summary, events, total: all.length };
+    if (from === undefined) {
+      const events = await readRecentEvents(id, cap);
+      return { summary, events, total: summary.events };
+    }
+    const events = await readEvents(id, { from, limit: cap });
+    return { summary, events, total: events.length };
   });
 
   handle('sessions:delete', async (payload) => {
@@ -404,9 +409,16 @@ export function registerIpc(getWindow: () => BrowserWindow | null): void {
   });
 
 
-  // Push updates so the UI reflects tunnel progress without polling.
+  // Push updates so the UI reflects tunnel progress without polling. buildState() crosses
+  // async secret/bridge reads, so an older snapshot can otherwise resolve after a newer one and
+  // repaint stale config/status. Latest-request-wins makes the push stream monotonic.
+  let statePushGeneration = 0;
   const pushState = (): void => {
-    void buildState().then((state) => getWindow()?.webContents.send('state:changed', state));
+    const generation = ++statePushGeneration;
+    void buildState().then((state) => {
+      if (generation !== statePushGeneration) return;
+      getWindow()?.webContents.send('state:changed', state);
+    });
   };
   onStatusChange(pushState);
   onBridgeChange(pushState);

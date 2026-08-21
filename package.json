@@ -1,6 +1,6 @@
 {
   "name": "chatgpt-local-files",
-  "version": "1.8.4",
+  "version": "1.8.9",
   "description": "Local Windows coding and computer-use bridge for ChatGPT over MCP, limited to folders and capabilities you approve.",
   "license": "MIT",
   "author": "ChatGPT Local Files",
@@ -16,12 +16,14 @@
     "tunnel": "node scripts/fetch-tunnel-client.mjs",
     "rg": "node scripts/fetch-ripgrep.mjs",
     "dist": "npm run icon && npm run tunnel && npm run rg && electron-vite build && electron-builder --win",
-    "dist:dir": "npm run icon && npm run tunnel && npm run rg && electron-vite build && electron-builder --win --dir"
+    "dist:dir": "npm run icon && npm run tunnel && npm run rg && electron-vite build && electron-builder --win --dir",
+    "test:kill": "node scripts/kill-stray-vitest.mjs"
   },
   "dependencies": {
     "@modelcontextprotocol/node": "^2.0.0",
     "@modelcontextprotocol/server": "^2.0.0",
     "node-pty": "1.2.0-beta.15",
+    "sharp": "0.35.3",
     "tree-sitter": "0.25.1",
     "tree-sitter-bash": "0.25.1",
     "zod": "^4.4.3"

@@ -237,10 +237,21 @@ describe('resolvePath — links and reparse points', () => {
     await expectRefused('/project/escape/planted.txt', true);
   });
 
+  it.runIf(IS_WINDOWS)('still rejects an escaping junction when the caller used a native path', async () => {
+    const err = await expectRefused(path.join(escapeLink, 'secret.txt'));
+    expect(err.message).toMatch(/escapes its approved folder/);
+  });
+
   it('allows a junction that stays inside the root, reporting the canonical path', async () => {
     const resolved = await resolvePath(roots, '/project/inner/nested.txt');
     expect(resolved.real).toBe(path.join(approved, 'sub', 'nested.txt'));
     // The virtual path reflects where the file really is, not how it was reached.
+    expect(resolved.virtual).toBe('/project/sub/nested.txt');
+  });
+
+  it.runIf(IS_WINDOWS)('canonicalizes an internal junction reached through a native path', async () => {
+    const resolved = await resolvePath(roots, path.join(innerLink, 'nested.txt'));
+    expect(resolved.real).toBe(path.join(approved, 'sub', 'nested.txt'));
     expect(resolved.virtual).toBe('/project/sub/nested.txt');
   });
 
@@ -350,35 +361,30 @@ describe('validateNewRoot', () => {
   });
 });
 
-/**
- * A drive path is still refused — but the refusal now says what to write.
- *
- * Everything the model reads prints native paths: command output, stack traces, error
- * messages. Pasting one back used to get "Path contains ':', which is not allowed", which
- * is true, is about the wrong thing, and reads as the sandbox refusing a path it can
- * plainly see is inside an approved folder. One canonical form is worth keeping; making
- * the user guess which one is not.
- */
+/** Native drive paths copied from command output are normalized back into the virtual sandbox. */
 describe.runIf(IS_WINDOWS)('a native Windows path', () => {
-  it('is refused with the exact virtual path to use instead', async () => {
-    const error = await expectRefused(path.join(approved, 'sub', 'nested.txt'));
-    expect(error.message).toContain('/project/sub/nested.txt');
-    expect(error.message).not.toContain('Path contains ":"');
+  it('resolves a file inside an approved root', async () => {
+    const resolved = await resolvePath(roots, path.join(approved, 'sub', 'nested.txt'));
+    expect(resolved.real).toBe(path.join(approved, 'sub', 'nested.txt'));
+    expect(resolved.virtual).toBe('/project/sub/nested.txt');
   });
 
-  it('names the root itself when that is what was pasted', async () => {
-    const error = await expectRefused(approved);
-    expect(error.message).toContain('"/project"');
+  it('resolves the approved root itself', async () => {
+    const resolved = await resolvePath(roots, approved);
+    expect(resolved.real).toBe(approved);
+    expect(resolved.virtual).toBe('/project');
+  });
+
+  it('rejects native dot-dot before Windows normalization can erase it', async () => {
+    const error = await expectRefused(`${approved}\\sub\\..\\file.txt`);
+    expect(error.message).toMatch(/traversal/i);
   });
 
   it('says it is outside the approved folders when it is, and lists them', async () => {
     const error = await expectRefused(path.join(outside, 'secret.txt'));
     expect(error.message).toContain('not inside an approved folder');
     expect(error.message).toContain('/project');
-    // No correction offered for a path there is no correct form of: the roots are listed
-    // instead, and nothing is invented that would resolve.
     expect(error.message).not.toContain('/project/');
-    expect(error.message).not.toContain('Use "');
   });
 
   it('refuses a UNC path without pretending to know a virtual path for it', async () => {

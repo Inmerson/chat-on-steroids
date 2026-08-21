@@ -40,7 +40,7 @@ function coreInstructions(ctx: ToolContext): string {
     // Roots used to be a tool of their own. They are one line of context, they change only
     // when the user changes them, and a tool call to learn them was a round trip every
     // conversation paid before it could do anything.
-    'Paths are virtual, like /project/src/main.ts. Real Windows paths are never accepted.',
+    'Paths are virtual, like /project/src/main.ts. Native Windows paths inside an approved folder are also accepted and normalized to the equivalent virtual path.',
     // Taught once here rather than in every tool description: it is one rule that holds
     // across read, find, exec_command and apply_patch alike, and repeating it per tool would
     // cost more context than the shorthand saves.
@@ -93,11 +93,15 @@ function coreInstructions(ctx: ToolContext): string {
     lines.push(
       '',
       'Multi-agent mode is on. As the prime agent you may use agents action=spawn with one task each, then keep',
-      'working; their messages are appended to your tool results as they arrive, and answering a worker with',
-      'agents action=message is the cheapest way to steer one while it is still working. A worker that has',
-      'finished is finished: give the remaining work to a new one. As a worker, call agents action=join to get',
-      'your task, message the prime agent with findings, decisions and blockers and keep working while you wait,',
-      'and use action=finish only when the work is done. Workers talk only to the prime agent, never to each other.'
+      'working; their messages are appended to your tool results as they arrive. Each worker sees its assigned',
+      'task rather than this prime conversation, so delegation is part of the job: describe the assignment from',
+      'the ground up with the project/location, objective, relevant subsystem/files and known facts, constraints,',
+      'what may be changed, validation to run, and the expected handoff. Do not prefix tasks with boilerplate like',
+      '“you have zero prior context”; make the actual task self-contained instead. Use agents action=message to',
+      'steer an active worker. A finished worker is finished: give remaining work to a new one. Workers are already',
+      'bound to their slot when opened; action=join is recovery-only for a lost binding. As a worker, message the',
+      'prime with findings/decisions/blockers, keep working while replies are pending, and call action=finish only',
+      'when done. Workers talk only to the prime agent, never to each other.'
     );
   }
 

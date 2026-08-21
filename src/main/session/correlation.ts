@@ -16,7 +16,7 @@
  */
 
 import { readDurable, writeDurableSoon } from '../durable.js';
-import { listAllSessions, readEvents } from './store.js';
+import { listAllSessions, readRecentEvents } from './store.js';
 
 export interface RequestCorrelation {
   requestId: string;
@@ -36,11 +36,23 @@ interface HeldCorrelation {
 
 const MAX_CORRELATIONS = 50_000;
 const CORRELATIONS_STATE = 'request-correlations';
-const CORRELATIONS_STATE_VERSION = 2;
+/**
+ * 3 drops the conflicts version 2 wrote.
+ *
+ * Until this version a page whose URL and React tree disagreed for one tick marked every
+ * request id in that sighting contradictory, and a contradiction is permanent — nothing
+ * republishes it and the repair pass skips it. Those verdicts are on disk in every profile
+ * that ran an earlier build, holding otherwise provable calls in Unattributed activity for
+ * good. Reading them back as *absent* rather than as contradictory lets the evidence decide
+ * again; a real contradiction is two conversations claiming one id, and merge() makes that
+ * one sticky again the moment it recurs.
+ */
+const CORRELATIONS_STATE_VERSION = 3;
 
 const byRequest = new Map<string, HeldCorrelation>();
 const waiters = new Map<string, Set<() => void>>();
 let restored = false;
+let restoring: Promise<void> | null = null;
 
 interface PersistedCorrelation {
   requestId: string;
@@ -142,7 +154,17 @@ function merge(input: RequestCorrelation): 'stored' | 'same' | 'conflict' {
  */
 export async function restoreRequestCorrelations(): Promise<void> {
   if (restored) return;
-  restored = true;
+  if (restoring) return restoring;
+  restoring = restoreRequestCorrelationsOnce();
+  try {
+    await restoring;
+    restored = true;
+  } finally {
+    restoring = null;
+  }
+}
+
+async function restoreRequestCorrelationsOnce(): Promise<void> {
 
   const saved = await readDurable<PersistedCorrelations>(CORRELATIONS_STATE);
   let loaded = false;
@@ -150,6 +172,9 @@ export async function restoreRequestCorrelations(): Promise<void> {
     for (const raw of saved.entries.slice(-MAX_CORRELATIONS)) {
       if (!raw || typeof raw !== 'object' || typeof raw.requestId !== 'string') continue;
       if (raw.conflicted === true) {
+        // Kept, and still permanent: this snapshot is version 3, so every conflict in it was
+        // written by merge() — two conversations claiming one request id — rather than by a
+        // page caught mid-navigation.
         byRequest.set(raw.requestId, { value: null, conflicted: true });
         loaded = true;
         continue;
@@ -161,12 +186,31 @@ export async function restoreRequestCorrelations(): Promise<void> {
     trim();
   }
 
-  if (loaded) return;
-
-  // One-time upgrade/recovery path. listSessions is already bounded for the UI; future starts
-  // use the small durable index above and never rescan history.
-  for (const session of await listAllSessions()) {
-    for (const event of await readEvents(session.id, { kinds: ['tool_call'] })) {
+  // The durable index is a debounced snapshot, while attributed tool-call JSONL is appended
+  // independently. A crash can therefore leave a perfectly valid *nonempty* snapshot that is
+  // merely behind the session history. Treat the snapshot as a fast baseline, not as proof that
+  // history has nothing newer. Reconcile the durable request-id facts on every restore; merge()
+  // is idempotent for the same conversation and still makes contradictions sticky.
+  let sessions;
+  try {
+    sessions = await listAllSessions();
+  } catch (error) {
+    // A valid direct snapshot can be restored before the session store is initialized (some
+    // tests and narrowly scoped consumers do exactly that). In the real app the store is ready
+    // before this function runs, so stale-snapshot reconciliation still happens there. With no
+    // usable snapshot, however, history is the only recovery source and the initialization
+    // error must remain visible rather than silently losing ownership.
+    if (loaded) return;
+    throw error;
+  }
+  for (const session of sessions.slice(0, 100)) {
+    // The persisted index is the baseline. Reconcile only a bounded newest crash window;
+    // parsing every historical JSONL on every launch made startup proportional to years of
+    // recorded work and could freeze the main process for a minute before the UI appeared.
+    for (const event of await readRecentEvents(session.id, 1024, {
+      kinds: ['tool_call'],
+      maxBytes: 512 * 1024
+    })) {
       if (event.kind !== 'tool_call') continue;
       const call = event.call;
       if (call.attributionMethod !== 'request_id' || !call.requestId || !call.conversationId) continue;
@@ -180,7 +224,7 @@ export async function restoreRequestCorrelations(): Promise<void> {
       });
     }
   }
-  if (byRequest.size > 0) persist();
+  if (byRequest.size > 0 || loaded) persist();
 }
 
 /**
@@ -193,20 +237,6 @@ export function observeRequestCorrelation(input: RequestCorrelation): 'stored' |
   const result = merge(input);
   if (result !== 'same') persist();
   return result;
-}
-
-/** Marks one request contradictory without ever publishing a successful ownership value. */
-export function rejectRequestCorrelation(requestId: string): void {
-  const previous = byRequest.get(requestId);
-  if (previous) {
-    previous.value = null;
-    previous.conflicted = true;
-  } else {
-    byRequest.set(requestId, { value: null, conflicted: true });
-    trim();
-  }
-  wake(requestId);
-  persist();
 }
 
 /** Exact request-id lookup. A contradiction and an absent request both resolve to null. */
@@ -250,5 +280,6 @@ export async function awaitRequestCorrelation(requestId: string | null | undefin
 export function resetCorrelationRegistryForTests(): void {
   byRequest.clear();
   restored = false;
+  restoring = null;
   for (const requestId of [...waiters.keys()]) wake(requestId);
 }

@@ -42,6 +42,21 @@ export interface AffectedPaths {
 /** Resolves a path as spelled in the patch. Throwing here rejects the whole patch. */
 export type PatchPathResolver = (spelledPath: string, cwd: string) => string;
 
+/** Patch matching holds old and reconstructed text together, so it needs its own budget. */
+export const MAX_PATCH_SOURCE_BYTES = 16 * 1024 * 1024;
+
+async function ensurePatchSourceWithinBudget(path: string, allowMissing = false): Promise<void> {
+  try {
+    const metadata = await getMetadata(path);
+    if (metadata.isFile && metadata.size > MAX_PATCH_SOURCE_BYTES) {
+      throw invalidInput(`file is too large to patch safely: limit is ${MAX_PATCH_SOURCE_BYTES} bytes`);
+    }
+  } catch (error) {
+    if (allowMissing && errorCode(error) === 'ENOENT') return;
+    throw error;
+  }
+}
+
 const defaultPathResolver: PatchPathResolver = (spelledPath, cwd) => nodePath.resolve(cwd, spelledPath);
 
 /** `AppliedPatchFileChange`. */
@@ -214,6 +229,7 @@ async function applyHunksToFiles(
     const resolved = resolveHunkPath(hunk, cwd, resolvePath);
 
     if (hunk.kind === 'add_file') {
+      await ensurePatchSourceWithinBudget(resolved, true);
       const overwrittenContent = await readOptionalFileTextForDelta(resolved, delta);
       await tryWrite(writeFileWithMissingParentRetry(resolved, hunk.contents));
       delta.changes.push({
@@ -225,6 +241,7 @@ async function applyHunksToFiles(
     }
 
     if (hunk.kind === 'delete_file') {
+      await ensurePatchSourceWithinBudget(resolved);
       await noteExistingPathDeltaSupport(resolved, delta);
       let deletedContent: string | null = null;
       try {
@@ -250,6 +267,7 @@ async function applyHunksToFiles(
       continue;
     }
 
+    await ensurePatchSourceWithinBudget(resolved);
     await noteExistingPathDeltaSupport(resolved, delta);
     const { originalContents, newContents } = await deriveNewContentsFromChunks(
       resolved,
@@ -473,10 +491,12 @@ export async function verifyApplyPatchArgs(
       );
     }
     if (hunk.kind === 'add_file') {
+      await ensurePatchSourceWithinBudget(path, true);
       changes.set(path, { kind: 'add', content: hunk.contents });
       continue;
     }
     if (hunk.kind === 'delete_file') {
+      await ensurePatchSourceWithinBudget(path);
       let content: string;
       try {
         content = await readFileText(path);
@@ -486,6 +506,7 @@ export async function verifyApplyPatchArgs(
       changes.set(path, { kind: 'delete', content });
       continue;
     }
+    await ensurePatchSourceWithinBudget(path);
     const { newContents } = await deriveNewContentsFromChunks(path, hunk.chunks, updateFileMode);
     changes.set(path, {
       kind: 'update',

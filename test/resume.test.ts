@@ -36,6 +36,7 @@ const { getSession, initSessionStore, resetSessionStoreForTests } = await import
 const { resetRecorderForTests, sessionForConversation } = await import('../src/main/session/recorder.js');
 const { resetSwarm } = await import('../src/main/agents.js');
 const { makeTempDir, removeTempDir } = await import('./helpers.js');
+const { BRIDGE_PROTOCOL } = await import('../src/main/version.js');
 
 const EXTENSION_ORIGIN = 'chrome-extension://abcdefghijklmnopabcdefghijklmnop';
 const CHAT_A = '6a805197-b090-83eb-bbd8-a32b482941da';
@@ -55,7 +56,13 @@ function request(
 ): Promise<{ status: number; body: any }> {
   const url = new URL(path, base);
   const payload = options.body === undefined ? null : JSON.stringify(options.body);
-  const headers: Record<string, string> = { origin: EXTENSION_ORIGIN };
+  // Every route past /hello, /pair included, refuses a caller that does not declare the
+  // protocol it speaks. The shipped extension always sends this; a test that omitted it was
+  // failing pairing with 426 and then reading every later 401 as a bridge bug.
+  const headers: Record<string, string> = {
+    origin: EXTENSION_ORIGIN,
+    'x-extension-protocol': String(BRIDGE_PROTOCOL)
+  };
   if (payload !== null) {
     headers['content-type'] = 'application/json';
     headers['content-length'] = String(Buffer.byteLength(payload));
@@ -150,6 +157,12 @@ afterAll(async () => {
 beforeEach(async () => {
   resetBridgeForTests();
   resetRecorderForTests();
+  resetSessionStoreForTests();
+  // Each case models one independent app history. Reusing CHAT_A/CHAT_B while retaining
+  // prior cases on disk hid duplicate-target ownership bugs and made the safe rebind check
+  // reject a later test for a session that only existed in an earlier test.
+  await fs.rm(nodePath.join(dir, 'sessions'), { recursive: true, force: true });
+  await fs.mkdir(nodePath.join(dir, 'sessions'), { recursive: true });
   resetSwarm();
   writeDurableSoon('bridge-commands', null);
   await flushDurable();
@@ -471,8 +484,11 @@ describe('the job the page polls', () => {
 });
 
 describe('the bridge port', () => {
+  // The shipped candidate range is asserted in bridge.test.ts, against the exported
+  // constant. Here the only claim is the one this suite depends on: whatever port the
+  // bridge took, it took it on loopback and nowhere else.
   it('is loopback only', () => {
-    expect(bridgePort()).toBeGreaterThanOrEqual(8765);
-    expect(bridgePort()).toBeLessThanOrEqual(8769);
+    expect(bridgePort()).toBeGreaterThan(0);
+    expect(base.startsWith('http://127.0.0.1:')).toBe(true);
   });
 });

@@ -1,10 +1,10 @@
 {
   "manifest_version": 3,
   "name": "ChatGPT Local Files companion",
-  "version": "1.8.4",
+  "version": "1.8.9",
   "description": "Records your ChatGPT session into the local ChatGPT Local Files app and labels its MCP tool calls with what they actually did.",
   "minimum_chrome_version": "116",
-  "permissions": ["storage", "scripting"],
+  "permissions": ["storage", "scripting", "alarms"],
   "host_permissions": [
     "https://chatgpt.com/*",
     "https://chat.openai.com/*",

@@ -61,9 +61,10 @@ import {
   thawPrimeTransfer
 } from '../agents.js';
 import { moveChatWorkspace } from '../workspace.js';
+import { writeDurableNow, writeDurableSoon } from '../durable.js';
 import { createHandoff } from './handoff.js';
 import { rebindConversation } from './recorder.js';
-import { rebindSession } from './store.js';
+import { getSession, readHandoff, rebindSession } from './store.js';
 
 /**
  * How long a continuation may stay open.
@@ -110,6 +111,8 @@ interface Continuation {
   handoff: Handoff | null;
   /** Whoever claimed it, so a second claimant is recognised as one. */
   claimedBy: string | null;
+  /** Chat B while the durable commit is in flight; persisted for restart recovery. */
+  to: string | null;
   /**
    * Whether the compaction instruction has already been handed out for this transaction.
    *
@@ -125,6 +128,55 @@ interface Continuation {
 
 /** At most one continuation per session, and at most one open per prime chat. */
 const byToken = new Map<string, Continuation>();
+export const CONTINUATIONS_STATE = 'continuations';
+
+interface ContinuationRecord {
+  token: string;
+  sessionId: string;
+  from: string;
+  to: string | null;
+  openedAt: number;
+  state: ContinuationState;
+  summary: string;
+  handoffId: string | null;
+  claimedBy: string | null;
+  armed: boolean;
+  error: string | null;
+}
+
+export interface ContinuationSnapshot {
+  version: 1;
+  savedAt: number;
+  entries: ContinuationRecord[];
+}
+
+export function snapshotContinuations(): ContinuationSnapshot {
+  return {
+    version: 1,
+    savedAt: Date.now(),
+    entries: [...byToken.values()].map((entry) => ({
+      token: entry.token,
+      sessionId: entry.sessionId,
+      from: entry.from,
+      to: entry.to,
+      openedAt: entry.openedAt,
+      state: entry.state,
+      summary: entry.summary.slice(0, 512 * 1024),
+      handoffId: entry.handoffId,
+      claimedBy: entry.claimedBy,
+      armed: entry.armed,
+      error: entry.error
+    }))
+  };
+}
+
+function changed(): void {
+  writeDurableSoon(CONTINUATIONS_STATE, snapshotContinuations());
+}
+
+async function changedNow(): Promise<void> {
+  await writeDurableNow(CONTINUATIONS_STATE, snapshotContinuations());
+}
 
 export interface ContinuationView {
   token: string;
@@ -209,12 +261,14 @@ export function openContinuation(sessionId: string, fromConversationId: string):
     capture: null,
     handoff: null,
     claimedBy: null,
+    to: null,
     error: null
   };
   byToken.set(entry.token, entry);
   // Pin the swarm's prime binding for the duration. Without this the prime chat closing
   // mid-handover would end the very run the handover exists to carry across.
   beginPrimeTransfer(fromConversationId);
+  changed();
   logInfo(`continuation ${entry.token.slice(0, 8)} opened for session ${sessionId} in chat ${fromConversationId}`);
   return view(entry);
 }
@@ -231,6 +285,7 @@ export function armContinuation(token: string): boolean {
   const entry = byToken.get(token);
   if (!entry || !isOpen(entry) || entry.state !== 'awaiting-summary' || entry.armed) return false;
   entry.armed = true;
+  changed();
   return true;
 }
 
@@ -295,6 +350,7 @@ async function capture(
     entry.handoffId = handoff.id;
     entry.handoff = handoff;
     entry.state = 'awaiting-chat';
+    await changedNow();
     logInfo(`continuation ${entry.token.slice(0, 8)} captured handoff ${handoff.id}`);
     return handoff;
   })();
@@ -345,6 +401,7 @@ export function claimContinuation(token: string, claimant: string): { summary: s
   if (entry.state === 'awaiting-chat' || entry.state === 'claimed') {
     entry.claimedBy = claimant;
     entry.state = 'claimed';
+    changed();
   }
   // Anything further along — `committing` — keeps its state and is answered read-only.
   return { summary: entry.summary };
@@ -372,6 +429,10 @@ export async function commitContinuation(token: string, toConversationId: string
   // get past this line.
   const wasClaimed = entry.state === 'claimed';
   entry.state = 'committing';
+  entry.to = toConversationId;
+  // Recovery intent must be durable before the session's own atomic rebind. If the app
+  // stops after that rebind, startup can prove chat B from meta.json and finish publication.
+  await changedNow();
 
   // --- preflight. Everything that may decline, asked before anything is written.
   const swarm = freezePrimeTransfer(entry.from);
@@ -380,7 +441,9 @@ export async function commitContinuation(token: string, toConversationId: string
     // without the swarm would leave a run coordinated by a chat nobody is attached to, so
     // the whole commit is refused and chat A stays exactly as it is.
     entry.state = wasClaimed ? 'claimed' : 'awaiting-chat';
+    entry.to = null;
     entry.error = 'the swarm handover expired, so the session stayed in the current chat';
+    await changedNow();
     logWarn(`continuation ${entry.token.slice(0, 8)} refused: no usable prime handover from ${entry.from}`);
     return false;
   }
@@ -392,7 +455,9 @@ export async function commitContinuation(token: string, toConversationId: string
     // claimable so the caller may retry.
     if (swarm === 'frozen') thawPrimeTransfer(entry.from);
     entry.state = wasClaimed ? 'claimed' : 'awaiting-chat';
+    entry.to = null;
     entry.error = 'the local session could not be moved to the new chat';
+    await changedNow();
     logWarn(`continuation ${entry.token.slice(0, 8)} could not rebind session ${entry.sessionId}`);
     return false;
   }
@@ -406,7 +471,9 @@ export async function commitContinuation(token: string, toConversationId: string
     logWarn(`continuation ${entry.token.slice(0, 8)} committed after its run ended; no prime to move`);
   }
   entry.state = 'committed';
+  entry.to = toConversationId;
   entry.error = null;
+  await changedNow();
   logInfo(
     `continuation ${entry.token.slice(0, 8)} committed: session ${entry.sessionId} is now chat ${toConversationId}`
   );
@@ -428,11 +495,117 @@ export function abortContinuation(token: string, reason: string): boolean {
   entry.state = 'aborted';
   entry.error = reason;
   cancelPrimeTransfer(entry.from);
+  changed();
   logWarn(`continuation ${entry.token.slice(0, 8)} abandoned — ${reason}`);
   return true;
+}
+
+/**
+ * Restores open continuation transactions after the agent/session projections are loaded.
+ *
+ * A persisted `committing` record is resolved from the authoritative session meta: if it
+ * already names chat B, the durable commit landed and publication is completed; if it still
+ * names A, the move did not land and the transaction becomes claimable again. Any third
+ * identity is quarantined as aborted rather than guessed across chats.
+ */
+export async function restoreContinuations(snapshot: ContinuationSnapshot | null): Promise<void> {
+  byToken.clear();
+  if (!snapshot || snapshot.version !== 1 || !Array.isArray(snapshot.entries)) return;
+  const now = Date.now();
+  const validStates = new Set<ContinuationState>([
+    'awaiting-summary',
+    'awaiting-chat',
+    'claimed',
+    'committing',
+    'committed',
+    'aborted'
+  ]);
+  for (const raw of snapshot.entries.slice(0, 32)) {
+    if (
+      !raw ||
+      !/^[A-Za-z0-9_-]{16,64}$/.test(raw.token) ||
+      !/^[0-9a-z-]{8,64}$/i.test(raw.sessionId) ||
+      typeof raw.from !== 'string' ||
+      raw.from.length === 0 || raw.from.length > 256 ||
+      !validStates.has(raw.state) ||
+      !Number.isFinite(raw.openedAt) ||
+      now - raw.openedAt >= CONTINUATION_TTL_MS * 2
+    ) {
+      continue;
+    }
+    if (raw.state === 'committed' || raw.state === 'aborted') continue;
+    const entry: Continuation = {
+      token: raw.token,
+      sessionId: raw.sessionId,
+      from: raw.from,
+      to: typeof raw.to === 'string' && raw.to ? raw.to : null,
+      openedAt: raw.openedAt,
+      state: raw.state,
+      summary: typeof raw.summary === 'string' ? raw.summary.slice(0, 512 * 1024) : '',
+      handoffId: typeof raw.handoffId === 'string' ? raw.handoffId : null,
+      capture: null,
+      handoff: null,
+      claimedBy: typeof raw.claimedBy === 'string' ? raw.claimedBy : null,
+      armed: raw.armed === true,
+      error: typeof raw.error === 'string' ? raw.error : null
+    };
+    if (entry.handoffId) {
+      try {
+        entry.handoff = await readHandoff(entry.sessionId, entry.handoffId);
+      } catch (err) {
+        logWarn(`continuation ${entry.token.slice(0, 8)} handoff recovery failed: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
+
+    if (entry.state === 'committing') {
+      let session = null;
+      try {
+        session = await getSession(entry.sessionId);
+      } catch (err) {
+        logWarn(`continuation ${entry.token.slice(0, 8)} session recovery failed: ${err instanceof Error ? err.message : String(err)}`);
+      }
+      if (session && entry.to && session.conversationId === entry.to) {
+        rebindConversation(entry.sessionId, entry.from, entry.to);
+        moveChatWorkspace(entry.from, entry.to);
+        commitPrimeTransfer(entry.from, entry.to);
+        entry.state = 'committed';
+        entry.error = 'Recovered a continuation whose durable session move had completed before restart.';
+        logInfo(`continuation ${entry.token.slice(0, 8)} recovered after durable commit`);
+      } else if (session && session.conversationId === entry.from) {
+        thawPrimeTransfer(entry.from);
+        entry.state = entry.claimedBy ? 'claimed' : 'awaiting-chat';
+        entry.to = null;
+        entry.error = 'Recovered before the durable session move; the continuation can be retried.';
+        beginPrimeTransfer(entry.from);
+      } else {
+        entry.state = 'aborted';
+        entry.error = 'Recovery found an unexpected session attachment and refused to guess a chat.';
+        cancelPrimeTransfer(entry.from);
+      }
+    } else if (entry.state !== 'aborted') {
+      // A stored brief is required for every post-capture state. Missing/corrupt durable
+      // handoff data is not an empty valid brief and must not be typed into a new chat.
+      if (entry.state !== 'awaiting-summary' && !entry.handoff) {
+        entry.state = 'aborted';
+        entry.error = 'The saved handoff could not be recovered.';
+        cancelPrimeTransfer(entry.from);
+      } else {
+        beginPrimeTransfer(entry.from);
+      }
+    }
+    byToken.set(entry.token, entry);
+  }
+  try {
+    await changedNow();
+  } catch (err) {
+    // Broken recovery state must not prevent the whole app from opening. New commits still
+    // require an immediate durable write and therefore continue to fail closed.
+    logWarn(`continuation recovery could not persist its repaired snapshot: ${err instanceof Error ? err.message : String(err)}`);
+  }
 }
 
 /** Test seam. */
 export function resetContinuationsForTests(): void {
   byToken.clear();
+  changed();
 }

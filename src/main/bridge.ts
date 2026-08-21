@@ -33,6 +33,7 @@ import {
   noteChatOrigin,
   recordAgentMessage,
   recordChatObservations,
+  restoreRecordedConversation,
   type ChatObservation,
   type PageCallEvidence
 } from './session/recorder.js';
@@ -42,7 +43,7 @@ import {
   findSessionByConversation,
   getSession,
   listSessions,
-  readEvents,
+  readRecentEvents,
   sessionDurableModifiedAt
 } from './session/store.js';
 import { inFlightMcpRequests, inFlightToolCalls } from './mcp/call-context.js';
@@ -52,12 +53,14 @@ import {
   bindConversation,
   currentRunId,
   failAgent,
+  forgetRetiredWorker,
   finishWorkerConversation,
   onSpawnRequest,
   onSwarmEnd,
   pendingWorkerSpawns,
   primeConversationGone,
   releaseQuiescentRun,
+  retiredWorkerForConversation,
   swarmState,
   swarmTransferActive,
   workerConversationGone
@@ -77,7 +80,23 @@ import { readDurable, writeDurableSoon } from './durable.js';
 import { APP_VERSION, BRIDGE_PROTOCOL } from './version.js';
 
 /** Fixed candidates so the extension can find the app without being told a port. */
-const PORTS = [8765, 8766, 8767, 8768, 8769];
+export const DEFAULT_PORTS = [8765, 8766, 8767, 8768, 8769];
+/**
+ * The shipped range is fixed on purpose, but the test suite runs many bridges in parallel
+ * forks on a machine where an installed app already holds 8765. A test whose own bind lost
+ * that race used to fall through to the real app's bridge: 401s at best, and at worst a
+ * test POSTing observations into the user's actual history. `CLF_BRIDGE_PORTS=0` asks the
+ * OS for a free port per bridge instead, so no run can collide with another or with the app.
+ */
+const PORTS = ((): number[] => {
+  const raw = process.env.CLF_BRIDGE_PORTS;
+  if (!raw) return DEFAULT_PORTS;
+  const parsed = raw
+    .split(',')
+    .map((part) => Number.parseInt(part.trim(), 10))
+    .filter((value) => Number.isInteger(value) && value >= 0 && value <= 65535);
+  return parsed.length > 0 ? parsed : DEFAULT_PORTS;
+})();
 const MAX_BODY_BYTES = 2 * 1024 * 1024;
 /** User-requested orphan safety net: slow enough to require durable inactivity, not a heartbeat lease. */
 export const STALE_SWARM_MS = 2 * 60_000;
@@ -331,14 +350,23 @@ function safeEqual(a: string, b: string): boolean {
  * it pairs, and then some routes quietly do nothing. One warning naming both versions
  * turns that into something the Activity log answers directly.
  */
+function extensionProtocol(req: http.IncomingMessage): number | null {
+  const value = Number(req.headers['x-extension-protocol'] ?? NaN);
+  return Number.isSafeInteger(value) ? value : null;
+}
+
+function protocolCompatible(req: http.IncomingMessage): boolean {
+  return extensionProtocol(req) === BRIDGE_PROTOCOL;
+}
+
 function noteExtensionVersion(req: http.IncomingMessage): void {
   const version = req.headers['x-extension-version'];
-  const protocol = Number(req.headers['x-extension-protocol'] ?? NaN);
+  const protocol = extensionProtocol(req);
   if (typeof version === 'string' && version !== extensionVersion) {
     extensionVersion = version.slice(0, 32);
     logInfo(`bridge: browser extension ${extensionVersion} connected`);
   }
-  if (!versionWarned && Number.isFinite(protocol) && protocol !== BRIDGE_PROTOCOL) {
+  if (!versionWarned && protocol !== null && protocol !== BRIDGE_PROTOCOL) {
     versionWarned = true;
     logWarn(
       `bridge: the browser extension speaks protocol ${protocol} but this app speaks ${BRIDGE_PROTOCOL}. ` +
@@ -499,6 +527,7 @@ function parseObservations(input: unknown): ChatObservation[] {
       kind: kind as ChatObservation['kind'],
       time: time > now + 60_000 || time < earliestChatGpt ? now : time
     };
+    if (item['authoredTime'] === true) observation.authoredTime = true;
     // Long final handoff-style answers are valid transcript content too. Keep this aligned
     // with the page-side assistant bound so the bridge does not silently become the next
     // truncation point after Fiber/content.js accepted the whole message.
@@ -530,6 +559,25 @@ function conversationId(value: unknown): string | null {
 
 // -------------------------------------------------------------------- routes
 
+/**
+ * Is ChatGPT working in this chat right now?
+ *
+ * The live half of the automatic-compaction rule, and the reason it is asked here rather
+ * than remembered in the session: `generating` is a fact about the connection this process
+ * is holding open, so it cannot survive a restart, a closed tab or a crash the way a
+ * durable flag can — which is exactly the property that keeps a stale chat quiet. Reopening
+ * a 500k conversation from last week starts no turn, so it never looks like work.
+ *
+ * In-flight tool calls are deliberately *not* counted. They are global to the app rather
+ * than to one chat, and a worker's `exec_command` running elsewhere must not make an idle
+ * chat look busy. It costs nothing: ChatGPT keeps the turn open while it waits for a tool
+ * result, so mid-tool-call is already mid-turn here.
+ */
+function chatIsWorking(conversationId: string): boolean {
+  const current = liveConversations().find((entry) => entry.conversationId === conversationId);
+  return Boolean(current && (current.generating || current.activeTurnId));
+}
+
 async function handle(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
   const { ok: originAllowed, origin } = originOf(req);
   const url = new URL(req.url ?? '/', 'http://127.0.0.1');
@@ -540,7 +588,7 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
     if (!origin) return json(res, 403, { error: 'forbidden_origin' }, null);
     res.writeHead(204, {
       'access-control-allow-origin': origin,
-      'access-control-allow-headers': 'authorization, content-type',
+      'access-control-allow-headers': 'authorization, content-type, x-extension-version, x-extension-protocol',
       'access-control-allow-methods': 'GET, POST, OPTIONS',
       // Chrome asks for this before letting an extension reach a loopback address.
       'access-control-allow-private-network': 'true',
@@ -550,7 +598,6 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
     return;
   }
 
-  if (rateLimited()) return json(res, 429, { error: 'rate_limited' }, origin);
   if (!originAllowed) return json(res, 403, { error: 'forbidden_origin' }, null);
 
   noteExtensionVersion(req);
@@ -564,6 +611,7 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
         app: 'chatgpt-local-files',
         version: APP_VERSION,
         bridge: BRIDGE_PROTOCOL,
+        compatible: protocolCompatible(req),
         paired: (await getSecret('bridgeToken')) !== null
       },
       origin
@@ -571,6 +619,10 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
   }
 
   if (route === '/pair' && req.method === 'POST') {
+    if (!protocolCompatible(req)) {
+      return json(res, 426, { error: 'incompatible_extension', bridge: BRIDGE_PROTOCOL, version: APP_VERSION }, origin);
+    }
+    if (rateLimited()) return json(res, 429, { error: 'rate_limited' }, origin);
     try {
       await readBody(req);
     } catch (err) {
@@ -599,6 +651,12 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
   }
 
   if (!(await authorised(req))) return json(res, 401, { error: 'unauthorised' }, origin);
+  if (!protocolCompatible(req)) {
+    return json(res, 426, { error: 'incompatible_extension', bridge: BRIDGE_PROTOCOL, version: APP_VERSION }, origin);
+  }
+  // Charge only an authenticated extension. A random local process must not be able to
+  // consume the browser's shared budget before failing origin/authentication.
+  if (rateLimited()) return json(res, 429, { error: 'rate_limited' }, origin);
   lastSeenAt = Date.now();
 
   if (route === '/status') {
@@ -683,6 +741,7 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
     const id = conversationId(body['conversationId']);
     if (id) {
       await closeConversation(id);
+      forgetRetiredWorker(id);
       // The extension owns this lifecycle. A swarm whose prime chat is gone has nobody to
       // report to, and workers that keep going are tabs writing files for a run nobody is
       // reading — so the run ends here, rather than the model being asked whether it is
@@ -701,17 +760,42 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
     const id = conversationId(url.searchParams.get('conversationId'));
     const since = Number(url.searchParams.get('since') ?? 0);
     if (!id) return json(res, 400, { error: 'bad_conversation_id' }, origin);
+    const retiredWorker = retiredWorkerForConversation(id);
     // Every open ChatGPT tab polls this for its own conversation every few seconds, so
     // this is the app's primary first-hand evidence of which chats exist right now.
-    const live = liveConversations().find((entry) => entry.conversationId === id);
+    let live = liveConversations().find((entry) => entry.conversationId === id);
     if (!live) {
-      return json(res, 200, { sessionId: null, entries: [], stream: [], userAnchors: [], nextSince: Number.isFinite(since) ? Math.max(0, since) : 0, job: null }, origin);
+      // `/activity` itself proves that this ChatGPT page is still open. After an app restart
+      // the durable session can keep receiving exact MCP calls while the recorder's live map
+      // is empty; returning an empty feed here leaves Overwrite stale forever. Reattach only
+      // when a durable session already exists, so a random poll cannot manufacture history.
+      await restoreRecordedConversation(id);
+      live = liveConversations().find((entry) => entry.conversationId === id);
+    }
+    if (!live) {
+      return json(res, 200, {
+        sessionId: null,
+        entries: [],
+        stream: [],
+        userAnchors: [],
+        nextSince: Number.isFinite(since) ? Math.max(0, since) : 0,
+        job: null,
+        ...(retiredWorker ? { retiredWorker } : {})
+      }, origin);
     }
     const summary = await getSession(live.sessionId);
-    const events = await readEvents(live.sessionId, {
-      // All renderable event kinds share one sequence cursor; filtered below.
-      from: Number.isFinite(since) ? Math.max(0, since) : 0
-    });
+    const requestedSince = Number.isFinite(since) ? Math.max(0, since) : 0;
+    // A page reload begins at cursor zero. Never turn that into a full JSONL parse/response:
+    // large audited sessions used to freeze the Electron main process here for tens of
+    // seconds. The browser stream is presentation state, so send a bounded newest window and
+    // explicitly tell the page to replace its local projection when its cursor predates it.
+    const recent = await readRecentEvents(live.sessionId, 1200);
+    const firstAvailable = recent.reduce((first, event) => Math.min(first, event.seq), Number.MAX_SAFE_INTEGER);
+    const resetActivity =
+      firstAvailable !== Number.MAX_SAFE_INTEGER &&
+      requestedSince < firstAvailable &&
+      !(requestedSince === 0 && firstAvailable === 1);
+    const events = recent.filter((event) => resetActivity || event.seq >= requestedSince);
     // App-owned transcript feed. Presentation-only: raw tool I/O stays in the local
     // session store. This is the source the connected page will render chronologically.
     const stream = events.flatMap((event) => {
@@ -787,7 +871,7 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
 
     // Legacy tool-only view, kept only while the old native-row relabeller is still a
     // fallback. It is derived from the same stream cursor and contains no raw args/result.
-    const nextSince = events.reduce((next, event) => Math.max(next, event.seq + 1), Number.isFinite(since) ? Math.max(0, since) : 0);
+    const nextSince = events.reduce((next, event) => Math.max(next, event.seq + 1), requestedSince);
 
     const entries = events.flatMap((event) =>
       event.kind === 'tool_call'
@@ -830,9 +914,10 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
         // history and its identity across the move, so a meter reading the lifetime figure
         // would come back full the moment the replacement chat opened and compact it again.
         tokens: summary?.contextTokens ?? 0,
-        // A durable threshold *crossing*, not a level check. Old chats that merely happen
-        // to open above the threshold never set this bit; only live growth from below can.
-        autoCompactReady: autoCompactionReady(summary),
+        // Over the line *and* mid-turn. Both halves matter: the level is what makes it
+        // fire at all, and the liveness is what keeps it off a stale chat that is merely
+        // being opened — see chatIsWorking.
+        autoCompactReady: autoCompactionReady(summary) && chatIsWorking(live.conversationId),
         // What the composer's meter fills against, and what its automatic trigger fires
         // on. Sent from here rather than worked out in the page so that the bar someone
         // is watching and the threshold that acts are the same number: a meter that
@@ -847,6 +932,8 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
         entries,
         stream,
         userAnchors,
+        resetActivity,
+        truncatedFrom: resetActivity ? firstAvailable : null,
         nextSince,
         // How this chat's own Compact & Resume is going, so the page can say what is
         // happening instead of spinning.
@@ -858,7 +945,8 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
         // The generation this chat currently has open, if it has one. A content script that
         // has just been reloaded into a turn already in flight adopts this instead of
         // minting a second id for the same run. See liveConversations().
-        activeTurnId: live.activeTurnId ?? null
+        activeTurnId: live.activeTurnId ?? null,
+        ...(retiredWorker ? { retiredWorker } : {})
       },
       origin
     );
@@ -892,16 +980,13 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
         origin
       );
     }
-    // A browser claim is only meaningful for the live page that is actually idle. Check on
-    // both sides of the durable write: if a new turn races in, consume the one-shot but tell
-    // the page `claimed:false`, so it never interrupts that new turn or retries the old edge.
-    const idle = (): boolean => {
-      const current = liveConversations().find((entry) => entry.conversationId === id);
-      return Boolean(current && !current.generating && !current.activeTurnId && inFlightToolCalls() === 0);
-    };
-    if (!idle()) return json(res, 200, { claimed: false, sessionId }, origin);
-    const claimed = await claimAutoCompaction(sessionId, id);
-    return json(res, 200, { claimed: claimed && idle(), sessionId }, origin);
+    // A claim is only meaningful while this chat is still mid-turn: an automatic compaction
+    // is a handoff *out of work in progress*, and once the answer has landed there is
+    // nothing left to carry across. Checked again inside the durable write, so a turn that
+    // finishes while the claim is queued leaves the trigger unspent for the next one.
+    if (!chatIsWorking(id)) return json(res, 200, { claimed: false, sessionId }, origin);
+    const claimed = await claimAutoCompaction(sessionId, id, () => chatIsWorking(id));
+    return json(res, 200, { claimed, sessionId }, origin);
   }
 
   /**
@@ -1084,6 +1169,13 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
     // should still have its agent filed correctly.
     const conversation = conversationId(body['conversationId']);
     const ownedCommand = commands.find((command) => command.id === id) ?? null;
+    // Every current page echoes its per-document client. If its command has already expired,
+    // been cancelled or been superseded, accepting the late ACK as success strands a real
+    // tab whose model can never be bound to the worker/session it was opened for. Legacy
+    // protocol pages omitted client and keep their old idempotent no-op response.
+    if (!ownedCommand && client) {
+      return json(res, 404, { error: 'no_such_command' }, origin);
+    }
     // The document that redeemed the marker is the only document allowed to finish it.
     // `client` is optional on the wire for compatibility with an extension already open
     // during an app upgrade, but every current page sends it. When present, fail closed if
@@ -1158,16 +1250,21 @@ async function durableQuiescence(conversationId: string, now: number): Promise<D
     return { quiescent: false, ended: summary.endedAt !== null, lastOutcome: summary.lastTurnOutcome };
   }
 
-  const openTurns = new Set<string>();
-  let lastOutcome: string | null = null;
-  for (const event of await readEvents(summary.id, { kinds: ['turn_start', 'turn_end'] })) {
-    if (event.kind === 'turn_start' && event.turnId) openTurns.add(event.turnId);
-    else if (event.kind === 'turn_end') {
-      if (event.turnId) openTurns.delete(event.turnId);
-      lastOutcome = event.outcome;
+  let lastOutcome: string | null = summary.lastTurnOutcome;
+  if (summary.activeTurnId) return { quiescent: false, ended: summary.endedAt !== null, lastOutcome };
+  // Pre-1.8.8 metadata has no durable open-turn projection. Bound that one migration path
+  // to the newest tail instead of reparsing the full lifetime on every 30-second sweep.
+  if (summary.activeTurnId === undefined) {
+    const openTurns = new Set<string>();
+    for (const event of await readRecentEvents(summary.id, 4096, { kinds: ['turn_start', 'turn_end'] })) {
+      if (event.kind === 'turn_start' && event.turnId) openTurns.add(event.turnId);
+      else if (event.kind === 'turn_end') {
+        if (event.turnId) openTurns.delete(event.turnId);
+        lastOutcome = event.outcome;
+      }
     }
+    if (openTurns.size > 0) return { quiescent: false, ended: summary.endedAt !== null, lastOutcome };
   }
-  if (openTurns.size > 0) return { quiescent: false, ended: summary.endedAt !== null, lastOutcome };
   if (summary.endedAt !== null) return { quiescent: true, ended: true, lastOutcome };
   // A live-but-idle session needs one durable terminal turn. A session with only a bootstrap
   // message and no turn_end is not proof that ChatGPT ever finished the worker/prime turn.
@@ -1246,9 +1343,29 @@ export async function sweepStaleSwarm(now = Date.now()): Promise<boolean> {
 /** Unsubscribes this module's swarm-end listener. Held so a restart cannot double it. */
 let dropSwarmEndListener: (() => void) | null = null;
 let staleSwarmTimer: NodeJS.Timeout | null = null;
+let staleSweepInFlight: Promise<boolean> | null = null;
+let bridgeStarting: Promise<number | null> | null = null;
+
+function runStaleSwarmSweep(): Promise<boolean> {
+  if (staleSweepInFlight) return staleSweepInFlight;
+  staleSweepInFlight = sweepStaleSwarm().finally(() => {
+    staleSweepInFlight = null;
+  });
+  return staleSweepInFlight;
+}
 
 export async function startBridge(): Promise<number | null> {
   if (server) return port;
+  if (bridgeStarting) return bridgeStarting;
+  bridgeStarting = startBridgeOnce();
+  try {
+    return await bridgeStarting;
+  } finally {
+    bridgeStarting = null;
+  }
+}
+
+async function startBridgeOnce(): Promise<number | null> {
   const instance = http.createServer((req, res) => {
     handle(req, res).catch((err: Error) => {
       logWarn(`bridge request failed: ${err.message}`);
@@ -1268,8 +1385,11 @@ export async function startBridge(): Promise<number | null> {
       });
     });
     if (bound) {
+      // Port 0 means the OS picked one; the socket knows which.
+      const address = instance.address();
+      const actual = typeof address === 'object' && address ? address.port : candidate;
       server = instance;
-      port = candidate;
+      port = actual;
       instance.on('error', (err) => logWarn(`bridge server error: ${err.message}`));
       // Commands from the previous run come back first, so a bootstrap that has already
       // failed three times keeps its history. Registering the spawn handler then replays
@@ -1300,15 +1420,15 @@ export async function startBridge(): Promise<number | null> {
       });
       if (staleSwarmTimer) clearInterval(staleSwarmTimer);
       staleSwarmTimer = setInterval(() => {
-        void sweepStaleSwarm().catch((err: Error) => logWarn(`stale swarm sweep failed: ${err.message}`));
+        void runStaleSwarmSweep().catch((err: Error) => logWarn(`stale swarm sweep failed: ${err.message}`));
       }, STALE_SWARM_SWEEP_MS);
       staleSwarmTimer.unref?.();
       // Anything restored from the previous run goes out now rather than waiting for a
       // browser to come and ask.
       deliver();
-      logInfo(`bridge listening on 127.0.0.1:${candidate}`);
+      logInfo(`bridge listening on 127.0.0.1:${actual}`);
       changed();
-      return candidate;
+      return actual;
     }
   }
   logWarn(`bridge could not bind any of ports ${PORTS.join(', ')}; the browser extension will not connect`);
@@ -1316,6 +1436,10 @@ export async function startBridge(): Promise<number | null> {
 }
 
 export async function stopBridge(): Promise<void> {
+  // A settings save can race start and stop. Waiting here prevents stop from observing
+  // `server === null`, returning, and then having an in-progress start publish a listener
+  // after the app already considers the bridge down.
+  if (bridgeStarting) await bridgeStarting.catch(() => null);
   const instance = server;
   if (!instance) return;
   server = null;
@@ -1329,8 +1453,22 @@ export async function stopBridge(): Promise<void> {
   if (staleSwarmTimer) clearInterval(staleSwarmTimer);
   staleSwarmTimer = null;
   await new Promise<void>((resolve) => {
-    instance.closeAllConnections();
-    instance.close(() => resolve());
+    // Stop admission and drain accepted extension writes. Abruptly destroying sockets here
+    // could lose an /events or /closed item after Chrome had already handed it to the app.
+    // Keep shutdown bounded because a wedged localhost client must not pin Electron forever.
+    let settled = false;
+    const force = setTimeout(() => {
+      if (settled) return;
+      logWarn('bridge drain timed out after 15s; forcing remaining connections closed');
+      instance.closeAllConnections();
+    }, 15_000);
+    force.unref?.();
+    instance.closeIdleConnections?.();
+    instance.close(() => {
+      settled = true;
+      clearTimeout(force);
+      resolve();
+    });
   });
   logInfo('bridge stopped');
   changed();
@@ -1631,13 +1769,13 @@ function deliver(): void {
   const url = commandUrl(command.id);
   logInfo(`bridge: opening a fresh ChatGPT chat for ${specKey(command.spec)}`);
   void openInBrowser(url).catch((err: Error) => {
-    // The browser could not be launched at all. Release the claim immediately so the
-    // next attempt is not stuck behind a lease nobody is holding, and tell the user
-    // plainly — this is the one failure they can actually do something about.
-    command.claimedAt = null;
-    command.lastError = `the browser could not be opened (${err.message})`;
-    logWarn(`bridge: could not open the browser for ${specKey(command.spec)} — ${err.message}`);
-    changed();
+    // One command is one browser-open attempt. A rejected opener can never produce an ACK,
+    // so leaving the row unleased merely blocks everything behind it until some unrelated
+    // future action calls deliver() again. End it honestly and immediately, then advance.
+    const why = `the browser could not be opened (${err.message})`;
+    command.lastError = why;
+    drop(command, why);
+    deliver();
   });
 }
 

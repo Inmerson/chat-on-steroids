@@ -356,14 +356,20 @@ describe('the swarm handover', () => {
     });
     const real = store.rebindSession;
     vi.spyOn(store, 'rebindSession').mockImplementation(async (...args) => {
+      // The handover deadline passes while the disk write is happening. Before the freeze
+      // this left the session durably in B with the swarm still bound to A.
+      //
+      // Moved from the caller into the write itself: out there the jump had to be timed by
+      // guessing how many microtasks the preflight takes, and the durable record written
+      // before the preflight is a real file write, so one `await Promise.resolve()` landed
+      // the jump *before* freezePrimeTransfer instead of after it. That tested plain expiry,
+      // which is a different test two cases down.
+      vi.setSystemTime(Date.now() + TRANSFER_TTL_MS + 1_000);
       await held;
       return real(...args);
     });
     const commit = commitContinuation(opened.token, CHAT_B);
     await Promise.resolve();
-    // The handover deadline passes while the disk write is happening. Before the freeze this
-    // left the session durably in B with the swarm still bound to A.
-    vi.setSystemTime(Date.now() + TRANSFER_TTL_MS + 1_000);
     release();
 
     expect(await commit).toBe(true);

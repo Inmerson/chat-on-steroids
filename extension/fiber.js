@@ -42,9 +42,7 @@
   // Recovery may therefore execute this file again in a page that still has an older helper
   // listener. Keep at most one listener for this protocol version; content.js rejects older
   // versions, so a v5 listener can coexist harmlessly until the document itself navigates.
-  const ACTIVE_VERSION = '__clfFiberHelperVersion';
-  if (window[ACTIVE_VERSION] === VERSION) return;
-  window[ACTIVE_VERSION] = VERSION;
+  const ACTIVE_HELPER = '__clfFiberHelper';
   const ASK = 'clf-fiber-ask';
   const REPLY = 'clf-fiber-reply';
   /** The control ChatGPT puts in a connector tool row and nowhere else. */
@@ -80,6 +78,18 @@
   // Safety guard only. Compact & Resume is specified in tokens (up to 30k), so this must be
   // comfortably larger than a normal handoff rather than acting as a second token budget.
   const MAX_RENDERED_TEXT = 256_000;
+  /** Aggregate authored text/HTML copied through MAIN -> isolated world in one scan. */
+  const MAX_RESPONSE_TEXT = MAX_TURNS * 512 * 1024;
+  const MAX_TURN_TEXT = 512 * 1024;
+
+  function budgetedText(value, budget, perValueLimit) {
+    if (typeof value !== 'string' || !value || !budget || budget.remaining <= 0) return '';
+    const limit = Math.max(0, Math.min(perValueLimit, budget.remaining));
+    if (limit === 0) return '';
+    const taken = value.slice(0, limit);
+    budget.remaining -= taken.length;
+    return taken;
+  }
   /**
    * The connectors this app is reached through. Nothing else is ours to vouch for.
    *
@@ -311,15 +321,10 @@
       if (!item || typeof item !== 'object' || item.type !== 'thought') continue;
       const key = str(item.key);
       if (!key) continue;
-      let owner = null;
-      for (let known = 0; known < thoughtIds.length; known++) {
-        const prefix = `thought-${thoughtIds[known]}-`;
-        if (key.indexOf(prefix) !== 0) continue;
-        const suffix = key.slice(prefix.length);
-        if (!/^\d{1,6}$/.test(suffix)) continue;
-        owner = thoughtIds[known];
-        break;
-      }
+      const suffixAt = key.lastIndexOf('-');
+      const suffix = suffixAt >= 0 ? key.slice(suffixAt + 1) : '';
+      const owner = key.startsWith('thought-') && /^\d{1,6}$/.test(suffix) ? key.slice(8, suffixAt) : null;
+      if (owner && !thoughtIds.has(owner)) continue;
       if (!owner) continue;
       if (found && found.messageId !== key) return null;
       found = { messageId: key, thoughtMessageId: owner };
@@ -405,23 +410,27 @@
   }
 
   /** Public assistant messages in ChatGPT's own turn model, in model order. */
-  function authoredAssistantMessages(messages) {
+  function authoredAssistantMessages(messages, budget) {
     const out = [];
-    const seen = [];
+    const seen = new Set();
+    const logicalIds = new Set();
+    const thoughtParents = new Map();
     if (!Array.isArray(messages)) return out;
+    for (const candidate of messages) {
+      if (thoughtMessage(candidate)) thoughtParents.set(str(candidate.id), candidate);
+    }
     for (let index = 0; index < messages.length; index++) {
+      if (!budget || budget.remaining <= 0) break;
       const message = messages[index];
       if (!message || typeof message !== 'object') continue;
       const author = message.author;
       if (!author || author.role !== 'assistant') continue;
       if (requestOf(message) || resultOf(message) || hiddenMessage(message)) continue;
       const id = str(message.id);
-      const rawText = authoredText(message);
+      const rawText = budgetedText(authoredText(message), budget, MAX_RENDERED_TEXT);
       if (!id || !rawText) continue;
-      let duplicate = false;
-      for (let at = 0; at < seen.length; at++) if (seen[at] === id) duplicate = true;
-      if (duplicate) continue;
-      seen.push(id);
+      if (seen.has(id)) continue;
+      seen.add(id);
       const meta = message.metadata && typeof message.metadata === 'object' ? message.metadata : null;
       const parentId = meta ? str(meta.parent_id) : null;
       const workingTurnId = meta ? str(meta.working_turn_id) : null;
@@ -431,8 +440,7 @@
       // Two messages of one branch sharing a creation millisecond would collide on that
       // identity. Keep the first and hand the later one the parent tuple instead, so a
       // collision costs a weaker key rather than a swallowed message.
-      let collides = false;
-      for (let at = 0; at < out.length; at++) if (out[at].messageId === authoredId) collides = true;
+      const collides = logicalIds.has(authoredId);
       let logicalId = collides ? assistantLogicalId(id, parentId, workingTurnId, turnExchangeId, null) : authoredId;
       // The reload-durable identity needs no thought parent to be trustworthy.
       let stable = !collides && Boolean(createTime) && logicalId !== id && logicalId !== parentId;
@@ -443,19 +451,17 @@
       // when the parent is actually present in this same turn model and its own turn metadata
       // does not contradict the child. No text, order, timing or DOM position participates.
       if (parentId) {
-        for (let parentAt = 0; parentAt < messages.length; parentAt++) {
-          const parent = messages[parentAt];
-          if (!thoughtMessage(parent) || str(parent.id) !== parentId) continue;
+          const parent = thoughtParents.get(parentId);
+          if (parent) {
           const parentMeta = parent.metadata && typeof parent.metadata === 'object' ? parent.metadata : null;
           const parentWorking = parentMeta ? str(parentMeta.working_turn_id) : null;
           const parentExchange = parentMeta ? str(parentMeta.turn_exchange_id) : null;
-          if (turnIdentityContradicts(workingTurnId, parentWorking)) break;
-          if (turnIdentityContradicts(turnExchangeId, parentExchange)) break;
+          if (!turnIdentityContradicts(workingTurnId, parentWorking) && !turnIdentityContradicts(turnExchangeId, parentExchange)) {
           // Keep the same exact tuple chosen above. If older page data has a thought parent
           // but no working/exchange metadata, parent_id itself is the stronger identity.
           if (logicalId === id) logicalId = parentId;
           stable = true;
-          break;
+          }
         }
       }
       // Keep the position from ChatGPT's own turn model. `messages` and native activity are
@@ -473,6 +479,7 @@
         order: index,
         createTime
       });
+      logicalIds.add(logicalId);
     }
     return out;
   }
@@ -486,22 +493,21 @@
    * it after a reload. The model id is already ChatGPT's durable identity, so there is no
    * reason to make user capture depend on the DOM having caught up.
    */
-  function authoredUserMessages(messages) {
+  function authoredUserMessages(messages, budget) {
     const out = [];
-    const seen = [];
+    const seen = new Set();
     if (!Array.isArray(messages)) return out;
     for (let index = 0; index < messages.length; index++) {
+      if (!budget || budget.remaining <= 0) break;
       const message = messages[index];
       if (!message || typeof message !== 'object') continue;
       const author = message.author;
       if (!author || author.role !== 'user') continue;
       const id = str(message.id);
-      const rawText = authoredText(message);
+      const rawText = budgetedText(authoredText(message), budget, MAX_RENDERED_TEXT);
       if (!id || !rawText) continue;
-      let duplicate = false;
-      for (let at = 0; at < seen.length; at++) if (seen[at] === id) duplicate = true;
-      if (duplicate) continue;
-      seen.push(id);
+      if (seen.has(id)) continue;
+      seen.add(id);
       out.push({
         id,
         messageId: id,
@@ -563,9 +569,9 @@
    * raw Markdown. Finally, the old positional fallback remains only for the fully balanced
    * case, where every remaining candidate has exactly one remaining visible block.
    */
-  function renderedMessagesOf(sections, messages) {
-    const assistantCandidates = authoredAssistantMessages(messages);
-    const userCandidates = authoredUserMessages(messages);
+  function renderedMessagesOf(sections, messages, budget) {
+    const assistantCandidates = authoredAssistantMessages(messages, budget);
+    const userCandidates = authoredUserMessages(messages, budget);
     if (assistantCandidates.length === 0 && userCandidates.length === 0) return [];
 
     const blocks = [];
@@ -586,7 +592,7 @@
       }
     }
 
-    const used = [];
+    const used = new Set();
     const ids = [];
     for (let at = 0; at < blocks.length; at++) {
       const block = blocks[at];
@@ -608,7 +614,7 @@
       let known = false;
       for (let c = 0; c < assistantCandidates.length; c++) if (assistantCandidates[c].id === id) known = true;
       if (!known) id = null;
-      if (id) used.push(id);
+      if (id) used.add(id);
       ids.push(id);
     }
 
@@ -617,7 +623,7 @@
     const freeCandidates = [];
     for (let c = 0; c < assistantCandidates.length; c++) {
       let taken = false;
-      for (let u = 0; u < used.length; u++) if (used[u] === assistantCandidates[c].id) taken = true;
+      if (used.has(assistantCandidates[c].id)) taken = true;
       if (!taken) freeCandidates.push(assistantCandidates[c]);
     }
 
@@ -648,7 +654,7 @@
       }
       if (candidateCount !== 1) continue;
       ids[match] = candidate.id;
-      used.push(candidate.id);
+      used.add(candidate.id);
     }
 
     const remainingBlocks = [];
@@ -656,7 +662,7 @@
     const remainingCandidates = [];
     for (let c = 0; c < assistantCandidates.length; c++) {
       let taken = false;
-      for (let u = 0; u < used.length; u++) if (used[u] === assistantCandidates[c].id) taken = true;
+      if (used.has(assistantCandidates[c].id)) taken = true;
       if (!taken) remainingCandidates.push(assistantCandidates[c]);
     }
     if (remainingBlocks.length === remainingCandidates.length) {
@@ -698,7 +704,7 @@
       const block = blocks[at];
       let renderedHtml = '';
       try {
-        renderedHtml = typeof block.innerHTML === 'string' ? block.innerHTML.slice(0, MAX_RENDERED_HTML) : '';
+        renderedHtml = budgetedText(block.innerHTML, budget, MAX_RENDERED_HTML);
       } catch {
         renderedHtml = '';
       }
@@ -718,17 +724,17 @@
    * neither version. The next stable scan reconciles it.
    */
   function nativeActivitiesOf(sections, messages) {
-    const thoughtIds = [];
+    const thoughtIds = new Set();
     const thoughtOrder = new Map();
     for (let at = 0; at < messages.length; at++) {
       if (!thoughtMessage(messages[at])) continue;
       const id = str(messages[at].id);
       if (id) {
-        thoughtIds.push(id);
+        thoughtIds.add(id);
         thoughtOrder.set(id, at);
       }
     }
-    if (thoughtIds.length === 0) return [];
+    if (thoughtIds.size === 0) return [];
 
     const held = [];
     for (let sectionAt = 0; sectionAt < sections.length; sectionAt++) {
@@ -740,19 +746,18 @@
         continue;
       }
       const rows = [];
+      const candidates = new Set(found);
+      const nestedParents = new Set();
       for (let at = 0; at < found.length; at++) {
         const row = found[at];
-        let nested = false;
-        for (let other = 0; other < found.length; other++) {
-          if (other === at) continue;
-          try {
-            if (row.contains(found[other])) nested = true;
-          } catch {
-            nested = false;
-          }
-          if (nested) break;
+        let parent = row && row.parentElement;
+        while (parent && parent !== section) {
+          if (candidates.has(parent)) nestedParents.add(parent);
+          parent = parent.parentElement;
         }
-        if (!nested) rows.push(row);
+      }
+      for (let at = 0; at < found.length; at++) {
+        if (!nestedParents.has(found[at])) rows.push(found[at]);
       }
 
       for (let at = 0; at < rows.length; at++) {
@@ -996,21 +1001,21 @@
   function callsOf(messages) {
     if (!Array.isArray(messages)) return [];
     const out = [];
-    const seen = [];
-    const answered = [];
+    const seen = new Set();
+    const answered = new Set();
     // Results first, so a request can say whether its own answer has arrived. `parent_id`
     // is what pairs them; position does not, and pairing by position is how a row came to
     // sit over another tool's output.
-    for (let at = 0; at < messages.length && answered.length < MAX_CALLS; at++) {
+    for (let at = 0; at < messages.length && answered.size < MAX_CALLS; at++) {
       const message = messages[at];
       const result = resultOf(message);
       if (!result || !ourApp(result.app)) continue;
       const meta = message && typeof message === 'object' ? message.metadata : null;
       const parent = meta && typeof meta === 'object' ? str(meta.parent_id) : null;
-      if (parent) answered.push(parent);
+      if (parent) answered.add(parent);
     }
 
-    const duplicated = [];
+    const duplicated = new Set();
     for (let at = 0; at < messages.length && out.length < MAX_CALLS; at++) {
       const request = requestOf(messages[at]);
       if (!request || !ourPath(request.path)) continue;
@@ -1020,10 +1025,9 @@
       // An id reported twice is an ambiguity, not a second call, and it is dropped on
       // *both* sides: keeping the first would still hand the app one identity standing
       // for two different requests, which is the same piece of evidence spent twice.
-      for (let seenAt = 0; seenAt < seen.length; seenAt++) if (seen[seenAt] === id) duplicated.push(id);
-      seen.push(id);
-      let hasResult = false;
-      for (let ansAt = 0; ansAt < answered.length; ansAt++) if (answered[ansAt] === id) hasResult = true;
+      if (seen.has(id)) duplicated.add(id);
+      seen.add(id);
+      const hasResult = answered.has(id);
       out.push({
         messageId: id,
         tool,
@@ -1040,9 +1044,7 @@
 
     const kept = [];
     for (let at = 0; at < out.length; at++) {
-      let bad = false;
-      for (let badAt = 0; badAt < duplicated.length; badAt++) if (duplicated[badAt] === out[at].messageId) bad = true;
-      if (bad) continue;
+      if (duplicated.has(out[at].messageId)) continue;
       out[at].order = kept.length;
       kept.push(out[at]);
     }
@@ -1079,6 +1081,7 @@
       else groups.push({ turnId: id, sections: [section] });
     }
     const first = Math.max(0, groups.length - MAX_TURNS);
+    const responseBudget = { remaining: MAX_RESPONSE_TEXT };
     for (let at = first; at < groups.length; at++) {
       const group = groups[at];
       const section = group.sections[0];
@@ -1088,7 +1091,10 @@
         if (!fiber) continue;
         const messages = turnMessagesOf(fiber);
         const calls = callsOf(messages);
-        const renderedMessages = renderedMessagesOf(group.sections, messages);
+        const turnBudget = { remaining: Math.min(MAX_TURN_TEXT, responseBudget.remaining) };
+        const before = turnBudget.remaining;
+        const renderedMessages = renderedMessagesOf(group.sections, messages, turnBudget);
+        responseBudget.remaining -= before - turnBudget.remaining;
         const activities = nativeActivitiesOf(group.sections, messages);
         if (calls.length === 0 && renderedMessages.length === 0 && activities.length === 0) continue;
         const index = out.length;
@@ -1148,16 +1154,18 @@
   function scan(nonce) {
     const rows = [];
     let turns = [];
+    let scanOk = true;
     try {
       turns = turnsOf();
     } catch {
       turns = [];
+      scanOk = false;
     }
     let found;
     try {
       found = document.querySelectorAll(CONNECTOR);
     } catch {
-      return post({ source: REPLY, nonce, v: VERSION, rows: [], turns }, location.origin);
+      return post({ source: REPLY, nonce, v: VERSION, scanOk: false, rows: [], turns }, location.origin);
     }
     const limit = Math.min(found.length, MAX_ROWS);
     for (let index = 0; index < limit; index++) {
@@ -1178,10 +1186,10 @@
       }
       if (descriptor) rows.push(descriptor);
     }
-    post({ source: REPLY, nonce, v: VERSION, rows, turns }, location.origin);
+    post({ source: REPLY, nonce, v: VERSION, scanOk, rows, turns }, location.origin);
   }
 
-  window.addEventListener('message', (event) => {
+  const listener = (event) => {
     // Only this window, only our own request shape. Anything else is not ours to answer.
     if (event.source !== window) return;
     const data = event.data;
@@ -1192,10 +1200,22 @@
       scan(nonce);
     } catch {
       try {
-        post({ source: REPLY, nonce, v: VERSION, rows: [], turns: [] }, location.origin);
+        post({ source: REPLY, nonce, v: VERSION, scanOk: false, rows: [], turns: [] }, location.origin);
       } catch {
         // Nothing further to try. The other side times out and keeps ChatGPT's labels.
       }
     }
-  });
+  };
+  // Re-execution is a repair, not a marker check. A stale primitive marker could survive
+  // while its listener did not, so keep the actual listener and always replace it.
+  const prior = window[ACTIVE_HELPER];
+  if (prior && prior.version === VERSION && typeof prior.listener === 'function') {
+    try {
+      window.removeEventListener('message', prior.listener);
+    } catch {
+      // Installing the replacement below is still the only useful recovery action.
+    }
+  }
+  window.addEventListener('message', listener);
+  window[ACTIVE_HELPER] = { version: VERSION, listener };
 })();

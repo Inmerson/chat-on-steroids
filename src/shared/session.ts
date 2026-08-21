@@ -374,29 +374,22 @@ export interface SessionSummary {
    */
   contextTokens: number;
   /**
-   * Durable automatic-compaction edge state for the currently attached ChatGPT chat.
+   * When this chat's one automatic compaction was claimed, or null while it still has one.
    *
-   * `armedAt` is set only when this chat's context estimate crosses the configured
-   * threshold from below. `readyAt` is set once the crossing turn finishes successfully.
-   * `triggeredAt` is set before the browser starts the automatic compaction, so reloads or
-   * failed attempts cannot turn one crossing into a retry loop. All four fields reset when
-   * Compact & Resume attaches the durable session to a fresh ChatGPT conversation.
+   * The whole durable state of automatic compaction, because the rest of the rule is read
+   * live rather than remembered: the chat is over `contextTokens`, and the model is working
+   * *right now*. Set before the browser is touched, so a failed or abandoned attempt can
+   * never become a retry loop, and reset when Compact & Resume attaches this session to a
+   * fresh ChatGPT conversation — a new chat gets a new budget and a new trigger.
    */
-  autoCompactThreshold: number | null;
-  /** Turn currently open in the recorder, used only to prove a crossing belongs to live work. */
-  autoCompactActiveTurnId: string | null;
-  /** Seq where the below-to-above edge was observed; pairs a just-sent user message with its turn_start. */
-  autoCompactArmedSeq: number | null;
-  /** The exact local generation that owns the armed edge. Null only while a crossing user message awaits turn_start. */
-  autoCompactTurnId: string | null;
-  autoCompactArmedAt: number | null;
-  autoCompactReadyAt: number | null;
   autoCompactTriggeredAt: number | null;
   /** Id of the newest stored handoff, or null when the session was never compacted. */
   lastHandoffId: string | null;
   lastHandoffAt: number | null;
   /** Outcome of the most recent finished turn. */
   lastTurnOutcome: TurnOutcome | null;
+  /** Durable open-turn projection. Undefined only on pre-1.8.8 metadata. */
+  activeTurnId?: string | null;
   /** Agents seen in this session, prime first. Empty when no swarm ran. */
   agents: string[];
   /** Set only for a chat this app opened itself. Null for one the user started. */

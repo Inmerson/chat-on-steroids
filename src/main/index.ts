@@ -21,20 +21,33 @@ import {
 import {
   agentConversation,
   bindConversation,
+  onRetiredWorkersPersist,
   onSwarmPersist,
+  restoreRetiredWorkers,
   restoreSwarm,
+  snapshotRetiredWorkers,
   snapshotSwarm,
+  type RetiredWorkersSnapshot,
   type SwarmSnapshot
 } from './agents.js';
 import { flushDurable, initDurableStore, readDurable, writeDurableSoon } from './durable.js';
 import { restoreRequestCorrelations } from './session/correlation.js';
+import { stopComputerHelper } from './computer/index.js';
+import {
+  CONTINUATIONS_STATE,
+  restoreContinuations,
+  type ContinuationSnapshot
+} from './session/continuation.js';
 
 /** Durable state file holding the multi-agent run. Hashes only, never credentials. */
 const SWARM_STATE = 'swarm';
+const RETIRED_WORKERS_STATE = 'retired-workers';
 
 let window: BrowserWindow | null = null;
 let tray: Tray | null = null;
 let quitting = false;
+let shutdownStarted = false;
+let shutdownComplete = false;
 // One-shot startup flag used by the self-update path. It reconnects this launch
 // without changing the user's persistent auto-connect preference.
 const connectOnStart = process.argv.includes('--connect-on-start');
@@ -178,7 +191,6 @@ void app.whenReady().then(async () => {
   // Request ownership must exist before either side of the bridge can race in. A request id
   // that was proved yesterday remains the same workflow today even if its ChatGPT tab closed.
   await restoreRequestCorrelations();
-  await repairDeterministicAttribution();
   setAgentConversationLookup(agentConversation);
   // The prime's chat is the user's own, so no extension report can name it. It is bound
   // when the recorder manages to place the prime's first call. See recordToolCall.
@@ -199,10 +211,15 @@ void app.whenReady().then(async () => {
   // A multi-agent run outlives this process. Restoring it before the bridge starts
   // means a worker that never joined gets its chat re-requested through the same queue
   // as a fresh one, rather than being stranded with a key nobody has.
+  onRetiredWorkersPersist(() => writeDurableSoon(RETIRED_WORKERS_STATE, snapshotRetiredWorkers()));
+  restoreRetiredWorkers(await readDurable<RetiredWorkersSnapshot>(RETIRED_WORKERS_STATE));
   if (getConfig().multiAgent.enabled) {
     onSwarmPersist(() => writeDurableSoon(SWARM_STATE, snapshotSwarm()));
     restoreSwarm(await readDurable<SwarmSnapshot>(SWARM_STATE));
   }
+  // Continuation recovery is after swarm restore because an interrupted durable rebind may
+  // have to finish publishing the prime transfer that was frozen in that snapshot.
+  await restoreContinuations(await readDurable<ContinuationSnapshot>(CONTINUATIONS_STATE));
 
   // Strict CSP for our own page. There is no remote content and no inline script.
   session.defaultSession.webRequest.onHeadersReceived((details, callback) => {
@@ -228,6 +245,13 @@ void app.whenReady().then(async () => {
   onStatusChange(refreshTray);
 
   logInfo('app started');
+
+  // Historical Unattributed repair may legitimately scan and rewrite a large legacy bucket.
+  // It is maintenance, not a prerequisite for showing the app or accepting new exact-id
+  // traffic, so never make startup/reload wait behind years of old session history.
+  void repairDeterministicAttribution().catch((err: Error) =>
+    logError(`historical attribution repair failed: ${err.message}`)
+  );
 
   // The bridge serves recording and multi-agent mode both: recording needs the
   // extension to observe the chat, and multi-agent mode needs it to open worker tabs.
@@ -256,18 +280,36 @@ app.on('window-all-closed', () => {
 });
 
 app.on('will-quit', (event) => {
-  if (!tray) return;
+  if (shutdownComplete) return;
   event.preventDefault();
-  tray.destroy();
+  if (shutdownStarted) return;
+  shutdownStarted = true;
+  tray?.destroy();
   tray = null;
-  // flushSessions and flushDurable last, so a summary or a swarm change written during
-  // shutdown still lands on disk instead of dying with the debounce timer. flushRecorder
-  // comes before them: tool calls are filed off the connector's path, so the last one or
-  // two of a session can still be queued at this point.
-  void Promise.all([disconnect(), unifiedExecManager.terminateAllProcesses(), stopBridge()])
-    .then(() => flushRecorder())
-    .then(() => Promise.all([flushSessions(), flushDurable()]))
-    .finally(() => app.quit());
+
+  const runPhase = async (name: string, tasks: Array<Promise<unknown>>): Promise<void> => {
+    const results = await Promise.allSettled(tasks);
+    for (const result of results) {
+      if (result.status === 'rejected') {
+        const message = result.reason instanceof Error ? result.reason.message : String(result.reason);
+        logError(`shutdown ${name} failed: ${message}`);
+      }
+    }
+  };
+
+  void (async () => {
+    // Phase 1: stop both listeners from admitting work and let accepted requests drain.
+    await runPhase('admission/drain', [disconnect(), stopBridge()]);
+    // Phase 2: only after request handlers are done may their owned child processes go.
+    await runPhase('process cleanup', [unifiedExecManager.terminateAllProcesses(), stopComputerHelper()]);
+    // Phase 3: recorder work can enqueue both session projections and named durable state.
+    await runPhase('recorder flush', [flushRecorder()]);
+    // These are independent writers. One rejection must never skip the other flush.
+    await runPhase('durable flush', [flushSessions(), flushDurable()]);
+  })().finally(() => {
+    shutdownComplete = true;
+    app.quit();
+  });
 });
 
 // Belt and braces: no web contents anywhere in this app may open a window or

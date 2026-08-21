@@ -116,7 +116,7 @@ export class IdentityLostError extends AgentError {
       'WORKER_IDENTITY_LOST: ChatGPT Local Files could not tell which conversation this call came from, so it cannot ' +
         'act on the run from here. Check that the extension is connected in this tab and try once more. If this chat ' +
         'was opened as a worker and never took up its slot, the user can recover it with agents action=join and the ' +
-        'recovery key from the app log.'
+        'one-time recovery key copied from the worker row in the app’s Chat/Swarm UI.'
     );
   }
 }
@@ -178,6 +178,9 @@ let spawnRequest: ((workers: WorkerSpawn[]) => void) | null = null;
 const listeners = new Set<() => void>();
 const endListeners = new Set<(reason: string, retired: RetiredChat[]) => void>();
 let persist: (() => void) | null = null;
+let retiredPersist: (() => void) | null = null;
+const RETIRED_WORKER_TTL_MS = 30 * 60_000;
+const retiredWorkers = new Map<string, RetiredChat>();
 
 const sha256 = (value: string): string => createHash('sha256').update(value).digest('hex');
 
@@ -200,6 +203,10 @@ export function onSwarmPersist(handler: (() => void) | null): void {
   persist = handler;
 }
 
+export function onRetiredWorkersPersist(handler: (() => void) | null): void {
+  retiredPersist = handler;
+}
+
 /**
  * Called when a run ends, for any reason.
  *
@@ -213,9 +220,11 @@ export function onSwarmEnd(listener: (reason: string, retired: RetiredChat[]) =>
 }
 
 /** A worker chat that was still going when its run ended. */
-interface RetiredChat {
+export interface RetiredChat {
   id: string;
   conversationId: string;
+  reason: string;
+  retiredAt: number;
 }
 
 /** A worker whose chat still has to be opened. Carries no credential. */
@@ -395,12 +404,46 @@ function endRun(reason: string): void {
   if (!run) return;
   const retired: RetiredChat[] = [...run.agents.values()]
     .filter((agent) => agent.info.role === 'worker' && !isOver(agent.info.state) && agent.info.conversationId)
-    .map((agent) => ({ id: agent.info.id, conversationId: agent.info.conversationId as string }));
+    .map((agent) => ({
+      id: agent.info.id,
+      conversationId: agent.info.conversationId as string,
+      reason,
+      retiredAt: Date.now()
+    }));
+  for (const worker of retired) retiredWorkers.set(worker.conversationId, worker);
+  retiredPersist?.();
   const what = `${run.runId} (${[...run.agents.keys()].join(', ')})`;
   run = null;
   forgetAgentSecrets();
   logInfo(`multi-agent: ended run ${what} — ${reason}`);
   for (const listener of endListeners) listener(reason, retired);
+}
+
+function pruneRetiredWorkers(): void {
+  const cutoff = Date.now() - RETIRED_WORKER_TTL_MS;
+  let changed = false;
+  for (const [conversationId, worker] of retiredWorkers) {
+    if (worker.retiredAt >= cutoff) continue;
+    retiredWorkers.delete(conversationId);
+    changed = true;
+  }
+  if (changed) retiredPersist?.();
+}
+
+export function retiredWorkerForConversation(conversationId: string | null | undefined): RetiredChat | null {
+  pruneRetiredWorkers();
+  if (!conversationId) return null;
+  const worker = retiredWorkers.get(conversationId);
+  return worker ? { ...worker } : null;
+}
+
+export function hasRetiredWorkerLeases(): boolean {
+  pruneRetiredWorkers();
+  return retiredWorkers.size > 0;
+}
+
+export function forgetRetiredWorker(conversationId: string): void {
+  if (retiredWorkers.delete(conversationId)) retiredPersist?.();
 }
 
 // -------------------------------------------------------------------- spawn
@@ -640,7 +683,7 @@ export function join(caller: Caller, joinKey?: string | null): AgentInfo {
     throw new AgentError(
       'This conversation is not part of the active run. Worker chats are bound to their slot by the extension that ' +
         'opens them, so there is no ordinary reason to call this. If a worker chat really did lose its binding, the ' +
-        'user can recover it by passing the recovery key from the ChatGPT Local Files log as join_key.'
+        'user can recover it by copying the one-time key from that worker’s Chat/Swarm row and passing it as join_key.'
     );
   }
   const hash = sha256(joinKey);
@@ -1268,6 +1311,37 @@ export function clearAgent(id: string): ClearResult {
 
 // -------------------------------------------------------------- persistence
 
+export interface RetiredWorkersSnapshot {
+  version: 1;
+  savedAt: number;
+  workers: RetiredChat[];
+}
+
+export function snapshotRetiredWorkers(): RetiredWorkersSnapshot {
+  pruneRetiredWorkers();
+  return { version: 1, savedAt: Date.now(), workers: [...retiredWorkers.values()].map((worker) => ({ ...worker })) };
+}
+
+export function restoreRetiredWorkers(snapshot: RetiredWorkersSnapshot | null): void {
+  retiredWorkers.clear();
+  if (!snapshot || snapshot.version !== 1 || !Array.isArray(snapshot.workers)) return;
+  const cutoff = Date.now() - RETIRED_WORKER_TTL_MS;
+  for (const worker of snapshot.workers.slice(-64)) {
+    if (
+      !worker ||
+      typeof worker.id !== 'string' ||
+      typeof worker.conversationId !== 'string' ||
+      !worker.conversationId ||
+      typeof worker.reason !== 'string' ||
+      !Number.isFinite(worker.retiredAt) ||
+      worker.retiredAt < cutoff
+    ) {
+      continue;
+    }
+    retiredWorkers.set(worker.conversationId, { ...worker });
+  }
+}
+
 /**
  * What survives a restart.
  *
@@ -1369,9 +1443,11 @@ export function restoreSwarm(snapshot: SwarmSnapshot | null): void {
 /** Test seam: forgets everything without touching disk. */
 export function resetAgentsForTests(): void {
   run = null;
+  retiredWorkers.clear();
   forgetAgentSecrets();
   spawnRequest = null;
   persist = null;
+  retiredPersist = null;
   listeners.clear();
   endListeners.clear();
 }

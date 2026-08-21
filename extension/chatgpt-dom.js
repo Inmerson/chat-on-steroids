@@ -773,6 +773,31 @@ var CLF_DOM = (() => {
     return label.length > 0 && label.length <= 200;
   }
 
+  /**
+   * Collapse nested selector matches without comparing every node with every other node.
+   * Long chats can contain hundreds of activity rows; the old `filter(...some(...))`
+   * shape turned every transcript pass into quadratic containment work.
+   */
+  function collapseNested(found, keepInnermost) {
+    if (found.length < 2) return found;
+    const candidates = new Set(found);
+    if (keepInnermost) {
+      const containsCandidate = new Set();
+      for (const node of found) {
+        for (let parent = node.parentElement; parent; parent = parent.parentElement) {
+          if (candidates.has(parent)) containsCandidate.add(parent);
+        }
+      }
+      return found.filter((node) => !containsCandidate.has(node));
+    }
+    return found.filter((node) => {
+      for (let parent = node.parentElement; parent; parent = parent.parentElement) {
+        if (candidates.has(parent)) return false;
+      }
+      return true;
+    });
+  }
+
   /** The tool-call blocks of one logical turn, across every split section, in DOM order. */
   function toolBlocks(turn) {
     return safe(
@@ -785,7 +810,7 @@ var CLF_DOM = (() => {
           // The two shapes nest — the display-contents wrapper can sit inside the legacy
           // span — and relabelling both would put our icon and title inside our own row.
           // Keep the innermost, which is the element that actually carries the label.
-          return found.filter((node) => !found.some((other) => other !== node && node.contains(other)));
+          return collapseNested(found, true);
         }),
       []
     );
@@ -832,7 +857,7 @@ var CLF_DOM = (() => {
           // it, every repaint reads back what we rendered last time and republishes it.
           const clone = stripOwn(root.cloneNode(true));
           const found = [...clone.querySelectorAll(TOOL)].filter(isToolBlock);
-          const slots = found.filter((node) => !found.some((other) => other !== node && node.contains(other)));
+          const slots = collapseNested(found, true);
           if (slots.length === 0) {
             const value = (clone.innerText || clone.textContent || '').trim();
             if (value) out.push({ kind: 'progress', text: value });
@@ -935,7 +960,7 @@ var CLF_DOM = (() => {
       const scope = root || document;
       const found = [...scope.querySelectorAll(CONNECTOR)];
       if (scope.nodeType === 1 && scope.matches(CONNECTOR)) found.unshift(scope);
-      return found.filter((node) => !found.some((other) => other !== node && other.contains(node)));
+      return collapseNested(found, false);
     }, []);
   }
 

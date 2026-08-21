@@ -270,7 +270,9 @@ export type SurfaceConnectionState =
 /** One link in the chain from ChatGPT to this PC, as reported by the self-test. */
 export interface Check {
   name: string;
-  /** true = working, false = broken, null = cannot tell / not applicable. */
+  /** Explicit execution state; unknown is never presented as a pass. */
+  status: 'pass' | 'fail' | 'skipped' | 'not-run';
+  /** Backward-compatible boolean projection used by older renderer/test consumers. */
   ok: boolean | null;
   detail: string;
 }
@@ -343,21 +345,50 @@ export const CAPABILITY_LABELS: Record<Capability, string> = {
   clipboardWrite: 'Write clipboard'
 };
 
-/** One line per capability, shown under its checkbox when the group is expanded. */
+/**
+ * One short line per capability, shown under its checkbox when the group is expanded.
+ *
+ * A clause, not a paragraph. Which MCP tools a permission actually turns on is a separate
+ * fact and is listed separately — see CAPABILITY_TOOLS — because that list is the part
+ * that goes stale when the tool surface is consolidated, and a sentence with the tool name
+ * buried in it is a sentence nobody rewrites when the tool is renamed.
+ */
 export const CAPABILITY_DETAILS: Record<Capability, string> = {
-  browse: 'read — list what is inside an approved folder.',
-  search: 'read, find — expand globs, and find files by name or text inside them.',
-  read: 'read — read text in bounded ranges, several files at once, and load a local PNG/JPEG/GIF/WebP straight into vision.',
-  metadata: 'read — size, dates and line count for a path, without returning its contents.',
-  create: 'apply_patch — add new files, creating any parent folders they need. An empty folder on its own needs Run commands.',
-  edit: 'apply_patch — exact edits, applied atomically across as many files as one change touches.',
-  move: 'apply_patch — move or rename, both ends inside approved folders.',
-  deleteFile: 'apply_patch — permanent, with no Recycle Bin. Deleting a whole folder needs Run commands.',
-  command:
-    'exec_command, write_stdin — PowerShell or cmd: run builds, tests, git and anything else as you, and keep long-running or interactive sessions going. Commands are NOT sandboxed to the approved folder.',
-  screen:
-    'observe — screenshots, the window list, and the buttons, fields and other controls on screen, without needing anything in front.',
-  control: 'computer — moves the pointer, clicks, types, scrolls and presses keys, as you.',
-  clipboardRead: 'computer — read current clipboard text. Separate because clipboard contents may be sensitive.',
-  clipboardWrite: 'computer — replace clipboard text without needing focus, clicks or keystrokes.'
+  browse: 'List what is inside an approved folder.',
+  search: 'Find files by name or glob, and text inside them.',
+  read: 'Read text in ranges, and open local images into vision.',
+  metadata: 'Size, dates and line count, without the contents.',
+  create: 'Add new files, and the folders they need.',
+  edit: 'Exact edits, applied atomically across files.',
+  move: 'Move or rename, both ends inside approved folders.',
+  deleteFile: 'Permanent — there is no Recycle Bin.',
+  command: 'Run anything as you. NOT limited to approved folders.',
+  screen: 'Screenshots, open windows, and the controls on them.',
+  control: 'Moves the pointer, clicks, types and presses keys, as you.',
+  clipboardRead: 'Read the current clipboard text.',
+  clipboardWrite: 'Replace the clipboard without focus or keystrokes.'
+};
+
+/**
+ * The MCP tools each permission actually exposes.
+ *
+ * Kept beside the capability list rather than written into the prose above, so the tool
+ * selector shows what this build really registers. `read` carries `view_image` as well as
+ * `read`; `find` exists only where running commands is switched off, which is why it is
+ * marked rather than listed flatly (see SurfaceRegistrar.findExposed).
+ */
+export const CAPABILITY_TOOLS: Record<Capability, readonly string[]> = {
+  browse: ['read'],
+  search: ['read', 'find'],
+  read: ['read', 'view_image'],
+  metadata: ['read'],
+  create: ['apply_patch'],
+  edit: ['apply_patch'],
+  move: ['apply_patch'],
+  deleteFile: ['apply_patch'],
+  command: ['exec_command', 'write_stdin'],
+  screen: ['observe'],
+  control: ['computer'],
+  clipboardRead: ['computer'],
+  clipboardWrite: ['computer']
 };

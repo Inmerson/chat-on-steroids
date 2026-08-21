@@ -178,4 +178,70 @@ describe('request correlation ownership', () => {
       await rm(dir, { recursive: true, force: true });
     }
   });
+
+  it('reconciles a valid stale snapshot with newer durable attributed history', async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), 'clf-correlation-stale-'));
+    try {
+      resetDurableForTests();
+      resetSessionStoreForTests();
+      initDurableStore(dir);
+      initSessionStore(dir);
+      const conversationId = 'conv-stale-reconcile';
+      const session = await createSession({ title: 'stale correlation snapshot', conversationId });
+      const toolCall = (callId: string, requestId: string, time: number) => ({
+        time,
+        source: 'mcp' as const,
+        kind: 'tool_call' as const,
+        call: {
+          callId,
+          tool: 'read',
+          attribution: 'request_id' as const,
+          requestId,
+          conversationId,
+          attributionMethod: 'request_id' as const,
+          args: { text: '{}', truncated: false, chars: 2 },
+          result: { text: 'ok', truncated: false, chars: 2 },
+          outcome: 'ok' as const,
+          durationMs: 1,
+          summary: { kind: 'read' as const, tone: 'neutral' as const, title: callId }
+        }
+      });
+
+      observeRequestCorrelation({
+        requestId: 'wfr_old_snapshot',
+        conversationId,
+        sessionId: session.id,
+        messageId: 'msg-old',
+        tool: 'read',
+        observedAt: 1
+      });
+      await appendEvent(session.id, toolCall('call-old', 'wfr_old_snapshot', 1));
+      await flushDurable(); // saved index contains only the old request
+
+      observeRequestCorrelation({
+        requestId: 'wfr_new_history',
+        conversationId,
+        sessionId: session.id,
+        messageId: 'msg-new',
+        tool: 'read',
+        observedAt: 2
+      });
+      await appendEvent(session.id, toolCall('call-new', 'wfr_new_history', 2));
+      // Lose process memory before the debounced index write catches up. Session JSONL is
+      // already durable, so restore must merge it into the older valid snapshot.
+      resetCorrelationRegistryForTests();
+      resetDurableForTests();
+      initDurableStore(dir);
+
+      await restoreRequestCorrelations();
+      expect(requestCorrelation('wfr_old_snapshot')?.conversationId).toBe(conversationId);
+      expect(requestCorrelation('wfr_new_history')?.conversationId).toBe(conversationId);
+    } finally {
+      resetCorrelationRegistryForTests();
+      resetSessionStoreForTests();
+      unsetSessionRootForTests();
+      resetDurableForTests();
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
 });

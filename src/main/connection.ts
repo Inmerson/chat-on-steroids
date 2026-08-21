@@ -126,6 +126,7 @@ function toolsFor(id: SurfaceId): string[] {
   }
   const tools: string[] = [];
   if (caps.read || caps.browse || caps.metadata) tools.push('read');
+  if (caps.read) tools.push('view_image');
   if (!caps.command && caps.search) tools.push('find');
   if (caps.create || caps.edit || caps.move || caps.deleteFile) tools.push('apply_patch');
   if (caps.command) tools.push('exec_command', 'write_stdin');
@@ -204,6 +205,7 @@ async function connectImpl(): Promise<void> {
       settings: config.tunnel,
       apiKey,
       discoveryHeaders: tunnelProbeHeaders(),
+      label: 'core',
       report: (report) => {
         if (generation !== connectionGeneration) return;
         setStatus({
@@ -277,6 +279,7 @@ async function startDesktopTunnel(
       settings: { ...settings, tunnelId: settings.desktopTunnelId },
       apiKey,
       discoveryHeaders: tunnelProbeHeaders(),
+      label: 'desktop',
       report: (report) => {
         if (generation !== connectionGeneration) return;
         updateSurface('desktop', {
@@ -352,6 +355,15 @@ export function applySettings(): Promise<void> {
 async function disconnectImpl(): Promise<void> {
   // Invalidate callbacks first; stopping a child can itself cause exit/health events.
   connectionGeneration += 1;
+  // Stop local admission first and let accepted MCP calls finish recording before any
+  // command process or durable writer is retired by the app-wide shutdown sequence.
+  // The public tunnel may briefly see the now-closed loopback endpoint, which is preferable
+  // to accepting a mutation after shutdown has already begun.
+  if (endpoint) {
+    const stopping = endpoint;
+    endpoint = null;
+    await stopping.stop().catch(() => {});
+  }
   if (desktopTunnel) {
     await desktopTunnel.stop().catch(() => {});
     desktopTunnel = null;
@@ -360,10 +372,6 @@ async function disconnectImpl(): Promise<void> {
   if (tunnel) {
     await tunnel.stop().catch(() => {});
     tunnel = null;
-  }
-  if (endpoint) {
-    await endpoint.stop().catch(() => {});
-    endpoint = null;
   }
   if (status.state !== 'disconnected') logInfo('disconnected');
   setStatus({

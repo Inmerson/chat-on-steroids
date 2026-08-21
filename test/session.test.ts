@@ -244,6 +244,37 @@ describe('session store', () => {
     expect(await readEvents(summary.id, { kinds: ['assistant_message'] })).toHaveLength(1);
   });
 
+  it('lets an authoritative page-model timestamp correct a delayed DOM first sight', async () => {
+    const summary = await createSession({ title: 'authored timestamp correction' });
+    const messageId = 'user-authored-time';
+    const message = { text: 'the real question', truncated: false, chars: 17 };
+    const first = await upsertMessageEvent(summary.id, {
+      time: 20_000,
+      source: 'extension',
+      kind: 'user_message',
+      messageId,
+      message
+    });
+    const corrected = await upsertMessageEvent(
+      summary.id,
+      {
+        time: 10_000,
+        source: 'extension',
+        kind: 'user_message',
+        messageId,
+        message
+      },
+      { preferTime: true }
+    );
+
+    expect(corrected.changed).toBe(true);
+    expect(corrected.event.time).toBe(10_000);
+    expect(corrected.event.kind === 'user_message' && corrected.event.origin).toBe(first.event.seq);
+    const [stored] = await readEvents(summary.id, { kinds: ['user_message'] });
+    expect(stored?.time).toBe(10_000);
+    expect(stored?.kind === 'user_message' && stored.origin).toBe(first.event.seq);
+  });
+
   it('revises one canonical row only when the website logical identity is the same', async () => {
     const summary = await createSession({ title: 'stable website identity' });
     const turnId = 'g-stream-growth';
@@ -449,6 +480,29 @@ describe('session store', () => {
     expect((await getSession(summary.id))?.events).toBe(1);
   });
 
+  it('shares one disk reconstruction across concurrent callers after a restart', async () => {
+    const summary = await createSession({ title: 'concurrent reopen' });
+    resetSessionStoreForTests();
+
+    const written = await Promise.all([
+      appendEvent(summary.id, {
+        time: 20,
+        source: 'app',
+        kind: 'note',
+        message: { text: 'first concurrent writer', truncated: false, chars: 23 }
+      }),
+      appendEvent(summary.id, {
+        time: 21,
+        source: 'app',
+        kind: 'note',
+        message: { text: 'second concurrent writer', truncated: false, chars: 24 }
+      })
+    ]);
+
+    expect(written.map((event) => event.seq).sort((a, b) => a - b)).toEqual([1, 2]);
+    expect((await readEvents(summary.id)).map((event) => event.seq)).toEqual([1, 2]);
+  });
+
   it('skips a torn final line and keeps appending after it', async () => {
     const summary = await createSession({ title: 'recovery' });
     await appendEvent(summary.id, {
@@ -485,6 +539,31 @@ describe('session store', () => {
     expect(all[2]!.seq).toBeGreaterThan(all[1]!.seq);
   });
 
+  it('recovers the prior sequence behind a near-limit torn final line', async () => {
+    const summary = await createSession({ title: 'large torn tail recovery' });
+    const prior = await appendEvent(summary.id, {
+      time: 1,
+      source: 'extension',
+      kind: 'chat_error',
+      message: { text: 'durable predecessor', truncated: false, chars: 19 }
+    });
+    const file = path.join(sessionsRoot(), summary.id, 'events.jsonl');
+    // Larger than the historical 128 KiB restart window, but still within the maximum
+    // amount a crash can leave from one otherwise legal event line.
+    await fs.appendFile(file, `{"seq":${prior.seq + 1},"kind":"chat_error","padding":"${'x'.repeat(400 * 1024)}`, 'utf8');
+    resetSessionStoreForTests();
+
+    const next = await appendEvent(summary.id, {
+      time: 2,
+      source: 'extension',
+      kind: 'chat_error',
+      message: { text: 'after restart', truncated: false, chars: 13 }
+    });
+
+    expect(next.seq).toBe(prior.seq + 1);
+    expect((await readEvents(summary.id)).map((event) => event.seq)).toEqual([prior.seq, next.seq]);
+  });
+
   it('recovers a session whose meta.json is gone', async () => {
     const summary = await createSession({ title: 'no meta' });
     await appendEvent(summary.id, { time: 1, source: 'extension', kind: 'turn_start' });
@@ -510,99 +589,58 @@ describe('session store', () => {
     expect(await readAsset(summary.id, '../../../config.json')).toBeNull();
   });
 
-  it('arms automatic compaction only on a real below-to-above threshold crossing', async () => {
+  /**
+   * The store half of automatic compaction is a level, not an edge.
+   *
+   * The edge version armed on the below-to-above crossing and waited for that turn to end
+   * cleanly, which had two consequences nobody wanted: one interrupted turn destroyed the
+   * trigger forever (a counter that only grows never crosses the same line twice), and
+   * every compaction that did fire landed after the answer, where a handoff carries
+   * nothing across. So the store now answers only "over the line, and this chat still has
+   * its one compaction". Whether the model is working is asked live, in bridge.ts.
+   */
+  it('offers its one automatic compaction while the chat is over the line', async () => {
     const base = defaultConfig();
     await saveConfig({ ...base, compaction: { ...base.compaction, auto: true, autoTokens: 10_000 } });
     try {
-      const summary = await createSession({ title: 'auto edge', conversationId: 'conv-auto-edge' });
+      const summary = await createSession({ title: 'auto level', conversationId: 'conv-auto-level' });
+      await appendEvent(summary.id, { time: 1, source: 'extension', kind: 'turn_start', turnId: 't-1' });
       await appendEvent(summary.id, {
-        time: 1,
+        time: 2,
         source: 'extension',
         kind: 'user_message',
         messageId: 'u1',
-        message: { text: 'a'.repeat(30_000), truncated: false, chars: 30_000 }
+        turnId: 't-1',
+        message: { text: 'a'.repeat(44_000), truncated: false, chars: 44_000 }
       });
+      expect(autoCompactionReady(await getSession(summary.id))).toBe(true);
+
+      // Mid-turn is exactly when it is meant to be taken, and taking it is terminal here.
+      expect(await claimAutoCompaction(summary.id, 'conv-auto-level')).toBe(true);
+      expect(await claimAutoCompaction(summary.id, 'conv-auto-level')).toBe(false);
+      const claimed = await getSession(summary.id);
+      expect(claimed?.autoCompactTriggeredAt).not.toBeNull();
+      expect(autoCompactionReady(claimed)).toBe(false);
+
+      // Not after several more turns above the line either: one per chat.
+      await appendEvent(summary.id, { time: 3, source: 'extension', kind: 'turn_end', turnId: 't-1', outcome: 'completed' });
+      await appendEvent(summary.id, { time: 4, source: 'extension', kind: 'turn_start', turnId: 't-2' });
       expect(autoCompactionReady(await getSession(summary.id))).toBe(false);
-
-      await appendEvent(summary.id, { time: 2, source: 'extension', kind: 'turn_start', turnId: 't-edge' });
-      await appendEvent(summary.id, {
-        time: 3,
-        source: 'extension',
-        kind: 'user_message',
-        messageId: 'u2',
-        turnId: 't-edge',
-        message: { text: 'b'.repeat(12_000), truncated: false, chars: 12_000 }
-      });
-      let current = await getSession(summary.id);
-      expect(current?.autoCompactThreshold).toBe(10_000);
-      expect(current?.autoCompactArmedAt).toBe(3);
-      expect(current?.autoCompactReadyAt).toBeNull();
-
-      await appendEvent(summary.id, { time: 4, source: 'extension', kind: 'turn_end', turnId: 't-edge', outcome: 'completed' });
-      current = await getSession(summary.id);
-      expect(autoCompactionReady(current)).toBe(true);
-      expect(current?.autoCompactReadyAt).toBe(4);
-      expect(await claimAutoCompaction(summary.id, 'conv-auto-edge')).toBe(true);
-      expect(await claimAutoCompaction(summary.id, 'conv-auto-edge')).toBe(false);
-      expect((await getSession(summary.id))?.autoCompactTriggeredAt).not.toBeNull();
     } finally {
       await saveConfig(base);
     }
   });
 
-  it('never makes a stopped crossing ready, even if a final assistant snapshot arrived first', async () => {
+  /**
+   * The interrupted crossing that used to be fatal. Replaying a real 587-event session
+   * armed correctly at the crossing, lost the arm to `interrupted` on that very turn, and
+   * then ran to 433k tokens against a 40k threshold without ever becoming ready.
+   */
+  it('still offers the trigger after the turn that crossed the line was interrupted', async () => {
     const base = defaultConfig();
     await saveConfig({ ...base, compaction: { ...base.compaction, auto: true, autoTokens: 10_000 } });
     try {
-      const summary = await createSession({ title: 'stopped auto edge', conversationId: 'conv-auto-stopped' });
-      await appendEvent(summary.id, {
-        time: 1,
-        source: 'extension',
-        kind: 'user_message',
-        messageId: 'before',
-        message: { text: 'a'.repeat(30_000), truncated: false, chars: 30_000 }
-      });
-      await appendEvent(summary.id, { time: 2, source: 'extension', kind: 'turn_start', turnId: 't-stop' });
-      await appendEvent(summary.id, {
-        time: 3,
-        source: 'extension',
-        kind: 'user_message',
-        messageId: 'cross',
-        turnId: 't-stop',
-        message: { text: 'b'.repeat(12_000), truncated: false, chars: 12_000 }
-      });
-      await appendEvent(summary.id, {
-        time: 4,
-        source: 'extension',
-        kind: 'assistant_message',
-        messageId: 'a-stop',
-        turnId: 't-stop',
-        message: { text: 'Looks final for a moment.', truncated: false, chars: 25 },
-        state: 'final',
-        final: true
-      });
-      expect(autoCompactionReady(await getSession(summary.id))).toBe(false);
-
-      // An unrelated completion cannot release this edge either.
-      await appendEvent(summary.id, { time: 5, source: 'extension', kind: 'turn_end', turnId: 't-other', outcome: 'completed' });
-      expect(autoCompactionReady(await getSession(summary.id))).toBe(false);
-
-      await appendEvent(summary.id, { time: 6, source: 'extension', kind: 'turn_end', turnId: 't-stop', outcome: 'stopped' });
-      const current = await getSession(summary.id);
-      expect(autoCompactionReady(current)).toBe(false);
-      expect(current?.autoCompactArmedAt).toBeNull();
-      expect(current?.autoCompactReadyAt).toBeNull();
-      expect(current?.autoCompactTurnId).toBeNull();
-    } finally {
-      await saveConfig(base);
-    }
-  });
-
-  it('keeps an automatic edge the crossing turn lost, until a turn finishes cleanly', async () => {
-    const base = defaultConfig();
-    await saveConfig({ ...base, compaction: { ...base.compaction, auto: true, autoTokens: 10_000 } });
-    try {
-      const summary = await createSession({ title: 'lost edge', conversationId: 'conv-lost-edge' });
+      const summary = await createSession({ title: 'interrupted', conversationId: 'conv-auto-interrupted' });
       await appendEvent(summary.id, { time: 1, source: 'extension', kind: 'turn_start', turnId: 't-crossed' });
       await appendEvent(summary.id, {
         time: 2,
@@ -612,135 +650,99 @@ describe('session store', () => {
         turnId: 't-crossed',
         message: { text: 'c'.repeat(44_000), truncated: false, chars: 44_000 }
       });
-      expect((await getSession(summary.id))?.autoCompactArmedAt).toBe(2);
-
-      // The turn that crossed the line was interrupted. A counter that only grows can never
-      // cross it again, so treating this as the end of the matter loses the trigger forever.
-      await appendEvent(summary.id, { time: 3, source: 'extension', kind: 'turn_end', turnId: 't-crossed', outcome: 'interrupted' });
-      let current = await getSession(summary.id);
-      expect(autoCompactionReady(current)).toBe(false);
-      expect(current?.autoCompactReadyAt).toBeNull();
-      expect(current?.autoCompactThreshold).toBe(10_000);
-
-      // A turn that fails does not make it ready either.
-      await appendEvent(summary.id, { time: 4, source: 'extension', kind: 'turn_start', turnId: 't-failed' });
-      await appendEvent(summary.id, { time: 5, source: 'extension', kind: 'turn_end', turnId: 't-failed', outcome: 'failed' });
-      expect(autoCompactionReady(await getSession(summary.id))).toBe(false);
-
-      // The next turn this log opens and sees finish cleanly does.
-      await appendEvent(summary.id, { time: 6, source: 'extension', kind: 'turn_start', turnId: 't-clean' });
-      await appendEvent(summary.id, { time: 7, source: 'extension', kind: 'turn_end', turnId: 't-clean', outcome: 'completed' });
-      current = await getSession(summary.id);
-      expect(autoCompactionReady(current)).toBe(true);
-      expect(current?.autoCompactReadyAt).toBe(7);
-
-      // Still exactly one automatic compaction per chat: claiming it is terminal, and later
-      // clean turns above the line cannot produce a second.
-      expect(await claimAutoCompaction(summary.id, 'conv-lost-edge')).toBe(true);
-      await appendEvent(summary.id, { time: 8, source: 'extension', kind: 'turn_start', turnId: 't-after' });
-      await appendEvent(summary.id, { time: 9, source: 'extension', kind: 'turn_end', turnId: 't-after', outcome: 'completed' });
-      expect(autoCompactionReady(await getSession(summary.id))).toBe(false);
-      expect(await claimAutoCompaction(summary.id, 'conv-lost-edge')).toBe(false);
+      await appendEvent(summary.id, {
+        time: 3,
+        source: 'extension',
+        kind: 'turn_end',
+        turnId: 't-crossed',
+        outcome: 'interrupted'
+      });
+      expect(autoCompactionReady(await getSession(summary.id))).toBe(true);
     } finally {
       await saveConfig(base);
     }
   });
 
-  it('does not turn stale transcript hydration into a live automatic crossing', async () => {
+  /**
+   * The claim is where the one-shot is spent, so it is also where liveness has to be
+   * proved. A turn that ends while the claim sits in the session queue must leave the
+   * trigger alone: the chat is still over the line, and its next turn can have it.
+   */
+  it('spends nothing when the chat stopped working before the claim was written', async () => {
     const base = defaultConfig();
     await saveConfig({ ...base, compaction: { ...base.compaction, auto: true, autoTokens: 10_000 } });
     try {
-      const summary = await createSession({ title: 'hydrated stale chat', conversationId: 'conv-hydrated-stale' });
+      const summary = await createSession({ title: 'raced', conversationId: 'conv-auto-raced' });
       await appendEvent(summary.id, {
         time: 1,
         source: 'extension',
         kind: 'user_message',
-        messageId: 'historic-user',
-        message: { text: 'x'.repeat(44_000), truncated: false, chars: 44_000 }
+        messageId: 'u1',
+        message: { text: 'a'.repeat(44_000), truncated: false, chars: 44_000 }
       });
-      await appendEvent(summary.id, {
-        time: 2,
-        source: 'extension',
-        kind: 'assistant_message',
-        messageId: 'historic-answer',
-        message: { text: 'old settled answer', truncated: false, chars: 18 },
-        state: 'final',
-        final: true
-      });
-      let current = await getSession(summary.id);
-      expect(current?.contextTokens).toBeGreaterThan(10_000);
-      expect(autoCompactionReady(current)).toBe(false);
-      expect(current?.autoCompactArmedAt).toBeNull();
+      expect(await claimAutoCompaction(summary.id, 'conv-auto-raced', () => false)).toBe(false);
+      const current = await getSession(summary.id);
+      expect(current?.autoCompactTriggeredAt).toBeNull();
+      expect(autoCompactionReady(current)).toBe(true);
 
-      // Even a later clean turn while the chat remains above the line is not a new crossing.
-      await appendEvent(summary.id, { time: 3, source: 'extension', kind: 'turn_start', turnId: 't-later' });
-      await appendEvent(summary.id, { time: 4, source: 'extension', kind: 'turn_end', turnId: 't-later', outcome: 'completed' });
-      current = await getSession(summary.id);
-      expect(autoCompactionReady(current)).toBe(false);
-      expect(current?.autoCompactReadyAt).toBeNull();
+      expect(await claimAutoCompaction(summary.id, 'conv-auto-raced', () => true)).toBe(true);
     } finally {
       await saveConfig(base);
     }
   });
 
-  it('does not synthesize an automatic crossing when an old chat is already above the threshold', async () => {
+  it('offers nothing while the switch is off, below the line, or for another chat', async () => {
     const base = defaultConfig();
     await saveConfig({ ...base, compaction: { ...base.compaction, auto: false, autoTokens: 10_000 } });
     try {
-      const summary = await createSession({ title: 'stale high chat', conversationId: 'conv-stale-high' });
+      const summary = await createSession({ title: 'off', conversationId: 'conv-auto-off' });
       await appendEvent(summary.id, {
         time: 1,
         source: 'extension',
         kind: 'user_message',
-        messageId: 'old',
-        message: { text: 'x'.repeat(44_000), truncated: false, chars: 44_000 }
+        messageId: 'u1',
+        message: { text: 'a'.repeat(44_000), truncated: false, chars: 44_000 }
       });
-      expect((await getSession(summary.id))?.contextTokens).toBeGreaterThan(10_000);
+      expect(autoCompactionReady(await getSession(summary.id))).toBe(false);
+      expect(await claimAutoCompaction(summary.id, 'conv-auto-off')).toBe(false);
 
-      // Turning automatic compaction on, opening the chat, or writing another message while
-      // already above the line is still not a threshold crossing.
+      await saveConfig({ ...base, compaction: { ...base.compaction, auto: true, autoTokens: 4_000_000 } });
+      expect(autoCompactionReady(await getSession(summary.id))).toBe(false);
+
       await saveConfig({ ...base, compaction: { ...base.compaction, auto: true, autoTokens: 10_000 } });
-      await appendEvent(summary.id, {
-        time: 2,
-        source: 'extension',
-        kind: 'user_message',
-        messageId: 'new',
-        message: { text: 'still here', truncated: false, chars: 10 }
-      });
-      const current = await getSession(summary.id);
-      expect(autoCompactionReady(current)).toBe(false);
-      expect(current?.autoCompactArmedAt).toBeNull();
-      expect(current?.autoCompactReadyAt).toBeNull();
+      expect(autoCompactionReady(await getSession(summary.id))).toBe(true);
+      // A claim names the chat it belongs to; the session's own id is not enough.
+      expect(await claimAutoCompaction(summary.id, 'conv-somebody-else')).toBe(false);
     } finally {
       await saveConfig(base);
     }
   });
 
-  it('forgets an unclaimed automatic edge when a genuinely closed chat is reopened later', async () => {
+  /**
+   * Reopening a closed chat must not hand it a second automatic compaction. Nothing about
+   * the trigger is reset there any more: the level speaks for itself, and the latch is a
+   * fact about this chat that outlives the tab being closed.
+   */
+  it('keeps a spent trigger spent across a close and a reopen', async () => {
     const base = defaultConfig();
     await saveConfig({ ...base, compaction: { ...base.compaction, auto: true, autoTokens: 10_000 } });
     try {
-      const summary = await createSession({ title: 'stale ready edge', conversationId: 'conv-stale-ready' });
-      await appendEvent(summary.id, { time: 1, source: 'extension', kind: 'turn_start', turnId: 't-ready' });
+      const summary = await createSession({ title: 'reopened', conversationId: 'conv-auto-reopen' });
       await appendEvent(summary.id, {
-        time: 2,
+        time: 1,
         source: 'extension',
         kind: 'user_message',
-        messageId: 'cross-ready',
-        turnId: 't-ready',
+        messageId: 'u1',
         message: { text: 'r'.repeat(44_000), truncated: false, chars: 44_000 }
       });
-      await appendEvent(summary.id, { time: 3, source: 'extension', kind: 'turn_end', turnId: 't-ready', outcome: 'completed' });
-      expect(autoCompactionReady(await getSession(summary.id))).toBe(true);
+      expect(await claimAutoCompaction(summary.id, 'conv-auto-reopen')).toBe(true);
 
       await endSession(summary.id);
       await reopenSession(summary.id);
       const reopened = await getSession(summary.id);
+      expect(reopened?.autoCompactTriggeredAt).not.toBeNull();
       expect(autoCompactionReady(reopened)).toBe(false);
-      expect(reopened?.autoCompactThreshold).toBeNull();
-      expect(reopened?.autoCompactReadyAt).toBeNull();
-      expect(reopened?.autoCompactTurnId).toBeNull();
-      expect(await claimAutoCompaction(summary.id, 'conv-stale-ready')).toBe(false);
+      expect(await claimAutoCompaction(summary.id, 'conv-auto-reopen')).toBe(false);
     } finally {
       await saveConfig(base);
     }
@@ -2444,6 +2446,52 @@ describe.skip('legacy recorder heuristics removed in 1.8', () => {
 });
 
 describe('canonical recorder 1.8', () => {
+  it('deduplicates replayed turn lifecycle boundaries from the at-least-once browser journal', async () => {
+    const conversationId = 'conv-lifecycle-replay';
+    const batch = [
+      { kind: 'turn_start' as const, time: 100, turnId: 'g-replayed-lifecycle' },
+      { kind: 'turn_end' as const, time: 200, turnId: 'g-replayed-lifecycle', outcome: 'completed' as const }
+    ];
+    const first = await recordChatObservations(conversationId, batch);
+    await recordChatObservations(conversationId, batch);
+
+    const lifecycle = await readEvents(first.sessionId!, { kinds: ['turn_start', 'turn_end'] });
+    expect(lifecycle.map((event) => event.kind)).toEqual(['turn_start', 'turn_end']);
+    expect(lifecycle.map((event) => event.turnId)).toEqual(['g-replayed-lifecycle', 'g-replayed-lifecycle']);
+  });
+
+  it('serializes concurrent replays before lifecycle dedupe is decided', async () => {
+    const conversationId = 'conv-lifecycle-concurrent-replay';
+    const batch = [
+      { kind: 'turn_start' as const, time: 100, turnId: 'g-concurrent-lifecycle' },
+      { kind: 'turn_end' as const, time: 200, turnId: 'g-concurrent-lifecycle', outcome: 'completed' as const }
+    ];
+    const [first] = await Promise.all([
+      recordChatObservations(conversationId, batch),
+      recordChatObservations(conversationId, batch)
+    ]);
+
+    const lifecycle = await readEvents(first.sessionId!, { kinds: ['turn_start', 'turn_end'] });
+    expect(lifecycle.map((event) => event.kind)).toEqual(['turn_start', 'turn_end']);
+  });
+
+  it('does not mark a lifecycle retry duplicate before its durable append commits', async () => {
+    const conversationId = 'conv-lifecycle-commit-failure';
+    const sessionId = await sessionForConversation(conversationId);
+    const start = { kind: 'turn_start' as const, time: 100, turnId: 'g-retry-after-disk-failure' };
+    const append = vi.spyOn(fs, 'appendFile').mockRejectedValueOnce(new Error('disk full'));
+    try {
+      await expect(recordChatObservations(conversationId, [start])).rejects.toThrow('disk full');
+    } finally {
+      append.mockRestore();
+    }
+
+    await recordChatObservations(conversationId, [start]);
+    const lifecycle = await readEvents(sessionId!, { kinds: ['turn_start'] });
+    expect(lifecycle).toHaveLength(1);
+    expect(lifecycle[0]?.turnId).toBe(start.turnId);
+  });
+
   const tool = (requestId: string, startedAt = Date.now()) =>
     recordToolCall({
       tool: 'read',
@@ -2591,6 +2639,42 @@ describe('canonical recorder 1.8', () => {
     const call = await tool('wfr_identity_conflict', now);
     expect(call?.attributionMethod).toBe('unattributed');
     expect(call?.conversationId).toBeNull();
+  });
+
+  /**
+   * A disagreement is a bad moment, not a bad request id.
+   *
+   * The page can be mid-navigation, still holding the previous chat's model, or showing a
+   * conversation whose client-side thread id is not yet the server's. All of those make the
+   * URL and the React tree disagree for a tick. Marking the request ids in that batch
+   * contradictory — which is what this used to do — is permanent: nothing republishes a
+   * conflicted id, and the deterministic repair pass skips it. Whole turns of provable tool
+   * calls stayed in Unattributed activity for good because of one transient tick.
+   */
+  it('lets agreeing evidence prove a call whose first sighting disagreed with the URL', async () => {
+    const conversationId = 'conv-late-agreement';
+    const sessionId = await sessionForConversation(conversationId);
+    const now = Date.now();
+
+    await recordChatObservations(conversationId, [{
+      kind: 'tool_evidence',
+      time: now,
+      fiberConversationId: 'conv-still-the-old-one',
+      calls: [{ messageId: 'late-call', tool: 'read', order: 0, answered: false, requestId: 'wfr_late_agreement' }]
+    }]);
+
+    // The same sighting a tick later, from a page that now agrees with its own URL.
+    await recordChatObservations(conversationId, [{
+      kind: 'tool_evidence',
+      time: now + 5,
+      fiberConversationId: conversationId,
+      calls: [{ messageId: 'late-call', tool: 'read', order: 0, answered: false, requestId: 'wfr_late_agreement' }]
+    }]);
+
+    const call = await tool('wfr_late_agreement', now + 10);
+    expect(call?.attributionMethod).toBe('request_id');
+    expect(call?.conversationId).toBe(conversationId);
+    expect(await readEvents(sessionId!, { kinds: ['tool_call'] })).toHaveLength(1);
   });
 
   it('preserves captured rendered Markdown HTML on the canonical transcript message', async () => {

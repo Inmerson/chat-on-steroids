@@ -149,6 +149,7 @@ async function harness(
 
   const sent: Array<Record<string, any>> = [];
   const reply = new Map<string, (message: Record<string, any>) => unknown>();
+  reply.set('register_document', () => ({ ok: true }));
   reply.set('status', () => ({ connected: true, paired: true, port: 8765, pending: 0 }));
   reply.set('events', () => ({ ok: true, pending: 0, durable: true }));
   reply.set('bind', () => ({ ok: true, bound: 0 }));
@@ -402,7 +403,7 @@ async function replyFiber(
     );
     window.dispatchEvent(
       new window.MessageEvent('message', {
-        data: { source: 'clf-fiber-reply', nonce: event.data.nonce, v: 8, rows, turns: indexedTurns },
+        data: { source: 'clf-fiber-reply', nonce: event.data.nonce, v: 8, scanOk: true, rows, turns: indexedTurns },
         source: window
       })
     );
@@ -1475,7 +1476,7 @@ describe('page-native tool presentation and archived row evidence', () => {
     live.hook.observe();
     await settle();
     expect(live.sent.filter((message) => message.type === 'closed')).toEqual([
-      { type: 'closed', conversationId: first }
+      { type: 'closed', conversationId: first, navigationEpoch: expect.any(Number) }
     ]);
   });
 
@@ -1846,6 +1847,7 @@ describe('canonical Fiber transcript ingestion in 1.8', () => {
       messageId: 'assistant-first-interim-raw-id',
       text: 'Starting with the first visible interim.',
       time: 1_787_165_100_125,
+      authoredTime: true,
       state: 'streaming',
       final: false
     });
@@ -1902,7 +1904,8 @@ describe('canonical Fiber transcript ingestion in 1.8', () => {
       expect.objectContaining({
         messageId: 'user-model-opening-id',
         text: 'opening prompt from the page model',
-        time: 1_787_165_090_500
+        time: 1_787_165_090_500,
+        authoredTime: true
       })
     );
   });
@@ -1932,6 +1935,7 @@ describe('canonical Fiber transcript ingestion in 1.8', () => {
         messageId: 'assistant-idless-history',
         text: 'Historical answer from an id-less virtualized section.',
         time: 1_780_000_000_000,
+        authoredTime: true,
         turnId: undefined
       })
     );
@@ -1967,6 +1971,7 @@ describe('canonical Fiber transcript ingestion in 1.8', () => {
     await replyFiber([], [{
       turnId: 'page-turn-canonical',
       conversationId: 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee',
+      endMessageId: 'msg-canonical-123',
       calls: [],
       messages: [{
         messageId: 'msg-canonical-123',
@@ -2582,6 +2587,107 @@ describe('the app-owned chronological stream', () => {
     expect(section.getAttribute('data-clf-turn-replaced')).toBeNull();
     expect(section.querySelector('.clf-stream')).toBeNull();
     expect(native.textContent).toBe('This native interim has not reached the local app yet.');
+  });
+
+  it('keeps a proven overwrite mounted through a transient incomplete Fiber scan', async () => {
+    const activity = () => ({
+      ok: true,
+      data: {
+        entries: [],
+        stream: [
+          { seq: 1, time: 100, kind: 'turn_start', turnId: 'g-sticky-overwrite', agent: null },
+          {
+            seq: 2,
+            time: 110,
+            kind: 'assistant_message',
+            turnId: 'g-sticky-overwrite',
+            messageId: 'site-sticky-one',
+            text: 'First complete local snapshot',
+            final: false
+          }
+        ],
+        job: null
+      }
+    });
+    live = await harness(undefined, { activity });
+    renderingOn();
+    const section = assistantTurn(live.document, 'page-sticky-overwrite', []);
+    await bindFiberTurns([{ section, turn: {
+      turnId: 'page-sticky-overwrite',
+      messages: [{
+        messageId: 'site-sticky-one',
+        stable: true,
+        rawText: 'First complete local snapshot',
+        renderedHtml: ''
+      }]
+    } }]);
+    await live.hook.pullActivity();
+    live.hook.renderStreams();
+    expect(section.getAttribute('data-clf-turn-replaced')).toBe('1');
+    expect(section.querySelector('.clf-stream')?.textContent).toContain('First complete local snapshot');
+
+    await bindFiberTurns([{ section, turn: {
+      turnId: 'page-sticky-overwrite',
+      messages: [
+        { messageId: 'site-sticky-one', stable: true, rawText: 'First complete local snapshot', renderedHtml: '' },
+        { messageId: 'site-sticky-two', stable: false, rawText: 'Second snapshot still in flight', renderedHtml: '' }
+      ]
+    } }]);
+    live.hook.renderStreams();
+
+    expect(section.getAttribute('data-clf-turn-replaced')).toBe('1');
+    expect(section.querySelector('.clf-stream')?.textContent).toContain('First complete local snapshot');
+  });
+
+  it('drops a stale overwrite immediately when Fiber exposes a new exact in-flight call', async () => {
+    const activity = () => ({
+      ok: true,
+      data: {
+        entries: [],
+        stream: [
+          { seq: 1, time: 100, kind: 'turn_start', turnId: 'g-live-call-gap', agent: null },
+          {
+            seq: 2,
+            time: 110,
+            kind: 'tool_call',
+            turnId: 'g-live-call-gap',
+            agent: null,
+            tool: 'read_file',
+            callId: 'call-one',
+            requestId: 'wfr-live-one',
+            outcome: 'ok',
+            durationMs: 2,
+            summary: { kind: 'read', tone: 'neutral', title: 'First call' }
+          }
+        ],
+        job: null
+      }
+    });
+    live = await harness(undefined, { activity });
+    renderingOn();
+    const section = assistantTurn(live.document, 'page-live-call-gap', []);
+    await bindFiberTurns([{ section, turn: {
+      turnId: 'page-live-call-gap',
+      calls: [{ messageId: 'fiber-one', tool: 'read_file', order: 0, answered: true, requestId: 'wfr-live-one' }]
+    } }]);
+    await live.hook.pullActivity();
+    live.hook.renderStreams();
+    expect(section.getAttribute('data-clf-turn-replaced')).toBe('1');
+
+    // ChatGPT knows call two has begun, but the handler has not returned yet, so /activity
+    // necessarily still contains only call one. The native page must become visible now rather
+    // than remain hidden behind the grace period's stale replacement.
+    await bindFiberTurns([{ section, turn: {
+      turnId: 'page-live-call-gap',
+      calls: [
+        { messageId: 'fiber-one', tool: 'read_file', order: 0, answered: true, requestId: 'wfr-live-one' },
+        { messageId: 'fiber-two', tool: 'exec_command', order: 1, answered: false, requestId: 'wfr-live-two' }
+      ]
+    } }]);
+    live.hook.renderStreams();
+
+    expect(section.getAttribute('data-clf-turn-replaced')).toBeNull();
+    expect(section.querySelector('.clf-stream')).toBeNull();
   });
 
   it('does not merge separate assistant turns when ChatGPT reuses the same DOM turn id', async () => {
@@ -3467,7 +3573,7 @@ describe('navigating from one chat to another', () => {
         error: '',
         now: Date.now()
       }).label
-    ).toBe('Compact & resume');
+    ).toBe('Compact');
   });
 });
 
@@ -3930,6 +4036,54 @@ describe('a stop button that goes missing while the turn is still running', () =
     await dropout(12);
 
     expect(emitted(live.sent, 'turn_start')).toHaveLength(1);
+    expect(emitted(live.sent, 'turn_end')).toHaveLength(0);
+  });
+
+  it('does not call interim assistant prose completed during a long stop-control dropout', async () => {
+    live = await harness();
+    startGenerating(live.document);
+    const section = assistantTurn(live.document, 'turn-interim-prose-dropout', []);
+    const interim = live.document.createElement('div');
+    interim.className = 'markdown';
+    interim.textContent = 'I found the first issue; checking the rest now.';
+    section.append(interim);
+    live.hook.observe();
+    await settle();
+    const opened = emitted(live.sent, 'turn_start')[0]!.event.turnId;
+
+    // The actual live bug requires stronger evidence than the DOM alone: ChatGPT's page
+    // model is present and explicitly has public assistant prose without a terminal
+    // end_turn message. Once Fiber exists, that nonterminal state must outrank the Stop
+    // control disappearing for longer than the settle window.
+    await replyFiber([], [{
+      turnId: 'turn-interim-prose-dropout',
+      conversationId: 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee',
+      endMessageId: null,
+      calls: [],
+      messages: [{
+        messageId: 'site-interim-prose-dropout',
+        stable: true,
+        rawText: 'I found the first issue; checking the rest now.',
+        renderedHtml: '<p>I found the first issue; checking the rest now.</p>'
+      }],
+      activities: []
+    }]);
+    await settle();
+
+    stopGenerating(live.document);
+    live.hook.observe();
+    await settle();
+    live.advance(live.hook.TURN_SETTLE_MS * 2);
+    live.hook.observe();
+    await settle();
+
+    expect(emitted(live.sent, 'turn_end')).toHaveLength(0);
+
+    section.append(toolBlock(live.document, 'Called tool!'));
+    startGenerating(live.document);
+    live.hook.observe();
+    await settle();
+    expect(emitted(live.sent, 'turn_start').map((entry) => entry.event.turnId)).toEqual([opened]);
     expect(emitted(live.sent, 'turn_end')).toHaveLength(0);
   });
 
@@ -5136,6 +5290,7 @@ describe('evidence from the page context', () => {
             source: 'clf-fiber-reply',
             nonce: event.data.nonce,
             v: 8,
+            scanOk: true,
             rows: [],
             turns: [
               {
@@ -5213,6 +5368,50 @@ describe('evidence from the page context', () => {
     block.setAttribute('data-clf-fiber', '0');
     await live.hook.refreshFiber();
     expect(live.hook.fiberFor(block)).toBeNull();
+  });
+
+  it('downgrades stale Fiber health, asks for one repair, and accepts the repaired helper', async () => {
+    live = await harness();
+    const section = assistantTurn(live.document, 'turn-repair', ['Called tool!']);
+    const block = section.querySelector('[aria-label="Open tool call list"]')!;
+    block.setAttribute('data-clf-fiber', '0');
+    await replyFiber([GOOD]);
+    expect(live.hook.fiberFor(block)).toMatchObject({ tool: 'agent_status' });
+
+    let repaired = false;
+    live.reply.set('repair_fiber', () => {
+      repaired = true;
+      return { ok: true };
+    });
+    const window = live.window as any;
+    const instant = window.setTimeout;
+    window.setTimeout = (fn: () => void, ms: number) => globalThis.setTimeout(fn, ms);
+    const onAsk = (event: any) => {
+      if (!repaired || !event.data || event.data.source !== 'clf-fiber-ask') return;
+      window.dispatchEvent(
+        new window.MessageEvent('message', {
+          data: {
+            source: 'clf-fiber-reply',
+            nonce: event.data.nonce,
+            v: 8,
+            scanOk: true,
+            rows: [{ ...GOOD, tool: 'read' }],
+            turns: []
+          },
+          source: window
+        })
+      );
+    };
+    window.addEventListener('message', onAsk);
+    try {
+      await live.hook.refreshFiber();
+    } finally {
+      window.removeEventListener('message', onAsk);
+      window.setTimeout = instant;
+    }
+
+    expect(live.sent.filter((message) => message.type === 'repair_fiber')).toHaveLength(1);
+    expect(live.hook.fiberFor(block)).toMatchObject({ tool: 'read' });
   });
 
   /**
@@ -5359,6 +5558,126 @@ describe('evidence from the page context', () => {
 });
 
 describe('the activity feed', () => {
+  it('keeps page ownership when the service worker could not make the batch durable', async () => {
+    let attempts = 0;
+    live = await harness(undefined, {
+      events: () => {
+        attempts += 1;
+        return attempts === 1
+          ? { ok: true, pending: 1, durable: false }
+          : { ok: true, pending: 0, durable: false };
+      }
+    });
+    attempts = 0;
+
+    live.hook.emit({ kind: 'chat_error', text: 'must survive a service-worker restart' });
+    await live.hook.flush();
+    await live.hook.flush();
+
+    // The first handled-but-volatile answer keeps the page copy. The second answer proves
+    // the app accepted the retained batch, so the page may finally release it.
+    expect(attempts).toBe(2);
+  });
+
+  it('bounds one UTF-8 observation before it can wedge the bridge on an unhalvable 413', async () => {
+    const delivered: Array<Record<string, any>> = [];
+    live = await harness(undefined, {
+      events: (message) => {
+        delivered.push(...message.entries);
+        return { ok: true, pending: 0, durable: true };
+      }
+    });
+    delivered.length = 0;
+
+    live.hook.emit({
+      kind: 'assistant_message',
+      messageId: 'huge-utf8',
+      text: '🧠'.repeat(140_000),
+      renderedHtml: `<p>${'界'.repeat(140_000)}</p>`,
+      final: true
+    });
+    await live.hook.flush();
+
+    expect(delivered).toHaveLength(1);
+    expect(Buffer.byteLength(JSON.stringify(delivered[0]!.event), 'utf8')).toBeLessThan(450 * 1024);
+    expect(delivered[0]!.event.text).toContain('browser observation truncated');
+  });
+
+  it('records an explicit gap instead of silently dropping the oldest page-local observation', async () => {
+    const delivered: Array<Record<string, any>> = [];
+    live = await harness(undefined, {
+      events: (message) => {
+        delivered.push(...message.entries);
+        return { ok: true, pending: 0, durable: true };
+      }
+    });
+    delivered.length = 0;
+
+    for (let index = 0; index < 401; index++) {
+      live.hook.emit({ kind: 'progress', text: `queued-${index}` });
+    }
+    await live.hook.flush();
+    await live.hook.flush();
+    await live.hook.flush();
+
+    expect(delivered).toHaveLength(400);
+    const gaps = delivered.filter(
+      (entry) => entry.event?.kind === 'chat_error' && /page-local queue/.test(String(entry.event?.text ?? ''))
+    );
+    expect(gaps).toHaveLength(1);
+    expect(gaps[0]!.event.text).toContain('2 observation(s) (2 progress)');
+    const progress = delivered.filter((entry) => entry.event?.kind === 'progress').map((entry) => entry.event.text);
+    expect(progress).toHaveLength(399);
+    expect(progress).not.toContain('queued-0');
+    expect(progress).not.toContain('queued-1');
+    expect(progress[0]).toBe('queued-2');
+    expect(progress.at(-1)).toBe('queued-400');
+  });
+
+  it('does not erase new overflow losses added while an older gap marker is in flight', async () => {
+    const delivered: Array<Record<string, any>> = [];
+    let blocked = false;
+    let release: (() => void) | null = null;
+    live = await harness(undefined, {
+      events: async (message) => {
+        delivered.push(...structuredClone(message.entries));
+        if (blocked) {
+          blocked = false;
+          await new Promise<void>((resolve) => {
+            release = resolve;
+          });
+        }
+        return { ok: true, pending: 0, durable: true };
+      }
+    });
+    delivered.length = 0;
+
+    for (let index = 0; index < 401; index++) {
+      live.hook.emit({ kind: 'progress', text: `before-send-${index}` });
+    }
+    blocked = true;
+    const firstFlush = live.hook.flush();
+    await settle();
+    expect(release).not.toBeNull();
+
+    // The old gap is already part of the structured-cloned first message. Pressure during
+    // that await must start a second marker rather than mutating and later deleting the old.
+    for (let index = 0; index < 401; index++) {
+      live.hook.emit({ kind: 'progress', text: `during-send-${index}` });
+    }
+    release!();
+    await firstFlush;
+    await live.hook.flush();
+    await live.hook.flush();
+    await live.hook.flush();
+
+    const gaps = delivered.filter(
+      (entry) => entry.event?.kind === 'chat_error' && /page-local queue/.test(String(entry.event?.text ?? ''))
+    );
+    expect(gaps.length).toBeGreaterThanOrEqual(2);
+    expect(gaps.some((entry) => /observation\(s\)/.test(entry.event.text))).toBe(true);
+  });
+
   it('keeps the recorder alive across a transient missing service-worker receiver', async () => {
     let attempts = 0;
     live = await harness(undefined, {
@@ -5487,7 +5806,7 @@ describe('the Compact & resume control', () => {
     ]);
     // `data-clf-tip`, not `title`: the hover text is drawn by this extension in ChatGPT's
     // own style rather than by the operating system. See `.clf-tip`.
-    expect(control.querySelector('.clf-compact-btn')!.getAttribute('data-clf-tip')).toBe('Compact & resume');
+    expect(control.querySelector('.clf-compact-btn')!.getAttribute('data-clf-tip')).toBe('Compact');
   });
 
   /**
@@ -5549,7 +5868,7 @@ describe('the Compact & resume control', () => {
         ...over
       });
 
-    expect(state({})).toMatchObject({ mode: 'idle', label: 'Compact & resume', action: 'start' });
+    expect(state({})).toMatchObject({ mode: 'idle', label: 'Compact', action: 'start' });
     expect(state({ disconnected: true })).toMatchObject({
       mode: 'off',
       hint: 'Browser connection is disconnected in ChatGPT Local Files.',
@@ -5562,32 +5881,32 @@ describe('the Compact & resume control', () => {
     const pending = { sessionId: 's1', stage: 'handoff-pending', busy: true, error: null, handoffId: null };
     expect(state({ job: pending, phase: 'interrupting' })).toMatchObject({
       mode: 'busy',
-      label: 'Stopping this turn…',
+      label: 'Stopping…',
       action: 'cancel'
     });
-    expect(state({ job: pending, phase: 'settling' })).toMatchObject({ mode: 'busy', label: 'Finishing local tools…' });
-    expect(state({ job: pending, phase: 'waiting' })).toMatchObject({ mode: 'busy', label: 'ChatGPT is writing…' });
+    expect(state({ job: pending, phase: 'settling' })).toMatchObject({ mode: 'busy', label: 'Settling…' });
+    expect(state({ job: pending, phase: 'waiting' })).toMatchObject({ mode: 'busy', label: 'Writing…' });
     // An unknown phase — a tab that reloaded mid-run and lost its local state — still says
     // something true rather than nothing.
-    expect(state({ job: pending, phase: '' })).toMatchObject({ mode: 'busy', label: 'Asking ChatGPT…' });
+    expect(state({ job: pending, phase: '' })).toMatchObject({ mode: 'busy', label: 'Asking…' });
 
     expect(state({ job: { stage: 'opening', busy: true, error: null, handoffId: 'h1' } })).toMatchObject({
       mode: 'busy',
-      label: 'Opening fresh chat…',
+      label: 'Opening…',
       action: 'cancel'
     });
     expect(
       state({ job: { stage: 'waiting-for-browser', busy: true, error: 'could not open your browser', handoffId: 'h1' } })
-    ).toMatchObject({ mode: 'waiting', label: 'Waiting for Chrome…', action: 'cancel' });
+    ).toMatchObject({ mode: 'waiting', label: 'Waiting…', action: 'cancel' });
     expect(state({ job: { stage: 'done', busy: false, error: null, handoffId: 'h1' } })).toMatchObject({
       mode: 'done',
-      label: 'Fresh chat opened'
+      label: 'Opened'
     });
     expect(
       state({ job: { stage: 'failed', busy: false, error: 'ChatGPT never wrote the brief', handoffId: null } })
     ).toMatchObject({
       mode: 'error',
-      label: 'Compaction failed',
+      label: 'Failed',
       hint: 'ChatGPT never wrote the brief',
       action: 'start'
     });
@@ -5626,7 +5945,7 @@ describe('the Compact & resume control', () => {
     // passes it cannot suppress the button by accident.
     expect(state({ generating: true })).toMatchObject({
       mode: 'idle',
-      label: 'Compact & resume',
+      label: 'Compact',
       action: 'start'
     });
     expect(state({ generating: true, job: { stage: 'handoff-pending', busy: true, error: null, handoffId: null } })).toMatchObject({
@@ -5783,8 +6102,9 @@ describe('the Compact & resume control', () => {
     await settle();
 
     expect((live.document.querySelector('.clf-composer') as HTMLElement).dataset.clfMode).toBe('error');
+    // The pill is one word everywhere except a failure, where the detail is the message.
     expect(live.document.querySelector('.clf-pill-text')!.textContent).toBe(
-      'Could not start · This chat has no recorded local session to compact.'
+      'This chat has no recorded local session to compact.'
     );
   });
 });
@@ -5997,7 +6317,11 @@ describe('the fresh chat the app opened', () => {
     );
 
     await settle(200);
-    expect(live.sent[0]?.type).toBe('redeem');
+    expect(live.sent[0]?.type).toBe('register_document');
+    expect(live.sent[1]?.type).toBe('redeem');
+    expect(live.sent.findIndex((message) => message.type === 'redeem')).toBeLessThan(
+      live.sent.findIndex((message) => message.type === 'status')
+    );
     expect(live.document.querySelector('#prompt-textarea')!.textContent).toContain('the long carried handoff');
     expect(live.sent.some((message) => message.type === 'ack' && message.status === 'sent')).toBe(true);
 
@@ -6084,8 +6408,50 @@ describe('the fresh chat the app opened', () => {
         status: 'sent',
         conversationId: '11111111-2222-3333-4444-555555555555',
         agent: null,
-        client: redeems[0]!.client
+        client: redeems[0]!.client,
+        navigationEpoch: expect.any(Number)
       }
+    ]);
+  });
+
+  it('never submits a worker bootstrap mixed with text typed after the tab took focus', async () => {
+    let sends = 0;
+    live = await harness(
+      'https://chatgpt.com/?clf=cmd-focus-race',
+      {
+        redeem: () => ({
+          ok: true,
+          command: { id: 'cmd-focus-race', type: 'worker', text: 'Audit the worker identity path.', agent: 'worker-1' }
+        }),
+        ack: () => ({ ok: true })
+      },
+      (document, dom) => {
+        document.querySelector('[data-testid="send-button"]')!.addEventListener('click', () => {
+          sends++;
+          dom.reconfigure({ url: 'https://chatgpt.com/c/99999999-aaaa-bbbb-cccc-dddddddddddd' });
+        });
+        const composer = document.querySelector('#prompt-textarea')!;
+        let changed = false;
+        new dom.window.MutationObserver(() => {
+          if (changed || !(composer.textContent || '').includes('Audit the worker identity path.')) return;
+          changed = true;
+          const user = document.createElement('p');
+          user.textContent = 'my unsent draft';
+          composer.append(user);
+        }).observe(composer, { childList: true, subtree: true });
+      }
+    );
+
+    await settle(400);
+
+    expect(sends).toBe(0);
+    expect(live.document.querySelector('#prompt-textarea')!.textContent).toContain('my unsent draft');
+    expect(live.sent.filter((message) => message.type === 'ack')).toEqual([
+      expect.objectContaining({
+        id: 'cmd-focus-race',
+        status: 'failed',
+        error: expect.stringMatching(/composer changed|draft was preserved|replaced the composer/)
+      })
     ]);
   });
 
@@ -6131,7 +6497,8 @@ describe('the fresh chat the app opened', () => {
         status: 'sent',
         conversationId: '22222222-3333-4444-5555-666666666666',
         agent: 'worker-1',
-        client: expect.any(String)
+        client: expect.any(String),
+        navigationEpoch: expect.any(Number)
       }
     ]);
   });
@@ -6357,111 +6724,149 @@ describe('the context meter and automatic compaction', () => {
     expect(live.sent.filter((message) => message.type === 'compact')).toEqual([]);
   });
 
-  it('does not compact an old chat merely because it opens above the threshold', async () => {
+  /**
+   * The whole of the stale-chat protection, on the page's side of it.
+   *
+   * The trigger is a level now — "this chat is over the line and still has its one
+   * compaction" — so an old 500k conversation answers yes to that for the rest of its life.
+   * What stops it from compacting the moment it is opened is that nothing is running in it.
+   * The app applies the same rule from the other side; this is the half a reader of
+   * content.js can check.
+   */
+  it('leaves an idle chat alone however far over the line it is', async () => {
     live = await harness(undefined, {
-      activity: () => withContext(250_000, settings({ auto: true, threshold: 200_000 }), { autoCompactReady: false }),
-      auto_compact_claim: () => ({ ok: true, data: { claimed: false } }),
+      activity: () => withContext(999_000, settings({ auto: true, threshold: 200_000 }), { autoCompactReady: true }),
+      auto_compact_claim: () => ({ ok: true, data: { claimed: true } }),
       compact: () => ({ ok: true, data: { started: true, job: null } })
     });
     live.hook.injectControl();
     for (let poll = 0; poll < 5; poll++) await live.hook.pullActivity();
+    await settle();
 
     expect(startedCompactions(live)).toEqual([]);
-    expect(live.sent.filter((message) => message.type === 'auto_compact_claim')).toEqual([]);
-  });
-
-  it('consumes one durable crossing once, then starts Compact & Resume', async () => {
-    let ready = true;
-    let claimed = false;
-    live = await harness(undefined, {
-      activity: () => withContext(205_000, settings({ auto: true, threshold: 200_000 }), { autoCompactReady: ready }),
-      auto_compact_claim: () => {
-        if (claimed) return { ok: true, data: { claimed: false } };
-        claimed = true;
-        ready = false;
-        return { ok: true, data: { claimed: true } };
-      },
-      compact: () => ({ ok: true, data: { started: true, job: null } })
-    });
-    live.hook.injectControl();
-    await live.hook.pullActivity();
-    await settle();
-
-    expect(startedCompactions(live)).toHaveLength(1);
-    expect(live.sent.filter((message) => message.type === 'auto_compact_claim')).toHaveLength(1);
-    for (let poll = 0; poll < 4; poll++) await live.hook.pullActivity();
-    expect(startedCompactions(live)).toHaveLength(1);
-  });
-
-  it('consumes the edge without stopping a new turn that races in after the claim', async () => {
-    let ready = true;
-    live = await harness(undefined, {
-      activity: () => withContext(205_000, settings({ auto: true, threshold: 200_000 }), { autoCompactReady: ready }),
-      auto_compact_claim: () => {
-        ready = false;
-        // The page was idle when it asked, then the user/new UI started another turn before
-        // startCompact got control. Automatic compaction must never click Stop in this race.
-        startGenerating(live!.document);
-        return { ok: true, data: { claimed: true } };
-      },
-      compact: () => ({ ok: true, data: { started: true, job: null } })
-    });
-    live.hook.injectControl();
-    await live.hook.pullActivity();
-    await settle();
-
-    expect(live.sent.filter((message) => message.type === 'auto_compact_claim')).toHaveLength(1);
-    expect(startedCompactions(live)).toEqual([]);
-  });
-
-  it('does not claim while local tools are still settling', async () => {
-    live = await harness(undefined, {
-      activity: () =>
-        withContext(205_000, settings({ auto: true, threshold: 200_000 }), { autoCompactReady: true, pendingTools: 1 }),
-      auto_compact_claim: () => ({ ok: true, data: { claimed: true } })
-    });
-    live.hook.injectControl();
-    await live.hook.pullActivity();
-    await settle();
     expect(live.sent.filter((message) => message.type === 'auto_compact_claim')).toEqual([]);
   });
 
   /**
-   * A durable edge is still not permission to interrupt an answer. The content script's
-   * generation state and the app's active turn id both have to be idle before it claims.
+   * And the rule that made all of this worth rewriting: a finished answer is the one moment
+   * where compacting is pointless. The work it would carry into the fresh chat has already
+   * been done and answered, so the handoff would summarise a job that is over.
    */
-  it('waits for the crossing turn to be completely idle before claiming it', async () => {
-    let ready = true;
-    let claimed = false;
+  it('does not compact once the answer has landed, even if the app still says yes', async () => {
+    // Off while the turn runs, so this test is about the moment after it: the app goes on
+    // reporting the level (the chat is still over the line) and the page still refuses.
+    let ready = false;
     live = await harness(undefined, {
       activity: () => withContext(205_000, settings({ auto: true, threshold: 200_000 }), { autoCompactReady: ready }),
-      auto_compact_claim: () => {
-        if (claimed) return { ok: true, data: { claimed: false } };
-        claimed = true;
-        ready = false;
-        return { ok: true, data: { claimed: true } };
-      },
+      auto_compact_claim: () => ({ ok: true, data: { claimed: true } }),
       compact: () => ({ ok: true, data: { started: true, job: null } })
-    }, (document) => {
-      startGenerating(document);
-      const section = assistantTurn(document, 'turn-auto-cross', []);
-      const answer = document.createElement('div');
-      answer.className = 'markdown';
-      answer.textContent = 'Finished crossing the context threshold.';
-      section.append(answer);
-    });
-    // Generating from before the script starts, so the first poll of all already sees it.
+    }, (document) => startGenerating(document));
     live.hook.injectControl();
-    await live.hook.pullActivity();
+    await settleTurn(live);
+    ready = true;
+
+    for (let poll = 0; poll < 3; poll++) await live.hook.pullActivity();
     await settle();
     expect(startedCompactions(live)).toEqual([]);
     expect(live.sent.filter((message) => message.type === 'auto_compact_claim')).toEqual([]);
+  });
 
-    await settleTurn(live);
+  it('interrupts the turn it is standing in and compacts exactly once', async () => {
+    let ready = true;
+    live = await harness(undefined, {
+      activity: () => withContext(205_000, settings({ auto: true, threshold: 200_000 }), { autoCompactReady: ready }),
+      auto_compact_claim: () => {
+        ready = false;
+        return { ok: true, data: { claimed: true } };
+      },
+      compact: () => ({
+        ok: true,
+        data: {
+          started: true,
+          token: 'tok-auto-1',
+          prompt: 'write the brief and call save_handoff',
+          job: { sessionId: 's1', stage: 'handoff-pending', busy: true, handoffId: null, error: null }
+        }
+      })
+    });
+    live.hook.injectControl();
+    startGenerating(live.document);
+    const stop = live.document.querySelector('[data-testid="stop-button"]') as HTMLButtonElement;
+    let stopped = false;
+    stop.addEventListener('click', () => {
+      stopped = true;
+      stopGenerating(live!.document);
+    });
+
     await live.hook.pullActivity();
     await settle();
-    expect(startedCompactions(live)).toHaveLength(1);
+
+    expect(stopped).toBe(true);
     expect(live.sent.filter((message) => message.type === 'auto_compact_claim')).toHaveLength(1);
+    expect(startedCompactions(live)).toHaveLength(1);
+
+    // And not again: the app has withdrawn the bit, and this tab is busy with the run it
+    // just started either way.
+    for (let poll = 0; poll < 4; poll++) await live.hook.pullActivity();
+    await settle();
+    expect(startedCompactions(live)).toHaveLength(1);
+  });
+
+  /**
+   * Mid-tool-call is mid-turn, and is explicitly allowed. Local calls are not raced: the
+   * same settle barrier a manual press goes through waits for them before anything is typed.
+   */
+  it('compacts while a local tool call is still running', async () => {
+    let ready = true;
+    let asked = 0;
+    live = await harness(undefined, {
+      activity: () => {
+        asked++;
+        return withContext(205_000, settings({ auto: true, threshold: 200_000 }), {
+          autoCompactReady: ready,
+          pendingTools: asked < 3 ? 1 : 0
+        });
+      },
+      auto_compact_claim: () => {
+        ready = false;
+        return { ok: true, data: { claimed: true } };
+      },
+      compact: () => ({
+        ok: true,
+        data: {
+          started: true,
+          token: 'tok-auto-2',
+          prompt: 'write the brief and call save_handoff',
+          job: { sessionId: 's1', stage: 'handoff-pending', busy: true, handoffId: null, error: null }
+        }
+      })
+    });
+    live.hook.injectControl();
+    startGenerating(live.document);
+    const stop = live.document.querySelector('[data-testid="stop-button"]') as HTMLButtonElement;
+    stop.addEventListener('click', () => stopGenerating(live!.document));
+
+    await live.hook.pullActivity();
+    await settle();
+
+    expect(live.sent.filter((message) => message.type === 'auto_compact_claim')).toHaveLength(1);
+    expect(startedCompactions(live)).toHaveLength(1);
+    // It waited for the call to finish before typing anything into the composer.
+    expect(asked).toBeGreaterThanOrEqual(3);
+  });
+
+  it('does not claim when the app says this chat has no trigger left', async () => {
+    live = await harness(undefined, {
+      activity: () => withContext(250_000, settings({ auto: true, threshold: 200_000 }), { autoCompactReady: false }),
+      auto_compact_claim: () => ({ ok: true, data: { claimed: false } }),
+      compact: () => ({ ok: true, data: { started: true, job: null } })
+    }, (document) => startGenerating(document));
+    live.hook.injectControl();
+    for (let poll = 0; poll < 5; poll++) await live.hook.pullActivity();
+    await settle();
+
+    expect(startedCompactions(live)).toEqual([]);
+    expect(live.sent.filter((message) => message.type === 'auto_compact_claim')).toEqual([]);
   });
 });
 

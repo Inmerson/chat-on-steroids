@@ -5,6 +5,7 @@ import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import {
   VIEW_IMAGE_INVALID_MESSAGE,
+  MAX_VIEW_IMAGE_BYTES,
   viewImage
 } from '../src/main/codex/view-image.js';
 
@@ -78,6 +79,29 @@ function pngWithValidZlibHeaderOverGarbageDeflate(): Buffer {
 /** A PNG whose IDAT inflates cleanly but to fewer pixels than IHDR promises. */
 function pngWithTruncatedPixelData(): Buffer {
   return pngWithReplacedImageData(deflateSync(Buffer.alloc(0)));
+}
+
+/** Tiny compressed payload with huge declared geometry: must be refused before inflation. */
+function pngWithOversizedDecodedGeometry(): Buffer {
+  const bytes = Buffer.from(
+    'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=',
+    'base64'
+  );
+  let offset = 8;
+  while (offset + 12 <= bytes.length) {
+    const length = bytes.readUInt32BE(offset);
+    const typeStart = offset + 4;
+    const dataStart = offset + 8;
+    const crcOffset = dataStart + length;
+    if (bytes.subarray(typeStart, dataStart).toString('ascii') === 'IHDR') {
+      bytes.writeUInt32BE(8192, dataStart);
+      bytes.writeUInt32BE(8192, dataStart + 4);
+      bytes.writeUInt32BE(pngCrc32(bytes, typeStart, crcOffset), crcOffset);
+      return bytes;
+    }
+    offset = crcOffset + 4;
+  }
+  throw new Error('fixture has no IHDR');
 }
 
 /** The 1x1 fixture above with its single IDAT payload swapped for `payload`, CRC repaired. */
@@ -177,7 +201,24 @@ function webpWithGarbageVp8Payload(): Buffer {
   return bytes;
 }
 
+function webpWithPlausibleVp8PrefixButNoBitstream(): Buffer {
+  const payload = Buffer.from([0x00, 0x00, 0x00, 0x9d, 0x01, 0x2a, 0x01, 0x00, 0x01, 0x00]);
+  const bytes = Buffer.alloc(20 + payload.length);
+  bytes.write('RIFF', 0, 'ascii');
+  bytes.writeUInt32LE(bytes.length - 8, 4);
+  bytes.write('WEBP', 8, 'ascii');
+  bytes.write('VP8 ', 12, 'ascii');
+  bytes.writeUInt32LE(payload.length, 16);
+  payload.copy(bytes, 20);
+  return bytes;
+}
+
 describe('Codex view_image runtime parity', () => {
+  it('budgets both MCP base64 copies inside the connector wire envelope', () => {
+    const encodedChars = 4 * Math.ceil(MAX_VIEW_IMAGE_BYTES / 3);
+    expect(encodedChars * 2 + 64 * 1024).toBeLessThanOrEqual(8 * 1024 * 1024);
+  });
+
   afterEach(async () => {
     await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
   });
@@ -214,6 +255,14 @@ describe('Codex view_image runtime parity', () => {
     await expect(viewImage(image, null)).rejects.toThrow(VIEW_IMAGE_INVALID_MESSAGE);
   });
 
+  it('rejects PNG geometry whose decoded scanlines exceed the main-process memory budget', async () => {
+    const root = await tempRoot();
+    const image = path.join(root, 'oversized-decoded.png');
+    await writeFile(image, pngWithOversizedDecodedGeometry());
+
+    await expect(viewImage(image, null)).rejects.toThrow(VIEW_IMAGE_INVALID_MESSAGE);
+  });
+
   it.each([
     ['JPEG without scan data', 'missing-scan.jpg', jpegWithoutScanData()],
     ['JPEG with a scan header but no entropy data', 'empty-scan.jpg', jpegWithScanHeaderButNoEntropyData()],
@@ -221,7 +270,8 @@ describe('Codex view_image runtime parity', () => {
     ['GIF with an image descriptor but no LZW data', 'empty-frame.gif', gifWithDescriptorButNoLzwData()],
     ['WebP with only a VP8X canvas header', 'missing-bitstream.webp', webpWithoutImageBitstream()],
     ['WebP with an empty VP8 bitstream chunk', 'empty-vp8.webp', webpWithEmptyVp8Chunk()],
-    ['WebP with a garbage VP8 bitstream', 'garbage-vp8.webp', webpWithGarbageVp8Payload()]
+    ['WebP with a garbage VP8 bitstream', 'garbage-vp8.webp', webpWithGarbageVp8Payload()],
+    ['WebP with a plausible VP8 prefix but no decodable bitstream', 'plausible-vp8.webp', webpWithPlausibleVp8PrefixButNoBitstream()]
   ])('rejects %s instead of returning undecodable bytes', async (_label, fileName, bytes) => {
     const root = await tempRoot();
     const image = path.join(root, fileName);

@@ -17,9 +17,16 @@ import { effectiveCapabilities, getConfig } from './config.js';
 import { logInfo, logWarn } from './logger.js';
 import { lastRequestAt, selfTestHeaders } from './mcp/server.js';
 import { lastToolCallAt } from './mcp/tools.js';
-import { ago, POLL_FRESH_MS, readClientStatus, readPollHealth } from './tunnel/health.js';
+import {
+  ago,
+  POLL_FRESH_MS,
+  readClientStatus,
+  readPollHealth,
+  type PollHealth
+} from './tunnel/health.js';
 
 import type { Check, Diagnosis } from '../shared/types.js';
+import { surfaceIsUseful } from './mcp/surfaces.js';
 
 async function fetchJson(
   url: string,
@@ -75,6 +82,50 @@ export function parseRpc(text: string): unknown {
 
 const PROTOCOL_VERSION = '2025-06-18';
 
+/**
+ * Reports the client → OpenAI link without calling a tunnel that is still starting broken.
+ *
+ * The first control-plane poll is a long poll with a 30s timeout, so a client that came up
+ * four seconds ago genuinely has no completed handshake yet. Reading that as "Not verified"
+ * put a red problem on the self-test every single time the app started, for a connection
+ * that was about to work — and it contradicted the tunnel supervisor, which already gives
+ * the first poll exactly this grace before it will say a word about an outage.
+ */
+export function describeRoute(
+  health: PollHealth | null,
+  uptimeSeconds: number | null,
+  nowMs = Date.now()
+): Check {
+  const name = 'Route to OpenAI';
+  if (health === null) return { name, status: 'not-run', ok: null, detail: 'The tunnel did not report its metrics.' };
+
+  const errors = `${health.errors ?? 0} poll error${health.errors === 1 ? '' : 's'} since start`;
+  if (health.lastSuccessMs !== null && nowMs - health.lastSuccessMs <= POLL_FRESH_MS) {
+    return {
+      name,
+      status: 'pass',
+      ok: true,
+      detail: `Verified — last completed handshake ${ago(health.lastSuccessMs, nowMs)}; ${errors}.`
+    };
+  }
+  // Only a client that has *never* polled successfully gets the benefit of the doubt. One
+  // that managed it once and then went quiet is a real outage, however young it is.
+  if (health.lastSuccessMs === null && uptimeSeconds !== null && uptimeSeconds * 1000 < POLL_FRESH_MS) {
+    return {
+      name,
+      status: 'not-run',
+      ok: null,
+      detail: `Still starting — the first poll of the control plane takes up to 30s; ${errors}.`
+    };
+  }
+  return {
+    name,
+    status: 'fail',
+    ok: false,
+    detail: `Not verified — last completed handshake ${ago(health.lastSuccessMs, nowMs)}; ${errors}.`
+  };
+}
+
 /** Runs an initialize + tools/list against our own loopback endpoint. */
 async function checkLocalServer(url: string): Promise<Check> {
   const init = await fetchJson(url, {
@@ -88,12 +139,13 @@ async function checkLocalServer(url: string): Promise<Check> {
     }
   });
   if (init === null) {
-    return { name: 'Local server', ok: false, detail: 'No answer on the loopback address.' };
+    return { name: 'Local server', status: 'fail', ok: false, detail: 'No answer on the loopback address.' };
   }
   const initObj = init.json as { error?: { message?: string } } | null;
   if (init.status >= 400 || initObj?.error) {
     return {
       name: 'Local server',
+      status: 'fail',
       ok: false,
       detail: `initialize failed: HTTP ${init.status} ${initObj?.error?.message ?? init.text.slice(0, 120)}`
     };
@@ -107,6 +159,7 @@ async function checkLocalServer(url: string): Promise<Check> {
   if (!Array.isArray(tools)) {
     return {
       name: 'Local server',
+      status: 'fail',
       ok: false,
       detail: `tools/list failed: ${listObj?.error?.message ?? `HTTP ${list?.status ?? 0}`}`
     };
@@ -114,6 +167,7 @@ async function checkLocalServer(url: string): Promise<Check> {
   const names = tools.map((t) => t.name).filter(Boolean);
   return {
     name: 'Local server',
+    status: 'pass',
     ok: true,
     detail: `Answers on loopback and offers ${names.length} tool${names.length === 1 ? '' : 's'}: ${names.join(', ')}`
   };
@@ -149,6 +203,7 @@ function developerMode(seen: number | null, called: number | null): Check {
   if (called !== null) {
     return {
       name: 'ChatGPT allowed to use the tools',
+      status: 'pass',
       ok: true,
       detail: `Yes — ChatGPT last ran a tool ${ago(called)}, so Developer mode is on and the whole chain works.`
     };
@@ -156,12 +211,14 @@ function developerMode(seen: number | null, called: number | null): Check {
   if (seen === null) {
     return {
       name: 'ChatGPT allowed to use the tools',
+      status: 'not-run',
       ok: null,
       detail: 'Unknown — ChatGPT has not reached this app at all yet, so there is nothing to judge.'
     };
   }
   return {
     name: 'ChatGPT allowed to use the tools',
+    status: 'not-run',
     ok: null,
     detail:
       'Cannot tell — ChatGPT connected and read the tool list, but has never run a tool. ' +
@@ -184,7 +241,9 @@ export async function runDiagnostics(): Promise<Diagnosis> {
     .map(([name]) => name);
   checks.push({
     name: 'Permissions',
-    ok: enabled.length > 0 && (config.roots.length > 0 || caps.screen || caps.control),
+    status:
+      enabled.length > 0 && (config.roots.length > 0 || surfaceIsUseful('desktop', caps)) ? 'pass' : 'fail',
+    ok: enabled.length > 0 && (config.roots.length > 0 || surfaceIsUseful('desktop', caps)),
     detail:
       enabled.length === 0
         ? 'Nothing is switched on, so the connector would expose no tools.'
@@ -195,6 +254,7 @@ export async function runDiagnostics(): Promise<Diagnosis> {
   if (!isServerRunning() || !status.localUrl) {
     checks.push({
       name: 'Local server',
+      status: 'fail',
       ok: false,
       detail: 'Not running. Press Connect first.'
     });
@@ -207,12 +267,14 @@ export async function runDiagnostics(): Promise<Diagnosis> {
   if (config.tunnel.kind !== 'openai') {
     checks.push({
       name: 'Tunnel',
+      status: 'skipped',
       ok: null,
       detail: `Using the ${config.tunnel.kind} path, which has no local health endpoint.`
     });
   } else if (!base) {
     checks.push({
       name: 'Tunnel',
+      status: 'fail',
       ok: false,
       detail: 'The tunnel program is not running or has not reported a health address yet.'
     });
@@ -220,6 +282,7 @@ export async function runDiagnostics(): Promise<Diagnosis> {
     const ready = await probeText(`${base}/readyz`);
     checks.push({
       name: 'Tunnel',
+      status: ready?.status === 200 ? 'pass' : 'fail',
       ok: ready?.status === 200,
       detail:
         ready === null
@@ -229,25 +292,16 @@ export async function runDiagnostics(): Promise<Diagnosis> {
             : `Not ready: HTTP ${ready.status} ${ready.body}`
     });
 
-    // 4. The link the outage actually breaks: client → OpenAI.
-    const health = await readPollHealth(base);
-    const fresh = health?.lastSuccessMs !== null && health?.lastSuccessMs !== undefined
-      ? Date.now() - health.lastSuccessMs <= POLL_FRESH_MS
-      : false;
-    checks.push({
-      name: 'Route to OpenAI',
-      ok: health === null ? null : fresh,
-      detail:
-        health === null
-          ? 'The tunnel did not report its metrics.'
-          : `${fresh ? 'Verified' : 'Not verified'} — last completed handshake ${ago(health.lastSuccessMs)}; ${health.errors ?? 0} poll error${health.errors === 1 ? '' : 's'} since start.`
-    });
+    // 4. The link the outage actually breaks: client → OpenAI, and 5. what the tunnel
+    //    thinks of us. Read together because the route check needs the client's uptime
+    //    to tell "not working" apart from "has not finished starting".
+    const [health, client] = await Promise.all([readPollHealth(base), readClientStatus(base)]);
+    checks.push(describeRoute(health, client?.uptimeSeconds ?? null));
 
-    // 5. What the tunnel thinks of us, and its last control-plane error.
-    const client = await readClientStatus(base);
     if (client) {
       checks.push({
         name: 'Tunnel → this app',
+        status: client.probe === null ? 'not-run' : client.probe === 'ok' ? 'pass' : 'fail',
         ok: client.probe === null ? null : client.probe === 'ok',
         detail:
           client.probe === null
@@ -257,6 +311,7 @@ export async function runDiagnostics(): Promise<Diagnosis> {
       if (client.metadataError) {
         checks.push({
           name: 'Last tunnel error',
+          status: 'fail',
           ok: false,
           detail: client.metadataError.slice(0, 300)
         });
@@ -268,6 +323,7 @@ export async function runDiagnostics(): Promise<Diagnosis> {
   const seen = lastRequestAt();
   checks.push({
     name: 'ChatGPT reaching this PC',
+    status: seen === null ? 'not-run' : 'pass',
     ok: seen === null ? null : true,
     detail:
       seen === null
@@ -279,11 +335,14 @@ export async function runDiagnostics(): Promise<Diagnosis> {
   //    answers, and the model is still not allowed to call anything.
   checks.push(developerMode(seen, lastToolCallAt()));
 
-  const broken = checks.filter((c) => c.ok === false);
+  const broken = checks.filter((c) => c.status === 'fail');
+  const incomplete = checks.filter((c) => c.status === 'not-run');
   const summary =
-    broken.length === 0
-      ? 'Every check passed.'
-      : `${broken.length} problem${broken.length === 1 ? '' : 's'}: ${broken.map((c) => c.name).join(', ')}.`;
+    broken.length > 0
+      ? `${broken.length} problem${broken.length === 1 ? '' : 's'}: ${broken.map((c) => c.name).join(', ')}.`
+      : incomplete.length > 0
+        ? `No failed checks · ${incomplete.length} not verified yet.`
+        : 'Every required check passed.';
 
   logInfo(`self-test: ${summary}`);
   for (const check of checks) {

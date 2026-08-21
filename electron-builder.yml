@@ -34,16 +34,17 @@ extraResources:
     filter:
       - '**/*'
 
-# node-pty is the one native module, and it ships Node-API prebuilds — one binary per
-# platform, not per ABI — so it loads in Electron unchanged. Rebuilding would require
-# Visual Studio build tools on every machine that packages this app, for no gain.
+# node-pty and Sharp ship prebuilt native binaries. Rebuilding would require Visual Studio
+# build tools on every machine that packages this app and would discard the tested prebuilds.
 npmRebuild: false
 
-# The ConPTY binaries have to be real files on disk: Windows loads conpty.dll and launches
-# OpenConsole.exe by path, and neither can be read from inside an asar. Without this the
-# packaged app would install cleanly and then fail to open a terminal at runtime.
+# ConPTY launches DLL/executable assets by path. Sharp loads its .node binding and libvips
+# DLLs from @img beside it. Keep both native dependency trees on the real filesystem; a clean
+# NSIS build is not proof they can be loaded from inside app.asar.
 asarUnpack:
   - '**/node_modules/node-pty/**'
+  - '**/node_modules/sharp/**'
+  - '**/node_modules/@img/**'
 compression: maximum
 
 win:

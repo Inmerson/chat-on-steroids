@@ -1,6 +1,7 @@
 /**
  * The Chat panel: recorded sessions, their timeline, the brief a compaction left behind,
- * and the settings those need (recording, the browser extension, multi-agent mode).
+ * and the three numbers those need. The switches that decide what ChatGPT can reach live
+ * in the Home permission list, and pairing the extension is a Setup step.
  *
  * This is a viewer, not a second ChatGPT client, and not a place a compaction is started:
  * a session is compacted by the chat it lives in, from the button the extension puts beside
@@ -53,6 +54,10 @@ const KIND_ICON: Record<ActivitySummary['kind'], string> = {
  * usually in the first page or two.
  */
 const MODEL_PAGE = 20;
+/** Hard renderer budgets: durable history may be larger, but one paint may not be. */
+const MAX_TIMELINE_ROWS = 160;
+const MAX_TIMELINE_TEXT_CHARS = 2 * 1024 * 1024;
+const MAX_RENDERED_HTML_CHARS = 256 * 1024;
 
 /**
  * Which agent's events the timeline is showing.
@@ -92,6 +97,9 @@ let handoff: Handoff | null = null;
 let handoffFor: string | null = null;
 
 let listTimer: number | undefined;
+let sessionsLoadGeneration = 0;
+let detailLoadGeneration = 0;
+let handoffLoadGeneration = 0;
 
 // ------------------------------------------------------------------ sessions
 
@@ -168,7 +176,8 @@ function sessionRow(summary: SessionSummary): HTMLElement {
     `${summary.toolCalls} tool${summary.toolCalls === 1 ? '' : 's'}`
   ];
   if (summary.errors > 0) bits.push(`${summary.errors} error${summary.errors === 1 ? '' : 's'}`);
-  if (summary.agents.length > 0) bits.push(`${summary.agents.length} agents`);
+  if (summary.agents.length > 0)
+    bits.push(`${summary.agents.length} agent${summary.agents.length === 1 ? '' : 's'}`);
   const sub = el('div', 'sess-sub');
   for (const badge of sessionBadges(summary)) {
     sub.append(el('span', `chip${badge.tone ? ` ${badge.tone}` : ''}`, badge.text));
@@ -205,14 +214,17 @@ async function deleteSession(id: string): Promise<void> {
     events = [];
     handoff = null;
     handoffFor = null;
+    detailLoadGeneration++;
+    handoffLoadGeneration++;
   }
   toast('Session deleted');
   await loadSessions();
 }
 
 async function loadSessions(): Promise<void> {
+  const generation = ++sessionsLoadGeneration;
   const list = await run(api.listSessions());
-  if (!list) return;
+  if (!list || generation !== sessionsLoadGeneration) return;
   sessions = list.sessions;
   activeId = list.activeId;
   pressure = new Map(list.pressure.map((entry) => [entry.id, entry]));
@@ -237,14 +249,17 @@ function paintSessions(): void {
 }
 
 async function loadDetail(): Promise<void> {
-  if (selectedId === null) {
+  const wanted = selectedId;
+  const generation = ++detailLoadGeneration;
+  if (wanted === null) {
+    handoffLoadGeneration++;
     events = [];
     totalEvents = 0;
     paintDetail();
     return;
   }
-  const detail = await run(api.getSession(selectedId));
-  if (!detail) return;
+  const detail = await run(api.getSession(wanted));
+  if (!detail || generation !== detailLoadGeneration || selectedId !== wanted) return;
   // User/assistant prose is canonical in messages.json, while structured page activity stays
   // append-only by design: ChatGPT can grow one commentary caption or rewrite one activity
   // label several times. `foldProgress` turns those snapshots back into the one logical row
@@ -258,9 +273,12 @@ async function loadDetail(): Promise<void> {
 }
 
 async function loadHandoff(): Promise<void> {
-  const summary = sessions.find((s) => s.id === selectedId) ?? null;
+  const sessionId = selectedId;
+  const generation = ++handoffLoadGeneration;
+  const summary = sessions.find((s) => s.id === sessionId) ?? null;
   const wanted = summary?.lastHandoffId ?? null;
   if (wanted === null) {
+    if (generation !== handoffLoadGeneration || selectedId !== sessionId) return;
     handoff = null;
     handoffFor = null;
     paintHandoff();
@@ -268,6 +286,7 @@ async function loadHandoff(): Promise<void> {
   }
   if (handoffFor === wanted) return;
   const loaded = await run(api.getHandoff(summary!.id, wanted));
+  if (generation !== handoffLoadGeneration || selectedId !== sessionId) return;
   handoff = loaded ?? null;
   handoffFor = wanted;
   paintHandoff();
@@ -313,12 +332,15 @@ function safeRenderedHref(value: string): string | null {
  */
 export function renderedMessage(html: string, fallback: string): HTMLElement {
   const box = el('div', 'msg rich');
+  const safeFallback = fallback.slice(0, MAX_RENDERED_HTML_CHARS);
   if (!html) {
-    box.textContent = fallback;
+    box.textContent = safeFallback;
     return box;
   }
   const template = document.createElement('template');
-  template.innerHTML = html;
+  // Parsing untrusted captured HTML constructs a second tree before sanitisation. Bound it
+  // before innerHTML so a valid but huge recorded turn cannot freeze/OOM the renderer.
+  template.innerHTML = html.slice(0, MAX_RENDERED_HTML_CHARS);
   const visit = (parent: ParentNode): void => {
     for (const node of [...parent.childNodes]) {
       // Namespace elements (SVG/MathML) are not HTMLElements. Checking HTMLElement here
@@ -355,14 +377,33 @@ export function renderedMessage(html: string, fallback: string): HTMLElement {
   };
   visit(template.content);
   box.append(template.content);
-  if (!box.textContent?.trim() && fallback) box.textContent = fallback;
+  if (!box.textContent?.trim() && safeFallback) box.textContent = safeFallback;
   return box;
 }
+
+/**
+ * Tool calls the user has opened, by their durable call id.
+ *
+ * The timeline is redrawn from scratch whenever anything is recorded, and a fresh
+ * `<details>` is closed. So opening a call to read its arguments and then having ChatGPT
+ * make one more MCP call — which is to say, the normal case — silently collapsed what you
+ * were reading, several times a minute. Remembering the open set outside the DOM is what
+ * makes a redraw invisible; the ids are the recorder's own, so they survive the rebuild.
+ *
+ * Cleared when a different session is selected, not on every repaint: the whole point is
+ * that a repaint must not be able to change what is open.
+ */
+const openTools = new Set<string>();
 
 function toolBody(event: Extract<SessionEvent, { kind: 'tool_call' }>): HTMLElement {
   const { call } = event;
   const box = document.createElement('details');
   box.className = `tool tone-${call.summary.tone}`;
+  box.open = openTools.has(call.callId);
+  box.addEventListener('toggle', () => {
+    if (box.open) openTools.add(call.callId);
+    else openTools.delete(call.callId);
+  });
 
   const head = document.createElement('summary');
   head.append(icon(KIND_ICON[call.summary.kind] ?? 'i-bolt', 'ico tool-ico'));
@@ -533,28 +574,84 @@ function visibleEvents(): SessionEvent[] {
   return events.filter((event) => event.agent === agentFilter);
 }
 
+function eventTextCost(event: SessionEvent): number {
+  switch (event.kind) {
+    case 'user_message':
+    case 'assistant_message':
+      return event.message.text.length + (event.kind === 'assistant_message' ? (event.renderedHtml?.text.length ?? 0) : 0);
+    case 'progress':
+    case 'chat_error':
+    case 'note':
+    case 'agent_message':
+      return event.message.text.length;
+    case 'tool_call':
+      return (
+        event.call.args.text.length +
+        event.call.result.text.length +
+        event.call.summary.title.length +
+        (event.call.summary.detail?.length ?? 0)
+      );
+    case 'page_tool':
+      return event.label.length;
+    case 'turn_end':
+      return event.detail?.length ?? 0;
+    default:
+      return 128;
+  }
+}
+
+/** Newest-first selection, returned chronologically, under row and text/HTML budgets. */
+function boundedTimeline(source: SessionEvent[]): { shown: SessionEvent[]; omitted: number } {
+  let chars = 0;
+  let start = source.length;
+  while (start > 0 && source.length - start < MAX_TIMELINE_ROWS) {
+    const next = source[start - 1]!;
+    const cost = Math.min(eventTextCost(next), MAX_TIMELINE_TEXT_CHARS);
+    if (start < source.length && chars + cost > MAX_TIMELINE_TEXT_CHARS) break;
+    chars += cost;
+    start -= 1;
+  }
+  return { shown: source.slice(start), omitted: start };
+}
+
 function paintDetail(): void {
   const summary = sessions.find((s) => s.id === selectedId) ?? null;
   $('chatTitle').textContent = summary ? summary.title || 'Untitled session' : 'No session selected';
 
   paintAgentFilter();
-  const shown = visibleEvents();
+  const filtered = visibleEvents();
+  const windowed = boundedTimeline(filtered);
+  const shown = windowed.shown;
 
   // The scroller is the card body, not the list: a live session appends to the bottom,
-  // so stay pinned there unless the user has scrolled up to read something.
+  // so stay pinned there unless the user has scrolled up to read something — and if they
+  // have, put them back exactly where they were instead of letting the rebuild jump.
   const pane = $('chatBody');
   const atBottom = pane.scrollTop + pane.clientHeight >= pane.scrollHeight - 40;
-  $('timeline').replaceChildren(...shown.map(eventRow));
+  const was = pane.scrollTop;
+  const timelineRows: HTMLElement[] = [];
+  if (windowed.omitted > 0) {
+    timelineRows.push(
+      el(
+        'p',
+        'timeline-window-note',
+        `${windowed.omitted} earlier row${windowed.omitted === 1 ? '' : 's'} kept on disk — showing the newest bounded window`
+      )
+    );
+  }
+  timelineRows.push(...shown.map(eventRow));
+  $('timeline').replaceChildren(...timelineRows);
   $('timelineEmpty').hidden = shown.length > 0;
-  if (atBottom) pane.scrollTop = pane.scrollHeight;
+  pane.scrollTop = atBottom ? pane.scrollHeight : was;
 
   const facts: string[] = [];
   if (summary) {
     facts.push(`${totalEvents} event${totalEvents === 1 ? '' : 's'}`);
     if (events.length < totalEvents) facts.push(`showing the last ${events.length}`);
     if (agentFilter !== null) {
-      facts.push(`filtered to ${agentFilter === UNATTRIBUTED ? 'unattributed' : agentFilter} — ${shown.length} shown`);
+      facts.push(`filtered to ${agentFilter === UNATTRIBUTED ? 'unattributed' : agentFilter} — ${filtered.length} matched`);
     }
+    if (windowed.omitted > 0) facts.push(`${shown.length} newest rendered`);
     facts.push(`~${compactNumber(summary.estimatedTokens)} rough context tokens`);
     const level = pressureOf(summary.id);
     if (level && level.level !== 'ok') {
@@ -744,6 +841,21 @@ function paintSwarm(state: SwarmState): void {
   $<HTMLButtonElement>('swarmReset').disabled = state.agents.length === 0;
 }
 
+/**
+ * The meter's red line, derived from the one threshold the user actually sets.
+ *
+ * There used to be three numbers for one quantity — "suggest at", "urgent at" and
+ * "compact at" — all measured in the same local estimate and all editable apart. That is
+ * three ways to describe one line, and they drifted: a meter could sit red for an hour on
+ * a chat whose automatic trigger was set far higher, or fill only halfway on the turn that
+ * compaction actually fired. The threshold is now the amber line by definition, and the red
+ * line sits a third further on, which is where the app's own observed ceiling has always
+ * been relative to its default (300k → 400k).
+ */
+function urgentFrom(threshold: number): number {
+  return Math.min(4_000_000, Math.max(10_000, Math.round((threshold * 4) / 3)));
+}
+
 /** Reads the three config sections this panel owns, for the renderer's save path. */
 export function chatSettingsPatch(current: Config): {
   sessions: Config['sessions'];
@@ -755,53 +867,61 @@ export function chatSettingsPatch(current: Config): {
     if (!Number.isFinite(raw)) return fallback;
     return Math.min(max, Math.max(min, Math.round(raw)));
   };
+  const threshold = number('autoCompactTokens', current.compaction.autoTokens, 10_000, 4_000_000);
   return {
     sessions: {
       record: $<HTMLInputElement>('sessRecord').checked,
       retainDays: number('sessRetain', current.sessions.retainDays, 0, 3650),
-      advisoryTokens: number('sessAdvisory', current.sessions.advisoryTokens, 10_000, 2_000_000),
-      limitTokens: number('sessLimit', current.sessions.limitTokens, 10_000, 4_000_000)
+      // Both follow the single threshold above rather than being typed separately.
+      advisoryTokens: Math.min(2_000_000, threshold),
+      limitTokens: urgentFrom(threshold)
     },
     compaction: {
       auto: $<HTMLInputElement>('autoCompact').checked,
-      autoTokens: number('autoCompactTokens', current.compaction.autoTokens, 10_000, 4_000_000)
+      autoTokens: threshold
     },
     multiAgent: {
-      enabled: $<HTMLInputElement>('maEnabled').checked,
+      // The exposure switch lives with every other ChatGPT tool switch, on Home. This
+      // panel keeps only the worker count, so it reads the one control that exists.
+      enabled: $<HTMLInputElement>('homeMaEnabled').checked,
       maxWorkers: number('maWorkers', current.multiAgent.maxWorkers, 1, 8)
     }
   };
 }
 
-/** Writes app state into this panel's controls. Called from the renderer's apply(). */
 /**
- * Says in words what the automatic switch will actually do, including the parts that are
- * easy to be surprised by: which chat ends, and that the number it fires on is an estimate
- * rather than ChatGPT's own accounting.
+ * One clause under the row, not a paragraph: what the switch will do, and the fact that
+ * the number it fires on is this app's own estimate rather than ChatGPT's accounting.
  */
 function applyAutoCompactHint(config: Config): void {
-  const { auto, autoTokens } = config.compaction;
-  const tokens = compactNumber(autoTokens);
-  $('autoCompactHint').textContent = !auto
-    ? 'Off. Compaction only happens when you press Compact & resume in the ChatGPT tab.'
-    : `Past roughly ${tokens} recorded tokens, this chat is stopped and asked to write its own ` +
-      'handoff, then a fresh chat opens carrying it. Each chat is compacted once; the fresh one ' +
-      'starts its own count.';
+  $('autoCompactHint').textContent = config.compaction.auto
+    ? 'Interrupts the answer at this many tokens, writes a handoff, opens a fresh chat. Once per chat.'
+    : 'Off — only the Compact & resume button in the ChatGPT tab compacts.';
 }
 
+/**
+ * Every control on the settings sheet, and the whole of it.
+ *
+ * A field that is not here does not save: it keeps what was typed until the next repaint
+ * and then quietly reverts. `autoCompactTokens` was missing, which made the one number the
+ * automatic trigger fires on the one control in the app that never kept what you typed.
+ * `sessRecord` is deliberately absent — it lives in the Home permission list now, with
+ * every other switch that decides what ChatGPT can reach, and saves from there.
+ */
+const CHAT_INPUTS = ['sessRetain', 'autoCompact', 'autoCompactTokens', 'maWorkers'];
+
+/** Writes app state into this panel's controls. Called from the renderer's apply(). */
 export function chatApply(state: AppState): void {
   const { config, bridge } = state;
 
-  $<HTMLInputElement>('sessRecord').checked = config.sessions.record;
+  // `sessRecord` is painted by the renderer's own apply(): it lives in the Home
+  // permission list now, with every other switch that decides what ChatGPT can reach.
   $<HTMLInputElement>('sessRetain').value = String(config.sessions.retainDays);
-  $<HTMLInputElement>('sessAdvisory').value = String(config.sessions.advisoryTokens);
-  $<HTMLInputElement>('sessLimit').value = String(config.sessions.limitTokens);
 
   $<HTMLInputElement>('autoCompact').checked = config.compaction.auto;
   $<HTMLInputElement>('autoCompactTokens').value = String(config.compaction.autoTokens);
   applyAutoCompactHint(config);
 
-  $<HTMLInputElement>('maEnabled').checked = config.multiAgent.enabled;
   $<HTMLInputElement>('maWorkers').value = String(config.multiAgent.maxWorkers);
 
   // Extension bridge. Connecting is automatic, so this reports rather than asks.
@@ -872,6 +992,8 @@ export function initChat(next: Deps): void {
     const row = (event.target as HTMLElement).closest<HTMLElement>('[data-id]');
     if (!row?.dataset.id || row.dataset.id === selectedId) return;
     selectedId = row.dataset.id;
+    // A different session is a different set of calls; nothing here should arrive open.
+    openTools.clear();
     handoff = null;
     handoffFor = null;
     paintSessions();
@@ -947,15 +1069,7 @@ export function initChat(next: Deps): void {
     );
   });
 
-  for (const id of [
-    'sessRecord',
-    'sessRetain',
-    'sessAdvisory',
-    'sessLimit',
-    'autoCompact',
-    'maEnabled',
-    'maWorkers'
-  ]) {
+  for (const id of CHAT_INPUTS) {
     $(id).addEventListener('change', () => void deps.save());
   }
 
