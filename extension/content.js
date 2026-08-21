@@ -41,7 +41,7 @@
   //
   // So: publish a handle instead of a flag and let a replacement supersede a dead one. A
   // *healthy* incumbent still wins, so the ordinary static/recovery race is unchanged.
-  const RECORDER_VERSION = 8;
+  const RECORDER_VERSION = 9;
   const recorderHandle = {
     version: RECORDER_VERSION,
     healthy: () => false,
@@ -1807,7 +1807,7 @@
   // 6: adds request-id ownership evidence used by deterministic MCP attribution.
   // 7: keys streaming commentary and native activity by ChatGPT thought/message identity,
   //    so React row replacement, raw text UUID rotation and refresh cannot mint duplicates.
-  const FIBER_VERSION = 8;
+  const FIBER_VERSION = 9;
   const FIBER_TIMEOUT_MS = 1500;
   const FIBER_MAX_ROWS = 400;
   /** Assistant turns whose per-call evidence is accepted from one scan. */
@@ -1947,6 +1947,28 @@
     }
     const kept = calls.filter((call) => !duplicated.has(call.messageId));
 
+    // Bare request ids: every `metadata.request_id` in the turn, with no tool name attached.
+    //
+    // `calls` above is the *renderable* view and needs a tool name to be one; this is the
+    // attribution view and needs nothing but the id. ChatGPT stamps the id on the plain
+    // assistant message as soon as a connector request is issued and only materializes the
+    // `api_tool` row once its safety check clears — up to a minute later, long past the app's
+    // fifteen second evidence window. Those ids are readable the entire time, and every one of
+    // them belongs to whatever conversation this document is pinned to.
+    const requests = [];
+    const requestSeen = new Set();
+    for (const entry of (Array.isArray(raw.requests) ? raw.requests : []).slice(0, FIBER_MAX_CALLS)) {
+      if (!entry || typeof entry !== 'object') continue;
+      const requestId = cap(entry.requestId, 100);
+      if (!requestId || requestSeen.has(requestId)) continue;
+      requestSeen.add(requestId);
+      requests.push({
+        requestId,
+        messageId: cap(entry.messageId, 200) || null,
+        createTime: typeof entry.createTime === 'number' && isFinite(entry.createTime) ? entry.createTime : null
+      });
+    }
+
     const messages = [];
     const messageIndex = new Map();
     const conflictingMessages = new Set();
@@ -2016,7 +2038,9 @@
       if (activities[priorAt].label !== label) conflictingActivities.add(messageId);
     }
     const keptActivities = activities.filter((activity) => !conflictingActivities.has(activity.messageId));
-    if (kept.length === 0 && keptMessages.length === 0 && keptActivities.length === 0) return null;
+    if (kept.length === 0 && requests.length === 0 && keptMessages.length === 0 && keptActivities.length === 0) {
+      return null;
+    }
     return {
       index,
       turnId,
@@ -2024,6 +2048,7 @@
       conversationConflict: raw.conversationConflict === true,
       endMessageId: cap(raw.endMessageId, 200),
       calls: kept,
+      requests,
       messages: keptMessages,
       activities: keptActivities
     };
@@ -2378,15 +2403,24 @@
       // exactly this conversation, plus the one turn this document owns (which may still
       // carry a fresh chat's provisional client thread). A descriptor naming a *different*
       // concrete conversation is still never promoted. One batched message per scan.
+      //
+      // Both views of the turn feed it: the labelled connector rows, and the bare
+      // `metadata.request_id` sightings that have no row yet. The tool name is not part of
+      // the join — the app maps request id -> conversation and nothing else — so requiring
+      // one only delayed the mapping until ChatGPT's safety check released the `api_tool`
+      // message, which is precisely the window the app spends deciding the call is
+      // unattributed. Labelled rows go first so the id carries its tool when both exist.
       const ownerCalls = [];
       const ownerSeen = new Set();
-      for (const turn of answer.turns) {
-        const pageConversation = concreteConversation(turn.conversationId);
-        if (turn !== ownedPageTurn && pageConversation !== askedConversation) continue;
-        for (const call of turn.calls || []) {
-          if (!call || !call.requestId || ownerSeen.has(call.requestId)) continue;
-          ownerSeen.add(call.requestId);
-          ownerCalls.push(call);
+      for (const source of ['calls', 'requests']) {
+        for (const turn of answer.turns) {
+          const pageConversation = concreteConversation(turn.conversationId);
+          if (turn !== ownedPageTurn && pageConversation !== askedConversation) continue;
+          for (const call of turn[source] || []) {
+            if (!call || !call.requestId || ownerSeen.has(call.requestId)) continue;
+            ownerSeen.add(call.requestId);
+            ownerCalls.push(call);
+          }
         }
       }
       confirmLiveRequestOwners(ownerCalls, askedConversation);
@@ -2445,11 +2479,38 @@
     // ordinal so we can restore the exact order before recording. Keeping two independent
     // loops here was the first-interim corruption: a scan that discovered a thinking headline
     // and the paragraph after it always journalled the paragraph first.
+    // Resolve settled-turn ownership across the whole scan before using any of it.
+    //
+    // `settledTurnOwner` claims a page turn for the local turn that recorded its request
+    // id, which is exact only while an id names one request. ChatGPT reuses a single
+    // `request_id` across the retries within a turn — live 2026-08-21, session
+    // `2026-08-21-204027d1` had one id on three calls and a second on two — so after a
+    // Retry several distinct page turns resolve to the same local turn, every one of them
+    // emits its prose under that id, and the app paints one answer twice.
+    //
+    // A local turn can own exactly one page turn. When more than one claims it, none of
+    // them is proven, so all of them drop to unowned — the same fail-closed answer
+    // `settledTurnOwner` already gives for an ambiguous id. The live generation's own
+    // binding is authoritative and is seeded first, so a settled turn can never take a
+    // turn id out from under the turn currently being written.
+    const settledOwners = new Map();
+    const ownerClaims = new Map();
+    if (activeTurnIndex >= 0 && activeLocalTurnId) ownerClaims.set(activeLocalTurnId, 1);
+    for (let index = 0; index < answer.turns.length; index++) {
+      if (index === activeTurnIndex) continue;
+      const owner = settledTurnOwner(answer.turns[index]);
+      if (!owner) continue;
+      settledOwners.set(answer.turns[index], owner);
+      ownerClaims.set(owner, (ownerClaims.get(owner) || 0) + 1);
+    }
+    for (const [turn, owner] of settledOwners) {
+      if ((ownerClaims.get(owner) || 0) > 1) settledOwners.delete(turn);
+    }
     for (let index = 0; index < answer.turns.length; index++) {
       const turn = answer.turns[index];
       // The live generation owns the turn it is writing; a settled one is claimed only by
       // ChatGPT's own request id. See settledTurnOwner().
-      const localOwner = index === activeTurnIndex ? activeLocalTurnId : settledTurnOwner(turn);
+      const localOwner = index === activeTurnIndex ? activeLocalTurnId : settledOwners.get(turn) || null;
       const items = [];
       let serial = 0;
       for (const message of turn.messages || []) {

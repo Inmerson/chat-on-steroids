@@ -542,6 +542,56 @@ describe('activity feed', () => {
       attributionMethod: 'request_id'
     });
   });
+  it('registers a request id the page could not yet name a tool for', async () => {
+    await pair();
+    const conversationId = '16161616-3838-6060-8282-949494949494';
+    const requestId = 'wfr-safety-check-held';
+    // ChatGPT stamps `metadata.request_id` on the plain public message the moment a turn
+    // issues a connector request, and materializes the `api_tool` message — the only one
+    // carrying a tool path — once its safety check clears, routinely well past this app's
+    // fifteen second evidence window. Requiring a tool name here meant that id was refused
+    // while the page could already prove who owned it, and the call was filed under
+    // Unattributed activity. The tool name takes no part in the join.
+    const mapped = await request('POST', '/correlations', {
+      body: {
+        conversationId,
+        calls: [{ messageId: 'page-message-before-tool-row', requestId, createTime: Date.now() / 1000 }]
+      }
+    });
+    expect(mapped.status).toBe(200);
+    expect(mapped.body).toMatchObject({ ok: true, conversationId, confirmed: [requestId], complete: true });
+
+    await recordToolCall({
+      tool: 'agents',
+      args: { action: 'launch' },
+      content: [{ type: 'text', text: 'launched' }],
+      outcome: 'ok',
+      durationMs: 1,
+      startedAt: Date.now(),
+      requestId
+    });
+
+    const calls = await readEvents(mapped.body.sessionId, { kinds: ['tool_call'] });
+    expect(calls).toHaveLength(1);
+    expect(calls[0]?.kind === 'tool_call' && calls[0].call).toMatchObject({
+      requestId,
+      conversationId,
+      attribution: 'request_id'
+    });
+  });
+
+  it('still refuses correlation evidence that names no request id at all', async () => {
+    await pair();
+    const refused = await request('POST', '/correlations', {
+      body: {
+        conversationId: '17171717-3939-6161-8383-959595959595',
+        calls: [{ messageId: 'page-message-with-nothing-to-join-on', tool: 'agents', order: 0 }]
+      }
+    });
+    expect(refused.status).toBe(400);
+    expect(refused.body).toMatchObject({ error: 'bad_request_evidence' });
+  });
+
   it('refuses a live handshake that contradicts an already-proven request owner without poisoning the original mapping', async () => {
     await pair();
     const firstConversation = '14141414-3636-5858-8080-929292929292';

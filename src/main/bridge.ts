@@ -468,7 +468,17 @@ const TOOL_NAME = /^[a-z0-9_.-]{1,64}$/i;
  * conversation a call this app *already ran* belongs to. It never creates a record, never
  * names an agent, and never carries an argument value.
  */
-function parseCallEvidence(input: unknown): PageCallEvidence[] {
+/**
+ * @param untooled when true, a sighting with no tool name is kept as long as it carries a
+ *   request id. Attribution and rendering want different things from this list. A tool row
+ *   in the transcript is meaningless without a tool name, so `/events` still requires one;
+ *   the request-id -> conversation join does not use the name at all, and requiring one
+ *   there meant an id ChatGPT had already published was ignored until the `api_tool`
+ *   message it belonged to cleared the safety check — routinely longer than the recorder's
+ *   evidence window, so the call was filed under Unattributed activity while the page had
+ *   been able to name its owner the whole time.
+ */
+function parseCallEvidence(input: unknown, untooled = false): PageCallEvidence[] {
   if (!Array.isArray(input)) return [];
   const out: PageCallEvidence[] = [];
   const seen = new Set<string>();
@@ -478,7 +488,8 @@ function parseCallEvidence(input: unknown): PageCallEvidence[] {
     const item = raw as Record<string, unknown>;
     const tool = typeof item['tool'] === 'string' && TOOL_NAME.test(item['tool']) ? item['tool'] : '';
     const messageId = typeof item['messageId'] === 'string' ? item['messageId'].slice(0, 120) : '';
-    if (!tool || !messageId) continue;
+    const bare = untooled && typeof item['requestId'] === 'string';
+    if ((!tool && !bare) || !messageId) continue;
     if (seen.has(messageId)) {
       duplicated.add(messageId);
       continue;
@@ -675,7 +686,7 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
     }
     const id = conversationId(body['conversationId']);
     if (!id) return json(res, 400, { error: 'bad_conversation_id' }, origin);
-    const calls = parseCallEvidence(body['calls']);
+    const calls = parseCallEvidence(body['calls'], true).filter((call) => call.requestId !== null);
     if (calls.length === 0) return json(res, 400, { error: 'bad_request_evidence' }, origin);
 
     // This is the live-turn ownership handshake, deliberately separate from transcript

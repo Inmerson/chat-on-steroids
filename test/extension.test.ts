@@ -711,7 +711,7 @@ describe('extension command delivery', () => {
     const session = new FakeStorageArea();
     const worker = loadWorker({ local, session });
     worker.tabsQuery.mockResolvedValueOnce([{ id: 41 }]);
-    worker.tabsSendMessage.mockResolvedValueOnce({ ok: true, recorderVersion: 8 });
+    worker.tabsSendMessage.mockResolvedValueOnce({ ok: true, recorderVersion: 9 });
 
     await worker.installed('update');
 

@@ -37,7 +37,7 @@
   'use strict';
 
   /** Bumped when the descriptor shape changes, so a stale pair cannot half-understand. */
-  const VERSION = 8;
+  const VERSION = 9;
   // The MAIN world survives an extension reload because the ChatGPT document survives it.
   // Recovery may therefore execute this file again in a page that still has an older helper
   // listener. Keep at most one listener for this protocol version; content.js rejects older
@@ -851,6 +851,48 @@
     };
   }
 
+  /**
+   * Every request id ChatGPT has stamped anywhere in this turn.
+   *
+   * `callsOf` deliberately answers a narrow question — which rows are *this app's* connector
+   * calls, so they can be labelled and rendered — and to answer it, it requires a readable
+   * `api_tool` recipient and a parseable tool path. That filter is right for a tool row and
+   * wrong for attribution, and the difference cost an entire class of calls.
+   *
+   * ChatGPT stamps `metadata.request_id` on the plain `recipient: "all"` message the moment a
+   * turn starts a connector request, and only materializes the `api_tool` message once its
+   * safety check clears — live 2026-08-21, forty seconds later, well past the app's fifteen
+   * second evidence window. The id was on screen and readable the whole time; this file threw
+   * it away because it was not yet attached to a row worth *drawing*. The app then filed the
+   * call under `Unattributed activity`, refused identity-sensitive calls, and the chat looked
+   * broken for reasons no log named.
+   *
+   * The request id is opaque, and the join it feeds is exact: id -> conversation, nothing
+   * else. So harvest it from every message in the turn, with no opinion about recipient, path
+   * or tool name, and let the app decide. Nothing here is rendered and nothing here is parsed
+   * from `content.text` — this list carries three allowlisted primitives per entry and never
+   * appears in the transcript.
+   */
+  function requestIdsOf(messages) {
+    if (!Array.isArray(messages)) return [];
+    const out = [];
+    const seen = new Set();
+    for (let at = 0; at < messages.length && out.length < MAX_CALLS; at++) {
+      const message = messages[at];
+      if (!message || typeof message !== 'object') continue;
+      const meta = message.metadata && typeof message.metadata === 'object' ? message.metadata : null;
+      const requestId = meta ? str(meta.request_id) : null;
+      if (!requestId || seen.has(requestId)) continue;
+      seen.add(requestId);
+      out.push({
+        requestId,
+        messageId: str(message.id),
+        createTime: num(message.create_time)
+      });
+    }
+    return out;
+  }
+
   /** "/ChatGPT Local Files Core/link_…/read" -> "read", or null if that is not a name. */
   function toolName(value) {
     if (typeof value !== 'string' || value.length === 0) return null;
@@ -1099,12 +1141,18 @@
         if (!fiber) continue;
         const messages = turnMessagesOf(fiber);
         const calls = callsOf(messages);
+        const requests = requestIdsOf(messages);
         const turnBudget = { remaining: Math.min(MAX_TURN_TEXT, responseBudget.remaining) };
         const before = turnBudget.remaining;
         const renderedMessages = renderedMessagesOf(group.sections, messages, turnBudget);
         responseBudget.remaining -= before - turnBudget.remaining;
         const activities = nativeActivitiesOf(group.sections, messages);
-        if (calls.length === 0 && renderedMessages.length === 0 && activities.length === 0) continue;
+        if (
+          calls.length === 0 &&
+          requests.length === 0 &&
+          renderedMessages.length === 0 &&
+          activities.length === 0
+        ) continue;
         const index = out.length;
         const conversation = conversationEvidenceOf(fiber);
         entry = {
@@ -1114,6 +1162,7 @@
           conversationConflict: conversation.conflict,
           endMessageId: turnEndMessageId(messages),
           calls,
+          requests,
           messages: renderedMessages,
           activities
         };

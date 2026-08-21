@@ -403,7 +403,7 @@ async function replyFiber(
     );
     window.dispatchEvent(
       new window.MessageEvent('message', {
-        data: { source: 'clf-fiber-reply', nonce: event.data.nonce, v: 8, scanOk: true, rows, turns: indexedTurns },
+        data: { source: 'clf-fiber-reply', nonce: event.data.nonce, v: 9, scanOk: true, rows, turns: indexedTurns },
         source: window
       })
     );
@@ -867,7 +867,7 @@ describe('naming the agent behind a row', () => {
     }));
     await replyFiber([
       {
-        v: 8,
+        v: 9,
         index: 0,
         tool: 'run_command',
         path: null,
@@ -906,7 +906,7 @@ describe('naming the agent behind a row', () => {
  */
 describe('the calls a row folded away', () => {
   const FOLDED = {
-    v: 8,
+    v: 9,
     index: 0,
     tool: 'run_command',
     path: '/TobisComputer/mcp/run_command',
@@ -1039,7 +1039,7 @@ describe('page-native tool presentation and archived row evidence', () => {
     const turn = assistantTurn(live.document, 'turn-folded-evidence', ['Called tool!']);
     turn.querySelector('[aria-label="Open tool call list"]')!.setAttribute('data-clf-fiber', '0');
     await replyFiber([{
-      v: 8,
+      v: 9,
       index: 0,
       tool: 'read',
       path: '/ChatGPT Local Files Core/link_x/read',
@@ -1062,7 +1062,7 @@ describe('page-native tool presentation and archived row evidence', () => {
     const turn = assistantTurn(live.document, 'turn-other-connector', ['Called tool!']);
     turn.querySelector('[aria-label="Open tool call list"]')!.setAttribute('data-clf-fiber', '0');
     await replyFiber([{
-      v: 8,
+      v: 9,
       index: 0,
       tool: 'search',
       path: '/Gmail/mcp/search',
@@ -1232,7 +1232,7 @@ describe('page-native tool presentation and archived row evidence', () => {
     const control = turn.querySelector('[aria-label="Open tool call list"]')!;
     control.setAttribute('data-clf-fiber', '0');
     await replyFiber([{
-      v: 8,
+      v: 9,
       index: 0,
       tool: 'computer',
       path: '/ChatGPT Local Files Desktop/link_x/computer',
@@ -5141,7 +5141,7 @@ describe('a page leaving the screen', () => {
  */
 describe('evidence from the page context', () => {
   const GOOD = {
-    v: 8,
+    v: 9,
     index: 0,
     tool: 'agent_status',
     path: '/TobisComputer/mcp/agent_status',
@@ -5470,6 +5470,61 @@ describe('evidence from the page context', () => {
     expect(requestEvidence).not.toHaveProperty('fiberConversationId');
   });
 
+  it('confirms a request id ChatGPT published before any tool row existed', async () => {
+    const conversationId = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee';
+    const requestId = 'wfr_safety_held';
+    live = await harness();
+    live.reply.set('correlate', () => ({
+      ok: true,
+      data: { conversationId, confirmed: [requestId], complete: true }
+    }));
+
+    // The live 2026-08-21 shape. ChatGPT stamps the request id on the plain public message
+    // as soon as the turn issues a connector request and holds the `api_tool` message
+    // behind its safety check for tens of seconds — the app gives up after fifteen and
+    // files the call under Unattributed activity. The tool name is no part of the
+    // request-id -> conversation join, so waiting for one only threw the window away.
+    await replyFiber([], [{
+      turnId: 'safety-held-turn',
+      conversationId,
+      calls: [],
+      requests: [{ requestId, messageId: 'm-pending', createTime: 1_700_000_001 }],
+      messages: []
+    }]);
+    await settle();
+
+    expect(live.sent.filter((message) => message.type === 'correlate')).toEqual([
+      expect.objectContaining({
+        conversationId,
+        calls: [expect.objectContaining({ requestId, messageId: 'm-pending' })]
+      })
+    ]);
+  });
+
+  it('sends one request id once when it arrives both as a labelled row and as a bare sighting', async () => {
+    const conversationId = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee';
+    const requestId = 'wfr_both_views';
+    live = await harness();
+    live.reply.set('correlate', () => ({
+      ok: true,
+      data: { conversationId, confirmed: [requestId], complete: true }
+    }));
+
+    await replyFiber([], [{
+      turnId: 'both-views-turn',
+      conversationId,
+      calls: [{ messageId: 'row-call', tool: 'agents', order: 0, answered: true, requestId, createTime: 1_700_000_001 }],
+      requests: [{ requestId, messageId: 'm-pending', createTime: 1_700_000_000 }],
+      messages: []
+    }]);
+    await settle();
+
+    const handshakes = live.sent.filter((message) => message.type === 'correlate');
+    expect(handshakes).toHaveLength(1);
+    // The labelled row wins, so the app still learns which tool the id belonged to.
+    expect(handshakes[0]!.calls).toEqual([expect.objectContaining({ requestId, tool: 'agents' })]);
+  });
+
   it('confirms request ids Fiber attributes to this chat with no live local turn at all', async () => {
     const conversationId = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee';
     const requestId = 'wfr_no_local_turn/2';
@@ -5673,7 +5728,7 @@ describe('evidence from the page context', () => {
           data: {
             source: 'clf-fiber-reply',
             nonce: event.data.nonce,
-            v: 8,
+            v: 9,
             scanOk: true,
             rows: [],
             turns: [
@@ -5777,7 +5832,7 @@ describe('evidence from the page context', () => {
           data: {
             source: 'clf-fiber-reply',
             nonce: event.data.nonce,
-            v: 8,
+            v: 9,
             scanOk: true,
             rows: [{ ...GOOD, tool: 'read' }],
             turns: []
@@ -7577,5 +7632,92 @@ describe('one live isolated-world recorder per document', () => {
     successor.observe();
     await settle();
     expect(live.sent.length).toBeGreaterThanOrEqual(before);
+  });
+});
+
+/**
+ * One local turn owns one page turn.
+ *
+ * `settledTurnOwner` claims a settled page turn for the local turn that recorded its
+ * request id, which is exact only while a request id names one request. ChatGPT reuses a
+ * single `request_id` across the retries inside a turn — live 2026-08-21, session
+ * `2026-08-21-204027d1` carried one id on three calls and a second on two — so after a
+ * Retry several distinct page turns resolved to the same local turn and the app painted
+ * one answer two, three and four times over.
+ */
+describe('a request id ChatGPT reused across retries', () => {
+  const requestId = 'wfr_reused_across_retries';
+  const activity = () => ({
+    ok: true,
+    data: {
+      entries: [],
+      stream: [
+        {
+          seq: 1,
+          time: 100,
+          kind: 'tool_call',
+          turnId: 'g-retried-8-11',
+          agent: 'prime',
+          tool: 'agents',
+          callId: 'call-retried',
+          requestId,
+          outcome: 'ok',
+          durationMs: 3,
+          summary: { kind: 'read', tone: 'neutral', title: 'Launched agent' }
+        }
+      ],
+      job: null
+    }
+  });
+
+  const settledTurn = (turnId: string, messageId: string, text: string) => ({
+    turnId,
+    conversationId: 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee',
+    endMessageId: messageId,
+    calls: [{ messageId: `${messageId}-call`, tool: 'agents', order: 0, answered: true, requestId }],
+    messages: [
+      {
+        messageId,
+        rawMessageId: messageId,
+        role: 'assistant',
+        stable: true,
+        order: 0,
+        rawText: text,
+        renderedHtml: `<p>${text}</p>`
+      }
+    ]
+  });
+
+  it('gives its turn id to neither page turn when two of them claim it', async () => {
+    live = await harness(undefined, { activity });
+    await live.hook.pullActivity();
+    await settle();
+
+    await replyFiber([], [
+      settledTurn('page-turn-first', 'msg-first', 'First attempt.'),
+      settledTurn('page-turn-second', 'msg-second', 'Second attempt.')
+    ]);
+    await live.hook.flush();
+    await settle();
+
+    const answers = emitted(live.sent, 'assistant_message').map((entry) => entry.event);
+    // Both answers still reach the transcript — losing them is not the fix. What they must
+    // not do is arrive owned, because that ownership is what made the app file two separate
+    // ChatGPT responses under one local turn and render the same answer twice.
+    expect(answers.map((event) => event.messageId)).toEqual(['msg-first', 'msg-second']);
+    expect(answers.map((event) => event.turnId)).toEqual([undefined, undefined]);
+  });
+
+  it('still gives its turn id to the one page turn that claims it', async () => {
+    live = await harness(undefined, { activity });
+    await live.hook.pullActivity();
+    await settle();
+
+    await replyFiber([], [settledTurn('page-turn-only', 'msg-only', 'The answer.')]);
+    await live.hook.flush();
+    await settle();
+
+    const answers = emitted(live.sent, 'assistant_message').map((entry) => entry.event);
+    expect(answers.map((event) => [event.messageId, event.turnId])).toEqual([['msg-only', 'g-retried-8-11']]);
   });
 });

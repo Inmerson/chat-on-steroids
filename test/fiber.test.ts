@@ -246,6 +246,7 @@ interface TurnEvidence {
   conversationConflict?: boolean;
   endMessageId?: string | null;
   calls: TurnCall[];
+  requests?: Array<{ requestId: string; messageId: string | null; createTime: number | null }>;
   messages: Array<{
     messageId: string;
     rawMessageId: string;
@@ -383,8 +384,8 @@ describe('reading a row out of the page', () => {
 
   it('keeps the version it was built for on the reply', async () => {
     const { version, rows } = await scan([row([request('req-1', 'read_file')])]);
-    expect(version).toBe(8);
-    expect(rows[0]!.v).toBe(8);
+    expect(version).toBe(9);
+    expect(rows[0]!.v).toBe(9);
   });
   it('counts only TobisComputer requests in the complete turn, not api_tool metadata calls', async () => {
     const mine1 = request('req-1', 'read_file');
@@ -786,6 +787,62 @@ describe('the calls a turn says it made', () => {
     const { turns } = await scan([], [{ id: 'turn-quiet', messages: [chatter] }]);
 
     expect(turns).toEqual([]);
+  });
+
+  it('reports a request id ChatGPT has published before the api_tool message exists', async () => {
+    // The live 2026-08-21 shape. ChatGPT stamps `metadata.request_id` on the plain public
+    // message the moment the turn issues a connector request, and holds the `api_tool`
+    // message behind its safety check — measured on this machine at around forty seconds,
+    // where the app gives up after fifteen. `calls` cannot see this id: there is no
+    // recipient and no tool path to read yet. `requests` is the view that can.
+    const pending = authored('m-pending', 'Working on it.', { createTime: 1786873650.5 });
+    pending.metadata!['request_id'] = 'wfr_safety_held';
+    const { turns } = await scan([], [{ id: 'turn-safety-held', messages: [pending], rendered: ['Working on it.'] }]);
+
+    expect(turns).toHaveLength(1);
+    expect(turns[0]!.calls).toEqual([]);
+    expect(turns[0]!.requests).toEqual([
+      { requestId: 'wfr_safety_held', messageId: 'm-pending', createTime: 1786873650.5 }
+    ]);
+  });
+
+  it('reports a turn that has nothing but a request id', async () => {
+    // Nothing rendered, no row, no result — the turn used to be dropped whole, taking the
+    // one fact the app actually needs with it.
+    const bare: Message = {
+      id: 'm-bare',
+      author: { role: 'assistant' },
+      recipient: 'all',
+      metadata: { request_id: 'wfr_bare' }
+    };
+    const { turns } = await scan([], [{ id: 'turn-bare', messages: [bare] }]);
+
+    expect(turns).toHaveLength(1);
+    expect(turns[0]!.requests).toEqual([{ requestId: 'wfr_bare', messageId: 'm-bare', createTime: null }]);
+  });
+
+  it('reports one request id once however many messages of the turn carry it', async () => {
+    // ChatGPT reuses a single request id across a turn's request, its result and its public
+    // message. The correlation join is a set, not a count.
+    const { turns } = await scan([], [{
+      id: 'turn-repeated-id',
+      messages: [request('req-1', 'read_file'), answer('res-1', 'req-1', 'read_file')]
+    }]);
+
+    expect(turns[0]!.requests).toEqual([
+      { requestId: 'wfr_01a009', messageId: 'req-1', createTime: 1786873658.125 }
+    ]);
+  });
+
+  it('carries nothing but the id, the message it sat on and its stamp', async () => {
+    const pending = authored('m-allowlist', 'Working.', { createTime: 1786873650.5 });
+    pending.metadata!['request_id'] = 'wfr_allowlist';
+    // Everything else on a real message's metadata, none of which may leave the page.
+    pending.metadata!['parent_id'] = 'must-not-leak';
+    pending.metadata!['turn_exchange_id'] = 'must-not-leak';
+    const { turns } = await scan([], [{ id: 'turn-allowlist', messages: [pending], rendered: ['Working.'] }]);
+
+    expect(Object.keys(turns[0]!.requests![0]!).sort()).toEqual(['createTime', 'messageId', 'requestId']);
   });
 
   it('clears a stale turn stamp when that section has no descriptor in this scan', async () => {

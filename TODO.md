@@ -9,8 +9,8 @@ Status: `[ ]` open · `[~]` in progress · `[x]` done · `[?]` needs a decision 
 into this list; do not create a second TODO. Screenshots and other raw proof may live under
 `docs/evidence/`, but every actionable item belongs here.
 
-**Installed build: v1.9.1** — see the record directly below. The v1.8.8 note that used to
-stand here is kept for history:
+**Installed build: v1.9.2** — see the record directly below; the v1.9.1 record follows it.
+The v1.8.8 note that used to stand here is kept for history:
 
 **Installed build: v1.8.8.** Verified directly on 2026-08-21 from
 `%LOCALAPPDATA%\Programs\ChatGPT Local Files\ChatGPT Local Files.exe`: file version `1.8.8`,
@@ -19,6 +19,63 @@ extension scripts, tunnel-client, cloudflared, ripgrep, app.asar, node-pty, Shar
 libvips 8.18.3 with a real PNG encode). It replaces v1.8.4, which had been the installed
 build since 2026-08-20; the 1.8.7 that was running on 2026-08-21 came from a stale `out/`
 and is what T-174 below is about.
+
+## v1.9.2 — package and install record — **PENDING INSTALL**
+
+The follow-up to 1.9.1. Attribution itself worked after 1.9.1 — every refused call in the
+2026-08-21 evidence carries `attribution: "request_id"` with the right conversation — but it
+worked *late*, and two things were still wrong.
+
+**1. The tool name was a precondition for a join that never used it.** `fiber.js callsOf()`
+only reports a request id when it can also read an `api_tool` recipient and parse a tool path
+off the front of the (usually truncated) payload. ChatGPT stamps `metadata.request_id` on the
+plain `recipient: "all"` message as soon as the turn issues a connector request, and only
+materializes the `api_tool` message once its safety check clears. Measured live on
+2026-08-21: the call started 13:16:55.1, the app gave up and refused at 13:17:10.1 exactly
+`REQUEST_ID_GRACE_MS` later, and the correlation finally landed at 13:17:53.2 — 58 s after the
+call. The page could name the owner the whole time. Now `requestIdsOf()` harvests every
+`metadata.request_id` in the turn with no opinion about recipient, path or tool, ships it as
+`turn.requests`, and `/correlations` accepts a sighting that carries a request id and no tool
+(`/events` still requires one — a transcript row without a tool name is meaningless).
+
+That also removes the second-order failure: the 30-minute retired-worker lease
+(`RETIRED_WORKER_TTL_MS`) makes `retiredLeaseAmbiguous` refuse every identity-sensitive call
+whose chat is not proven inside 15 s, which is why subagent launches failed ~50% of the time
+and *always* on a regenerate. The lease was firing correctly; it was starved of the proof.
+
+**2. One reused request id claimed several page turns.** ChatGPT reuses a single `request_id`
+across the retries inside a turn — session `2026-08-21-204027d1` had one id on three calls and
+another on two. `settledTurnOwner()` claims a page turn for the local turn that recorded its
+id, so after a Retry several page turns resolved to the same local turn, all of them emitted
+under it, and the extension painted the same answer twice (four assistant messages under one
+generation `g-6xh9pz1m3eqgg-8-11`, spanning two user messages). Ownership is now resolved
+across the whole scan first: a local turn owns exactly one page turn, and a contested turn id
+drops every claimant to unowned rather than picking one.
+
+Protocol: `FIBER_VERSION` / `RECORDER_VERSION` / `PAGE_RECORDER_VERSION` 8 -> 9, so a MAIN-world
+`fiber.js` left over from 1.9.1 is refused and re-injected rather than silently answering
+without `requests`. `BRIDGE_PROTOCOL` is unchanged at 6.
+
+- `npm run verify`: typecheck clean, 1088 passed / 83 skipped.
+- 10 new regression tests, each shown to fail against the reverted behaviour: 4 in
+  `test/fiber.test.ts` (bare-id harvest, allowlist, dedupe, turn kept when the id is all it
+  has), 4 in `test/content-script.test.ts` (bare-id handshake, labelled row wins when both
+  views carry the id, the two doubling cases) and 2 in `test/bridge.test.ts` (untooled
+  correlation accepted; evidence with no request id still refused).
+
+**Open — the extension must be reloaded by hand** after installing, `chrome://extensions` ->
+reload on ChatGPT Local Files. The protocol bump is between content.js and fiber.js, not
+between the extension and the app, so a stale 1.9.1 extension still connects and pairs.
+
+After the reload, the things to watch:
+
+- `request attribution: <id> -> conversation <id>` appears in the app log *while ChatGPT is
+  still running its safety check*, not after the answer lands.
+- No `request attribution: no page evidence for <id> within 15000ms` lines.
+- Subagent launches stop failing on a regenerate, and stop failing intermittently in a chat
+  whose worker was retired in the last 30 minutes.
+- A Retry no longer produces a duplicated assistant answer in the extension's stream.
+
 
 ## v1.9.1 — package and install record — **INSTALLED 2026-08-21**
 
