@@ -9,6 +9,9 @@ Status: `[ ]` open · `[~]` in progress · `[x]` done · `[?]` needs a decision 
 into this list; do not create a second TODO. Screenshots and other raw proof may live under
 `docs/evidence/`, but every actionable item belongs here.
 
+**Installed build: v1.9.1** — see the record directly below. The v1.8.8 note that used to
+stand here is kept for history:
+
 **Installed build: v1.8.8.** Verified directly on 2026-08-21 from
 `%LOCALAPPDATA%\Programs\ChatGPT Local Files\ChatGPT Local Files.exe`: file version `1.8.8`,
 product version `1.8.8.0`, written 07:14. Packaged-runtime smoke passed (version agreement,
@@ -16,6 +19,43 @@ extension scripts, tunnel-client, cloudflared, ripgrep, app.asar, node-pty, Shar
 libvips 8.18.3 with a real PNG encode). It replaces v1.8.4, which had been the installed
 build since 2026-08-20; the 1.8.7 that was running on 2026-08-21 came from a stale `out/`
 and is what T-174 below is about.
+
+## v1.9.1 — package and install record — **INSTALLED 2026-08-21**
+
+Commit `dd8f49b`. The fix for the outage where every connector call in a chat was filed under
+`Unattributed activity` while the popup showed the request id as read and sent: ownership was
+gated end to end on ChatGPT's `data-turn-id`, which its virtualized renderer omits. Ships with
+it the Fiber conversation-conflict bit, the fresh-reload provisional journal carry in
+background.js, and the recorder's discard/unattributed diagnostics.
+
+- Installer: `release/ChatGPT-Local-Files-Setup-1.9.1.exe`, 144,151,986 bytes,
+  SHA-256 `2F45F3CC7ACA8921019A09C119ACA365531BFC8FF5042E22E817A98EEACE526F`.
+- `node scripts/smoke-packaged-runtime.mjs` passed: `{"version":"1.9.1","sharp":"0.35.3",
+  "libvips":"8.18.3","pngBytes":95,"ptySpawn":"function"}`.
+- `npm run verify` before packaging: typecheck clean, 1078 passed / 83 skipped.
+- Installed `ChatGPT Local Files.exe` reports FileVersion `1.9.1`, ProductVersion `1.9.1.0`.
+  All five extension files under `resources/extension` hash-match the repo copies — the
+  1.8.7-style app/extension split check.
+- Live probe of the running build: `GET /hello` → `{"version":"1.9.1","bridge":6,
+  "compatible":true,"paired":true}` with `x-extension-protocol: 6`.
+
+**Open — the extension must be reloaded by hand.** `BRIDGE_PROTOCOL` is unchanged at 6, so
+unlike the 1.8.9 release there is no 426 gate to make the staleness loud: Chrome's loaded
+1.9.0 copy connects and pairs happily while still running the broken `content.js`. Until
+`chrome://extensions` → reload on ChatGPT Local Files, nothing in this release is in effect.
+
+After the reload, the things to watch:
+
+- New chats: connector calls appear under the chat itself, not `Unattributed activity`, and
+  the app log carries a `request attribution: <id> -> conversation <id>` line per call.
+- Subagents can address each other again (no `CALLER_IDENTITY_REQUIRED` /
+  `WORKER_IDENTITY_LOST` on calls that plainly came from a live chat), and calls stop
+  spending the full 15 s `REQUEST_ID_GRACE_MS` before being filed.
+- If something still lands unattributed, the log now names it:
+  `request attribution: no page evidence for <id> within 15000ms`, or
+  `... Discarded request ids: <ids>` when the URL and Fiber conversations disagree. Those two
+  lines are the ones to quote — their absence is what made this outage invisible.
+
 
 ## v1.8.9 — package and install record — **INSTALLED 2026-08-21**
 
