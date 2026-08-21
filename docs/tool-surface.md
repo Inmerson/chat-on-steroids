@@ -7,7 +7,7 @@ implementation brief.
 release — see the note at the top of that section. Measured on the shipped surface, the
 worst-case `tools/list` is **core 12,506 bytes over six tools** and **desktop 7,915 bytes
 over two**, down from the 45 tools / 60,484 bytes recorded in §1. `test/mcp.test.ts`
-holds those numbers as budgets. See T-101 in `TODO.md` for the state of the work.
+holds those numbers as budgets.
 
 The rule this document exists to enforce: *a new capability becomes a skill or a workflow
 over the existing primitives, not a new permanently exposed tool.*
@@ -332,7 +332,7 @@ What shipped:
 
 Compact, everywhere: offending field path, the bad value, the constraint it broke, and a
 corrected example. Never a dump of the whole schema — that harness bug is already recorded
-in `TOOL_CALL_ISSUES.md` and the new surface must not reintroduce it.
+in the maintainer's local tool-call audit, and the new surface must not reintroduce it.
 
 ## 4. What we deliberately do not copy from Codex
 

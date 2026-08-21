@@ -2,6 +2,25 @@
 
 A small Windows utility that gives ChatGPT access to folders **you** approve, over MCP, from your own PC.
 
+> ### ⚠️ This is a beta
+>
+> It works, it is tested (1000+ automated tests), and it is used daily by its author
+> — but it is a one-person project that moves fast, and it is asking you to point a
+> language model at your own filesystem. Please treat it accordingly:
+>
+> - **Point it at a project folder, not your whole home directory or `C:\`.**
+>   An approved folder is approved in full, including everything reachable through it.
+> - **Use it on code you have committed**, or otherwise backed up, somewhere else.
+> - **Path containment is defence in depth, not a kernel sandbox.** See
+>   [Privacy and security](#privacy-and-security) and [`SECURITY.md`](SECURITY.md).
+> - **The installer is unsigned**, so Windows will warn you. See
+>   [Installation](#installation) for exactly what you will see.
+> - Behaviour may change between releases, and ChatGPT's own Developer-mode UI
+>   changes underneath this app regularly.
+>
+> Bugs and rough edges are expected. [Reports](../../issues) are welcome;
+> security problems go [privately](SECURITY.md), not into a public issue.
+
 It is only a bridge and a permission manager. It has no chat interface of its own: you keep using ChatGPT, and this app decides what ChatGPT is allowed to touch.
 
 - Approve one or more folders. Nothing outside them is reachable.
@@ -20,9 +39,39 @@ The installer ships the version of [`tunnel-client`](https://github.com/openai/t
 
 ## Installation
 
-Download and run `ChatGPT-Local-Files-Setup-<version>.exe`, or build it yourself (see [Building](#building)).
+Download `ChatGPT-Local-Files-Setup-<version>.exe` from the
+[latest release](../../releases/latest) and run it, or build it yourself (see
+[Building](#building)).
 
 The installer is per-user and never asks for administrator rights. The app itself runs as an ordinary user and never elevates.
+
+### Windows will warn you, and that is expected
+
+**The installer is not code-signed.** A code-signing certificate costs a few hundred
+euros a year, and — this is the part that is rarely explained — an ordinary one would
+*not* remove the warning below anyway. SmartScreen trusts publishers by download
+reputation, which is earned over time and volume, not bought. For a beta, that money
+buys nothing. So: unsigned, and documented honestly instead.
+
+What you will see, and how to get past it:
+
+1. **Your browser** may say the file *"isn't commonly downloaded"* or *"can't be
+   verified"*. Choose **Keep** (in Chrome, via the **⋯** next to the download).
+2. **Windows SmartScreen** shows a blue box: *"Windows protected your PC"*. There is
+   no visible Run button. Click **More info**, then **Run anyway**.
+3. Because the install is per-user, there is no administrator prompt at any point.
+
+Verify what you downloaded before running it — from PowerShell:
+
+```powershell
+Get-FileHash .\ChatGPT-Local-Files-Setup-1.9.2.exe -Algorithm SHA256
+```
+
+Compare that against the checksum published in the release notes. If it does not
+match, do not run it, and please [report it](../../issues).
+
+If you would rather not click through a SmartScreen warning at all, that is a
+perfectly reasonable position — [build it from source](#building) instead.
 
 ## Connecting it to ChatGPT
 
@@ -154,7 +203,15 @@ The optional Chrome extension in [`extension/`](extension/) adds the browser hal
 
 ### Installing the extension
 
-It is not on the Chrome Web Store; load it directly.
+It is not on the Chrome Web Store; load it directly. (Publishing it there would mean a
+store review of an extension that reads your ChatGPT conversations — worth doing later,
+not worth blocking a beta on.)
+
+> **The extension and the app are versioned together.** `extension/manifest.json` is
+> bumped in lockstep with the app. After you update the app, open `chrome://extensions`
+> and press **Reload** on this extension. A mismatched pair will still connect, but can
+> mis-attribute tool calls to the wrong turn.
+
 
 1. Leave **Chat → Record this session** on, or enable it if your existing config has it off. The local bridge also runs when experimental multi-agent mode is enabled, because workers need the extension even if session recording is off.
 2. Open `chrome://extensions`, turn on **Developer mode**, press **Load unpacked** and pick the `extension` folder.
@@ -259,6 +316,18 @@ Spawning opens a fresh ChatGPT tab per worker, **with that worker's task as the 
 
 **Settings vanished after reinstalling.** They should not: everything lives in `%APPDATA%\chatgpt-local-files\` and the uninstaller is configured to leave it alone.
 
+## Contributing
+
+Bug reports and PRs are welcome. Please read [`CONTRIBUTING.md`](CONTRIBUTING.md)
+first — and for anything non-trivial, open an issue before writing code. Security
+issues go through [`SECURITY.md`](SECURITY.md), privately.
+
+[`AGENTS.md`](AGENTS.md) is the full architectural map of the repository: one section
+per subsystem, covering what it owns, its files, how it fails, and which tests cover
+it. It is the fastest way in, whether you are a person or an agent.
+
+Release history is in [`CHANGELOG.md`](CHANGELOG.md).
+
 ## Development
 
 ```sh
@@ -300,4 +369,7 @@ npm run dist:dir   # unpacked build, no installer
 
 ## Licence
 
-MIT.
+MIT — see [`LICENSE`](LICENSE).
+
+Not affiliated with, endorsed by, or connected to OpenAI. "ChatGPT" is a trademark of
+OpenAI; it is used here only to describe what this tool interoperates with.

@@ -127,10 +127,11 @@ Sources disagree here because the architecture moved fast. Precedence:
 1. current implementation **plus a reproducible test or live repro**;
 2. current declarations: `mcp/surfaces.ts`, `mcp/tools-core.ts`, `mcp/tools-desktop.ts`,
    `shared/types.ts`, `package.json`, `main/version.ts`, `extension/manifest.json`;
-3. the newest consolidated report under `bughunt-*` (evidence, not spec — see §21);
-4. `README.md`;
-5. historical design/audit files: `docs/tool-surface.md`, `TODO.md`,
-   `TOOL_CALL_ISSUES.md`, `TOOL_USABILITY_AUDIT.md`, `CLAUDE_LIVE_FINDINGS.md`.
+3. `README.md`;
+4. historical design/audit files: `docs/tool-surface.md`, plus the maintainer's local
+   working notes (`TODO.md`, `TOOL_CALL_ISSUES.md`, `CLAUDE_LIVE_FINDINGS.md` and the
+   `bughunt-*` forensic snapshots). Those are deliberately **not** published — see §21 —
+   so if you are working from a clone, treat §5–§18 of this file as the design record.
 
 **Code comments in this project are unusually load-bearing.** Many name the exact live
 failure that motivated a guard. Read the comment before deleting the guard or "simplifying"
@@ -810,17 +811,16 @@ Before cutting a version, synchronize `package.json`, `src/main/version.ts` and
 the **installed** app really contains the extension folder, tunnel binary, ripgrep resource
 and node-pty runtime — a successful installer build does not prove it.
 
-## 21. Current forensic context — `bughunt-2026-08-20/`
+## 21. Known-fragile areas
 
-Before changing extension identity/transcripts, MCP lifecycle, sandbox/path handling, the
-Codex ports, or session performance, read:
+The maintainer keeps detailed forensic audits (`bughunt-*/`) locally and does not publish
+them: for a tool that runs commands on someone's machine, a public catalogue of exact
+reproductions is an attack map. The honest summary belongs here instead.
 
-```text
-bughunt-2026-08-20/00-2026-08-20-1220-CONSOLIDATED-BUGHUNT.md
-```
-
-**Evidence from an active audit, not permanent specification.** Reproduce against the
-current tree before changing production code. Root clusters at that snapshot:
+**These are areas of known fragility, not permanent specification, and not a claim that
+each is currently broken.** Reproduce against the current tree before changing production
+code. Before touching extension identity/transcripts, MCP lifecycle, sandbox/path handling,
+the Codex ports, or session performance, understand the cluster you are entering:
 
 - **Request identity / Fiber health** — a bound worker keeps executing while its MCP calls
   become Unattributed; recovery proves the isolated recorder alive but can miss a dead
@@ -836,8 +836,11 @@ current tree before changing production code. Root clusters at that snapshot:
 - **Resource bounds** — session-history work and image decode must be bounded by computation
   and decoded size, not by requested count or compressed input size.
 
-**Do not scatter fixes across symptoms before proving the shared root.** The retained probes
-in that directory exist to reproduce several of these orderings.
+**Do not scatter fixes across symptoms before proving the shared root.**
+
+If you are contributing and need the underlying reproductions for one of these, open an
+issue and ask — they can be shared per-area. Suspected security issues go through
+`SECURITY.md`, privately, not into a public issue.
 
 ## 22. Definition of done
 

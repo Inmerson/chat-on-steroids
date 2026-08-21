@@ -12,3 +12,18 @@ resources/
 *.log
 .DS_Store
 Thumbs.db
+
+# Internal working notes and forensic audits. Kept locally, not published:
+# they are a detailed map of unfixed weaknesses in a tool that runs commands
+# on the user's machine. Architecture lives in AGENTS.md instead.
+TODO.md
+CLAUDE_LIVE_FINDINGS.md
+TOOL_CALL_ISSUES.md
+TOOL_USABILITY_AUDIT.md
+bughunt-*/
+docs/evidence/
+docs/android-mcp-brainstorm/
+
+# Smoke-test scratch fixtures.
+smoke/
+smoke-switch.txt
