@@ -17,6 +17,29 @@ libvips 8.18.3 with a real PNG encode). It replaces v1.8.4, which had been the i
 build since 2026-08-20; the 1.8.7 that was running on 2026-08-21 came from a stale `out/`
 and is what T-174 below is about.
 
+## v1.8.9 — package and install record — **INSTALLED 2026-08-21**
+
+Commit `8a1a00d`. Ships the 1.8.8 hardening pass, the test-suite fixes above, and the
+`BRIDGE_PROTOCOL` 5 → 6 bump the post-implementation review (L-02) left as a release
+decision.
+
+- Installer: `release/ChatGPT-Local-Files-Setup-1.8.9.exe`, 144,145,242 bytes,
+  SHA-256 `FA18BFD31BE31D5C8CB4BA9DB1F68BA1FB151F320F3E37F58375CA5127ABC847`.
+- `node scripts/smoke-packaged-runtime.mjs` passed: `{"version":"1.8.9","sharp":"0.35.3",
+  "libvips":"8.18.3","pngBytes":95,"ptySpawn":"function"}`.
+- Installed `ChatGPT Local Files.exe` reports FileVersion `1.8.9`. All four extension files
+  under `resources/extension` hash-match the repo copies, so no 1.8.7-style split where the
+  app and the extension disagree.
+- Live probe of the running build: `GET /hello` → `{"version":"1.8.9","bridge":6,
+  "compatible":true,"paired":true}` when the caller declares protocol 6.
+
+**Open — the extension must be reloaded by hand.** Chrome still holds the 1.8.8 copy it was
+loaded from, which sends protocol 5, so the new 426 gate rejects it on every stateful route.
+That is the bump working as intended, but until `chrome://extensions` → reload on ChatGPT
+Local Files, the browser side is dead. Watch after the reload: observations attributing to a
+session instead of UNIDENTIFIED_CALLER, and message ordering now driven by `authoredTime`.
+
+
 ## Test suite — 10+ minutes / hangs — **ALL FIXED 2026-08-21**
 
 Full suite before: minutes, often never finishing, 17+ spurious failures.
