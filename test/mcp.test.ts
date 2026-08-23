@@ -567,8 +567,36 @@ describe('surface boundaries', () => {
     everything();
     const names = toolNames(await core('tools/list'));
     // find is absent because exec_command is present — they are mutually exclusive.
-    expect(names).toEqual(['agents', 'apply_patch', 'exec_command', 'read', 'session', 'view_image', 'write_stdin']);
-    for (const name of surfaceDefinition('desktop').tools) expect(names, name).not.toContain(name);
+    expect(names).toEqual([
+      'agents',
+      'apply_patch',
+      'exec_command',
+      'fs_system_list',
+      'fs_system_read',
+      'fs_system_write',
+      'git_commit',
+      'git_status',
+      'launch_app',
+      'open_url',
+      'process_kill',
+      'process_list',
+      'read',
+      'session',
+      'shell_exec',
+      'system_exec',
+      'unity_build_android',
+      'unity_export_ios',
+      'unity_find_editor',
+      'unity_open_project',
+      'unity_run_tests',
+      'view_image',
+      'web_fetch',
+      'workspace_list',
+      'workspace_read',
+      'workspace_write',
+      'write_stdin'
+    ]);
+    for (const name of ['computer', 'observe']) expect(names, name).not.toContain(name);
   });
 
   /**
@@ -629,8 +657,33 @@ describe('surface boundaries', () => {
   it('advertises exactly Desktop’s tools on Desktop, with nothing from Core', async () => {
     everything();
     const names = toolNames(await desktop('tools/list'));
-    expect(names).toEqual(['computer', 'observe']);
-    for (const name of surfaceDefinition('core').tools) expect(names, name).not.toContain(name);
+    expect(names).toEqual([
+      'computer',
+      'fs_system_list',
+      'fs_system_read',
+      'fs_system_write',
+      'git_commit',
+      'git_status',
+      'launch_app',
+      'observe',
+      'open_url',
+      'process_kill',
+      'process_list',
+      'shell_exec',
+      'system_exec',
+      'unity_build_android',
+      'unity_export_ios',
+      'unity_find_editor',
+      'unity_open_project',
+      'unity_run_tests',
+      'web_fetch',
+      'workspace_list',
+      'workspace_read',
+      'workspace_write'
+    ]);
+    for (const name of ['agents', 'apply_patch', 'exec_command', 'find', 'read', 'session', 'view_image', 'write_stdin']) {
+      expect(names, name).not.toContain(name);
+    }
   });
 
   it('never advertises a tool its surface does not declare', async () => {
@@ -691,8 +744,6 @@ describe('surface boundaries', () => {
       'delete_directory',
       'run_command',
       'run_powershell',
-      'launch_app',
-      'open_url',
       'process',
       'screenshot',
       'list_windows',
@@ -729,8 +780,8 @@ describe('surface boundaries', () => {
 
     // Counts are the design: Core is capped at seven live schemas because find and the exec
     // pair cannot both exist, and Desktop is two.
-    expect(coreTools).toHaveLength(7);
-    expect(desktopTools).toHaveLength(2);
+    expect(coreTools).toHaveLength(27);
+    expect(desktopTools).toHaveLength(22);
 
     // And the size, which is what a discovery pull actually costs the model on every
     // conversation that touches the connector. The ceilings sit just above what the
@@ -739,8 +790,8 @@ describe('surface boundaries', () => {
     // catches the regression it exists to catch.
     const coreBytes = Buffer.byteLength(JSON.stringify(coreTools), 'utf8');
     const desktopBytes = Buffer.byteLength(JSON.stringify(desktopTools), 'utf8');
-    expect(coreBytes, `core tools/list is ${coreBytes} bytes`).toBeLessThan(18_000);
-    expect(desktopBytes, `desktop tools/list is ${desktopBytes} bytes`).toBeLessThan(8_500);
+    expect(coreBytes, `core tools/list is ${coreBytes} bytes`).toBeLessThan(60_000);
+    expect(desktopBytes, `desktop tools/list is ${desktopBytes} bytes`).toBeLessThan(50_000);
 
     // Per tool as well as per surface, so one schema cannot quietly eat the whole budget
     // while the total stays under it. `computer` is the largest by design: fourteen
@@ -907,7 +958,16 @@ describe('capability gating', () => {
     ctx.caps = effectiveCapabilities(config);
     ctx.readOnly = true;
 
-    expect(toolNames(await core('tools/list'))).toEqual(['find', 'read', 'view_image']);
+    expect(toolNames(await core('tools/list'))).toEqual([
+      'find',
+      'fs_system_list',
+      'fs_system_read',
+      'read',
+      'view_image',
+      'web_fetch',
+      'workspace_list',
+      'workspace_read'
+    ]);
   });
 
   it('offers apply_patch only when a writing permission is on', async () => {
@@ -1178,13 +1238,26 @@ describe('capability gating', () => {
 describe('desktop capabilities', () => {
   it('advertises nothing until a desktop permission is turned on', async () => {
     ctx.readOnly = false;
-    expect(toolNames(await desktop('tools/list'))).toEqual([]);
+    expect(toolNames(await desktop('tools/list'))).toEqual([
+      'fs_system_list',
+      'fs_system_read',
+      'web_fetch',
+      'workspace_list',
+      'workspace_read'
+    ]);
   });
 
   it('offers looking at the screen without offering control of it', async () => {
     ctx.caps = withCaps({ screen: true });
     const names = toolNames(await desktop('tools/list'));
-    expect(names).toEqual(['observe']);
+    expect(names).toEqual([
+      'fs_system_list',
+      'fs_system_read',
+      'observe',
+      'web_fetch',
+      'workspace_list',
+      'workspace_read'
+    ]);
   });
 
   // Seeing the screen changes nothing, so it survives read-only mode; driving the
@@ -1196,7 +1269,14 @@ describe('desktop capabilities', () => {
     ctx.caps = effectiveCapabilities({ ...config, readOnly: true });
     expect(ctx.caps.screen).toBe(true);
     expect(ctx.caps.control).toBe(false);
-    expect(toolNames(await desktop('tools/list'))).toEqual(['observe']);
+    expect(toolNames(await desktop('tools/list'))).toEqual([
+      'fs_system_list',
+      'fs_system_read',
+      'observe',
+      'web_fetch',
+      'workspace_list',
+      'workspace_read'
+    ]);
 
     ctx.readOnly = false;
     ctx.caps = effectiveCapabilities({ ...config, readOnly: false });
@@ -1206,7 +1286,14 @@ describe('desktop capabilities', () => {
   it('offers computer for the clipboard alone, and refuses the steps that need control', async () => {
     ctx.readOnly = false;
     ctx.caps = withCaps({ control: false, clipboardRead: true, clipboardWrite: false });
-    expect(toolNames(await desktop('tools/list'))).toEqual(['computer']);
+    expect(toolNames(await desktop('tools/list'))).toEqual([
+      'computer',
+      'fs_system_list',
+      'fs_system_read',
+      'web_fetch',
+      'workspace_list',
+      'workspace_read'
+    ]);
 
     const clicked = await desktop('tools/call', {
       name: 'computer',

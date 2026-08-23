@@ -108,7 +108,36 @@ const CORE: SurfaceDefinition = {
     'worker agents, subagents or a parallel swarm across several ChatGPT conversations.',
   cardSummary: 'Files, patches and the terminal. Required — this is the coding connector.',
   required: true,
-  tools: ['read', 'view_image', 'find', 'apply_patch', 'exec_command', 'write_stdin', 'session', 'agents']
+  tools: [
+    'read',
+    'view_image',
+    'find',
+    'apply_patch',
+    'exec_command',
+    'write_stdin',
+    'session',
+    'agents',
+    'workspace_list',
+    'workspace_read',
+    'workspace_write',
+    'shell_exec',
+    'unity_find_editor',
+    'unity_open_project',
+    'unity_run_tests',
+    'unity_build_android',
+    'unity_export_ios',
+    'git_status',
+    'git_commit',
+    'open_url',
+    'web_fetch',
+    'launch_app',
+    'system_exec',
+    'process_list',
+    'process_kill',
+    'fs_system_list',
+    'fs_system_read',
+    'fs_system_write'
+  ]
 };
 
 /**
@@ -126,14 +155,38 @@ const DESKTOP: SurfaceDefinition = {
   serverName: 'chat-on-steroids-desktop',
   connectorName: `${CONNECTOR_BRAND} Desktop`,
   description:
-    'See and control this Windows desktop, including its clipboard. ' +
+    'See and control this Windows desktop, browser, and full system applications, clipboard, workspaces, Unity and Git. ' +
     'Use for: taking a screenshot, reading what is on screen, listing and finding windows, inspecting buttons, fields and other UI controls, ' +
     'clicking, typing, pressing keys, scrolling and dragging in any Windows application, ' +
-    'and reading the clipboard or copying and pasting text between programs.',
+    'opening URLs in browser, fetching web pages, launching any app, running system PowerShell/CMD commands, ' +
+    'managing processes, reading/writing files anywhere on disk, and automating tasks across Windows.',
   cardSummary:
-    'Screenshots, windows, mouse/keyboard control and the clipboard. Optional — connect it only if you want desktop automation.',
+    'Full Windows system control: browser, apps, processes, shell commands, screenshots and GUI automation.',
   required: false,
-  tools: ['observe', 'computer']
+  tools: [
+    'observe',
+    'computer',
+    'workspace_list',
+    'workspace_read',
+    'workspace_write',
+    'shell_exec',
+    'unity_find_editor',
+    'unity_open_project',
+    'unity_run_tests',
+    'unity_build_android',
+    'unity_export_ios',
+    'git_status',
+    'git_commit',
+    'open_url',
+    'web_fetch',
+    'launch_app',
+    'system_exec',
+    'process_list',
+    'process_kill',
+    'fs_system_list',
+    'fs_system_read',
+    'fs_system_write'
+  ]
 };
 
 export const SURFACES: Record<SurfaceId, SurfaceDefinition> = { core: CORE, desktop: DESKTOP };
