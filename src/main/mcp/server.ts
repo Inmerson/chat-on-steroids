@@ -26,6 +26,7 @@ import { getConfig } from '../config.js';
 import { logError, logInfo, logWarn } from '../logger.js';
 import { buildServer, resetToolClock, type ToolContext } from './tools.js';
 import { SURFACE_IDS, surfaceDefinition, type SurfaceId } from './surfaces.js';
+import { readDurable, writeDurableSoon } from '../durable.js';
 
 const MAX_BODY_BYTES = 8 * 1024 * 1024;
 
@@ -239,6 +240,34 @@ export function forgetExposedSurface(): void {
   exposedFind = null;
 }
 
+interface SurfaceTokenStore {
+  tokens: Record<string, string>;
+}
+
+export async function resetSurfaceTokens(): Promise<void> {
+  const tokens: Record<string, string> = {};
+  for (const id of SURFACE_IDS) {
+    tokens[id] = randomBytes(32).toString('base64url');
+  }
+  writeDurableSoon('mcp-tokens', { tokens });
+}
+
+async function getOrCreateSurfaceTokens(): Promise<Record<SurfaceId, string>> {
+  const store = await readDurable<SurfaceTokenStore>('mcp-tokens');
+  const tokens: Record<string, string> = { ...(store?.tokens ?? {}) };
+  let changed = false;
+  for (const id of SURFACE_IDS) {
+    if (!tokens[id]) {
+      tokens[id] = randomBytes(32).toString('base64url');
+      changed = true;
+    }
+  }
+  if (changed) {
+    writeDurableSoon('mcp-tokens', { tokens });
+  }
+  return tokens as Record<SurfaceId, string>;
+}
+
 export async function startMcpServer(getContext: () => ToolContext): Promise<McpEndpoint> {
   // A per-session token in the path is what authorises callers. It is regenerated on
   // every app start, so a URL that leaks stops working when the app restarts.
@@ -247,13 +276,12 @@ export async function startMcpServer(getContext: () => ToolContext): Promise<Mcp
   resetToolClock();
   selfTestToken = randomBytes(16).toString('hex');
   tunnelProbeToken = randomBytes(16).toString('hex');
-  // One path per surface, each with its own token. Distinct tokens rather than one shared
-  // secret because the two connectors are configured separately in ChatGPT and may be
-  // shared, revoked or re-pasted at different times; a single token would make "give me
-  // Desktop" and "give me everything" the same act.
+  // One path per surface, each with its own persistent token so existing ChatGPT
+  // conversations survive local app restarts without disconnecting.
+  const persistedTokens = await getOrCreateSurfaceTokens();
   const surfacePaths = SURFACE_IDS.map((id) => ({
     id,
-    basePath: `/mcp/${id}/${randomBytes(32).toString('base64url')}`
+    basePath: `/mcp/${id}/${persistedTokens[id] || randomBytes(32).toString('base64url')}`
   }));
 
   // ChatGPT can keep a cached tools/list snapshot for the lifetime of a connector

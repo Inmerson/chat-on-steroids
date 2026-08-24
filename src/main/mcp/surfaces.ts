@@ -136,7 +136,16 @@ const CORE: SurfaceDefinition = {
     'process_kill',
     'fs_system_list',
     'fs_system_read',
-    'fs_system_write'
+    'fs_system_write',
+    'notify_user',
+    'memory_store',
+    'memory_recall',
+    'memory_list',
+    'memory_forget',
+    'task_start_background',
+    'task_status',
+    'task_kill',
+    'browser_search'
   ]
 };
 
@@ -158,10 +167,10 @@ const DESKTOP: SurfaceDefinition = {
     'See and control this Windows desktop, browser, and full system applications, clipboard, workspaces, Unity and Git. ' +
     'Use for: taking a screenshot, reading what is on screen, listing and finding windows, inspecting buttons, fields and other UI controls, ' +
     'clicking, typing, pressing keys, scrolling and dragging in any Windows application, ' +
-    'opening URLs in browser, fetching web pages, launching any app, running system PowerShell/CMD commands, ' +
-    'managing processes, reading/writing files anywhere on disk, and automating tasks across Windows.',
+    'opening URLs in browser, web search, fetching web pages, launching any app, running background tasks and PowerShell/CMD commands, ' +
+    'managing persistent memory, sending Windows notifications, and automating tasks across Windows.',
   cardSummary:
-    'Full Windows system control: browser, apps, processes, shell commands, screenshots and GUI automation.',
+    'Full Windows system control: browser, apps, background tasks, memory, shell commands, screenshots and GUI automation.',
   required: false,
   tools: [
     'observe',
@@ -185,7 +194,16 @@ const DESKTOP: SurfaceDefinition = {
     'process_kill',
     'fs_system_list',
     'fs_system_read',
-    'fs_system_write'
+    'fs_system_write',
+    'notify_user',
+    'memory_store',
+    'memory_recall',
+    'memory_list',
+    'memory_forget',
+    'task_start_background',
+    'task_status',
+    'task_kill',
+    'browser_search'
   ]
 };
 

@@ -1,14 +1,22 @@
 /**
- * Power Agent MCP tools for full Windows system autonomy, browser navigation,
- * web content fetching, process management, and unrestricted command execution.
+ * Power Agent MCP tools for full Windows system autonomy:
+ * - Browser navigation & clean web research
+ * - Web search (browser_search)
+ * - Long-term persistent agent memory (memory_store, memory_recall, memory_list, memory_forget)
+ * - Background async task execution (task_start_background, task_status, task_kill)
+ * - Windows native notifications (notify_user)
+ * - Application launcher & process management
+ * - Unrestricted system shell execution
+ * - System-wide file management
  */
 
-import { spawn } from 'node:child_process';
+import { spawn, type ChildProcess } from 'node:child_process';
 import nodePath from 'node:path';
 import { rawPromises as fs } from '../rawfs.js';
 import { z } from 'zod';
-import { childEnv } from '../exec.js';
+import { childEnv, terminateProcessTree } from '../exec.js';
 import { fail, guard, ok, type SurfaceRegistrar } from './kernel.js';
+import { readDurable, writeDurableSoon } from '../durable.js';
 
 const MAX_TEXT_BYTES = 2 * 1024 * 1024;
 const MAX_PROCESS_OUTPUT_BYTES = 2 * 1024 * 1024;
@@ -125,8 +133,459 @@ export function htmlToCleanMarkdown(html: string): string {
     .slice(0, MAX_TEXT_BYTES);
 }
 
+// ---------------------------------------------------------------- Background Tasks Store
+export interface BackgroundTask {
+  id: string;
+  command: string;
+  shell: string;
+  cwd: string;
+  startedAt: number;
+  completedAt?: number;
+  status: 'running' | 'completed' | 'failed' | 'killed';
+  exitCode: number | null;
+  stdout: Buffer[];
+  stderr: Buffer[];
+  stdoutBytes: number;
+  stderrBytes: number;
+  child: ChildProcess | null;
+}
+
+const backgroundTasks = new Map<string, BackgroundTask>();
+
+// ---------------------------------------------------------------- Persistent Memory Store
+export interface MemoryItem {
+  key: string;
+  category: string;
+  content: string;
+  updatedAt: string;
+}
+
+interface MemoryStoreState {
+  memories: Record<string, MemoryItem>;
+}
+
+async function loadMemories(): Promise<Record<string, MemoryItem>> {
+  const data = await readDurable<MemoryStoreState>('agent-memory');
+  return data?.memories ?? {};
+}
+
+async function saveMemories(memories: Record<string, MemoryItem>): Promise<void> {
+  writeDurableSoon('agent-memory', { memories });
+}
+
 export function registerPowerAgentTools(reg: SurfaceRegistrar): void {
   const { caps, exposedCaps } = reg;
+
+  // ---------------------------------------------------------------- notify_user
+  if (exposedCaps.command) {
+    reg.register(
+      'notify_user',
+      {
+        title: 'Send Windows notification to user',
+        description:
+          'Display a native Windows Toast notification to the user with title, message, and sound. Useful when long builds or tasks finish.',
+        inputSchema: z
+          .object({
+            title: z.string().max(100).optional().default('Chat On Steroids').describe('Notification title.'),
+            message: z.string().min(1).max(500).describe('Notification text to display.'),
+            sound: z.boolean().optional().default(true).describe('Whether to play notification chime.')
+          })
+          .strict(),
+        annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false }
+      },
+      async ({ title, message, sound }) =>
+        reg.guarded('command', 'notify_user', async () => {
+          try {
+            const script = `
+Add-Type -AssemblyName System.Windows.Forms;
+$notify = New-Object System.Windows.Forms.NotifyIcon;
+$notify.Icon = [System.Drawing.SystemIcons]::Information;
+$notify.BalloonTipTitle = ${JSON.stringify(title || 'Chat On Steroids')};
+$notify.BalloonTipText = ${JSON.stringify(message)};
+$notify.Visible = $true;
+$notify.ShowBalloonTip(7000);
+Start-Sleep -Milliseconds 200;
+$notify.Dispose();
+`;
+            await runSystemProcess('powershell.exe', ['-NoProfile', '-Command', script], process.cwd(), 8_000);
+            return ok(`Notification displayed: "${title || 'Chat On Steroids'}: ${message}"`);
+          } catch (error) {
+            return fail(`Failed to send notification: ${(error as Error).message}`);
+          }
+        })
+    );
+  }
+
+  // ---------------------------------------------------------------- memory_store
+  if (exposedCaps.create || exposedCaps.edit) {
+    reg.register(
+      'memory_store',
+      {
+        title: 'Store persistent memory',
+        description:
+          'Save a persistent fact, project preference, guideline, or context to local memory so it is remembered across all future chats.',
+        inputSchema: z
+          .object({
+            key: z.string().min(1).max(100).describe('Unique memory key/topic (e.g. "unity_rules", "user_preferences").'),
+            content: z.string().min(1).max(50_000).describe('Information to remember.'),
+            category: z.string().max(50).optional().default('general').describe('Category (e.g. "project", "preference", "tooling").')
+          })
+          .strict(),
+        annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false }
+      },
+      async ({ key, content, category }) =>
+        guard('memory_store', async () => {
+          try {
+            const memories = await loadMemories();
+            const cleanKey = key.trim().toLowerCase();
+            memories[cleanKey] = {
+              key: cleanKey,
+              category: category || 'general',
+              content,
+              updatedAt: new Date().toISOString()
+            };
+            await saveMemories(memories);
+            return ok(`Stored memory for "${cleanKey}" under category "${category || 'general'}".`);
+          } catch (error) {
+            return fail(`Failed to store memory: ${(error as Error).message}`);
+          }
+        })
+    );
+  }
+
+  // ---------------------------------------------------------------- memory_recall
+  if (exposedCaps.read) {
+    reg.register(
+      'memory_recall',
+      {
+        title: 'Recall persistent memory',
+        description: 'Retrieve or search facts, guidelines, and context previously saved in persistent agent memory.',
+        inputSchema: z
+          .object({
+            query: z.string().max(200).optional().describe('Search term to look for in keys and memory content.'),
+            category: z.string().max(50).optional().describe('Filter by memory category.')
+          })
+          .strict(),
+        annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false }
+      },
+      async ({ query, category }) =>
+        reg.guarded('read', 'memory_recall', async () => {
+          try {
+            const memories = await loadMemories();
+            let list = Object.values(memories);
+            if (category) {
+              list = list.filter((m) => m.category.toLowerCase() === category.toLowerCase());
+            }
+            if (query) {
+              const needle = query.toLowerCase();
+              list = list.filter((m) => m.key.includes(needle) || m.content.toLowerCase().includes(needle));
+            }
+            if (list.length === 0) return ok('No matching persistent memories found.');
+            const formatted = list
+              .map((m) => `### [${m.category}] ${m.key} (Updated: ${m.updatedAt})\n${m.content}`)
+              .join('\n\n---\n\n');
+            return ok(formatted);
+          } catch (error) {
+            return fail(`Failed to recall memory: ${(error as Error).message}`);
+          }
+        })
+    );
+  }
+
+  // ---------------------------------------------------------------- memory_list
+  if (exposedCaps.read) {
+    reg.register(
+      'memory_list',
+      {
+        title: 'List all persistent memories',
+        description: 'List all stored memory keys and categories.',
+        inputSchema: z.object({}).strict(),
+        annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false }
+      },
+      async () =>
+        reg.guarded('read', 'memory_list', async () => {
+          try {
+            const memories = await loadMemories();
+            const keys = Object.values(memories);
+            if (keys.length === 0) return ok('Persistent memory is currently empty.');
+            const lines = keys.map((m) => `- [${m.category}] ${m.key} (${Buffer.byteLength(m.content, 'utf8')} bytes)`);
+            return ok(`Stored memories (${keys.length}):\n${lines.join('\n')}`);
+          } catch (error) {
+            return fail(`Failed to list memories: ${(error as Error).message}`);
+          }
+        })
+    );
+  }
+
+  // ---------------------------------------------------------------- memory_forget
+  if (exposedCaps.create || exposedCaps.edit) {
+    reg.register(
+      'memory_forget',
+      {
+        title: 'Forget persistent memory',
+        description: 'Delete a specific key from persistent memory.',
+        inputSchema: z
+          .object({
+            key: z.string().min(1).max(100).describe('Key of the memory to delete.')
+          })
+          .strict(),
+        annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false }
+      },
+      async ({ key }) =>
+        guard('memory_forget', async () => {
+          try {
+            const memories = await loadMemories();
+            const cleanKey = key.trim().toLowerCase();
+            if (!memories[cleanKey]) return ok(`Key "${cleanKey}" was not found in memory.`);
+            delete memories[cleanKey];
+            await saveMemories(memories);
+            return ok(`Deleted memory key "${cleanKey}".`);
+          } catch (error) {
+            return fail(`Failed to forget memory: ${(error as Error).message}`);
+          }
+        })
+    );
+  }
+
+  // ---------------------------------------------------------------- task_start_background
+  if (exposedCaps.command) {
+    reg.register(
+      'task_start_background',
+      {
+        title: 'Start background async task',
+        description:
+          'Run a long-running command (e.g. builds, tests, long scripts) in background without blocking ChatGPT or timing out. Returns task_id immediately.',
+        inputSchema: z
+          .object({
+            command: z.string().min(1).max(32_000).describe('The command to run.'),
+            shell: z.enum(['powershell', 'pwsh', 'cmd']).optional().default('powershell').describe('Shell to use.'),
+            cwd: z.string().max(1024).optional().describe('Working directory.')
+          })
+          .strict(),
+        annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true }
+      },
+      async ({ command, shell, cwd }) =>
+        reg.guarded('command', 'task_start_background', async () => {
+          try {
+            const taskId = `task_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+            const workDir = cwd ? nodePath.resolve(cwd) : process.env.USERPROFILE || process.cwd();
+
+            let executable: string;
+            let args: string[];
+
+            if (shell === 'cmd') {
+              executable = 'cmd.exe';
+              args = ['/d', '/c', command];
+            } else if (shell === 'pwsh') {
+              executable = 'pwsh.exe';
+              args = ['-NoProfile', '-Command', command];
+            } else {
+              executable = 'powershell.exe';
+              args = ['-NoProfile', '-Command', command];
+            }
+
+            const child = spawn(executable, args, {
+              cwd: workDir,
+              env: childEnv(),
+              windowsHide: true,
+              stdio: ['ignore', 'pipe', 'pipe']
+            });
+
+            const taskEntry: BackgroundTask = {
+              id: taskId,
+              command,
+              shell: shell ?? 'powershell',
+              cwd: workDir,
+              startedAt: Date.now(),
+              status: 'running',
+              exitCode: null,
+              stdout: [],
+              stderr: [],
+              stdoutBytes: 0,
+              stderrBytes: 0,
+              child
+            };
+
+            const outState = { bytes: 0, truncated: false };
+            const errState = { bytes: 0, truncated: false };
+
+            child.stdout?.on('data', (chunk: Buffer) => {
+              appendBounded(taskEntry.stdout, chunk, outState);
+              taskEntry.stdoutBytes = outState.bytes;
+            });
+            child.stderr?.on('data', (chunk: Buffer) => {
+              appendBounded(taskEntry.stderr, chunk, errState);
+              taskEntry.stderrBytes = errState.bytes;
+            });
+
+            child.once('error', (err) => {
+              taskEntry.status = 'failed';
+              taskEntry.completedAt = Date.now();
+              taskEntry.stderr.push(Buffer.from(`Spawn error: ${err.message}`));
+            });
+
+            child.once('close', (code) => {
+              if (taskEntry.status === 'running') {
+                taskEntry.status = code === 0 ? 'completed' : 'failed';
+                taskEntry.exitCode = code;
+                taskEntry.completedAt = Date.now();
+              }
+            });
+
+            backgroundTasks.set(taskId, taskEntry);
+            return ok(`Started background task with ID: ${taskId}\nUse task_status(task_id="${taskId}") to check progress.`);
+          } catch (error) {
+            return fail(`Failed to start background task: ${(error as Error).message}`);
+          }
+        })
+    );
+  }
+
+  // ---------------------------------------------------------------- task_status
+  if (exposedCaps.command) {
+    reg.register(
+      'task_status',
+      {
+        title: 'Check background task status',
+        description: 'Get real-time execution status, exit code, and live stdout/stderr log output of a background task.',
+        inputSchema: z
+          .object({
+            task_id: z.string().min(1).describe('The task ID returned by task_start_background.'),
+            max_lines: z.number().int().min(1).max(200).optional().default(50)
+          })
+          .strict(),
+        annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false }
+      },
+      async ({ task_id, max_lines }) =>
+        reg.guarded('command', 'task_status', async () => {
+          const task = backgroundTasks.get(task_id);
+          if (!task) return fail(`Task "${task_id}" not found.`);
+
+          const durationSec = Math.round(((task.completedAt ?? Date.now()) - task.startedAt) / 1000);
+          const stdoutText = Buffer.concat(task.stdout).toString('utf8').trim();
+          const stderrText = Buffer.concat(task.stderr).toString('utf8').trim();
+
+          const limit = max_lines ?? 50;
+          const outLines = stdoutText ? stdoutText.split('\n').slice(-limit).join('\n') : '(empty)';
+          const errLines = stderrText ? stderrText.split('\n').slice(-limit).join('\n') : '';
+
+          const parts = [
+            `Task ID: ${task.id}`,
+            `Status: ${task.status.toUpperCase()}`,
+            `Duration: ${durationSec}s`,
+            `Exit code: ${task.exitCode ?? 'still running'}`,
+            `\n--- Recent stdout (${outLines.split('\n').length} lines) ---\n${outLines}`
+          ];
+          if (errLines) parts.push(`\n--- Recent stderr ---\n${errLines}`);
+
+          return ok(parts.join('\n'));
+        })
+    );
+  }
+
+  // ---------------------------------------------------------------- task_kill
+  if (exposedCaps.command) {
+    reg.register(
+      'task_kill',
+      {
+        title: 'Kill background task',
+        description: 'Terminate a running background task by task_id.',
+        inputSchema: z
+          .object({
+            task_id: z.string().min(1).describe('Task ID to terminate.')
+          })
+          .strict(),
+        annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false }
+      },
+      async ({ task_id }) =>
+        reg.guarded('command', 'task_kill', async () => {
+          const task = backgroundTasks.get(task_id);
+          if (!task) return fail(`Task "${task_id}" not found.`);
+          if (task.status !== 'running' || !task.child || task.child.pid === undefined) {
+            return ok(`Task "${task_id}" is already in state: ${task.status}`);
+          }
+          task.status = 'killed';
+          task.completedAt = Date.now();
+          await terminateProcessTree(task.child.pid).catch(() => {
+            try {
+              task.child?.kill('SIGKILL');
+            } catch {
+              /* gone */
+            }
+          });
+          return ok(`Terminated background task "${task_id}".`);
+        })
+    );
+  }
+
+  // ---------------------------------------------------------------- browser_search
+  if (exposedCaps.read) {
+    reg.register(
+      'browser_search',
+      {
+        title: 'Search the web',
+        description: 'Search the web using public search APIs and extract top results with titles, links, and snippets.',
+        inputSchema: z
+          .object({
+            query: z.string().min(1).max(500).describe('Search query string.'),
+            max_results: z.number().int().min(1).max(20).optional().default(8)
+          })
+          .strict(),
+        annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true }
+      },
+      async ({ query, max_results }) =>
+        reg.guarded('read', 'browser_search', async () => {
+          try {
+            const url = `https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}`;
+            const response = await fetch(url, {
+              headers: {
+                'User-Agent':
+                  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36',
+                Accept: 'text/html'
+              },
+              signal: AbortSignal.timeout(15_000)
+            });
+
+            if (!response.ok) return fail(`Search request failed with HTTP ${response.status}`);
+            const html = await response.text();
+
+            const results: Array<{ title: string; link: string; snippet: string }> = [];
+            const resultBlocks = html.split(/class=["']result__body["']/gi).slice(1);
+
+            for (const block of resultBlocks) {
+              const linkMatch =
+                /<a\s+class=["']result__url["'][^>]*href=["']([^"']+)["']/i.exec(block) ||
+                /<a\s+class=["']result__snippet["'][^>]*href=["']([^"']+)["']/i.exec(block) ||
+                /<a[^>]+href=["']([^"']+)["'][^>]*class=["']result__a["']/i.exec(block);
+
+              const titleMatch = /<a[^>]*class=["']result__a["'][^>]*>(.*?)<\/a>/i.exec(block);
+              const snippetMatch = /<a[^>]*class=["']result__snippet["'][^>]*>(.*?)<\/a>/i.exec(block);
+
+              if (titleMatch?.[1]) {
+                const title = titleMatch[1].replace(/<[^>]+>/g, '').trim();
+                let link = linkMatch?.[1] ? linkMatch[1] : '';
+                if (link && link.startsWith('//duckduckgo.com/l/?uddg=')) {
+                  const actualUrl = new URL(`https:${link}`).searchParams.get('uddg');
+                  if (actualUrl) link = actualUrl;
+                }
+                const snippet = snippetMatch?.[1] ? snippetMatch[1].replace(/<[^>]+>/g, '').trim() : '';
+                results.push({ title, link, snippet });
+              }
+              if (results.length >= (max_results ?? 8)) break;
+            }
+
+            if (results.length === 0) return ok(`No search results found for "${query}".`);
+
+            const lines = results.map(
+              (r, idx) => `${idx + 1}. **[${r.title}](${r.link})**\n   ${r.snippet}`
+            );
+            return ok(`--- Search Results for "${query}" ---\n\n${lines.join('\n\n')}`);
+          } catch (error) {
+            return fail(`Search failed: ${(error as Error).message}`);
+          }
+        })
+    );
+  }
 
   // ---------------------------------------------------------------- open_url
   if (exposedCaps.command) {

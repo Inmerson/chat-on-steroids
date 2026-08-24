@@ -3,6 +3,7 @@ import { htmlToCleanMarkdown, runSystemProcess } from '../src/main/mcp/tools-pow
 import path from 'node:path';
 import { promises as fs } from 'node:fs';
 import os from 'node:os';
+import { initDurableStore, readDurable, writeDurableNow } from '../src/main/durable.js';
 
 describe('Power Agent tools', () => {
   it('converts HTML to clean readable markdown', () => {
@@ -48,6 +49,29 @@ describe('Power Agent tools', () => {
 
     const entries = await fs.readdir(tempDir);
     expect(entries).toContain('subfolder');
+
+    await fs.rm(tempDir, { recursive: true, force: true });
+  });
+
+  it('persists and recalls agent memory via durable store', async () => {
+    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'cglf-mem-test-'));
+    initDurableStore(tempDir);
+
+    const testMemories = {
+      memories: {
+        project_goal: {
+          key: 'project_goal',
+          category: 'project',
+          content: 'Autonomous AI bridge on Windows',
+          updatedAt: new Date().toISOString()
+        }
+      }
+    };
+
+    await writeDurableNow('agent-memory', testMemories);
+
+    const retrieved = await readDurable<typeof testMemories>('agent-memory');
+    expect(retrieved?.memories.project_goal.content).toBe('Autonomous AI bridge on Windows');
 
     await fs.rm(tempDir, { recursive: true, force: true });
   });

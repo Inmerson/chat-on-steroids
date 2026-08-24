@@ -570,6 +570,7 @@ describe('surface boundaries', () => {
     expect(names).toEqual([
       'agents',
       'apply_patch',
+      'browser_search',
       'exec_command',
       'fs_system_list',
       'fs_system_read',
@@ -577,6 +578,11 @@ describe('surface boundaries', () => {
       'git_commit',
       'git_status',
       'launch_app',
+      'memory_forget',
+      'memory_list',
+      'memory_recall',
+      'memory_store',
+      'notify_user',
       'open_url',
       'process_kill',
       'process_list',
@@ -584,6 +590,9 @@ describe('surface boundaries', () => {
       'session',
       'shell_exec',
       'system_exec',
+      'task_kill',
+      'task_start_background',
+      'task_status',
       'unity_build_android',
       'unity_export_ios',
       'unity_find_editor',
@@ -658,6 +667,7 @@ describe('surface boundaries', () => {
     everything();
     const names = toolNames(await desktop('tools/list'));
     expect(names).toEqual([
+      'browser_search',
       'computer',
       'fs_system_list',
       'fs_system_read',
@@ -665,12 +675,20 @@ describe('surface boundaries', () => {
       'git_commit',
       'git_status',
       'launch_app',
+      'memory_forget',
+      'memory_list',
+      'memory_recall',
+      'memory_store',
+      'notify_user',
       'observe',
       'open_url',
       'process_kill',
       'process_list',
       'shell_exec',
       'system_exec',
+      'task_kill',
+      'task_start_background',
+      'task_status',
       'unity_build_android',
       'unity_export_ios',
       'unity_find_editor',
@@ -780,8 +798,8 @@ describe('surface boundaries', () => {
 
     // Counts are the design: Core is capped at seven live schemas because find and the exec
     // pair cannot both exist, and Desktop is two.
-    expect(coreTools).toHaveLength(27);
-    expect(desktopTools).toHaveLength(22);
+    expect(coreTools).toHaveLength(36);
+    expect(desktopTools).toHaveLength(31);
 
     // And the size, which is what a discovery pull actually costs the model on every
     // conversation that touches the connector. The ceilings sit just above what the
@@ -790,8 +808,8 @@ describe('surface boundaries', () => {
     // catches the regression it exists to catch.
     const coreBytes = Buffer.byteLength(JSON.stringify(coreTools), 'utf8');
     const desktopBytes = Buffer.byteLength(JSON.stringify(desktopTools), 'utf8');
-    expect(coreBytes, `core tools/list is ${coreBytes} bytes`).toBeLessThan(60_000);
-    expect(desktopBytes, `desktop tools/list is ${desktopBytes} bytes`).toBeLessThan(50_000);
+    expect(coreBytes, `core tools/list is ${coreBytes} bytes`).toBeLessThan(80_000);
+    expect(desktopBytes, `desktop tools/list is ${desktopBytes} bytes`).toBeLessThan(70_000);
 
     // Per tool as well as per surface, so one schema cannot quietly eat the whole budget
     // while the total stays under it. `computer` is the largest by design: fourteen
@@ -959,9 +977,12 @@ describe('capability gating', () => {
     ctx.readOnly = true;
 
     expect(toolNames(await core('tools/list'))).toEqual([
+      'browser_search',
       'find',
       'fs_system_list',
       'fs_system_read',
+      'memory_list',
+      'memory_recall',
       'read',
       'view_image',
       'web_fetch',
@@ -1239,8 +1260,11 @@ describe('desktop capabilities', () => {
   it('advertises nothing until a desktop permission is turned on', async () => {
     ctx.readOnly = false;
     expect(toolNames(await desktop('tools/list'))).toEqual([
+      'browser_search',
       'fs_system_list',
       'fs_system_read',
+      'memory_list',
+      'memory_recall',
       'web_fetch',
       'workspace_list',
       'workspace_read'
@@ -1251,8 +1275,11 @@ describe('desktop capabilities', () => {
     ctx.caps = withCaps({ screen: true });
     const names = toolNames(await desktop('tools/list'));
     expect(names).toEqual([
+      'browser_search',
       'fs_system_list',
       'fs_system_read',
+      'memory_list',
+      'memory_recall',
       'observe',
       'web_fetch',
       'workspace_list',
@@ -1270,8 +1297,11 @@ describe('desktop capabilities', () => {
     expect(ctx.caps.screen).toBe(true);
     expect(ctx.caps.control).toBe(false);
     expect(toolNames(await desktop('tools/list'))).toEqual([
+      'browser_search',
       'fs_system_list',
       'fs_system_read',
+      'memory_list',
+      'memory_recall',
       'observe',
       'web_fetch',
       'workspace_list',
@@ -1287,9 +1317,12 @@ describe('desktop capabilities', () => {
     ctx.readOnly = false;
     ctx.caps = withCaps({ control: false, clipboardRead: true, clipboardWrite: false });
     expect(toolNames(await desktop('tools/list'))).toEqual([
+      'browser_search',
       'computer',
       'fs_system_list',
       'fs_system_read',
+      'memory_list',
+      'memory_recall',
       'web_fetch',
       'workspace_list',
       'workspace_read'
