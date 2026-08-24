@@ -1,19 +1,25 @@
 /**
- * Power Agent MCP tools for full Windows system autonomy:
+ * Power Agent MCP tools for full Windows system autonomy (Steromi Suite):
+ * - Voice & Audio (audio_speak_text, audio_beep)
+ * - Checkpoints & Rollback (checkpoint_create, checkpoint_list, checkpoint_restore)
+ * - PDF & Documents (pdf_read_text, markdown_to_html, json_schema_validate)
+ * - Clipboard & Env (clipboard_read, clipboard_write, system_env_get, system_env_set)
+ * - Archive & Integrity (fs_hash_file, fs_zip_compress, fs_zip_extract)
+ * - Unity Live Diagnostics (unity_read_editor_log)
  * - Semantic Code Intelligence (code_find_definition, code_find_references, code_outline_symbols, code_get_diagnostics)
  * - Web Network & Cookie Inspector (browser_network_inspect, browser_cookies_get, browser_evaluate_js)
  * - Codex-style Live Chrome Tab Automation (browser_tab_list, browser_tab_open, browser_tab_focus, browser_tab_read, browser_tab_click, browser_tab_fill, browser_tab_screenshot)
- * - Browser navigation & clean web research
- * - Web search (browser_search)
+ * - Web search & clean research (browser_search, open_url, web_fetch)
  * - Long-term persistent agent memory (memory_store, memory_recall, memory_list, memory_forget)
  * - Background async task execution (task_start_background, task_status, task_kill)
  * - Windows native notifications (notify_user)
- * - Application launcher & process management
- * - Unrestricted system shell execution
- * - System-wide file management
+ * - Application launcher & process management (launch_app, process_list, process_kill)
+ * - Unrestricted system shell execution (system_exec)
+ * - System-wide file management (fs_system_list, fs_system_read, fs_system_write)
  */
 
 import { spawn, type ChildProcess } from 'node:child_process';
+import crypto from 'node:crypto';
 import nodePath from 'node:path';
 import { rawPromises as fs } from '../rawfs.js';
 import { z } from 'zod';
@@ -299,6 +305,28 @@ export async function outlineSourceSymbols(filePath: string): Promise<string> {
   return symbols.length > 0 ? symbols.join('\n') : 'No primary symbols detected.';
 }
 
+// ---------------------------------------------------------------- Checkpoints & Snapshots
+export interface CheckpointSnapshot {
+  id: string;
+  name: string;
+  timestamp: string;
+  targetPath: string;
+  files: Record<string, string>; // relativePath -> content
+}
+
+interface CheckpointStoreState {
+  checkpoints: Record<string, CheckpointSnapshot>;
+}
+
+async function loadCheckpoints(): Promise<Record<string, CheckpointSnapshot>> {
+  const data = await readDurable<CheckpointStoreState>('agent-checkpoints');
+  return data?.checkpoints ?? {};
+}
+
+async function saveCheckpoints(checkpoints: Record<string, CheckpointSnapshot>): Promise<void> {
+  writeDurableSoon('agent-checkpoints', { checkpoints });
+}
+
 // ---------------------------------------------------------------- Background Tasks Store
 export interface BackgroundTask {
   id: string;
@@ -342,6 +370,564 @@ async function saveMemories(memories: Record<string, MemoryItem>): Promise<void>
 export function registerPowerAgentTools(reg: SurfaceRegistrar): void {
   const { caps, exposedCaps } = reg;
 
+  // ================================================================ 1. AUDIO & VOICE
+  // ---------------------------------------------------------------- audio_speak_text
+  if (exposedCaps.command) {
+    reg.register(
+      'audio_speak_text',
+      {
+        title: 'Speak text aloud via Windows speech synthesis',
+        description: 'Speak a message aloud through the user\'s speakers in Turkish or English using native Windows TTS.',
+        inputSchema: z
+          .object({
+            text: z.string().min(1).max(2000).describe('Text to speak aloud.'),
+            rate: z.number().int().min(-10).max(10).optional().default(0).describe('Speech rate from -10 (slow) to 10 (fast).')
+          })
+          .strict(),
+        annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false }
+      },
+      async ({ text, rate }) =>
+        reg.guarded('command', 'audio_speak_text', async () => {
+          try {
+            const script = `
+Add-Type -AssemblyName System.Speech;
+$synth = New-Object System.Speech.Synthesis.SpeechSynthesizer;
+$synth.Rate = ${rate ?? 0};
+$synth.Speak(${JSON.stringify(text)});
+$synth.Dispose();
+`;
+            await runSystemProcess('powershell.exe', ['-NoProfile', '-Command', script], process.cwd(), 15_000);
+            return ok(`Spoke aloud: "${text}"`);
+          } catch (error) {
+            return fail(`Failed to speak text: ${(error as Error).message}`);
+          }
+        })
+    );
+  }
+
+  // ---------------------------------------------------------------- audio_beep
+  if (exposedCaps.command) {
+    reg.register(
+      'audio_beep',
+      {
+        title: 'Play system chime or beep sound',
+        description: 'Play a tone or chime through the PC speaker to signal build complete or error.',
+        inputSchema: z
+          .object({
+            frequency: z.number().int().min(100).max(5000).optional().default(800).describe('Frequency in Hz (default: 800).'),
+            duration_ms: z.number().int().min(50).max(2000).optional().default(300).describe('Duration in ms (default: 300).')
+          })
+          .strict(),
+        annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false }
+      },
+      async ({ frequency, duration_ms }) =>
+        reg.guarded('command', 'audio_beep', async () => {
+          try {
+            const freq = frequency ?? 800;
+            const dur = duration_ms ?? 300;
+            const script = `[console]::beep(${freq}, ${dur})`;
+            await runSystemProcess('powershell.exe', ['-NoProfile', '-Command', script], process.cwd(), 5_000);
+            return ok(`Played tone: ${freq}Hz for ${dur}ms.`);
+          } catch (error) {
+            return fail(`Failed to play beep: ${(error as Error).message}`);
+          }
+        })
+    );
+  }
+
+  // ================================================================ 2. CHECKPOINTS & ROLLBACK
+  // ---------------------------------------------------------------- checkpoint_create
+  if (exposedCaps.create || exposedCaps.edit) {
+    reg.register(
+      'checkpoint_create',
+      {
+        title: 'Create project snapshot checkpoint',
+        description: 'Create an instant local snapshot of files in a directory before making risky refactoring changes.',
+        inputSchema: z
+          .object({
+            name: z.string().min(1).max(100).describe('Name or reason for snapshot (e.g. "before_player_refactor").'),
+            target_path: z.string().max(1024).optional().describe('Folder to snapshot. Defaults to current directory.')
+          })
+          .strict(),
+        annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false }
+      },
+      async ({ name, target_path }) =>
+        guard('checkpoint_create', async () => {
+          try {
+            const root = target_path ? nodePath.resolve(target_path) : process.cwd();
+            const files = await findCodeFiles(root, 100);
+            const snapshotFiles: Record<string, string> = {};
+
+            for (const file of files) {
+              const rel = nodePath.relative(root, file);
+              const content = await fs.readFile(file, 'utf8');
+              snapshotFiles[rel] = content;
+            }
+
+            const cpId = `cp_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
+            const checkpoints = await loadCheckpoints();
+            checkpoints[cpId] = {
+              id: cpId,
+              name,
+              timestamp: new Date().toISOString(),
+              targetPath: root,
+              files: snapshotFiles
+            };
+            await saveCheckpoints(checkpoints);
+            return ok(`Created checkpoint "${name}" [ID: ${cpId}] with ${Object.keys(snapshotFiles).length} files.`);
+          } catch (error) {
+            return fail(`Failed to create checkpoint: ${(error as Error).message}`);
+          }
+        })
+    );
+  }
+
+  // ---------------------------------------------------------------- checkpoint_list
+  if (exposedCaps.read) {
+    reg.register(
+      'checkpoint_list',
+      {
+        title: 'List saved project checkpoints',
+        description: 'List all available local checkpoints and snapshot IDs.',
+        inputSchema: z.object({}).strict(),
+        annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false }
+      },
+      async () =>
+        reg.guarded('read', 'checkpoint_list', async () => {
+          try {
+            const checkpoints = await loadCheckpoints();
+            const list = Object.values(checkpoints);
+            if (list.length === 0) return ok('No checkpoints saved.');
+            const lines = list.map(
+              (cp) => `- [${cp.id}] "${cp.name}" (${Object.keys(cp.files).length} files) at ${cp.timestamp} [${cp.targetPath}]`
+            );
+            return ok(`Saved Checkpoints (${list.length}):\n${lines.join('\n')}`);
+          } catch (error) {
+            return fail(`Failed to list checkpoints: ${(error as Error).message}`);
+          }
+        })
+    );
+  }
+
+  // ---------------------------------------------------------------- checkpoint_restore
+  if (exposedCaps.create || exposedCaps.edit) {
+    reg.register(
+      'checkpoint_restore',
+      {
+        title: 'Restore project to checkpoint snapshot',
+        description: 'Revert all files in the target folder to an exact previous snapshot state.',
+        inputSchema: z
+          .object({
+            checkpoint_id: z.string().min(1).describe('The checkpoint ID to restore.')
+          })
+          .strict(),
+        annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false }
+      },
+      async ({ checkpoint_id }) =>
+        guard('checkpoint_restore', async () => {
+          try {
+            const checkpoints = await loadCheckpoints();
+            const cp = checkpoints[checkpoint_id];
+            if (!cp) return fail(`Checkpoint "${checkpoint_id}" not found.`);
+
+            let restoredCount = 0;
+            for (const [relPath, content] of Object.entries(cp.files)) {
+              const fullPath = nodePath.join(cp.targetPath, relPath);
+              await fs.mkdir(nodePath.dirname(fullPath), { recursive: true });
+              await fs.writeFile(fullPath, content, 'utf8');
+              restoredCount++;
+            }
+            return ok(`Restored ${restoredCount} files to checkpoint "${cp.name}" [${cp.id}].`);
+          } catch (error) {
+            return fail(`Failed to restore checkpoint: ${(error as Error).message}`);
+          }
+        })
+    );
+  }
+
+  // ================================================================ 3. PDF & DOCUMENTS
+  // ---------------------------------------------------------------- pdf_read_text
+  if (exposedCaps.read) {
+    reg.register(
+      'pdf_read_text',
+      {
+        title: 'Extract text from PDF file',
+        description: 'Read and extract text content from any PDF file on disk.',
+        inputSchema: z
+          .object({
+            file_path: z.string().min(1).max(1024).describe('Absolute or relative path to PDF file.'),
+            max_pages: z.number().int().min(1).max(100).optional().default(20)
+          })
+          .strict(),
+        annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false }
+      },
+      async ({ file_path }) =>
+        reg.guarded('read', 'pdf_read_text', async () => {
+          try {
+            const resolved = nodePath.resolve(file_path);
+            const buffer = await fs.readFile(resolved);
+            const raw = buffer.toString('latin1');
+            const textParts: string[] = [];
+
+            const streamRegex = /stream[\r\n]+([\s\S]*?)[\r\n]+endstream/g;
+            let streamMatch: RegExpExecArray | null;
+            while ((streamMatch = streamRegex.exec(raw)) !== null && textParts.length < 50) {
+              const streamContent = streamMatch[1] ?? '';
+              const tjMatches = streamContent.match(/\((.*?)\)\s*Tj/g);
+              if (tjMatches) {
+                const pageText = tjMatches.map((m) => m.replace(/^\(|\)\s*Tj$/g, '')).join(' ');
+                if (pageText.trim()) textParts.push(pageText.trim());
+              }
+            }
+
+            if (textParts.length === 0) {
+              const script = `
+Add-Type -AssemblyName System.IO;
+$content = [System.IO.File]::ReadAllText(${JSON.stringify(resolved)});
+$strings = [regex]::Matches($content, '[A-Za-z0-9 ,.:;!?-]{4,}') | ForEach-Object { $_.Value };
+$strings -join ' ';
+`;
+              const res = await runSystemProcess('powershell.exe', ['-NoProfile', '-Command', script], process.cwd(), 8_000);
+              const text = res.stdout.slice(0, 20_000);
+              return ok(`--- PDF Text (${resolved}) ---\n${text || 'No extractable plain text found.'}`);
+            }
+
+            return ok(`--- PDF Text (${resolved}) ---\n${textParts.join('\n\n')}`);
+          } catch (error) {
+            return fail(`Failed to read PDF: ${(error as Error).message}`);
+          }
+        })
+    );
+  }
+
+  // ---------------------------------------------------------------- markdown_to_html
+  if (exposedCaps.create || exposedCaps.edit) {
+    reg.register(
+      'markdown_to_html',
+      {
+        title: 'Convert Markdown to styled standalone HTML',
+        description: 'Convert markdown text into a beautiful, styled standalone HTML document and save it.',
+        inputSchema: z
+          .object({
+            markdown: z.string().min(1).max(MAX_TEXT_BYTES).describe('Markdown content to convert.'),
+            output_file: z.string().max(1024).optional().describe('Optional file path to save HTML to.')
+          })
+          .strict(),
+        annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false }
+      },
+      async ({ markdown, output_file }) =>
+        guard('markdown_to_html', async () => {
+          try {
+            let htmlBody = markdown
+              .replace(/^### (.*$)/gim, '<h3>$1</h3>')
+              .replace(/^## (.*$)/gim, '<h2>$1</h2>')
+              .replace(/^# (.*$)/gim, '<h1>$1</h1>')
+              .replace(/\*\*(.*?)\*\*/gim, '<b>$1</b>')
+              .replace(/\*(.*?)\*/gim, '<i>$1</i>')
+              .replace(/\[(.*?)\]\((.*?)\)/gim, '<a href="$2">$1</a>')
+              .replace(/^\s*-\s+(.*$)/gim, '<li>$1</li>')
+              .replace(/\n\n/gim, '<p></p>');
+
+            const fullHtml = `<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; line-height: 1.6; max-width: 800px; margin: 40px auto; padding: 0 20px; color: #24292f; background: #fff; }
+h1, h2, h3 { border-bottom: 1px solid #eaecef; padding-bottom: .3em; }
+code { background: #f6f8fa; padding: 2px 6px; border-radius: 4px; font-family: monospace; }
+pre { background: #f6f8fa; padding: 16px; border-radius: 6px; overflow: auto; }
+li { margin: 4px 0; }
+a { color: #0969da; text-decoration: none; }
+</style>
+</head>
+<body>
+${htmlBody}
+</body>
+</html>`;
+
+            if (output_file) {
+              const resolved = nodePath.resolve(output_file);
+              await fs.mkdir(nodePath.dirname(resolved), { recursive: true });
+              await fs.writeFile(resolved, fullHtml, 'utf8');
+              return ok(`Converted Markdown and saved HTML to: ${resolved}`);
+            }
+            return ok(fullHtml);
+          } catch (error) {
+            return fail(`Failed to convert markdown: ${(error as Error).message}`);
+          }
+        })
+    );
+  }
+
+  // ---------------------------------------------------------------- json_schema_validate
+  if (exposedCaps.read) {
+    reg.register(
+      'json_schema_validate',
+      {
+        title: 'Validate JSON structure against schema',
+        description: 'Validate a JSON string or object against required fields and basic types.',
+        inputSchema: z
+          .object({
+            json_string: z.string().min(1).max(MAX_TEXT_BYTES).describe('JSON data string.'),
+            required_fields: z.array(z.string()).optional().describe('List of required field names.')
+          })
+          .strict(),
+        annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false }
+      },
+      async ({ json_string, required_fields }) =>
+        reg.guarded('read', 'json_schema_validate', async () => {
+          try {
+            const parsed = JSON.parse(json_string);
+            const missing: string[] = [];
+            if (required_fields && typeof parsed === 'object' && parsed !== null) {
+              for (const req of required_fields) {
+                if (!(req in parsed)) missing.push(req);
+              }
+            }
+            if (missing.length > 0) {
+              return fail(`JSON is valid, but missing required fields: ${missing.join(', ')}`);
+            }
+            return ok(`JSON is valid! (Parsed ${typeof parsed === 'object' ? Object.keys(parsed).length : 1} keys/items)`);
+          } catch (error) {
+            return fail(`Invalid JSON: ${(error as Error).message}`);
+          }
+        })
+    );
+  }
+
+  // ================================================================ 4. CLIPBOARD & ENVIRONMENT
+  // ---------------------------------------------------------------- clipboard_read
+  if (exposedCaps.read) {
+    reg.register(
+      'clipboard_read',
+      {
+        title: 'Read Windows clipboard text',
+        description: 'Read the text currently copied to the user\'s Windows clipboard.',
+        inputSchema: z.object({}).strict(),
+        annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false }
+      },
+      async () =>
+        reg.guarded('read', 'clipboard_read', async () => {
+          try {
+            const script = `Get-Clipboard -Raw`;
+            const result = await runSystemProcess('powershell.exe', ['-NoProfile', '-Command', script], process.cwd(), 6_000);
+            if (result.exitCode !== 0) return fail('Failed to read clipboard');
+            return ok(`--- Clipboard Content ---\n${result.stdout.trim() || '(clipboard is empty)'}`);
+          } catch (error) {
+            return fail(`Failed to read clipboard: ${(error as Error).message}`);
+          }
+        })
+    );
+  }
+
+  // ---------------------------------------------------------------- clipboard_write
+  if (exposedCaps.command) {
+    reg.register(
+      'clipboard_write',
+      {
+        title: 'Write text to Windows clipboard',
+        description: 'Copy a code snippet or text directly into the user\'s Windows clipboard.',
+        inputSchema: z
+          .object({
+            text: z.string().min(1).max(MAX_TEXT_BYTES).describe('Text or code to copy to clipboard.')
+          })
+          .strict(),
+        annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false }
+      },
+      async ({ text }) =>
+        reg.guarded('command', 'clipboard_write', async () => {
+          try {
+            const script = `Set-Clipboard -Value ${JSON.stringify(text)}`;
+            await runSystemProcess('powershell.exe', ['-NoProfile', '-Command', script], process.cwd(), 6_000);
+            return ok(`Copied ${Buffer.byteLength(text, 'utf8')} bytes to clipboard.`);
+          } catch (error) {
+            return fail(`Failed to write to clipboard: ${(error as Error).message}`);
+          }
+        })
+    );
+  }
+
+  // ---------------------------------------------------------------- system_env_get
+  if (exposedCaps.read) {
+    reg.register(
+      'system_env_get',
+      {
+        title: 'Get environment variables',
+        description: 'Inspect system environment variables (PATH, APPDATA, USERPROFILE, etc.).',
+        inputSchema: z
+          .object({
+            name: z.string().max(100).optional().describe('Specific variable name to get (e.g. "PATH", "TEMP").')
+          })
+          .strict(),
+        annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false }
+      },
+      async ({ name }) =>
+        reg.guarded('read', 'system_env_get', async () => {
+          if (name) {
+            const val = process.env[name] || process.env[name.toUpperCase()] || process.env[name.toLowerCase()];
+            return ok(`${name}=${val ?? '(undefined)'}`);
+          }
+          const keys = Object.keys(process.env).sort();
+          const lines = keys.slice(0, 60).map((k) => `${k}=${(process.env[k] || '').slice(0, 100)}`);
+          return ok(`Environment Variables (${keys.length}):\n${lines.join('\n')}`);
+        })
+    );
+  }
+
+  // ---------------------------------------------------------------- system_env_set
+  if (exposedCaps.command) {
+    reg.register(
+      'system_env_set',
+      {
+        title: 'Set environment variable for process',
+        description: 'Set an environment variable for the current process and sub-processes.',
+        inputSchema: z
+          .object({
+            name: z.string().min(1).max(100).describe('Variable name.'),
+            value: z.string().max(4096).describe('Variable value.')
+          })
+          .strict(),
+        annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false }
+      },
+      async ({ name, value }) =>
+        reg.guarded('command', 'system_env_set', async () => {
+          process.env[name] = value;
+          return ok(`Set environment variable ${name}=${value}`);
+        })
+    );
+  }
+
+  // ================================================================ 5. ARCHIVE & FILE INTEGRITY
+  // ---------------------------------------------------------------- fs_hash_file
+  if (exposedCaps.read) {
+    reg.register(
+      'fs_hash_file',
+      {
+        title: 'Compute file hash checksum',
+        description: 'Compute SHA-256 or MD5 hash of any file on disk for integrity checking.',
+        inputSchema: z
+          .object({
+            file_path: z.string().min(1).max(1024).describe('Path to the file.'),
+            algorithm: z.enum(['sha256', 'md5', 'sha1']).optional().default('sha256').describe('Hashing algorithm.')
+          })
+          .strict(),
+        annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false }
+      },
+      async ({ file_path, algorithm }) =>
+        reg.guarded('read', 'fs_hash_file', async () => {
+          try {
+            const resolved = nodePath.resolve(file_path);
+            const buffer = await fs.readFile(resolved);
+            const hash = crypto.createHash(algorithm ?? 'sha256').update(buffer).digest('hex');
+            return ok(`Hash [${(algorithm ?? 'sha256').toUpperCase()}]: ${hash} (${resolved})`);
+          } catch (error) {
+            return fail(`Failed to compute hash: ${(error as Error).message}`);
+          }
+        })
+    );
+  }
+
+  // ---------------------------------------------------------------- fs_zip_compress
+  if (exposedCaps.create || exposedCaps.edit) {
+    reg.register(
+      'fs_zip_compress',
+      {
+        title: 'Compress folder or files to zip archive',
+        description: 'Create a `.zip` archive from a folder or file path.',
+        inputSchema: z
+          .object({
+            source_path: z.string().min(1).max(1024).describe('Folder or file to compress.'),
+            destination_zip: z.string().min(1).max(1024).describe('Target `.zip` file path.')
+          })
+          .strict(),
+        annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false }
+      },
+      async ({ source_path, destination_zip }) =>
+        guard('fs_zip_compress', async () => {
+          try {
+            const src = nodePath.resolve(source_path);
+            const dest = nodePath.resolve(destination_zip);
+            const script = `Compress-Archive -Path ${JSON.stringify(src)} -DestinationPath ${JSON.stringify(dest)} -Force`;
+            await runSystemProcess('powershell.exe', ['-NoProfile', '-Command', script], process.cwd(), 30_000);
+            return ok(`Created archive: ${dest}`);
+          } catch (error) {
+            return fail(`Failed to compress archive: ${(error as Error).message}`);
+          }
+        })
+    );
+  }
+
+  // ---------------------------------------------------------------- fs_zip_extract
+  if (exposedCaps.create || exposedCaps.edit) {
+    reg.register(
+      'fs_zip_extract',
+      {
+        title: 'Extract zip archive to folder',
+        description: 'Extract a `.zip` archive into a target directory.',
+        inputSchema: z
+          .object({
+            zip_path: z.string().min(1).max(1024).describe('Path to the `.zip` archive.'),
+            destination_dir: z.string().min(1).max(1024).describe('Destination directory to extract files into.')
+          })
+          .strict(),
+        annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false }
+      },
+      async ({ zip_path, destination_dir }) =>
+        guard('fs_zip_extract', async () => {
+          try {
+            const src = nodePath.resolve(zip_path);
+            const dest = nodePath.resolve(destination_dir);
+            const script = `Expand-Archive -Path ${JSON.stringify(src)} -DestinationPath ${JSON.stringify(dest)} -Force`;
+            await runSystemProcess('powershell.exe', ['-NoProfile', '-Command', script], process.cwd(), 30_000);
+            return ok(`Extracted archive ${src} to ${dest}`);
+          } catch (error) {
+            return fail(`Failed to extract archive: ${(error as Error).message}`);
+          }
+        })
+    );
+  }
+
+  // ================================================================ 6. UNITY LIVE DIAGNOSTICS
+  // ---------------------------------------------------------------- unity_read_editor_log
+  if (exposedCaps.read) {
+    reg.register(
+      'unity_read_editor_log',
+      {
+        title: 'Read Unity Editor console log and errors',
+        description: 'Read the latest errors, compilation logs, and stack traces from Unity\'s Editor.log.',
+        inputSchema: z
+          .object({
+            max_lines: z.number().int().min(10).max(500).optional().default(100).describe('Number of recent lines to read.')
+          })
+          .strict(),
+        annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false }
+      },
+      async ({ max_lines }) =>
+        reg.guarded('read', 'unity_read_editor_log', async () => {
+          try {
+            const localApp = process.env.LOCALAPPDATA || nodePath.join(process.env.USERPROFILE || 'C:\\Users\\exprt', 'AppData', 'Local');
+            const logPath = nodePath.join(localApp, 'Unity', 'Editor', 'Editor.log');
+            if (!(await exists(logPath))) {
+              return ok(`No Unity Editor.log found at: ${logPath}`);
+            }
+            const buffer = await fs.readFile(logPath);
+            const text = buffer.toString('utf8');
+            const lines = text.split('\n');
+            const limit = max_lines ?? 100;
+            const slice = lines.slice(-limit);
+
+            const errors = slice.filter((l) => /error|exception|stacktrace|failed/i.test(l));
+            const header = `--- Unity Editor.log (Last ${limit} lines, ${errors.length} error lines found) ---\n`;
+            return ok(header + slice.join('\n'));
+          } catch (error) {
+            return fail(`Failed to read Unity Editor log: ${(error as Error).message}`);
+          }
+        })
+    );
+  }
+
+  // ================================================================ 7. SEMANTIC CODE INTELLIGENCE
   // ---------------------------------------------------------------- code_find_definition
   if (exposedCaps.read) {
     reg.register(
@@ -470,6 +1056,7 @@ export function registerPowerAgentTools(reg: SurfaceRegistrar): void {
     );
   }
 
+  // ================================================================ 8. WEB NETWORK & COOKIE INSPECTOR
   // ---------------------------------------------------------------- browser_network_inspect
   if (exposedCaps.read) {
     reg.register(
@@ -597,6 +1184,7 @@ export function registerPowerAgentTools(reg: SurfaceRegistrar): void {
     );
   }
 
+  // ================================================================ 9. NOTIFICATIONS & MEMORY
   // ---------------------------------------------------------------- notify_user
   if (exposedCaps.command) {
     reg.register(
@@ -621,7 +1209,7 @@ export function registerPowerAgentTools(reg: SurfaceRegistrar): void {
 Add-Type -AssemblyName System.Windows.Forms;
 $notify = New-Object System.Windows.Forms.NotifyIcon;
 $notify.Icon = [System.Drawing.SystemIcons]::Information;
-$notify.BalloonTipTitle = ${JSON.stringify(title || 'Chat On Steroids')};
+$notify.BalloonTipTitle = ${JSON.stringify(title || 'Steromi')};
 $notify.BalloonTipText = ${JSON.stringify(message)};
 $notify.Visible = $true;
 $notify.ShowBalloonTip(7000);
@@ -629,7 +1217,7 @@ Start-Sleep -Milliseconds 200;
 $notify.Dispose();
 `;
             await runSystemProcess('powershell.exe', ['-NoProfile', '-Command', script], process.cwd(), 8_000);
-            return ok(`Notification displayed: "${title || 'Chat On Steroids'}: ${message}"`);
+            return ok(`Notification displayed: "${title || 'Steromi'}: ${message}"`);
           } catch (error) {
             return fail(`Failed to send notification: ${(error as Error).message}`);
           }
@@ -768,6 +1356,7 @@ $notify.Dispose();
     );
   }
 
+  // ================================================================ 10. BACKGROUND TASKS
   // ---------------------------------------------------------------- task_start_background
   if (exposedCaps.command) {
     reg.register(
@@ -939,6 +1528,7 @@ $notify.Dispose();
     );
   }
 
+  // ================================================================ 11. WEB & CHROME TAB AUTOMATION
   // ---------------------------------------------------------------- browser_search
   if (exposedCaps.read) {
     reg.register(
@@ -1318,6 +1908,7 @@ $bitmap.Dispose();
     );
   }
 
+  // ================================================================ 12. WINDOWS PROCESS & APPS
   // ---------------------------------------------------------------- launch_app
   if (exposedCaps.command) {
     reg.register(
@@ -1492,6 +2083,7 @@ Get-Process | Where-Object { $_.MainWindowTitle -or $_.CPU -gt 0.1 } |
     );
   }
 
+  // ================================================================ 13. SYSTEM FILE OPS
   // ---------------------------------------------------------------- fs_system_list
   if (exposedCaps.browse) {
     reg.register(

@@ -131,4 +131,31 @@ namespace Game.Core {
 
     await fs.rm(tempDir, { recursive: true, force: true });
   });
+
+  it('manages project checkpoints and snapshots via durable store', async () => {
+    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'cglf-cp-test-'));
+    initDurableStore(tempDir);
+
+    const testCheckpoints = {
+      checkpoints: {
+        cp_1: {
+          id: 'cp_1',
+          name: 'initial_state',
+          timestamp: new Date().toISOString(),
+          targetPath: tempDir,
+          files: {
+            'main.ts': 'console.log("v1");'
+          }
+        }
+      }
+    };
+
+    await writeDurableNow('agent-checkpoints', testCheckpoints);
+
+    const retrieved = await readDurable<typeof testCheckpoints>('agent-checkpoints');
+    expect(retrieved?.checkpoints.cp_1.name).toBe('initial_state');
+    expect(retrieved?.checkpoints.cp_1.files['main.ts']).toBe('console.log("v1");');
+
+    await fs.rm(tempDir, { recursive: true, force: true });
+  });
 });

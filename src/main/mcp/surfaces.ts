@@ -159,7 +159,23 @@ const CORE: SurfaceDefinition = {
     'code_get_diagnostics',
     'browser_network_inspect',
     'browser_cookies_get',
-    'browser_evaluate_js'
+    'browser_evaluate_js',
+    'audio_speak_text',
+    'audio_beep',
+    'checkpoint_create',
+    'checkpoint_list',
+    'checkpoint_restore',
+    'pdf_read_text',
+    'markdown_to_html',
+    'json_schema_validate',
+    'clipboard_read',
+    'clipboard_write',
+    'system_env_get',
+    'system_env_set',
+    'fs_hash_file',
+    'fs_zip_compress',
+    'fs_zip_extract',
+    'unity_read_editor_log'
   ]
 };
 
@@ -182,7 +198,7 @@ const DESKTOP: SurfaceDefinition = {
     'Use for: taking a screenshot, reading what is on screen, listing and finding windows, inspecting buttons, fields and other UI controls, ' +
     'clicking, typing, pressing keys, scrolling and dragging in any Windows application, ' +
     'opening URLs in browser, live Chrome tab automation, web search, network inspection, code intelligence, launching any app, running background tasks and PowerShell/CMD commands, ' +
-    'managing persistent memory, sending Windows notifications, and automating tasks across Windows.',
+    'managing persistent memory, sending Windows notifications, voice audio, checkpoints, and automating tasks across Windows.',
   cardSummary:
     'Full Windows system control: browser tabs, code intelligence, apps, background tasks, memory, shell commands, screenshots and GUI automation.',
   required: false,
@@ -231,7 +247,23 @@ const DESKTOP: SurfaceDefinition = {
     'code_get_diagnostics',
     'browser_network_inspect',
     'browser_cookies_get',
-    'browser_evaluate_js'
+    'browser_evaluate_js',
+    'audio_speak_text',
+    'audio_beep',
+    'checkpoint_create',
+    'checkpoint_list',
+    'checkpoint_restore',
+    'pdf_read_text',
+    'markdown_to_html',
+    'json_schema_validate',
+    'clipboard_read',
+    'clipboard_write',
+    'system_env_get',
+    'system_env_set',
+    'fs_hash_file',
+    'fs_zip_compress',
+    'fs_zip_extract',
+    'unity_read_editor_log'
   ]
 };
 
