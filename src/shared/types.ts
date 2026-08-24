@@ -221,7 +221,7 @@ export interface ConnectionStatus {
 }
 
 /** The identifiers of the connectors this app publishes. Mirrors `mcp/surfaces.ts`. */
-export type SurfaceId = 'core' | 'desktop';
+export type SurfaceId = 'core' | 'desktop' | 'steromi';
 
 export interface SurfaceStatus {
   id: SurfaceId;

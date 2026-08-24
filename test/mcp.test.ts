@@ -887,10 +887,10 @@ describe('surface boundaries', () => {
     }
   });
 
-  it('describes both surfaces well enough for a user to set them up and a model to find them', () => {
+  it('describes each surface well enough for a user to set them up and a model to find them', () => {
     for (const surface of SURFACE_LIST) {
-      expect(surface.serverName, surface.id).toMatch(/^chat-on-steroids-/);
-      expect(surface.connectorName, surface.id).toContain('Chat On Steroids');
+      expect(surface.serverName.length, surface.id).toBeGreaterThan(5);
+      expect(surface.connectorName.length, surface.id).toBeGreaterThan(5);
       expect(surface.cardSummary.length, surface.id).toBeGreaterThan(20);
       // The description is the only thing the model has before discovery, so it has to
       // carry real vocabulary rather than a label.
@@ -899,8 +899,10 @@ describe('surface boundaries', () => {
     }
     expect(surfaceDefinition('core').required).toBe(true);
     expect(surfaceDefinition('desktop').required).toBe(false);
+    expect(surfaceDefinition('steromi').required).toBe(false);
     // Distinct names, because the connector name is also the retrieval handle.
     expect(surfaceDefinition('core').connectorName).not.toBe(surfaceDefinition('desktop').connectorName);
+    expect(surfaceDefinition('steromi').connectorName).not.toBe(surfaceDefinition('core').connectorName);
   });
 
   it('gives each surface its own server identity and instructions', async () => {

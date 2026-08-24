@@ -37,7 +37,12 @@ export function buildServer(ctx: ToolContext, surface: SurfaceId): McpServer {
     registerCoreTools(registrar);
     registerProjectInmersionTools(registrar);
     registerPowerAgentTools(registrar);
+  } else if (surface === 'desktop') {
+    registerDesktopTools(registrar);
+    registerProjectInmersionTools(registrar);
+    registerPowerAgentTools(registrar);
   } else {
+    registerCoreTools(registrar);
     registerDesktopTools(registrar);
     registerProjectInmersionTools(registrar);
     registerPowerAgentTools(registrar);
