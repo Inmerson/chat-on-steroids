@@ -570,6 +570,9 @@ describe('surface boundaries', () => {
     expect(names).toEqual([
       'agents',
       'apply_patch',
+      'browser_cookies_get',
+      'browser_evaluate_js',
+      'browser_network_inspect',
       'browser_search',
       'browser_tab_click',
       'browser_tab_fill',
@@ -578,6 +581,10 @@ describe('surface boundaries', () => {
       'browser_tab_open',
       'browser_tab_read',
       'browser_tab_screenshot',
+      'code_find_definition',
+      'code_find_references',
+      'code_get_diagnostics',
+      'code_outline_symbols',
       'exec_command',
       'fs_system_list',
       'fs_system_read',
@@ -674,6 +681,9 @@ describe('surface boundaries', () => {
     everything();
     const names = toolNames(await desktop('tools/list'));
     expect(names).toEqual([
+      'browser_cookies_get',
+      'browser_evaluate_js',
+      'browser_network_inspect',
       'browser_search',
       'browser_tab_click',
       'browser_tab_fill',
@@ -682,6 +692,10 @@ describe('surface boundaries', () => {
       'browser_tab_open',
       'browser_tab_read',
       'browser_tab_screenshot',
+      'code_find_definition',
+      'code_find_references',
+      'code_get_diagnostics',
+      'code_outline_symbols',
       'computer',
       'fs_system_list',
       'fs_system_read',
@@ -812,8 +826,8 @@ describe('surface boundaries', () => {
 
     // Counts are the design: Core is capped at seven live schemas because find and the exec
     // pair cannot both exist, and Desktop is two.
-    expect(coreTools).toHaveLength(43);
-    expect(desktopTools).toHaveLength(38);
+    expect(coreTools).toHaveLength(50);
+    expect(desktopTools).toHaveLength(45);
 
     // And the size, which is what a discovery pull actually costs the model on every
     // conversation that touches the connector. The ceilings sit just above what the
@@ -822,8 +836,8 @@ describe('surface boundaries', () => {
     // catches the regression it exists to catch.
     const coreBytes = Buffer.byteLength(JSON.stringify(coreTools), 'utf8');
     const desktopBytes = Buffer.byteLength(JSON.stringify(desktopTools), 'utf8');
-    expect(coreBytes, `core tools/list is ${coreBytes} bytes`).toBeLessThan(100_000);
-    expect(desktopBytes, `desktop tools/list is ${desktopBytes} bytes`).toBeLessThan(90_000);
+    expect(coreBytes, `core tools/list is ${coreBytes} bytes`).toBeLessThan(120_000);
+    expect(desktopBytes, `desktop tools/list is ${desktopBytes} bytes`).toBeLessThan(110_000);
 
     // Per tool as well as per surface, so one schema cannot quietly eat the whole budget
     // while the total stays under it. `computer` is the largest by design: fourteen
@@ -991,10 +1005,15 @@ describe('capability gating', () => {
     ctx.readOnly = true;
 
     expect(toolNames(await core('tools/list'))).toEqual([
+      'browser_cookies_get',
+      'browser_network_inspect',
       'browser_search',
       'browser_tab_list',
       'browser_tab_read',
       'browser_tab_screenshot',
+      'code_find_definition',
+      'code_find_references',
+      'code_outline_symbols',
       'find',
       'fs_system_list',
       'fs_system_read',
@@ -1277,10 +1296,15 @@ describe('desktop capabilities', () => {
   it('advertises nothing until a desktop permission is turned on', async () => {
     ctx.readOnly = false;
     expect(toolNames(await desktop('tools/list'))).toEqual([
+      'browser_cookies_get',
+      'browser_network_inspect',
       'browser_search',
       'browser_tab_list',
       'browser_tab_read',
       'browser_tab_screenshot',
+      'code_find_definition',
+      'code_find_references',
+      'code_outline_symbols',
       'fs_system_list',
       'fs_system_read',
       'memory_list',
@@ -1295,10 +1319,15 @@ describe('desktop capabilities', () => {
     ctx.caps = withCaps({ screen: true });
     const names = toolNames(await desktop('tools/list'));
     expect(names).toEqual([
+      'browser_cookies_get',
+      'browser_network_inspect',
       'browser_search',
       'browser_tab_list',
       'browser_tab_read',
       'browser_tab_screenshot',
+      'code_find_definition',
+      'code_find_references',
+      'code_outline_symbols',
       'fs_system_list',
       'fs_system_read',
       'memory_list',
@@ -1320,10 +1349,15 @@ describe('desktop capabilities', () => {
     expect(ctx.caps.screen).toBe(true);
     expect(ctx.caps.control).toBe(false);
     expect(toolNames(await desktop('tools/list'))).toEqual([
+      'browser_cookies_get',
+      'browser_network_inspect',
       'browser_search',
       'browser_tab_list',
       'browser_tab_read',
       'browser_tab_screenshot',
+      'code_find_definition',
+      'code_find_references',
+      'code_outline_symbols',
       'fs_system_list',
       'fs_system_read',
       'memory_list',
@@ -1343,10 +1377,15 @@ describe('desktop capabilities', () => {
     ctx.readOnly = false;
     ctx.caps = withCaps({ control: false, clipboardRead: true, clipboardWrite: false });
     expect(toolNames(await desktop('tools/list'))).toEqual([
+      'browser_cookies_get',
+      'browser_network_inspect',
       'browser_search',
       'browser_tab_list',
       'browser_tab_read',
       'browser_tab_screenshot',
+      'code_find_definition',
+      'code_find_references',
+      'code_outline_symbols',
       'computer',
       'fs_system_list',
       'fs_system_read',

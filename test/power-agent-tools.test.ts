@@ -1,5 +1,12 @@
 import { describe, expect, it } from 'vitest';
-import { htmlToCleanMarkdown, htmlToSemanticTree, runSystemProcess } from '../src/main/mcp/tools-power-agent.js';
+import {
+  htmlToCleanMarkdown,
+  htmlToSemanticTree,
+  runSystemProcess,
+  findSymbolDefinition,
+  findSymbolReferences,
+  outlineSourceSymbols
+} from '../src/main/mcp/tools-power-agent.js';
 import path from 'node:path';
 import { promises as fs } from 'node:fs';
 import os from 'node:os';
@@ -92,5 +99,36 @@ describe('Power Agent tools', () => {
     expect(interactive.some((i) => i.tag === 'button')).toBe(true);
     expect(interactive.some((i) => i.tag === 'link')).toBe(true);
     expect(markdown).toContain('Documentation Link');
+  });
+
+  it('finds symbol definitions, references, and outlines in code files', async () => {
+    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'cglf-code-test-'));
+    const sourceFile = path.join(tempDir, 'PlayerController.cs');
+    const csharpCode = `
+using System;
+namespace Game.Core {
+  public class PlayerController {
+    public int health = 100;
+    public void TakeDamage(int amount) {
+      health -= amount;
+    }
+  }
+}
+`;
+    await fs.writeFile(sourceFile, csharpCode, 'utf8');
+
+    const defs = await findSymbolDefinition('PlayerController', tempDir);
+    expect(defs.length).toBeGreaterThanOrEqual(1);
+    expect(defs[0]?.file).toBe(sourceFile);
+    expect(defs[0]?.kind).toContain('class');
+
+    const refs = await findSymbolReferences('health', tempDir);
+    expect(refs.length).toBeGreaterThanOrEqual(2);
+
+    const outline = await outlineSourceSymbols(sourceFile);
+    expect(outline).toContain('PlayerController');
+    expect(outline).toContain('TakeDamage');
+
+    await fs.rm(tempDir, { recursive: true, force: true });
   });
 });

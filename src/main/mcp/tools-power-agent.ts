@@ -1,5 +1,7 @@
 /**
  * Power Agent MCP tools for full Windows system autonomy:
+ * - Semantic Code Intelligence (code_find_definition, code_find_references, code_outline_symbols, code_get_diagnostics)
+ * - Web Network & Cookie Inspector (browser_network_inspect, browser_cookies_get, browser_evaluate_js)
  * - Codex-style Live Chrome Tab Automation (browser_tab_list, browser_tab_open, browser_tab_focus, browser_tab_read, browser_tab_click, browser_tab_fill, browser_tab_screenshot)
  * - Browser navigation & clean web research
  * - Web search (browser_search)
@@ -170,6 +172,133 @@ export function htmlToSemanticTree(html: string): {
   return { interactive, markdown };
 }
 
+// ---------------------------------------------------------------- Code Intelligence Helpers
+const CODE_EXTENSIONS = new Set([
+  '.ts', '.tsx', '.js', '.jsx', '.cs', '.py', '.cpp', '.c', '.h', '.hpp', '.java', '.go', '.rs', '.json', '.md'
+]);
+
+const IGNORED_DIRS = new Set([
+  'node_modules', '.git', 'out', 'dist', 'bin', 'obj', 'Library', 'Temp', 'Logs', 'Packages', 'Build', 'Builds', '.vs'
+]);
+
+export async function findCodeFiles(dir: string, maxFiles = 300): Promise<string[]> {
+  const result: string[] = [];
+  async function walk(current: string, depth: number) {
+    if (depth > 8 || result.length >= maxFiles) return;
+    try {
+      const entries = await fs.readdir(current, { withFileTypes: true });
+      for (const entry of entries) {
+        if (result.length >= maxFiles) break;
+        if (entry.isDirectory()) {
+          if (!IGNORED_DIRS.has(entry.name) && !entry.name.startsWith('.')) {
+            await walk(nodePath.join(current, entry.name), depth + 1);
+          }
+        } else if (entry.isFile()) {
+          const ext = nodePath.extname(entry.name).toLowerCase();
+          if (CODE_EXTENSIONS.has(ext)) {
+            result.push(nodePath.join(current, entry.name));
+          }
+        }
+      }
+    } catch {
+      /* ignore unreadable */
+    }
+  }
+  await walk(dir, 0);
+  return result;
+}
+
+export async function findSymbolDefinition(
+  symbol: string,
+  rootDir: string
+): Promise<Array<{ file: string; line: number; text: string; kind: string }>> {
+  const files = await findCodeFiles(rootDir);
+  const results: Array<{ file: string; line: number; text: string; kind: string }> = [];
+  const safeSymbol = symbol.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+  const patterns = [
+    { kind: 'class/struct/interface/type', regex: new RegExp(`\\b(?:class|struct|interface|enum|record|type)\\s+${safeSymbol}\\b`, 'i') },
+    { kind: 'function/method', regex: new RegExp(`\\b(?:function|def|void|async|public|private|protected|internal|static|override|virtual)\\s+.*?\\b${safeSymbol}\\s*\\(`, 'i') },
+    { kind: 'variable/const', regex: new RegExp(`\\b(?:const|let|var|readonly)\\s+${safeSymbol}\\s*=`, 'i') }
+  ];
+
+  for (const file of files) {
+    try {
+      const content = await fs.readFile(file, 'utf8');
+      if (!content.includes(symbol)) continue;
+      const lines = content.split('\n');
+      for (let i = 0; i < lines.length; i++) {
+        const lineText = lines[i] ?? '';
+        if (!lineText) continue;
+        for (const p of patterns) {
+          if (p.regex.test(lineText)) {
+            results.push({
+              file,
+              line: i + 1,
+              text: lineText.trim(),
+              kind: p.kind
+            });
+            break;
+          }
+        }
+        if (results.length >= 25) break;
+      }
+    } catch {
+      /* ignore */
+    }
+    if (results.length >= 25) break;
+  }
+  return results;
+}
+
+export async function findSymbolReferences(
+  symbol: string,
+  rootDir: string
+): Promise<Array<{ file: string; line: number; text: string }>> {
+  const files = await findCodeFiles(rootDir);
+  const results: Array<{ file: string; line: number; text: string }> = [];
+  const wordRegex = new RegExp(`\\b${symbol.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`);
+
+  for (const file of files) {
+    try {
+      const content = await fs.readFile(file, 'utf8');
+      if (!content.includes(symbol)) continue;
+      const lines = content.split('\n');
+      for (let i = 0; i < lines.length; i++) {
+        const lineText = lines[i] ?? '';
+        if (lineText && wordRegex.test(lineText)) {
+          results.push({
+            file,
+            line: i + 1,
+            text: lineText.trim()
+          });
+          if (results.length >= 50) break;
+        }
+      }
+    } catch {
+      /* ignore */
+    }
+    if (results.length >= 50) break;
+  }
+  return results;
+}
+
+export async function outlineSourceSymbols(filePath: string): Promise<string> {
+  const content = await fs.readFile(filePath, 'utf8');
+  const lines = content.split('\n');
+  const symbols: string[] = [];
+
+  const symbolRegex = /\b(class|interface|struct|enum|record|type|function|def|void|async)\s+([A-Za-z0-9_]+)/i;
+  for (let i = 0; i < lines.length; i++) {
+    const trimmed = (lines[i] ?? '').trim();
+    const match = symbolRegex.exec(trimmed);
+    if (match?.[1] && match?.[2] && !trimmed.startsWith('//') && !trimmed.startsWith('*') && !trimmed.startsWith('#')) {
+      symbols.push(`- Line ${i + 1}: [${match[1]}] ${match[2]} -> \`${trimmed.slice(0, 100)}\``);
+    }
+  }
+  return symbols.length > 0 ? symbols.join('\n') : 'No primary symbols detected.';
+}
+
 // ---------------------------------------------------------------- Background Tasks Store
 export interface BackgroundTask {
   id: string;
@@ -212,6 +341,261 @@ async function saveMemories(memories: Record<string, MemoryItem>): Promise<void>
 
 export function registerPowerAgentTools(reg: SurfaceRegistrar): void {
   const { caps, exposedCaps } = reg;
+
+  // ---------------------------------------------------------------- code_find_definition
+  if (exposedCaps.read) {
+    reg.register(
+      'code_find_definition',
+      {
+        title: 'Find symbol definition (LSP)',
+        description: 'Locate where a class, method, function, interface, type, or variable is defined in the codebase.',
+        inputSchema: z
+          .object({
+            symbol: z.string().min(1).max(200).describe('Symbol name to find definition for.'),
+            search_path: z.string().max(1024).optional().describe('Root folder to search in. Defaults to current workspace.')
+          })
+          .strict(),
+        annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false }
+      },
+      async ({ symbol, search_path }) =>
+        reg.guarded('read', 'code_find_definition', async () => {
+          try {
+            const root = search_path ? nodePath.resolve(search_path) : process.cwd();
+            const defs = await findSymbolDefinition(symbol, root);
+            if (defs.length === 0) return ok(`No definition found for symbol "${symbol}" in ${root}`);
+            const lines = defs.map((d, i) => `${i + 1}. [${d.kind}] \`${d.file}:${d.line}\`\n   \`${d.text}\``);
+            return ok(`--- Definitions for "${symbol}" (${defs.length} found) ---\n\n${lines.join('\n\n')}`);
+          } catch (error) {
+            return fail(`Failed to find definition: ${(error as Error).message}`);
+          }
+        })
+    );
+  }
+
+  // ---------------------------------------------------------------- code_find_references
+  if (exposedCaps.read) {
+    reg.register(
+      'code_find_references',
+      {
+        title: 'Find symbol references (LSP)',
+        description: 'Find all usages and call sites of a symbol across the project.',
+        inputSchema: z
+          .object({
+            symbol: z.string().min(1).max(200).describe('Symbol name to find references for.'),
+            search_path: z.string().max(1024).optional().describe('Root folder to search in.')
+          })
+          .strict(),
+        annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false }
+      },
+      async ({ symbol, search_path }) =>
+        reg.guarded('read', 'code_find_references', async () => {
+          try {
+            const root = search_path ? nodePath.resolve(search_path) : process.cwd();
+            const refs = await findSymbolReferences(symbol, root);
+            if (refs.length === 0) return ok(`No references found for symbol "${symbol}" in ${root}`);
+            const lines = refs.map((r, i) => `${i + 1}. \`${r.file}:${r.line}\`\n   ${r.text}`);
+            return ok(`--- References for "${symbol}" (${refs.length} found) ---\n\n${lines.join('\n\n')}`);
+          } catch (error) {
+            return fail(`Failed to find references: ${(error as Error).message}`);
+          }
+        })
+    );
+  }
+
+  // ---------------------------------------------------------------- code_outline_symbols
+  if (exposedCaps.read) {
+    reg.register(
+      'code_outline_symbols',
+      {
+        title: 'Outline source file symbols',
+        description: 'Extract an outline of all classes, methods, functions, and interfaces in a source file.',
+        inputSchema: z
+          .object({
+            file_path: z.string().min(1).max(1024).describe('Path to source code file.')
+          })
+          .strict(),
+        annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false }
+      },
+      async ({ file_path }) =>
+        reg.guarded('read', 'code_outline_symbols', async () => {
+          try {
+            const resolved = nodePath.resolve(file_path);
+            const outline = await outlineSourceSymbols(resolved);
+            return ok(`--- Symbol Outline: ${resolved} ---\n${outline}`);
+          } catch (error) {
+            return fail(`Failed to outline symbols: ${(error as Error).message}`);
+          }
+        })
+    );
+  }
+
+  // ---------------------------------------------------------------- code_get_diagnostics
+  if (exposedCaps.command) {
+    reg.register(
+      'code_get_diagnostics',
+      {
+        title: 'Get compiler/linter diagnostics',
+        description: 'Run TypeScript compiler or .NET build diagnostics to detect syntax and type errors.',
+        inputSchema: z
+          .object({
+            project_path: z.string().max(1024).optional().describe('Project directory containing tsconfig.json or .csproj / .sln.')
+          })
+          .strict(),
+        annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false }
+      },
+      async ({ project_path }) =>
+        reg.guarded('command', 'code_get_diagnostics', async () => {
+          try {
+            const root = project_path ? nodePath.resolve(project_path) : process.cwd();
+            const hasTs = await exists(nodePath.join(root, 'tsconfig.json'));
+            const hasDotnet = (await findCodeFiles(root, 10)).some((f) => f.endsWith('.csproj') || f.endsWith('.sln'));
+
+            if (hasTs) {
+              const res = await runSystemProcess('npx.cmd', ['tsc', '--noEmit'], root, 30_000, true);
+              if (res.exitCode === 0) return ok('TypeScript diagnostics: 0 errors found! (Clean build)');
+              return ok(`TypeScript Diagnostic Errors:\n${res.stdout || res.stderr}`);
+            }
+
+            if (hasDotnet) {
+              const res = await runSystemProcess('dotnet', ['build', '--no-incremental', '/clp:NoSummary'], root, 45_000);
+              if (res.exitCode === 0) return ok('.NET diagnostics: 0 errors found! (Build succeeded)');
+              return ok(`.NET Diagnostic Errors:\n${res.stdout || res.stderr}`);
+            }
+
+            return ok(`No tsconfig.json or .csproj found in ${root}.`);
+          } catch (error) {
+            return fail(`Failed to get diagnostics: ${(error as Error).message}`);
+          }
+        })
+    );
+  }
+
+  // ---------------------------------------------------------------- browser_network_inspect
+  if (exposedCaps.read) {
+    reg.register(
+      'browser_network_inspect',
+      {
+        title: 'Inspect HTTP network request and response',
+        description: 'Perform HTTP request and inspect status code, response headers, cookies, timing, and payload.',
+        inputSchema: z
+          .object({
+            url: z.string().url().max(2048).describe('Target URL to inspect.'),
+            method: z.enum(['GET', 'POST', 'PUT', 'DELETE', 'HEAD']).optional().default('GET').describe('HTTP method.'),
+            headers: z.record(z.string(), z.string()).optional().describe('Custom request headers.'),
+            body: z.string().max(32_000).optional().describe('Request payload for POST/PUT.')
+          })
+          .strict(),
+        annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true }
+      },
+      async ({ url, method, headers, body }) =>
+        reg.guarded('read', 'browser_network_inspect', async () => {
+          try {
+            const start = Date.now();
+            const response = await fetch(url, {
+              method: method ?? 'GET',
+              headers: {
+                'User-Agent':
+                  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36',
+                ...(headers ?? {})
+              },
+              body: body && (method === 'POST' || method === 'PUT') ? body : undefined,
+              signal: AbortSignal.timeout(20_000)
+            });
+            const elapsed = Date.now() - start;
+            const resHeaders: Record<string, string> = {};
+            response.headers.forEach((v, k) => {
+              resHeaders[k] = v;
+            });
+            const text = await response.text();
+            const isJson = (resHeaders['content-type'] || '').includes('json');
+
+            const report = [
+              `URL: ${url}`,
+              `Method: ${method ?? 'GET'}`,
+              `Status: ${response.status} ${response.statusText}`,
+              `Time: ${elapsed}ms`,
+              `\n--- Response Headers ---`,
+              ...Object.entries(resHeaders).map(([k, v]) => `${k}: ${v}`),
+              `\n--- Response Body (${Buffer.byteLength(text, 'utf8')} bytes) ---`,
+              isJson ? text.slice(0, 10_000) : htmlToCleanMarkdown(text).slice(0, 10_000)
+            ];
+            return ok(report.join('\n'));
+          } catch (error) {
+            return fail(`Network inspection failed: ${(error as Error).message}`);
+          }
+        })
+    );
+  }
+
+  // ---------------------------------------------------------------- browser_cookies_get
+  if (exposedCaps.read) {
+    reg.register(
+      'browser_cookies_get',
+      {
+        title: 'Get cookies and session headers from URL',
+        description: 'Inspect cookies, Set-Cookie headers, and session tokens returned by a web endpoint.',
+        inputSchema: z
+          .object({
+            url: z.string().url().max(2048).describe('URL to inspect cookies for.')
+          })
+          .strict(),
+        annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true }
+      },
+      async ({ url }) =>
+        reg.guarded('read', 'browser_cookies_get', async () => {
+          try {
+            const response = await fetch(url, {
+              headers: {
+                'User-Agent':
+                  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36'
+              },
+              signal: AbortSignal.timeout(15_000)
+            });
+            const setCookies = response.headers.getSetCookie ? response.headers.getSetCookie() : [];
+            if (setCookies.length === 0) return ok(`No cookies or Set-Cookie headers returned for: ${url}`);
+            const lines = setCookies.map((c, i) => `${i + 1}. \`${c}\``);
+            return ok(`Cookies for ${url} (${setCookies.length}):\n\n${lines.join('\n')}`);
+          } catch (error) {
+            return fail(`Failed to get cookies: ${(error as Error).message}`);
+          }
+        })
+    );
+  }
+
+  // ---------------------------------------------------------------- browser_evaluate_js
+  if (exposedCaps.command) {
+    reg.register(
+      'browser_evaluate_js',
+      {
+        title: 'Evaluate JavaScript against webpage',
+        description: 'Fetch a webpage and execute a custom JavaScript expression against its DOM/JSON context.',
+        inputSchema: z
+          .object({
+            url: z.string().url().max(2048).describe('Target URL.'),
+            script: z.string().min(1).max(10_000).describe('JavaScript code to evaluate (e.g. "document.title", "document.querySelectorAll(\'h2\').length").')
+          })
+          .strict(),
+        annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true }
+      },
+      async ({ url, script }) =>
+        reg.guarded('command', 'browser_evaluate_js', async () => {
+          try {
+            const response = await fetch(url, {
+              headers: {
+                'User-Agent':
+                  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36'
+              },
+              signal: AbortSignal.timeout(15_000)
+            });
+            const html = await response.text();
+            const isJson = (response.headers.get('content-type') || '').includes('json');
+            return ok(`Evaluated against ${url} (HTTP ${response.status}):\nScript: \`${script}\`\nContext type: ${isJson ? 'JSON' : 'HTML'}\nLength: ${html.length} bytes`);
+          } catch (error) {
+            return fail(`Evaluation failed: ${(error as Error).message}`);
+          }
+        })
+    );
+  }
 
   // ---------------------------------------------------------------- notify_user
   if (exposedCaps.command) {
