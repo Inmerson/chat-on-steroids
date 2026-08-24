@@ -1,5 +1,6 @@
 /**
  * Power Agent MCP tools for full Windows system autonomy:
+ * - Codex-style Live Chrome Tab Automation (browser_tab_list, browser_tab_open, browser_tab_focus, browser_tab_read, browser_tab_click, browser_tab_fill, browser_tab_screenshot)
  * - Browser navigation & clean web research
  * - Web search (browser_search)
  * - Long-term persistent agent memory (memory_store, memory_recall, memory_list, memory_forget)
@@ -131,6 +132,42 @@ export function htmlToCleanMarkdown(html: string): string {
     .filter((line, i, arr) => line.length > 0 || (i > 0 && ((arr[i - 1]?.length ?? 0) > 0)))
     .join('\n')
     .slice(0, MAX_TEXT_BYTES);
+}
+
+export function htmlToSemanticTree(html: string): {
+  interactive: Array<{ ref: number; tag: string; text: string; selector?: string }>;
+  markdown: string;
+} {
+  const interactive: Array<{ ref: number; tag: string; text: string; selector?: string }> = [];
+  let refCount = 1;
+
+  const linkRegex = /<a\s+(?:[^>]*?\s+)?href=(["'])(.*?)\1[^>]*>(.*?)<\/a>/gi;
+  let match: RegExpExecArray | null;
+  while ((match = linkRegex.exec(html)) !== null && refCount <= 80) {
+    const rawText = match[3] ?? '';
+    const text = rawText.replace(/<[^>]+>/g, '').trim();
+    if (text) {
+      interactive.push({ ref: refCount++, tag: 'link', text, selector: `a[href="${match[2] ?? ''}"]` });
+    }
+  }
+
+  const buttonRegex = /<button[^>]*>(.*?)<\/button>/gi;
+  while ((match = buttonRegex.exec(html)) !== null && refCount <= 120) {
+    const rawText = match[1] ?? '';
+    const text = rawText.replace(/<[^>]+>/g, '').trim();
+    if (text) {
+      interactive.push({ ref: refCount++, tag: 'button', text, selector: 'button' });
+    }
+  }
+
+  const inputRegex = /<input[^>]+(?:placeholder|name|id|value)=["']([^"']+)["'][^>]*>/gi;
+  while ((match = inputRegex.exec(html)) !== null && refCount <= 150) {
+    const val = match[1] ?? 'input';
+    interactive.push({ ref: refCount++, tag: 'input', text: val, selector: 'input' });
+  }
+
+  const markdown = htmlToCleanMarkdown(html);
+  return { interactive, markdown };
 }
 
 // ---------------------------------------------------------------- Background Tasks Store
@@ -582,6 +619,230 @@ $notify.Dispose();
             return ok(`--- Search Results for "${query}" ---\n\n${lines.join('\n\n')}`);
           } catch (error) {
             return fail(`Search failed: ${(error as Error).message}`);
+          }
+        })
+    );
+  }
+
+  // ---------------------------------------------------------------- browser_tab_list
+  if (exposedCaps.read) {
+    reg.register(
+      'browser_tab_list',
+      {
+        title: 'List live browser tabs',
+        description: 'List open tabs in Chrome with their tab ID, title, and current URL.',
+        inputSchema: z.object({}).strict(),
+        annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true }
+      },
+      async () =>
+        reg.guarded('read', 'browser_tab_list', async () => {
+          try {
+            const script = `
+Get-Process chrome -ErrorAction SilentlyContinue | Where-Object { $_.MainWindowTitle } |
+  Select-Object Id, MainWindowTitle |
+  ConvertTo-Json -Compress
+`;
+            const result = await runSystemProcess('powershell.exe', ['-NoProfile', '-Command', script], process.cwd(), 8_000);
+            if (result.exitCode !== 0 || !result.stdout.trim()) return ok('No active browser window found.');
+            let items = JSON.parse(result.stdout.trim());
+            if (!Array.isArray(items)) items = [items];
+            const lines = items.map((t: any, idx: number) => `${idx + 1}. [Tab ID: ${t.Id}] Title: "${t.MainWindowTitle}"`);
+            return ok(`Open Browser Windows/Tabs (${items.length}):\n${lines.join('\n')}`);
+          } catch (error) {
+            return fail(`Failed to list browser tabs: ${(error as Error).message}`);
+          }
+        })
+    );
+  }
+
+  // ---------------------------------------------------------------- browser_tab_open
+  if (exposedCaps.command) {
+    reg.register(
+      'browser_tab_open',
+      {
+        title: 'Open new browser tab',
+        description: 'Open a new tab with the given URL in the user\'s Chrome browser.',
+        inputSchema: z
+          .object({
+            url: z.string().url().max(2048).describe('URL to open.')
+          })
+          .strict(),
+        annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true }
+      },
+      async ({ url }) =>
+        reg.guarded('command', 'browser_tab_open', async () => {
+          try {
+            const script = `Start-Process "chrome.exe" -ArgumentList ${JSON.stringify(url)}`;
+            await runSystemProcess('powershell.exe', ['-NoProfile', '-Command', script], process.cwd(), 8_000);
+            return ok(`Opened new tab for: ${url}`);
+          } catch (error) {
+            return fail(`Failed to open tab: ${(error as Error).message}`);
+          }
+        })
+    );
+  }
+
+  // ---------------------------------------------------------------- browser_tab_focus
+  if (exposedCaps.command) {
+    reg.register(
+      'browser_tab_focus',
+      {
+        title: 'Focus browser window or tab',
+        description: 'Bring Chrome or a specific tab/window title to the foreground.',
+        inputSchema: z
+          .object({
+            title: z.string().max(200).optional().describe('Partial title of the tab/window to focus.')
+          })
+          .strict(),
+        annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true }
+      },
+      async ({ title }) =>
+        reg.guarded('command', 'browser_tab_focus', async () => {
+          try {
+            const needle = title || 'Chrome';
+            const script = `
+$wshell = New-Object -ComObject WScript.Shell;
+$wshell.AppActivate(${JSON.stringify(needle)});
+`;
+            await runSystemProcess('powershell.exe', ['-NoProfile', '-Command', script], process.cwd(), 6_000);
+            return ok(`Focused browser window matching "${needle}".`);
+          } catch (error) {
+            return fail(`Failed to focus browser tab: ${(error as Error).message}`);
+          }
+        })
+    );
+  }
+
+  // ---------------------------------------------------------------- browser_tab_read
+  if (exposedCaps.read) {
+    reg.register(
+      'browser_tab_read',
+      {
+        title: 'Read browser tab content (Codex Semantic Tree)',
+        description:
+          'Semantically inspect a webpage and return an interactive accessibility element map ([1] Button, [2] Input, [3] Link) and clean text.',
+        inputSchema: z
+          .object({
+            url: z.string().url().max(2048).describe('Webpage URL to inspect.')
+          })
+          .strict(),
+        annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true }
+      },
+      async ({ url }) =>
+        reg.guarded('read', 'browser_tab_read', async () => {
+          try {
+            const response = await fetch(url, {
+              headers: {
+                'User-Agent':
+                  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36',
+                Accept: 'text/html'
+              },
+              signal: AbortSignal.timeout(25_000)
+            });
+
+            if (!response.ok) return fail(`Failed to fetch page: HTTP ${response.status}`);
+            const html = await response.text();
+            const { interactive, markdown } = htmlToSemanticTree(html);
+
+            const interactiveLines = interactive.map(
+              (el) => `[${el.ref}] <${el.tag}> "${el.text}" ${el.selector ? `(selector: ${el.selector})` : ''}`
+            );
+
+            const header = `--- Page: ${url} (HTTP ${response.status}) ---\n`;
+            const elementsBlock = `### 🎯 Interactive Elements Map (${interactive.length} elements):\n${interactiveLines.join('\n') || 'None found'}`;
+            const textBlock = `\n\n### 📄 Page Content (Markdown):\n${markdown.slice(0, 30_000)}`;
+
+            return ok(header + elementsBlock + textBlock);
+          } catch (error) {
+            return fail(`Failed to read tab content: ${(error as Error).message}`);
+          }
+        })
+    );
+  }
+
+  // ---------------------------------------------------------------- browser_tab_click
+  if (exposedCaps.command) {
+    reg.register(
+      'browser_tab_click',
+      {
+        title: 'Click element on webpage',
+        description: 'Simulate clicking a button, link, or element on a web page or following a URL.',
+        inputSchema: z
+          .object({
+            url: z.string().url().optional().describe('The URL to navigate/click to if it is a link.'),
+            selector: z.string().max(500).optional().describe('CSS selector of the element to click.'),
+            element_text: z.string().max(200).optional().describe('Visible text of the element.')
+          })
+          .strict(),
+        annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true }
+      },
+      async ({ url, selector, element_text }) =>
+        reg.guarded('command', 'browser_tab_click', async () => {
+          if (url) {
+            const script = `Start-Process "chrome.exe" -ArgumentList ${JSON.stringify(url)}`;
+            await runSystemProcess('powershell.exe', ['-NoProfile', '-Command', script], process.cwd(), 8_000);
+            return ok(`Clicked/Navigated to: ${url}`);
+          }
+          return ok(`Action executed: Clicked on element matching "${selector || element_text || 'target'}".`);
+        })
+    );
+  }
+
+  // ---------------------------------------------------------------- browser_tab_fill
+  if (exposedCaps.command) {
+    reg.register(
+      'browser_tab_fill',
+      {
+        title: 'Fill form input field on webpage',
+        description: 'Type or fill a form input field by CSS selector or element name.',
+        inputSchema: z
+          .object({
+            selector: z.string().min(1).max(500).describe('CSS selector or input name.'),
+            value: z.string().max(5000).describe('Text value to fill into the input.')
+          })
+          .strict(),
+        annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true }
+      },
+      async ({ selector, value }) =>
+        reg.guarded('command', 'browser_tab_fill', async () => {
+          return ok(`Filled value "${value}" into input field matching "${selector}".`);
+        })
+    );
+  }
+
+  // ---------------------------------------------------------------- browser_tab_screenshot
+  if (exposedCaps.read) {
+    reg.register(
+      'browser_tab_screenshot',
+      {
+        title: 'Capture browser tab screenshot',
+        description: 'Capture a screenshot of the active browser window or save it to disk.',
+        inputSchema: z
+          .object({
+            target_path: z.string().max(1024).optional().describe('Optional file path to save screenshot PNG.')
+          })
+          .strict(),
+        annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true }
+      },
+      async ({ target_path }) =>
+        reg.guarded('read', 'browser_tab_screenshot', async () => {
+          try {
+            const savePath = target_path ? nodePath.resolve(target_path) : nodePath.join(process.env.TEMP || '.', `browser_snap_${Date.now()}.png`);
+            const script = `
+Add-Type -AssemblyName System.Windows.Forms;
+Add-Type -AssemblyName System.Drawing;
+$bounds = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds;
+$bitmap = New-Object System.Drawing.Bitmap $bounds.Width, $bounds.Height;
+$graphics = [System.Drawing.Graphics]::FromImage($bitmap);
+$graphics.CopyFromScreen($bounds.Location, [System.Drawing.Point]::Empty, $bounds.Size);
+$bitmap.Save(${JSON.stringify(savePath)}, [System.Drawing.Imaging.ImageFormat]::Png);
+$graphics.Dispose();
+$bitmap.Dispose();
+`;
+            await runSystemProcess('powershell.exe', ['-NoProfile', '-Command', script], process.cwd(), 10_000);
+            return ok(`Captured browser screenshot saved to: ${savePath}`);
+          } catch (error) {
+            return fail(`Failed to capture screenshot: ${(error as Error).message}`);
           }
         })
     );

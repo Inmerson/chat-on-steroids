@@ -571,6 +571,13 @@ describe('surface boundaries', () => {
       'agents',
       'apply_patch',
       'browser_search',
+      'browser_tab_click',
+      'browser_tab_fill',
+      'browser_tab_focus',
+      'browser_tab_list',
+      'browser_tab_open',
+      'browser_tab_read',
+      'browser_tab_screenshot',
       'exec_command',
       'fs_system_list',
       'fs_system_read',
@@ -668,6 +675,13 @@ describe('surface boundaries', () => {
     const names = toolNames(await desktop('tools/list'));
     expect(names).toEqual([
       'browser_search',
+      'browser_tab_click',
+      'browser_tab_fill',
+      'browser_tab_focus',
+      'browser_tab_list',
+      'browser_tab_open',
+      'browser_tab_read',
+      'browser_tab_screenshot',
       'computer',
       'fs_system_list',
       'fs_system_read',
@@ -798,8 +812,8 @@ describe('surface boundaries', () => {
 
     // Counts are the design: Core is capped at seven live schemas because find and the exec
     // pair cannot both exist, and Desktop is two.
-    expect(coreTools).toHaveLength(36);
-    expect(desktopTools).toHaveLength(31);
+    expect(coreTools).toHaveLength(43);
+    expect(desktopTools).toHaveLength(38);
 
     // And the size, which is what a discovery pull actually costs the model on every
     // conversation that touches the connector. The ceilings sit just above what the
@@ -808,8 +822,8 @@ describe('surface boundaries', () => {
     // catches the regression it exists to catch.
     const coreBytes = Buffer.byteLength(JSON.stringify(coreTools), 'utf8');
     const desktopBytes = Buffer.byteLength(JSON.stringify(desktopTools), 'utf8');
-    expect(coreBytes, `core tools/list is ${coreBytes} bytes`).toBeLessThan(80_000);
-    expect(desktopBytes, `desktop tools/list is ${desktopBytes} bytes`).toBeLessThan(70_000);
+    expect(coreBytes, `core tools/list is ${coreBytes} bytes`).toBeLessThan(100_000);
+    expect(desktopBytes, `desktop tools/list is ${desktopBytes} bytes`).toBeLessThan(90_000);
 
     // Per tool as well as per surface, so one schema cannot quietly eat the whole budget
     // while the total stays under it. `computer` is the largest by design: fourteen
@@ -978,6 +992,9 @@ describe('capability gating', () => {
 
     expect(toolNames(await core('tools/list'))).toEqual([
       'browser_search',
+      'browser_tab_list',
+      'browser_tab_read',
+      'browser_tab_screenshot',
       'find',
       'fs_system_list',
       'fs_system_read',
@@ -1261,6 +1278,9 @@ describe('desktop capabilities', () => {
     ctx.readOnly = false;
     expect(toolNames(await desktop('tools/list'))).toEqual([
       'browser_search',
+      'browser_tab_list',
+      'browser_tab_read',
+      'browser_tab_screenshot',
       'fs_system_list',
       'fs_system_read',
       'memory_list',
@@ -1276,6 +1296,9 @@ describe('desktop capabilities', () => {
     const names = toolNames(await desktop('tools/list'));
     expect(names).toEqual([
       'browser_search',
+      'browser_tab_list',
+      'browser_tab_read',
+      'browser_tab_screenshot',
       'fs_system_list',
       'fs_system_read',
       'memory_list',
@@ -1298,6 +1321,9 @@ describe('desktop capabilities', () => {
     expect(ctx.caps.control).toBe(false);
     expect(toolNames(await desktop('tools/list'))).toEqual([
       'browser_search',
+      'browser_tab_list',
+      'browser_tab_read',
+      'browser_tab_screenshot',
       'fs_system_list',
       'fs_system_read',
       'memory_list',
@@ -1318,6 +1344,9 @@ describe('desktop capabilities', () => {
     ctx.caps = withCaps({ control: false, clipboardRead: true, clipboardWrite: false });
     expect(toolNames(await desktop('tools/list'))).toEqual([
       'browser_search',
+      'browser_tab_list',
+      'browser_tab_read',
+      'browser_tab_screenshot',
       'computer',
       'fs_system_list',
       'fs_system_read',

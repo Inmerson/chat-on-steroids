@@ -145,7 +145,14 @@ const CORE: SurfaceDefinition = {
     'task_start_background',
     'task_status',
     'task_kill',
-    'browser_search'
+    'browser_search',
+    'browser_tab_list',
+    'browser_tab_open',
+    'browser_tab_focus',
+    'browser_tab_read',
+    'browser_tab_click',
+    'browser_tab_fill',
+    'browser_tab_screenshot'
   ]
 };
 
@@ -167,10 +174,10 @@ const DESKTOP: SurfaceDefinition = {
     'See and control this Windows desktop, browser, and full system applications, clipboard, workspaces, Unity and Git. ' +
     'Use for: taking a screenshot, reading what is on screen, listing and finding windows, inspecting buttons, fields and other UI controls, ' +
     'clicking, typing, pressing keys, scrolling and dragging in any Windows application, ' +
-    'opening URLs in browser, web search, fetching web pages, launching any app, running background tasks and PowerShell/CMD commands, ' +
+    'opening URLs in browser, live Chrome tab automation, web search, fetching web pages, launching any app, running background tasks and PowerShell/CMD commands, ' +
     'managing persistent memory, sending Windows notifications, and automating tasks across Windows.',
   cardSummary:
-    'Full Windows system control: browser, apps, background tasks, memory, shell commands, screenshots and GUI automation.',
+    'Full Windows system control: browser tabs, apps, background tasks, memory, shell commands, screenshots and GUI automation.',
   required: false,
   tools: [
     'observe',
@@ -203,7 +210,14 @@ const DESKTOP: SurfaceDefinition = {
     'task_start_background',
     'task_status',
     'task_kill',
-    'browser_search'
+    'browser_search',
+    'browser_tab_list',
+    'browser_tab_open',
+    'browser_tab_focus',
+    'browser_tab_read',
+    'browser_tab_click',
+    'browser_tab_fill',
+    'browser_tab_screenshot'
   ]
 };
 

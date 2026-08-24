@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { htmlToCleanMarkdown, runSystemProcess } from '../src/main/mcp/tools-power-agent.js';
+import { htmlToCleanMarkdown, htmlToSemanticTree, runSystemProcess } from '../src/main/mcp/tools-power-agent.js';
 import path from 'node:path';
 import { promises as fs } from 'node:fs';
 import os from 'node:os';
@@ -74,5 +74,23 @@ describe('Power Agent tools', () => {
     expect(retrieved?.memories.project_goal.content).toBe('Autonomous AI bridge on Windows');
 
     await fs.rm(tempDir, { recursive: true, force: true });
+  });
+
+  it('extracts interactive element map and semantic tree for Codex browsing', () => {
+    const html = `
+      <html>
+        <body>
+          <input name="username" placeholder="Enter username" />
+          <button id="login-btn">Sign In</button>
+          <a href="/help">Documentation Link</a>
+        </body>
+      </html>
+    `;
+    const { interactive, markdown } = htmlToSemanticTree(html);
+    expect(interactive.length).toBeGreaterThanOrEqual(3);
+    expect(interactive.some((i) => i.tag === 'input')).toBe(true);
+    expect(interactive.some((i) => i.tag === 'button')).toBe(true);
+    expect(interactive.some((i) => i.tag === 'link')).toBe(true);
+    expect(markdown).toContain('Documentation Link');
   });
 });
