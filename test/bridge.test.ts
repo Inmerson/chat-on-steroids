@@ -47,7 +47,7 @@ const {
 const { flushDurable, initDurableStore, readDurable, writeDurableNow, writeDurableSoon } = await import('../src/main/durable.js');
 const { humanReply, resetGoalStateForTests } = await import('../src/main/goal.js');
 const { setGoalDriverForTests } = await import('../src/main/antigravity/goal-driver.js');
-const { goalForSession, noteManualGoal, resetGoalStatesForTests } = await import('../src/main/goal-state.js');
+const { goalForSession, noteGoalAutoTurn, noteManualGoal, resetGoalStatesForTests } = await import('../src/main/goal-state.js');
 const { createSession, getSession, initSessionStore, readEvents, resetSessionStoreForTests } = await import(
   '../src/main/session/store.js'
 );
@@ -2500,15 +2500,63 @@ describe('the goal loop over the bridge', () => {
       expect(feed.body.goal.draft.reply).toBe(humanReply('what about the tests'));
 
       const acked = await request('POST', '/goal/ack', {
-        body: { conversationId: 'cafe0003-0000-4000-8000-000000000003', token: started.body.goal.token }
+        body: { conversationId: 'cafe0003-0000-4000-8000-000000000003', token: started.body.goal.token, sent: true }
       });
       expect(acked.body.acknowledged).toBe(true);
+      const sessionId = started.body.sessionId as string;
+      expect(goalForSession(sessionId)?.consecutiveAutoTurns).toBe(1);
+      // A lost response can repeat the exact ACK; the token is the accounting tombstone.
+      const replay = await request('POST', '/goal/ack', {
+        body: { conversationId: 'cafe0003-0000-4000-8000-000000000003', token: started.body.goal.token, sent: true }
+      });
+      expect(replay.body.acknowledged).toBe(true);
+      expect(goalForSession(sessionId)?.consecutiveAutoTurns).toBe(1);
 
       const after = await request('GET', '/activity?conversationId=cafe0003-0000-4000-8000-000000000003');
       expect(after.body.goal.draft).toBeNull();
     } finally {
       setGoalDriverForTests(null);
     }
+  });
+
+  it('refuses Goal drafting while Compact & Resume owns the session', async () => {
+    await pair();
+    const conversationId = 'cafe0006-0000-4000-8000-000000000006';
+    await request('POST', '/events', {
+      body: { conversationId, events: [{ kind: 'user_message', provenance: 'manual', time: Date.now(), text: 'finish it', messageId: 'm-compact-goal' }] }
+    });
+    const sessionId = liveConversations().find((entry) => entry.conversationId === conversationId)?.sessionId;
+    expect(sessionId).toBeTruthy();
+    await openContinuationNow(sessionId!, conversationId);
+    let calls = 0;
+    setGoalDriverForTests(async () => { calls++; return { kind: 'message', text: 'must not run' }; });
+    const reply = await request('POST', '/goal/draft', { body: { conversationId, turnId: 'g-compaction-active' } });
+    expect(reply.status).toBe(409);
+    expect(reply.body.error).toBe('compaction_active');
+    expect(calls).toBe(0);
+  });
+
+  it('refuses the 33rd automatic turn until a new manual revision is created', async () => {
+    await pair();
+    const conversationId = 'cafe0007-0000-4000-8000-000000000007';
+    await request('POST', '/events', {
+      body: { conversationId, events: [{ kind: 'user_message', provenance: 'manual', time: Date.now(), text: 'long goal', messageId: 'm-cap-goal' }] }
+    });
+    const sessionId = liveConversations().find((entry) => entry.conversationId === conversationId)?.sessionId;
+    expect(sessionId).toBeTruthy();
+    const revision = goalForSession(sessionId!)!.revision;
+    for (let index = 0; index < 32; index++) noteGoalAutoTurn(sessionId!, revision);
+    expect(goalForSession(sessionId!)).toMatchObject({ status: 'stopped', consecutiveAutoTurns: 32 });
+    let calls = 0;
+    setGoalDriverForTests(async () => { calls++; return { kind: 'message', text: 'must not run' }; });
+    const blocked = await request('POST', '/goal/draft', { body: { conversationId, turnId: 'g-33' } });
+    expect(blocked.status).toBe(409);
+    expect(blocked.body.error).toBe('goal_inactive');
+    expect(calls).toBe(0);
+    await request('POST', '/events', {
+      body: { conversationId, events: [{ kind: 'user_message', provenance: 'manual', time: Date.now() + 1, text: 'continue with a fresh revision', messageId: 'm-cap-reset' }] }
+    });
+    expect(goalForSession(sessionId!)).toMatchObject({ status: 'active', consecutiveAutoTurns: 0 });
   });
 
   it('stops a session locally without calling the Goal Driver, then a later manual message starts a newer revision', async () => {

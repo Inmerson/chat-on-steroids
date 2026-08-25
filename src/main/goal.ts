@@ -17,8 +17,10 @@ import {
   goalForSession,
   goalRevisionMatches,
   markGoalComplete,
-  markGoalFailed
+  markGoalFailed,
+  noteGoalAutoTurn
 } from './goal-state.js';
+import { continuationForSession } from './session/continuation.js';
 
 /** How many messages of history the Goal Driver is given, newest kept. */
 const MAX_CONTEXT_MESSAGES = 120;
@@ -52,6 +54,8 @@ interface GoalDraft extends GoalDraftView {
   startedAt: number;
   settledAt: number;
   acknowledged: boolean;
+  /** Successful browser-send ACK already charged to consecutiveAutoTurns for this token. */
+  sentCounted: boolean;
   work: Promise<void> | null;
 }
 
@@ -98,13 +102,34 @@ export function goalViewFor(conversationId: string, clientId?: string): GoalDraf
   expireDraftPayload(draft);
   if (clientId !== undefined && draft.clientId !== clientId) return null;
   if (draft.acknowledged) return null;
+  // A browser-visible reply is authority to perform an irreversible send. Re-check the two
+  // session-level fences at the moment that authority is projected, not only while the driver
+  // was running: a manual revision or Compact & Resume can win after the draft became ready.
+  if (
+    draft.stage === 'ready' &&
+    (!goalRevisionMatches(draft.sessionId, draft.revision) || continuationForSession(draft.sessionId))
+  ) {
+    retireStale(draft);
+    return null;
+  }
   return view(draft);
 }
 
-export function ackGoalDraft(conversationId: string, token: string, clientId?: string): boolean {
+export function ackGoalDraft(
+  conversationId: string,
+  token: string,
+  clientId?: string,
+  sent = false
+): boolean {
   const draft = drafts.get(conversationId);
   if (!draft || draft.token !== token) return false;
   if (clientId !== undefined && draft.clientId !== clientId) return false;
+  // The draft token is the exactly-once accounting key. A lost HTTP response may make the
+  // browser repeat this ACK, but the same generated send must advance the runaway guard once.
+  if (sent && !draft.sentCounted) {
+    const updated = noteGoalAutoTurn(draft.sessionId, draft.revision);
+    if (updated) draft.sentCounted = true;
+  }
   draft.acknowledged = true;
   if (draft.settledAt === 0) draft.settledAt = Date.now();
   return true;
@@ -164,6 +189,7 @@ export function startGoalDraft(input: StartGoalDraftInput): GoalDraftView {
     startedAt: Date.now(),
     settledAt: 0,
     acknowledged: false,
+    sentCounted: false,
     work: null
   };
   drafts.set(input.conversationId, draft);
@@ -179,7 +205,12 @@ function settle(draft: GoalDraft, stage: GoalStage, error: string | null = null)
 }
 
 function stillCurrent(draft: GoalDraft): boolean {
-  return !draft.acknowledged && drafts.get(draft.conversationId) === draft && goalRevisionMatches(draft.sessionId, draft.revision);
+  return (
+    !draft.acknowledged &&
+    drafts.get(draft.conversationId) === draft &&
+    goalRevisionMatches(draft.sessionId, draft.revision) &&
+    continuationForSession(draft.sessionId) === null
+  );
 }
 
 function retireStale(draft: GoalDraft): void {

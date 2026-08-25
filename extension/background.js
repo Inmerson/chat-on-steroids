@@ -1778,6 +1778,7 @@ const HANDLERS = {
         conversationId: message.conversationId,
         token: String(message.token || ''),
         clientId: String(source.tab),
+        sent: message.sent === true,
         sentMessageId: typeof message.sentMessageId === 'string' ? message.sentMessageId : null
       })
     });

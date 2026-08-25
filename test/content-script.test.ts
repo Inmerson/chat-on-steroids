@@ -8217,6 +8217,35 @@ describe('the goal loop', () => {
     expect(acks(live)).toHaveLength(1);
   });
 
+  it('re-checks app activity before insertion and discards a ready draft when compaction won meanwhile', async () => {
+    let busy = false;
+    let draft: unknown = readyDraft('do the next thing');
+    let sends = () => 0;
+    live = await harness(`https://chatgpt.com/c/${CHAT}`, {
+      ...goalReplies(),
+      activity: () => ({
+        ok: true,
+        data: {
+          entries: [], stream: [], nextSince: 0, pendingTools: 0,
+          job: busy ? { sessionId: 's1', stage: 'opening', busy: true, handoffId: 'h1', error: null } : null,
+          goal: { enabled: true, hasKey: true, model: MODEL, draft }
+        }
+      }),
+      goal_ack: () => { draft = null; return { ok: true, data: { acknowledged: true } }; }
+    }, (document) => {
+      sends = watchSend(document);
+      document.querySelector('#prompt-textarea')!.textContent = 'my draft';
+    });
+    await live.hook.pullActivity();
+    // The first attempt retained the Goal draft because the composer was occupied.
+    live.document.querySelector('#prompt-textarea')!.replaceChildren();
+    busy = true;
+    await live.hook.maybeSendGoalReply();
+    await settle();
+    expect(sends()).toBe(0);
+    expect(acks(live)).toHaveLength(1);
+  });
+
   it('never sends the same ready draft twice when the acknowledgement is lost', async () => {
     let ackAttempts = 0;
     let draft: unknown = null;

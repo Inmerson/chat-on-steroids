@@ -6401,6 +6401,34 @@
    * a half-written message is never overwritten; this waits a while for it to be free and
    * then gives up honestly rather than typing over somebody mid-sentence.
    */
+  async function goalSendFenceOpen(draft) {
+    const forId = conversationId;
+    const forEpoch = epoch;
+    if (!forId || CLF_DOM.conversationId() !== forId) return false;
+    const reply = await ask({ type: 'activity', conversationId: forId, since });
+    if (
+      !reply || reply.ok !== true || !reply.data || !alive ||
+      conversationId !== forId || epoch !== forEpoch || CLF_DOM.conversationId() !== forId
+    ) return false;
+    const data = reply.data;
+    job = data.job || null;
+    goalConfig = data.goal && typeof data.goal === 'object' ? data.goal : null;
+    goalDraft = goalConfig ? goalConfig.draft || null : null;
+    bootstrap = data.bootstrap === 'resume' || data.bootstrap === 'worker' ? data.bootstrap : null;
+    return Boolean(
+      goalUsable() &&
+      goalDraft &&
+      goalDraft.token === draft.token &&
+      goalDraft.stage === 'ready' &&
+      goalDraft.reply &&
+      !generating &&
+      !CLF_DOM.generating() &&
+      !compactCapture &&
+      !nativeBusy &&
+      !(job && job.busy)
+    );
+  }
+
   async function maybeSendGoalReply() {
     const draft = goalDraft;
     if (!draft || !conversationId || draft.conversationId !== conversationId) return;
@@ -6409,7 +6437,7 @@
       // The message already crossed the browser's irreversible boundary. A lost ACK may make
       // the app re-offer it, including after a content-script reload; only retry the receipt.
       goalDraft = null;
-      await ask({ type: 'goal_ack', conversationId, token: draft.token }).catch(() => undefined);
+      await ask({ type: 'goal_ack', conversationId, token: draft.token, sent: true }).catch(() => undefined);
       return;
     }
     if (!goalUsable()) {
@@ -6448,6 +6476,15 @@
     }
     goalBusy = true;
     try {
+      // The ready payload can sit on the page while a manual revision, worker rebind or
+      // Compact & Resume starts in the app. Re-pull the authoritative control state at the
+      // last possible moment and fail closed before touching the composer.
+      if (!(await goalSendFenceOpen(draft))) {
+        goalPhase = '';
+        goalDraft = null;
+        await ask({ type: 'goal_ack', conversationId, token: draft.token }).catch(() => undefined);
+        return;
+      }
       if (goalTypingSince === 0) goalTypingSince = Date.now();
       goalPhase = 'sending';
       injectStage();
@@ -6483,6 +6520,7 @@
         type: 'goal_ack',
         conversationId,
         token: draft.token,
+        sent: true,
         sentMessageId: sent.messageId
       }).catch(() => undefined);
       goalPhase = '';

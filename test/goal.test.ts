@@ -27,6 +27,7 @@ const { appendEvent, createSession, initSessionStore, resetSessionStoreForTests 
 const goalState = await import('../src/main/goal-state.js');
 const goalDriver = await import('../src/main/antigravity/goal-driver.js');
 const goal = await import('../src/main/goal.js');
+const continuation = await import('../src/main/session/continuation.js');
 const { makeTempDir, removeTempDir } = await import('./helpers.js');
 
 let dir: string;
@@ -74,6 +75,7 @@ beforeEach(async () => {
   goal.resetGoalStateForTests();
   goalState.resetGoalStatesForTests();
   goalDriver.setGoalDriverForTests(null);
+  continuation.resetContinuationsForTests();
   await saveConfig({ ...defaultConfig(), goal: { ...defaultConfig().goal, enabled: true } });
 });
 
@@ -252,6 +254,53 @@ describe('Antigravity-backed draft lifecycle', () => {
     expect(view.stage).toBe('failed');
     expect(view.error).toMatch(/agy unavailable/i);
     expect(goalState.goalForSession(sessionId)).toMatchObject({ revision, status: 'failed' });
+  });
+});
+
+describe('revision and continuation fences', () => {
+  it('never exposes a late result from an older goal revision', async () => {
+    const active = await activeSession('c-stale-revision', 'first goal');
+    let release!: (value: GoalDriverResult) => void;
+    let entered!: () => void;
+    const started = new Promise<void>((resolve) => { entered = resolve; });
+    goalDriver.setGoalDriverForTests(async () => {
+      entered();
+      return await new Promise<GoalDriverResult>((resolve) => { release = resolve; });
+    });
+    goal.startGoalDraft({ sessionId: active.sessionId, conversationId: 'c-stale-revision', turnId: 'g-1', revision: active.revision });
+    await started;
+    const newer = goalState.noteManualGoal(active.sessionId, 'newer goal', 'manual-newer');
+    release({ kind: 'message', text: 'stale follow-up' });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(goal.goalViewFor('c-stale-revision')).toBeNull();
+    expect(goalState.goalForSession(active.sessionId)).toMatchObject({ revision: newer.revision, consecutiveAutoTurns: 0, status: 'active' });
+  });
+
+  it('withdraws a ready reply as soon as Compact & Resume owns the session', async () => {
+    const active = await activeSession('c-compaction-wins', 'finish the migration');
+    goalDriver.setGoalDriverForTests(async () => ({ kind: 'message', text: 'continue after this' }));
+    goal.startGoalDraft({ sessionId: active.sessionId, conversationId: 'c-compaction-wins', turnId: 'g-1', revision: active.revision });
+    expect((await settled('c-compaction-wins')).reply).not.toBe('');
+    await continuation.openContinuationNow(active.sessionId, 'c-compaction-wins');
+    expect(goal.goalViewFor('c-compaction-wins')).toBeNull();
+  });
+
+  it('counts successful generated sends once and stops the revision at 32', async () => {
+    const active = await activeSession('c-auto-cap', 'long unattended goal');
+    goalDriver.setGoalDriverForTests(async () => ({ kind: 'message', text: 'continue' }));
+    for (let index = 0; index < 32; index += 1) {
+      const started = goal.startGoalDraft({
+        sessionId: active.sessionId,
+        conversationId: 'c-auto-cap',
+        turnId: `g-${index}`,
+        revision: active.revision
+      });
+      await settled('c-auto-cap');
+      expect(goal.ackGoalDraft('c-auto-cap', started.token, undefined, true)).toBe(true);
+      // Lost ACK replay must not count twice.
+      expect(goal.ackGoalDraft('c-auto-cap', started.token, undefined, true)).toBe(true);
+    }
+    expect(goalState.goalForSession(active.sessionId)).toMatchObject({ status: 'stopped', consecutiveAutoTurns: 32 });
   });
 });
 

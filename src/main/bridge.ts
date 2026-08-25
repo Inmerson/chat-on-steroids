@@ -1490,6 +1490,9 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
     if (!activeGoal || activeGoal.status !== 'active') {
       return json(res, 409, { error: 'goal_inactive' }, origin);
     }
+    if (continuationForSession(sessionId)) {
+      return json(res, 409, { error: 'compaction_active' }, origin);
+    }
     let draft;
     try {
       draft = startGoalDraft({ sessionId, conversationId: id, turnId, clientId, revision: activeGoal.revision });
@@ -1519,7 +1522,8 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
     if (!id) return json(res, 400, { error: 'bad_conversation_id' }, origin);
     const token = typeof body['token'] === 'string' ? body['token'] : '';
     const clientId = typeof body['clientId'] === 'string' ? body['clientId'].slice(0, 100) : '';
-    return json(res, 200, { acknowledged: ackGoalDraft(id, token, clientId) }, origin);
+    const sent = body['sent'] === true;
+    return json(res, 200, { acknowledged: ackGoalDraft(id, token, clientId, sent) }, origin);
   }
 
   /**

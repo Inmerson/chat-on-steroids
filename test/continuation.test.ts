@@ -54,6 +54,7 @@ const { createSession, getSession, initSessionStore, resetSessionStoreForTests, 
   '../src/main/session/store.js'
 );
 const store = await import('../src/main/session/store.js');
+const goalState = await import('../src/main/goal-state.js');
 const { resetRecorderForTests, sessionForConversation } = await import('../src/main/session/recorder.js');
 const { resetWorkspaces, setWorkspaceFor, workspaceEntries } = await import('../src/main/workspace.js');
 const { makeTempDir, removeTempDir, SAMPLE_BRIEF } = await import('./helpers.js');
@@ -93,6 +94,7 @@ beforeEach(async () => {
   resetAgentsForTests();
   resetRecorderForTests();
   resetWorkspaces();
+  goalState.resetGoalStatesForTests();
   await resetSessionStoreForTests();
 });
 
@@ -108,6 +110,19 @@ async function readyContinuation(): Promise<{ sessionId: string; token: string }
   await attachSummary(opened.token, SAMPLE_BRIEF);
   return { sessionId: summary.id, token: opened.token };
 }
+
+describe('goal ownership across continuation', () => {
+  it('keeps the exact session goal revision when chat A commits to chat B', async () => {
+    const session = await createSession({ title: 'goal move', conversationId: CHAT_A });
+    const before = goalState.noteManualGoal(session.id, 'finish the whole migration', 'manual-goal');
+    const opened = await openContinuationNow(session.id, CHAT_A);
+    await attachSummary(opened.token, SAMPLE_BRIEF);
+    await claimContinuationNow(opened.token, 'tab-b');
+    expect(await commitContinuation(opened.token, CHAT_B)).toBe(true);
+    expect(await attachedChat(session.id)).toBe(CHAT_B);
+    expect(goalState.goalForSession(session.id)).toEqual(before);
+  });
+});
 
 describe('capturing the brief', () => {
   it('answers a repeated capture with the handoff it already wrote', async () => {
