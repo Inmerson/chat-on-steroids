@@ -61,6 +61,7 @@ const {
   workerConversationGone
 } = await import('../src/main/agents.js');
 const { startMcpServer } = await import('../src/main/mcp/server.js');
+const { setAntigravityInvestigatorForTests } = await import('../src/main/antigravity/investigator.js');
 const { flushDurable, initDurableStore, readDurable, writeDurableNow, writeDurableSoon } = await import('../src/main/durable.js');
 const { initSessionStore, resetSessionStoreForTests } = await import('../src/main/session/store.js');
 const { recordChatObservations, resetRecorderForTests } = await import('../src/main/session/recorder.js');
@@ -91,6 +92,7 @@ afterAll(async () => {
 beforeEach(() => {
   resetAgentsForTests();
   resetRecorderForTests();
+  setAntigravityInvestigatorForTests(null);
   // The real app wires the broker's immediate persistence sink during startup. MCP endpoint
   // tests exercise that production contract rather than an intentionally half-wired broker;
   // durability-specific cases below replace this no-op sink with controlled writers.
@@ -938,7 +940,7 @@ describe('through the MCP endpoint', () => {
 
   beforeEach(async () => {
     endpoint = await startMcpServer(() => ({
-      roots: [],
+      roots: [{ name: 'workspace', path: dir }],
       caps: { ...DEFAULT_CAPABILITIES },
       readOnly: true,
       sessionTools: false,
@@ -952,7 +954,7 @@ describe('through the MCP endpoint', () => {
 
   // One flat tool with five actions. The names it replaced are gone outright, not aliased,
   // so a chat still holding the old instructions gets an honest unknown-tool error.
-  it('publishes one agents tool with exactly four actions', async () => {
+  it('publishes one agents tool with exactly five actions', async () => {
     const reply = await post({ jsonrpc: '2.0', id: nextId++, method: 'tools/list', params: {} });
     const names = (reply.result.tools as Array<{ name: string }>).map((tool) => tool.name);
     expect(names).toContain('agents');
@@ -971,9 +973,84 @@ describe('through the MCP endpoint', () => {
     const schema = (reply.result.tools as Array<{ name: string; inputSchema: any }>).find(
       (tool) => tool.name === 'agents'
     )!.inputSchema;
-    expect(schema.properties.action.enum.slice().sort()).toEqual(['finish', 'message', 'spawn', 'status']);
+    expect(schema.properties.action.enum.slice().sort()).toEqual(['finish', 'investigate', 'message', 'spawn', 'status']);
+    expect(schema.properties.task.type).toBe('string');
+    expect(schema.properties.workdir.type).toBe('string');
     // Revive is gone from the wire as well as from the broker: no field survives for it.
     expect(Object.keys(schema.properties)).not.toContain('agent');
+  });
+
+  it('delegates broad read-only investigation through the approved workspace', async () => {
+    let calls = 0;
+    setAntigravityInvestigatorForTests(async ({ task, cwd }) => {
+      calls += 1;
+      expect(task).toMatch(/stale/i);
+      expect(cwd).toBe(dir);
+      return {
+        report: 'Likely stale bridge state.',
+        observedFiles: ['src/main/bridge.ts'],
+        toolErrors: [],
+        toolCalls: 4,
+        conversationId: 'conv-fast',
+        durationSeconds: 2.4,
+        totalTokens: 700,
+        partial: false,
+        budgetExceeded: false
+      };
+    });
+
+    const reply = await post({
+      jsonrpc: '2.0',
+      id: nextId++,
+      method: 'tools/call',
+      params: {
+        name: 'agents',
+        arguments: {
+          action: 'investigate',
+          task: 'Trace why MCP state becomes stale across multiple files.',
+          workdir: '/workspace'
+        }
+      }
+    });
+    expect(reply.result?.structuredContent).toMatchObject({
+      action: 'investigate',
+      provider: 'antigravity',
+      delegated: true,
+      model: 'gemini-3.7-flash-low',
+      report: 'Likely stale bridge state.',
+      observed_files: ['src/main/bridge.ts']
+    });
+    expect(calls).toBe(1);
+  });
+
+  it('declines trivial investigate work before workspace resolution or Antigravity launch', async () => {
+    let calls = 0;
+    setAntigravityInvestigatorForTests(async () => {
+      calls += 1;
+      throw new Error('should not launch');
+    });
+    const reply = await post({
+      jsonrpc: '2.0', id: nextId++, method: 'tools/call',
+      params: { name: 'agents', arguments: { action: 'investigate', task: 'Read the npm package name from package.json.' } }
+    });
+    expect(reply.result?.structuredContent).toMatchObject({ action: 'investigate', provider: 'antigravity', delegated: false });
+    expect(calls).toBe(0);
+  });
+
+  it('declines mutation and final-verification investigate requests without Antigravity launch', async () => {
+    let calls = 0;
+    setAntigravityInvestigatorForTests(async () => {
+      calls += 1;
+      throw new Error('should not launch');
+    });
+    for (const task of ['Implement the fix across src/main.', 'Run final verification and deploy it.']) {
+      const reply = await post({
+        jsonrpc: '2.0', id: nextId++, method: 'tools/call',
+        params: { name: 'agents', arguments: { action: 'investigate', task } }
+      });
+      expect(reply.result?.structuredContent).toMatchObject({ action: 'investigate', provider: 'antigravity', delegated: false });
+    }
+    expect(calls).toBe(0);
   });
 
   it('is identified by exact request-id evidence that arrived before the call it names', async () => {

@@ -85,12 +85,13 @@ Compact & Resume is app/browser orchestration. There is no model-visible `save_h
 
 ### `agents`
 
-Available while multi-agent mode is enabled. It has exactly four actions:
+Available while multi-agent mode is enabled. It has exactly five actions:
 
 - `spawn` creates worker chats from one shared context plus per-worker tasks.
 - `message` sends one message or an all-or-nothing batch.
 - `status` reports the run and workers.
 - `finish` is the worker's terminal handoff to the prime.
+- `investigate` asks the bounded local Antigravity Flash fast lane for read-only repository reconnaissance. A deterministic router declines trivial lookups, mutation/release work and final verification before any workspace resolution or Antigravity process starts. Returned evidence is advisory; Prime independently verifies it.
 
 There is no model-supplied agent credential or `agent_key`. Worker/prime identity is bound to
 the ChatGPT conversation using extension evidence; control calls fail closed when that identity

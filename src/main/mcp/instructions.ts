@@ -112,6 +112,7 @@ function coreInstructions(ctx: ToolContext): string {
       'and folder, conventions file, what not to touch, how to validate, what to report — in "context" once, and',
       'give each worker the objective, files and constraints that are its own in its "task". Do not repeat the',
       'context inside the tasks, and do not preface a task with boilerplate like “you have zero prior context”.',
+      'For broad read-only repository reconnaissance such as root-cause tracing, cross-file execution paths, or all-reference discovery, prefer agents action=investigate when it can save wall-clock time. The local router may decline trivial, mutating, command-verification, or final-gate work; treat every Antigravity finding as advisory and independently verify consequential claims before editing, testing, releasing, or reporting a final conclusion.',
       'Workers write code as readily as they investigate, so say which files each one may change. Steer an active',
       'worker with action=message, and send several at once with "messages" rather than one call per worker. A',
       'finished worker is finished: give remaining work to a new one. As a worker, message the prime with',
