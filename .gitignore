@@ -34,3 +34,6 @@ docs/android-mcp-brainstorm/
 # Smoke-test scratch fixtures.
 smoke/
 smoke-switch.txt
+
+# Isolated implementation worktrees.
+.worktrees/
