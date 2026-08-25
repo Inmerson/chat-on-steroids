@@ -878,13 +878,9 @@ function registerAgentsTool(reg: SurfaceRegistrar): void {
     {
       title: 'Multi-agent run',
       description:
-        'Run ChatGPT worker agents or a fast read-only Antigravity investigation on this machine. ' +
-        'spawn — create workers; the calling chat becomes the run\'s prime and each worker opens in its own ChatGPT conversation with its brief in it. A worker sees only what you send: shared instructions go in "context" once, each job in its own "task". ' +
-        'message — the prime may message any worker, a worker only "prime"; send several at once in "messages". Replies arrive on later tool results, so never wait or poll. ' +
-        'status — every agent, its task, and what is waiting. ' +
-        'finish — workers only, terminal. ' +
-        'investigate ? broad read-only repository reconnaissance; its advisory evidence must be independently verified by Prime. ' +
-        'An agent is the conversation it runs in, so no call here carries a key.',
+        'Run ChatGPT workers or bounded read-only Antigravity reconnaissance. ' +
+        'spawn creates workers (shared context once, per-worker task); message sends one or a batch; status reports the run; finish is terminal for workers. ' +
+        'investigate is advisory repository reconnaissance that Prime must verify independently. No agent call carries a key.',
       inputSchema: z.object({
         action: z.enum(['spawn', 'message', 'status', 'finish', 'investigate']).describe('What to do.'),
         context: z
