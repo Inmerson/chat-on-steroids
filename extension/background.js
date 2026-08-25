@@ -1777,7 +1777,8 @@ const HANDLERS = {
       body: JSON.stringify({
         conversationId: message.conversationId,
         token: String(message.token || ''),
-        clientId: String(source.tab)
+        clientId: String(source.tab),
+        sentMessageId: typeof message.sentMessageId === 'string' ? message.sentMessageId : null
       })
     });
     return ownsDocument(source) ? result : { ok: false, error: 'stale_document' };

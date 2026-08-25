@@ -1248,7 +1248,7 @@ describe('extension observation journal', () => {
     const conversationId = '22222222-3333-4444-5555-666666666666';
     const local = new FakeStorageArea({ port: 8765, token: 'paired-token' });
     const session = new FakeStorageArea();
-    const seen: Array<{ route: string; client: string | null }> = [];
+    const seen: Array<{ route: string; client: string | null; sentMessageId?: string | null }> = [];
     const fetch = vi.fn(async (input: string, init: Record<string, unknown> = {}) => {
       const url = new URL(input);
       if (url.pathname === '/hello') return response(200, { app: 'chat-on-steroids', paired: true });
@@ -1258,7 +1258,13 @@ describe('extension observation journal', () => {
       }
       if (url.pathname === '/goal/draft' || url.pathname === '/goal/ack') {
         const body = JSON.parse(String(init.body || '{}'));
-        seen.push({ route: url.pathname, client: typeof body.clientId === 'string' ? body.clientId : null });
+        seen.push({
+          route: url.pathname,
+          client: typeof body.clientId === 'string' ? body.clientId : null,
+          ...(url.pathname.endsWith('/ack')
+            ? { sentMessageId: typeof body.sentMessageId === 'string' ? body.sentMessageId : null }
+            : {})
+        });
         return response(200, url.pathname.endsWith('/draft') ? { goal: { stage: 'drafting' } } : { acknowledged: true });
       }
       return response(404, {});
@@ -1267,12 +1273,15 @@ describe('extension observation journal', () => {
 
     await worker.send({ type: 'activity', conversationId, since: 0 }, 73);
     await worker.send({ type: 'goal_draft', conversationId, turnId: 'generation-owned' }, 73);
-    await worker.send({ type: 'goal_ack', conversationId, token: 'goal-token' }, 73);
+    await worker.send(
+      { type: 'goal_ack', conversationId, token: 'goal-token', sentMessageId: 'm-goal-sent' },
+      73
+    );
 
     expect(seen).toEqual([
       { route: '/activity', client: '73' },
       { route: '/goal/draft', client: '73' },
-      { route: '/goal/ack', client: '73' }
+      { route: '/goal/ack', client: '73', sentMessageId: 'm-goal-sent' }
     ]);
   });
 

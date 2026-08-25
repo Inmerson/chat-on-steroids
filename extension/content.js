@@ -233,6 +233,44 @@
    */
   let epoch = 0;
 
+  // Browser-authoritative provenance for app-owned user sends. Identity, never text, decides
+  // whether a rendered user row is manual, Goal-generated, or an app bootstrap/compaction.
+  let pendingUserProvenance = null;
+  const userProvenanceByMessage = new Map();
+
+  function armUserProvenance(kind) {
+    const fence = { kind, epoch };
+    pendingUserProvenance = fence;
+    return fence;
+  }
+
+  function cancelUserProvenance(fence) {
+    if (pendingUserProvenance === fence) pendingUserProvenance = null;
+  }
+
+  function bindUserProvenance(fence, messageId) {
+    if (!fence || fence.epoch !== epoch) return;
+    if (typeof messageId === 'string' && messageId) {
+      userProvenanceByMessage.set(messageId, { kind: fence.kind, epoch: fence.epoch });
+      while (userProvenanceByMessage.size > 64) userProvenanceByMessage.delete(userProvenanceByMessage.keys().next().value);
+      if (pendingUserProvenance === fence) pendingUserProvenance = null;
+    }
+  }
+
+  function provenanceForUser(messageId) {
+    const bound = userProvenanceByMessage.get(messageId);
+    if (bound && bound.epoch === epoch) {
+      userProvenanceByMessage.delete(messageId);
+      return bound.kind;
+    }
+    if (pendingUserProvenance && pendingUserProvenance.epoch === epoch) {
+      const kind = pendingUserProvenance.kind;
+      pendingUserProvenance = null;
+      return kind;
+    }
+    return 'manual';
+  }
+
   /**
    * Messages already reported from this page load — each as an id *and what it said*.
    *
@@ -992,6 +1030,8 @@
 
   function resetConversation() {
     seenMessages.clear();
+    pendingUserProvenance = null;
+    userProvenanceByMessage.clear();
     reportedConversationTitle = '';
     seenTurns.clear();
     bootstrap = null;
@@ -1325,7 +1365,8 @@
           kind: 'user_message',
           text: message.text,
           messageId: message.id,
-          turnId: message.turnId || undefined
+          turnId: message.turnId || undefined,
+          provenance: provenanceForUser(message.id)
         });
       } else if (message.role === 'assistant') {
         // Assistant identity/content comes exclusively from the MAIN-world Fiber scan now.
@@ -2685,6 +2726,7 @@
             kind: 'user_message',
             messageId: message.messageId,
             text: message.rawText,
+            provenance: provenanceForUser(message.messageId),
             ...(message.createTime ? { time: message.createTime, authoredTime: true } : {})
           });
           continue;
@@ -5728,10 +5770,14 @@
         summary: null
       };
       rememberCapture();
-      if (!CLF_DOM.send()) {
+      const provenanceFence = armUserProvenance('bootstrap');
+      const sent = await CLF_DOM.send();
+      if (!sent.sent) {
+        cancelUserProvenance(provenanceFence);
         releaseCapture();
         return void (await abandon('ChatGPT would not send the handoff instruction. Nothing was compacted.'));
       }
+      bindUserProvenance(provenanceFence, sent.messageId);
 
       // WAITING — for one generation, the one this send starts, and for nothing else.
       nativePhase = 'waiting';
@@ -6417,9 +6463,11 @@
         return;
       }
       await sleep(200);
+      const provenanceFence = armUserProvenance('goal');
       const sent = await CLF_DOM.send();
       goalDraft = null;
-      if (!sent) {
+      if (!sent.sent) {
+        cancelUserProvenance(provenanceFence);
         await ask({ type: 'goal_ack', conversationId, token: draft.token }).catch(() => undefined);
         goalPhase = 'sending';
         goalError = 'ChatGPT would not send the message';
@@ -6428,7 +6476,15 @@
       // Sending is the irreversible step. Record it before the fallible ACK hop so a lost
       // receipt can never turn the same ready draft into a second user message.
       rememberGoalSpent(conversationId, draft.token);
-      await ask({ type: 'goal_ack', conversationId, token: draft.token }).catch(() => undefined);
+      bindUserProvenance(provenanceFence, sent.messageId);
+      observe();
+      await flush();
+      await ask({
+        type: 'goal_ack',
+        conversationId,
+        token: draft.token,
+        sentMessageId: sent.messageId
+      }).catch(() => undefined);
       goalPhase = '';
       goalError = '';
     } finally {
@@ -6737,7 +6793,14 @@
       return void (await fail('the composer changed before bootstrap send; the draft was preserved'));
     }
     if (await failIfRetargeted()) return;
-    if (!(await CLF_DOM.send())) return void (await fail('ChatGPT did not accept the bootstrap send'));
+    const provenanceFence = armUserProvenance('bootstrap');
+    const sent = await CLF_DOM.send();
+    if (!sent.sent) {
+      cancelUserProvenance(provenanceFence);
+      return void (await fail('ChatGPT did not accept the bootstrap send'));
+    }
+    bindUserProvenance(provenanceFence, sent.messageId);
+    observe();
     agent = boot.agent || null;
     agentCommandId = agent && typeof boot.id === 'string' ? boot.id : null;
 

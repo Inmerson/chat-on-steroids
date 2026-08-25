@@ -1282,9 +1282,9 @@ var CLF_DOM = (() => {
   async function send() {
     try {
       const box = composer();
-      if (!box) return false;
+      if (!box) return { sent: false, messageId: null };
       const submitted = (box.textContent || '').trim();
-      if (!submitted) return false;
+      if (!submitted) return { sent: false, messageId: null };
       const compact = (value) => String(value || '').replace(/\s+/g, '');
       const expected = compact(submitted);
       const beforeConversation = conversationId();
@@ -1295,6 +1295,22 @@ var CLF_DOM = (() => {
           .filter((message) => message.role === 'user' && message.node)
           .map((message) => message.node)
       );
+      let acceptedMessageId = null;
+
+      // A newly rendered user row is the strongest acceptance proof because it also gives the
+      // stable ChatGPT message identity the recorder needs. Text participates only in proving
+      // that this new row is the submitted prompt; it is never used by content.js to decide
+      // provenance. If another page-owned signal wins first, messageId stays null honestly.
+      const freshSubmitted = () => {
+        const visible = messages();
+        for (let at = visible.length - 1; at >= 0; at--) {
+          const message = visible[at];
+          if (message.role !== 'user' || priorUserNodes.has(message.node)) continue;
+          if (compact(message.text) !== expected) continue;
+          return { messageId: typeof message.id === 'string' && message.id ? message.id : null };
+        }
+        return null;
+      };
 
       // click()/dispatchEvent() only prove that JavaScript ran, not that ChatGPT accepted a
       // prompt. Observe for a page-owned consequence instead of sleeping and re-sampling on a
@@ -1302,18 +1318,17 @@ var CLF_DOM = (() => {
       // evidence; a newly assigned conversation id or a generation/Stop transition covers
       // editor variants that leave the rich-text value mounted while React starts the turn.
       const accepted = () => {
+        const fresh = freshSubmitted();
+        if (fresh) {
+          acceptedMessageId = fresh.messageId;
+          return true;
+        }
         const current = composer();
         if (current && (current.textContent || '').trim() === '') return true;
         const currentConversation = conversationId();
         if (currentConversation && currentConversation !== beforeConversation) return true;
         if (!beforeGenerating && generating()) return true;
         if (!beforeStop && stopButton()) return true;
-        const visible = messages();
-        for (let at = visible.length - 1; at >= 0; at--) {
-          const message = visible[at];
-          if (message.role !== 'user') continue;
-          if (!priorUserNodes.has(message.node) && compact(message.text) === expected) return true;
-        }
         return false;
       };
 
@@ -1321,12 +1336,12 @@ var CLF_DOM = (() => {
         let done = false;
         let observer = null;
         let timer = null;
-        const finish = (value) => {
+        const finish = (sent) => {
           if (done) return;
           done = true;
           if (observer) observer.disconnect();
           if (timer !== null) clearTimeout(timer);
-          resolve(value);
+          resolve({ sent, messageId: sent ? acceptedMessageId : null });
         };
         const check = () => {
           if (accepted()) finish(true);
@@ -1358,7 +1373,7 @@ var CLF_DOM = (() => {
         }
       });
     } catch {
-      return false;
+      return { sent: false, messageId: null };
     }
   }
 

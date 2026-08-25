@@ -46,7 +46,8 @@ const {
 } = await import('../src/main/bridge.js');
 const { flushDurable, initDurableStore, readDurable, writeDurableNow, writeDurableSoon } = await import('../src/main/durable.js');
 const { humanReply, resetGoalStateForTests } = await import('../src/main/goal.js');
-const { goalForSession, resetGoalStatesForTests } = await import('../src/main/goal-state.js');
+const { setGoalDriverForTests } = await import('../src/main/antigravity/goal-driver.js');
+const { goalForSession, noteManualGoal, resetGoalStatesForTests } = await import('../src/main/goal-state.js');
 const { createSession, getSession, initSessionStore, readEvents, resetSessionStoreForTests } = await import(
   '../src/main/session/store.js'
 );
@@ -249,6 +250,8 @@ beforeEach(async () => {
   });
   resetRecorderForTests();
   resetGoalStatesForTests();
+  resetGoalStateForTests();
+  setGoalDriverForTests(null);
   writeDurableSoon('bridge-commands', null);
   await flushDurable();
   await setSecret('bridgeToken', '');
@@ -2385,7 +2388,7 @@ describe('the goal loop over the bridge', () => {
     expect(getConfig().goal.enabled).toBe(true);
   });
 
-  it('refuses to draft when the loop is off or has no key', async () => {
+  it('refuses to draft when the loop is off and never requires an OpenRouter key', async () => {
     await pair();
     await request('POST', '/events', {
       body: {
@@ -2409,9 +2412,10 @@ describe('the goal loop over the bridge', () => {
       goal: { ...defaultConfig().goal, enabled: true }
     });
     await setSecret('openRouterApiKey', '');
+    setGoalDriverForTests(async () => ({ kind: 'no-reply', raw: 'NO_REPLY' }));
     const keyless = await request('POST', '/goal/draft', { body: { conversationId: 'cafe0002-0000-4000-8000-000000000002', turnId: 'g-1' } });
-    expect(keyless.status).toBe(409);
-    expect(keyless.body.error).toBe('no_api_key');
+    expect(keyless.status).toBe(200);
+    expect(keyless.body.goal.model).toBe('gemini-3.7-flash-low');
   });
 
   /** A generation is the draft's identity, so it has to be given one. */
@@ -2441,7 +2445,8 @@ describe('the goal loop over the bridge', () => {
     });
     await setSecret('openRouterApiKey', 'sk-or-test');
     const conversationId = 'cafe0099-0000-4000-8000-000000000099';
-    await createSession({ title: 'older but still owned', conversationId });
+    const older = await createSession({ title: 'older but still owned', conversationId });
+    noteManualGoal(older.id, 'continue this older recorded goal', 'm-old-goal');
     for (let index = 0; index < 65; index++) {
       await createSession({ title: `newer session ${index}`, conversationId: null });
     }
@@ -2467,18 +2472,10 @@ describe('the goal loop over the bridge', () => {
     });
 
     let calls = 0;
-    const realFetch = globalThis.fetch;
-    globalThis.fetch = (async () => {
+    setGoalDriverForTests(async () => {
       calls++;
-      const body = new ReadableStream<Uint8Array>({
-        start(controller) {
-          const payload = JSON.stringify({ choices: [{ delta: { content: 'what about the tests' } }] });
-          controller.enqueue(new TextEncoder().encode('data: ' + payload + '\ndata: [DONE]\n'));
-          controller.close();
-        }
-      });
-      return new Response(body, { status: 200 });
-    }) as never;
+      return { kind: 'message', text: 'what about the tests' };
+    });
 
     try {
       const started = await request('POST', '/goal/draft', {
@@ -2510,8 +2507,56 @@ describe('the goal loop over the bridge', () => {
       const after = await request('GET', '/activity?conversationId=cafe0003-0000-4000-8000-000000000003');
       expect(after.body.goal.draft).toBeNull();
     } finally {
-      globalThis.fetch = realFetch;
+      setGoalDriverForTests(null);
     }
+  });
+
+  it('stops a session locally without calling the Goal Driver, then a later manual message starts a newer revision', async () => {
+    await pair();
+    const conversationId = 'cafe0005-0000-4000-8000-000000000005';
+    let calls = 0;
+    setGoalDriverForTests(async () => {
+      calls++;
+      return { kind: 'message', text: 'continue' };
+    });
+
+    await request('POST', '/events', {
+      body: {
+        conversationId,
+        events: [{ kind: 'user_message', provenance: 'manual', time: Date.now(), text: 'build it', messageId: 'm-start' }]
+      }
+    });
+    const sessionId = liveConversations().find((entry) => entry.conversationId === conversationId)?.sessionId;
+    expect(sessionId).toBeTruthy();
+    const first = goalForSession(sessionId!);
+    expect(first?.status).toBe('active');
+
+    await request('POST', '/events', {
+      body: {
+        conversationId,
+        events: [{ kind: 'user_message', provenance: 'manual', time: Date.now() + 1, text: 'goalı durdur', messageId: 'm-stop' }]
+      }
+    });
+    const stopped = goalForSession(sessionId!);
+    expect(stopped?.status).toBe('stopped');
+    const refused = await request('POST', '/goal/draft', { body: { conversationId, turnId: 'g-stopped' } });
+    expect(refused.status).toBe(409);
+    expect(refused.body.error).toBe('goal_inactive');
+    expect(calls).toBe(0);
+
+    await request('POST', '/events', {
+      body: {
+        conversationId,
+        events: [{ kind: 'user_message', provenance: 'manual', time: Date.now() + 2, text: 'devam et', messageId: 'm-resume' }]
+      }
+    });
+    const resumed = goalForSession(sessionId!);
+    expect(resumed?.status).toBe('active');
+    expect(resumed?.revision).toBeGreaterThan(stopped!.revision);
+    const drafted = await request('POST', '/goal/draft', { body: { conversationId, turnId: 'g-resumed' } });
+    expect(drafted.status).toBe(200);
+    for (let attempt = 0; attempt < 100 && calls === 0; attempt++) await new Promise((resolve) => setTimeout(resolve, 5));
+    expect(calls).toBe(1);
   });
 
   /**

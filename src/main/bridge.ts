@@ -35,6 +35,7 @@ import {
 } from './goal.js';
 import {
   isGoalStopCommand,
+  goalForSession,
   noteGoalStop,
   noteManualGoal
 } from './goal-state.js';
@@ -1472,10 +1473,8 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
     const clientId = typeof body['clientId'] === 'string' ? body['clientId'].slice(0, 100) : '';
     if (!id) return json(res, 400, { error: 'bad_conversation_id' }, origin);
     if (!turnId) return json(res, 400, { error: 'bad_turn_id' }, origin);
-    // Checked here as well as in the page, because the page's copy of the setting is a poll
-    // old and this is the request that spends somebody's OpenRouter credit.
+    // Checked here as well as in the page, because the page's copy of the setting is a poll old.
     if (!goalEnabledFor(id)) return json(res, 409, { error: 'goal_disabled' }, origin);
-    if (!(await goalKeyPresent())) return json(res, 409, { error: 'no_api_key' }, origin);
     const live = liveConversations().find((entry) => entry.conversationId === id);
     const known = live ? null : await findSessionByConversation(id, { requireUnique: true });
     const sessionId = live?.sessionId ?? known?.id ?? null;
@@ -1487,9 +1486,13 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
         origin
       );
     }
+    const activeGoal = goalForSession(sessionId);
+    if (!activeGoal || activeGoal.status !== 'active') {
+      return json(res, 409, { error: 'goal_inactive' }, origin);
+    }
     let draft;
     try {
-      draft = startGoalDraft({ sessionId, conversationId: id, turnId, clientId });
+      draft = startGoalDraft({ sessionId, conversationId: id, turnId, clientId, revision: activeGoal.revision });
     } catch (err) {
       if (err instanceof Error && err.message === 'goal_owned_elsewhere') {
         return json(

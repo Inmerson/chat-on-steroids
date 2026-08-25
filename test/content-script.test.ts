@@ -1351,6 +1351,31 @@ function alertBanner(document: Document, text: string): HTMLElement {
  * a guess that is too long drops the new chat's opening message — so what it does instead
  * is prove which sections it was already watching before the URL moved.
  */
+describe('page-owned send identity', () => {
+  it('returns the fresh ChatGPT user message identity that proves the send was accepted', async () => {
+    live = await harness(undefined, {}, (document) => {
+      document.querySelector('[data-testid="send-button"]')!.addEventListener('click', () => {
+        userTurn(document, 'send-identity-42', 'the app-owned prompt');
+      });
+    });
+    expect((live.window as any).CLF_DOM.insertPrompt('the app-owned prompt')).toBe(true);
+    await expect((live.window as any).CLF_DOM.send()).resolves.toEqual({
+      sent: true,
+      messageId: 'm-send-identity-42'
+    });
+  });
+
+  it('returns null identity when acceptance happens before ChatGPT exposes a user message id', async () => {
+    live = await harness(undefined, {}, (document) => {
+      document.querySelector('[data-testid="send-button"]')!.addEventListener('click', () => {
+        document.querySelector('#prompt-textarea')!.replaceChildren();
+      });
+    });
+    expect((live.window as any).CLF_DOM.insertPrompt('accepted before identity')).toBe(true);
+    await expect((live.window as any).CLF_DOM.send()).resolves.toEqual({ sent: true, messageId: null });
+  });
+});
+
 describe('recording authored message text', () => {
   it('reports ChatGPT’s generated document title as conversation metadata and ignores the generic shell title', async () => {
     live = await harness();
@@ -1383,6 +1408,7 @@ describe('recording authored message text', () => {
     const messages = emitted(live.sent, 'user_message');
     expect(messages).toHaveLength(1);
     expect(messages[0]!.event.text).toBe('the exact authored message');
+    expect(messages[0]!.event.provenance).toBe('manual');
   });
 
   /**
@@ -6041,6 +6067,7 @@ describe('the Compact & resume control', () => {
 
     startGenerating(live.document);
     const sends = watchSend(live.document);
+    live.document.querySelector('[data-testid="send-button"]')!.addEventListener('click', () => startGenerating(live!.document));
     const stop = live.document.querySelector('[data-testid="stop-button"]') as HTMLButtonElement;
     let stopped = false;
     stop.addEventListener('click', () => {
@@ -6156,6 +6183,7 @@ describe('the Compact & resume control', () => {
     });
     live.hook.injectControl();
     watchSend(live.document);
+    live.document.querySelector('[data-testid="send-button"]')!.addEventListener('click', () => startGenerating(live!.document));
 
     await live.hook.startCompact();
 
@@ -6315,6 +6343,7 @@ describe('the Compact & resume control', () => {
         }
       };
     });
+    live.document.querySelector('[data-testid="send-button"]')!.addEventListener('click', () => startGenerating(live!.document));
     live.hook.injectControl();
 
     // The gear opens the sheet; the sheet's action row is the press. One path still — the
@@ -6635,6 +6664,7 @@ describe('the fresh chat the app opened', () => {
       (document, dom) => {
         // ChatGPT accepting the message is what gives the chat its id.
         document.querySelector('[data-testid="send-button"]')!.addEventListener('click', () => {
+          userTurn(document, 'bootstrap-sent-message', 'Continue the previous ChatGPT session. Handoff: h-1');
           dom.reconfigure({ url: 'https://chatgpt.com/c/11111111-2222-3333-4444-555555555555' });
         });
       }
@@ -6664,6 +6694,12 @@ describe('the fresh chat the app opened', () => {
         navigationEpoch: expect.any(Number)
       }
     ]);
+    expect(emitted(live.sent, 'user_message').map((entry) => entry.event)).toContainEqual(
+      expect.objectContaining({
+        messageId: 'm-bootstrap-sent-message',
+        provenance: 'bootstrap'
+      })
+    );
   });
 
   it('abandons a redeemed bootstrap if SPA navigation retargets the tab before insertion', async () => {
@@ -8143,7 +8179,15 @@ describe('the goal loop', () => {
    */
   it('types the message, sends it, and acknowledges the draft once', async () => {
     const source = liveFeed();
-    live = await harness(`https://chatgpt.com/c/${CHAT}`, source.replies);
+    live = await harness(
+      `https://chatgpt.com/c/${CHAT}`,
+      source.replies,
+      (document) => {
+        document.querySelector('[data-testid="send-button"]')!.addEventListener('click', () => {
+          userTurn(document, 'goal-sent-message', 'what about the tests');
+        });
+      }
+    );
     const sends = watchSend(live.document);
 
     source.set(readyDraft('what about the tests'));
@@ -8153,7 +8197,17 @@ describe('the goal loop', () => {
     expect(composerText(live.document)).toBe('what about the tests');
     expect(sends()).toBe(1);
     expect(acks(live)).toHaveLength(1);
-    expect(acks(live)[0]).toMatchObject({ conversationId: CHAT, token: 'g-token' });
+    expect(acks(live)[0]).toMatchObject({
+      conversationId: CHAT,
+      token: 'g-token',
+      sentMessageId: 'm-goal-sent-message'
+    });
+    expect(emitted(live.sent, 'user_message').map((entry) => entry.event)).toContainEqual(
+      expect.objectContaining({
+        messageId: 'm-goal-sent-message',
+        provenance: 'goal'
+      })
+    );
 
     // The app stops offering an acknowledged draft, and the page must not re-send from its
     // own memory of one either.
