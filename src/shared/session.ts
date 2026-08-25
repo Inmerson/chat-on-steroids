@@ -581,9 +581,13 @@ export function eventTokens(event: SessionEvent): number {
       // most likely to need compacting — the multi-agent ones.
       return estimateTokens(event.message.text);
     case 'tool_call':
+      // `text` is only the bounded inline journal copy. When a large tool argument/result
+      // spills to an asset, `chars` remains the size of the complete redacted value that
+      // crossed the MCP wire. Context pressure must follow that original size or a 2 MB
+      // command result looks like an 8 kB result and automatic compaction fires far too late.
       return (
-        estimateTokens(event.call.args.text) +
-        estimateTokens(event.call.result.text) +
+        Math.ceil(event.call.args.chars / 4) +
+        Math.ceil(event.call.result.chars / 4) +
         estimateTokens(event.call.summary.title)
       );
     case 'handoff':

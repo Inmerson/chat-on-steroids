@@ -97,6 +97,12 @@ import {
   type Caller
 } from '../agents.js';
 import {
+  ANTIGRAVITY_MODEL,
+  formatAntigravityInvestigation,
+  investigateWithAntigravity
+} from '../antigravity-worker.js';
+import { routeAntigravityInvestigation } from '../delegation-router.js';
+import {
   currentCall,
   currentCaller,
   noteChanges,
@@ -949,7 +955,7 @@ function historyContext(
 // ---------------------------------------------------------------------------
 
 /**
- * One tool, four actions, registered only while multi-agent mode is on. Fresh installs enable
+ * One tool, five actions, registered only while multi-agent mode is on. Fresh installs enable
  * it; existing configs keep their stored choice, so a user who has it off never sees this schema.
  *
  * The identity model is the whole design, and it is the same one for every role: an agent *is*
@@ -975,70 +981,55 @@ function registerAgentsTool(reg: SurfaceRegistrar): void {
     {
       title: 'Multi-agent run',
       description:
-        'Run ChatGPT worker agents on this machine. ' +
-        'spawn — create workers; the calling chat becomes the run\'s prime and each worker opens in its own ChatGPT conversation with its brief in it. A worker sees only what you send: shared instructions go in "context" once, each job in its own "task". ' +
-        'message — the prime may message any worker, a worker only "prime"; send several at once in "messages". Replies arrive on later tool results, so never wait or poll. ' +
-        'status — every agent, its task, and what is waiting. ' +
-        'finish — workers only, terminal. ' +
-        'An agent is the conversation it runs in, so no call here carries a key.',
+        'Coordinate ChatGPT workers or run a fast read-only Antigravity Flash investigation. ' +
+        'spawn creates worker chats; message routes corrections/results; status reports the run; finish is worker-terminal; ' +
+        'investigate scans an approved workspace and returns advisory evidence that the prime must verify.',
       inputSchema: z.object({
-        action: z.enum(['spawn', 'message', 'status', 'finish']).describe('What to do.'),
+        action: z.enum(['spawn', 'message', 'status', 'finish', 'investigate']).describe('What to do.'),
         context: z
           .string()
           .max(4000)
           .optional()
-          .describe(
-            'spawn: what every worker here needs, written once — the app puts it in front of each task, so never ' +
-              'repeat it there. Repo, conventions file, what not to touch, how to validate, what to report. ' +
-              'e.g. "Work in C:\\repo. Follow AGENTS.md. Change nothing unrelated. Run npm test. Do not commit."'
-          ),
+          .describe('spawn: shared repo, constraints and validation instructions supplied once to every worker.'),
         workers: z
           .array(
             z.object({
-              label: z.string().max(60).optional().describe('Short name shown to the user, e.g. "Security".'),
-              task: z
-                .string()
-                .min(1)
-                .max(4000)
-                .describe(
-                  'This worker\'s own job — with "context", all it sees: objective, files, constraints, what to hand ' +
-                    'back. Workers write code as readily as they report, so name the files this one may edit. ' +
-                    'e.g. {"label":"Security","task":"Audit attribution in session/correlation.ts; list paths that ' +
-                    'misattribute a call. Read only."} · {"label":"Implementer","task":"Make delivery all-or-nothing ' +
-                    'in agents.ts, update its test, run npm test, report the diff."}'
-                )
+              label: z.string().max(60).optional().describe('Short worker label.'),
+              task: z.string().min(1).max(4000).describe('spawn: this worker\'s specific task, scope and handoff requirements.')
             })
           )
           .min(1)
           .max(8)
           .optional()
-          .describe('spawn: the workers to create.'),
+          .describe('spawn: workers to create.'),
         messages: z
           .array(
             z.object({
               to: z.string().min(1).max(40).describe('Recipient.'),
-              text: z.string().min(1).max(4000).describe('What to say.')
+              text: z.string().min(1).max(4000).describe('Message text.')
             })
           )
           .min(1)
           .max(16)
           .optional()
-          .describe(
-            'message: several at once, delivered together or not at all — prefer this to one call per recipient. ' +
-              'e.g. [{"to":"worker-1","text":"Ignore the UI."},{"to":"worker-3","text":"Check the README."}]'
-          ),
-        to: z.string().min(1).max(40).optional().describe('message: one recipient, e.g. prime or worker-2.'),
-        text: z.string().min(1).max(4000).optional().describe('message: what to say.'),
+          .describe('message: atomic batch; prefer this for several recipients.'),
+        to: z.string().min(1).max(40).optional().describe('message: one recipient.'),
+        text: z.string().min(1).max(4000).optional().describe('message: text for one recipient.'),
         result: z
           .string()
           .min(1)
           .max(4000)
           .optional()
-          .describe(
-            'finish: your handoff to the prime, all it ever sees of your work. Four headings, in order, factual: ' +
-              'RESULT (what you found or did), CHANGES (each file created/edited/deleted, one per line, or None), ' +
-              'VALIDATION (what you ran and what it said, or None), BLOCKERS (or None).'
-          )
+          .describe('finish: factual RESULT / CHANGES / VALIDATION / BLOCKERS handoff to the prime.'),
+        task: z
+          .string()
+          .min(1)
+          .max(4000)
+          .optional()
+          .describe('investigate: narrow read-only reconnaissance question; never final verification.'),
+        workdir: pathArg
+          .optional()
+          .describe('investigate: approved workspace; defaults to current workspace or first root.')
       }),
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true }
     },
@@ -1051,6 +1042,57 @@ function registerAgentsTool(reg: SurfaceRegistrar): void {
       const startedAt = currentCall()?.startedAt ?? Date.now();
       return guard('agents', async () => {
         if (!reg.agentToolsLive) return reg.featureDisabled('Multi-agent mode', 'Multi-agent mode (experimental)');
+
+        if (input.action === 'investigate') {
+          if (!input.task) return fail('agents action=investigate requires task.');
+          const route = routeAntigravityInvestigation(input.task);
+          if (!route.delegated) {
+            noteCount(0);
+            noteDetail(`Antigravity router kept task with Prime (score ${route.score})`);
+            return {
+              content: [
+                {
+                  type: 'text' as const,
+                  text: `Delegation router: not delegated. Prime should do this directly. ${route.reasons.join('; ')}`
+                }
+              ],
+              structuredContent: {
+                action: 'investigate',
+                provider: 'antigravity',
+                delegated: false,
+                router_score: route.score,
+                router_reasons: route.reasons
+              }
+            };
+          }
+          const cwd = await resolveCwd(reg.ctx, input.workdir);
+          const report = await investigateWithAntigravity({ task: input.task, cwd: cwd.real });
+          noteCount(report.observedFiles.length);
+          noteDetail(
+            `Antigravity Flash: ${report.toolCalls} tool call(s), ${report.observedFiles.length} source file(s) observed`
+          );
+          return {
+            content: [{ type: 'text' as const, text: formatAntigravityInvestigation(report) }],
+            structuredContent: {
+              action: 'investigate',
+              provider: 'antigravity',
+              delegated: true,
+              router_score: route.score,
+              router_reasons: route.reasons,
+              model: ANTIGRAVITY_MODEL,
+              workdir: cwd.virtual,
+              conversation_id: report.conversationId,
+              duration_seconds: report.durationSeconds,
+              total_tokens: report.totalTokens,
+              partial: report.partial,
+              budget_exceeded: report.budgetExceeded,
+              report: report.report,
+              observed_files: report.observedFiles,
+              tool_errors: report.toolErrors,
+              tool_calls: report.toolCalls
+            }
+          };
+        }
 
         if (input.action === 'spawn') {
           if (!input.workers) return fail('agents action=spawn requires workers.');

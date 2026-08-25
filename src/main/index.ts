@@ -34,6 +34,7 @@ import {
 } from './agents.js';
 import { flushDurable, initDurableStore, readDurable, writeDurableNow, writeDurableSoon } from './durable.js';
 import { restoreRequestCorrelations } from './session/correlation.js';
+import { presentWindow, secondInstanceAction } from './window-lifecycle.js';
 import { stopComputerHelper } from './computer/index.js';
 import {
   CONTINUATIONS_STATE,
@@ -51,6 +52,7 @@ let tray: Tray | null = null;
 let quitting = false;
 let shutdownStarted = false;
 let shutdownComplete = false;
+let relaunchRequested = false;
 // One-shot startup flag used by the self-update path. It reconnects this launch
 // without changing the user's persistent auto-connect preference.
 const connectOnStart = process.argv.includes('--connect-on-start');
@@ -61,7 +63,7 @@ if (!app.requestSingleInstanceLock()) {
 }
 
 function createWindow(): void {
-  window = new BrowserWindow({
+  const created = new BrowserWindow({
     // The layout is a fixed frame: three cards over a log over a nav bar, sized to
     // fit exactly. Resizing could only break it, so the window does not resize.
     width: 1080,
@@ -86,48 +88,59 @@ function createWindow(): void {
       webSecurity: true
     }
   });
+  window = created;
 
-  window.once('ready-to-show', () => window?.show());
+  created.once('ready-to-show', () => {
+    if (!created.isDestroyed()) created.show();
+  });
 
   // A renderer that fails to load leaves a blank window with no other clue, so
   // record it where the diagnostics panel can show it.
-  window.webContents.on('did-finish-load', () => logInfo('window loaded'));
-  window.webContents.on('did-fail-load', (_event, code, description) =>
+  created.webContents.on('did-finish-load', () => logInfo('window loaded'));
+  created.webContents.on('did-fail-load', (_event, code, description) =>
     logError(`window failed to load (${code}): ${description}`)
   );
   // Renderer errors are otherwise invisible from here. Only errors, and only the
   // message text — never anything the page was working with.
-  window.webContents.on('console-message', (details) => {
+  created.webContents.on('console-message', (details) => {
     if (details.level === 'error') logError(`renderer: ${details.message}`);
   });
 
   // Nothing in this app should ever open a second window or navigate away.
-  window.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
-  window.webContents.on('will-navigate', (event) => event.preventDefault());
-  window.webContents.on('will-attach-webview', (event) => event.preventDefault());
+  created.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
+  created.webContents.on('will-navigate', (event) => event.preventDefault());
+  created.webContents.on('will-attach-webview', (event) => event.preventDefault());
 
-  window.on('close', (event) => {
+  created.on('close', (event) => {
     if (!quitting && getConfig().ui.minimizeToTray) {
       event.preventDefault();
-      window?.hide();
+      created.hide();
     }
+  });
+  created.on('closed', () => {
+    if (window === created) window = null;
   });
 
   if (process.env.ELECTRON_RENDERER_URL) {
-    void window.loadURL(process.env.ELECTRON_RENDERER_URL);
+    void created.loadURL(process.env.ELECTRON_RENDERER_URL);
   } else {
-    void window.loadFile(path.join(__dirname, '../renderer/index.html'));
+    void created.loadFile(path.join(__dirname, '../renderer/index.html'));
   }
 }
 
 function showWindow(): void {
-  if (!window) {
-    createWindow();
+  presentWindow(window, createWindow);
+}
+
+function handleSecondInstance(): void {
+  if (secondInstanceAction(quitting, shutdownStarted) === 'show') {
+    showWindow();
     return;
   }
-  if (window.isMinimized()) window.restore();
-  window.show();
-  window.focus();
+  if (!relaunchRequested) {
+    relaunchRequested = true;
+    app.relaunch();
+  }
 }
 
 /** A tiny generated icon keeps the tray working without shipping image assets. */
@@ -182,7 +195,7 @@ function refreshTray(): void {
   );
 }
 
-app.on('second-instance', showWindow);
+app.on('second-instance', handleSecondInstance);
 
 void app.whenReady().then(async () => {
   const userData = app.getPath('userData');
@@ -244,7 +257,7 @@ void app.whenReady().then(async () => {
   session.defaultSession.setPermissionRequestHandler((_wc, _permission, callback) => callback(false));
 
   createWindow();
-  registerIpc(() => window);
+  registerIpc(() => (window && !window.isDestroyed() ? window : null));
 
   tray = new Tray(trayIcon(false));
   tray.on('click', showWindow);

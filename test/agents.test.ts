@@ -1,7 +1,7 @@
 /**
  * The broker: what a run is, who may act in it, and what happens to messages.
  *
- * Identity itself — which conversation is which agent, and what a code may and may not do —
+ * Identity itself â€” which conversation is which agent, and what a code may and may not do â€”
  * lives in swarm.test.ts. This file is about everything downstream of that answer: creating
  * a run atomically, the star topology, at-least-once delivery, terminal states, restart, and
  * the shape of all of it over the actual MCP endpoint.
@@ -176,14 +176,14 @@ describe('spawning a run', () => {
 });
 
 describe('star topology', () => {
-  it('allows worker → prime and prime → worker', () => {
+  it('allows worker â†’ prime and prime â†’ worker', () => {
     startSwarm(1);
     const worker = startWorker('worker-1');
     expect(sendMessage(worker.caller, PRIME_ID, 'found something').to).toBe(PRIME_ID);
     expect(sendMessage(prime, 'worker-1', 'noted, carry on').to).toBe('worker-1');
   });
 
-  it('forbids worker → worker in both directions', () => {
+  it('forbids worker â†’ worker in both directions', () => {
     startSwarm(2);
     const one = startWorker('worker-1');
     const two = startWorker('worker-2');
@@ -302,7 +302,7 @@ describe('an agent that has ended', () => {
     startSwarm(1);
     const worker = startWorker('worker-1');
     finishAgent(worker.caller, 'done');
-    // The chat itself does not stop when the slot does — the turn is ChatGPT's — so the
+    // The chat itself does not stop when the slot does â€” the turn is ChatGPT's â€” so the
     // next call from it has to be the sentence that says the work is over.
     const notice = endedWorkerNotice(worker.caller.conversationId);
     expect(notice).toMatch(/WORKER_ENDED/);
@@ -524,7 +524,7 @@ describe('restart', () => {
     expect(spawned).toEqual(['worker-1', 'worker-2']);
   });
 
-  it('repairs only the exact durable prime A→B recovery transition after transfer state was lost', () => {
+  it('repairs only the exact durable prime Aâ†’B recovery transition after transfer state was lost', () => {
     startSwarm(2);
     const snapshot = snapshotSwarm()!;
     resetAgentsForTests();
@@ -639,8 +639,8 @@ describe('through the MCP endpoint', () => {
    *
    * This is the only identity anything has now, so it is the only way to make a control
    * call as somebody. The evidence is fed *while the request is in flight*, which is one of
-   * the two ways it really arrives. The other is ahead of the call — ChatGPT paints the
-   * connector row while it is still composing the request — and that one is covered
+   * the two ways it really arrives. The other is ahead of the call â€” ChatGPT paints the
+   * connector row while it is still composing the request â€” and that one is covered
    * separately below, because assuming it could not happen is exactly what made every live
    * spawn impossible.
    */
@@ -678,7 +678,7 @@ describe('through the MCP endpoint', () => {
 
   // One flat tool with five actions. The names it replaced are gone outright, not aliased,
   // so a chat still holding the old instructions gets an honest unknown-tool error.
-  it('publishes one agents tool with exactly four actions', async () => {
+  it('publishes one agents tool with exactly five actions', async () => {
     const reply = await post({ jsonrpc: '2.0', id: nextId++, method: 'tools/list', params: {} });
     const names = (reply.result.tools as Array<{ name: string }>).map((tool) => tool.name);
     expect(names).toContain('agents');
@@ -697,7 +697,7 @@ describe('through the MCP endpoint', () => {
     const schema = (reply.result.tools as Array<{ name: string; inputSchema: any }>).find(
       (tool) => tool.name === 'agents'
     )!.inputSchema;
-    expect(schema.properties.action.enum.slice().sort()).toEqual(['finish', 'message', 'spawn', 'status']);
+    expect(schema.properties.action.enum.slice().sort()).toEqual(['finish', 'investigate', 'message', 'spawn', 'status']);
     // Revive is gone from the wire as well as from the broker: no field survives for it.
     expect(Object.keys(schema.properties)).not.toContain('agent');
   });
@@ -732,7 +732,7 @@ describe('through the MCP endpoint', () => {
   it('exposes no key field anywhere in the agents schema', async () => {
     const reply = await post({ jsonrpc: '2.0', id: nextId++, method: 'tools/list', params: {} });
     const tools = reply.result.tools as Array<{ name: string; inputSchema: any }>;
-    // Not on agents, and — the part that used to be false — not on any other tool either.
+    // Not on agents, and â€” the part that used to be false â€” not on any other tool either.
     for (const tool of tools) {
       expect(Object.keys(tool.inputSchema.properties ?? {})).not.toContain('agent_key');
     }
@@ -763,7 +763,7 @@ describe('through the MCP endpoint', () => {
     expect(text).not.toContain('worker-1');
   });
 
-  it('uses the inbound HTTP request id instead of stealing a worker’s earlier agents evidence', async () => {
+  it('uses the inbound HTTP request id instead of stealing a workerâ€™s earlier agents evidence', async () => {
     startSwarm(1);
     expect(bindConversation('worker-1', 'c-worker-1')).toBe(true);
     const now = Date.now();

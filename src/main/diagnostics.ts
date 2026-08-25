@@ -199,13 +199,31 @@ async function probeText(url: string): Promise<{ status: number; body: string } 
  * never reports a hard failure. It names the suspicion, which is the part that costs
  * an hour to work out from scratch.
  */
-function developerMode(seen: number | null, called: number | null): Check {
+const ACCESS_RECHECK_GAP_MS = 15_000;
+const ACCESS_SIGNAL_FRESH_MS = 5 * 60_000;
+
+export function developerModeCheck(seen: number | null, called: number | null, now = Date.now()): Check {
   if (called !== null) {
+    const freshReconnectWithoutTool =
+      seen !== null && seen - called >= ACCESS_RECHECK_GAP_MS && now - seen <= ACCESS_SIGNAL_FRESH_MS;
+    if (freshReconnectWithoutTool) {
+      return {
+        name: 'ChatGPT allowed to use the tools',
+        status: 'not-run',
+        ok: null,
+        detail:
+          `ChatGPT reached this connector ${ago(seen)} after the last successful tool call ${ago(called)}, ` +
+          'but no newer tool call followed. In ChatGPT, app selection is per message: select or @mention ' +
+          'Chat On Steroids again for the message that needs it. If the app is missing or calls remain ' +
+          'forbidden, check Developer mode in ChatGPT ? Settings ? Apps ? Advanced settings. If tool ' +
+          'definitions changed, refresh the app actions or start a new chat.'
+      };
+    }
     return {
       name: 'ChatGPT allowed to use the tools',
       status: 'pass',
       ok: true,
-      detail: `Yes — ChatGPT last ran a tool ${ago(called)}, so Developer mode is on and the whole chain works.`
+      detail: `Yes ? ChatGPT last ran a tool ${ago(called)}. For a later prompt that needs the app, select or @mention it again because app selection is per message.`
     };
   }
   if (seen === null) {
@@ -213,7 +231,7 @@ function developerMode(seen: number | null, called: number | null): Check {
       name: 'ChatGPT allowed to use the tools',
       status: 'not-run',
       ok: null,
-      detail: 'Unknown — ChatGPT has not reached this app at all yet, so there is nothing to judge.'
+      detail: 'Unknown ? ChatGPT has not reached this app at all yet, so there is nothing to judge.'
     };
   }
   return {
@@ -221,11 +239,10 @@ function developerMode(seen: number | null, called: number | null): Check {
     status: 'not-run',
     ok: null,
     detail:
-      'Cannot tell — ChatGPT connected and read the tool list, but has never run a tool. ' +
-      'That is normal if you have not asked it to do anything yet. If you have asked and it ' +
-      'answered “does not support developer MCPs”, the cause is on ChatGPT’s side: turn ' +
-      'Developer mode back on in ChatGPT → Settings → Apps & Connectors → Advanced. It can ' +
-      'switch itself off after a ChatGPT update.'
+      'Cannot tell ? ChatGPT connected and read the tool list, but has never run a tool. ' +
+      'Select or @mention Chat On Steroids on the message that needs it. If you already did that and ' +
+      'the model still cannot call it, turn Developer mode back on in ChatGPT ? Settings ? Apps ? ' +
+      'Advanced settings. Developer mode can be affected by account/workspace changes or product updates.'
   };
 }
 
@@ -333,7 +350,7 @@ export async function runDiagnostics(): Promise<Diagnosis> {
 
   // 7. The failure that looks exactly like success: ChatGPT connects, this app
   //    answers, and the model is still not allowed to call anything.
-  checks.push(developerMode(seen, lastToolCallAt()));
+  checks.push(developerModeCheck(seen, lastToolCallAt()));
 
   const broken = checks.filter((c) => c.status === 'fail');
   const incomplete = checks.filter((c) => c.status === 'not-run');

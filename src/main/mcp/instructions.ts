@@ -92,6 +92,10 @@ function coreInstructions(ctx: ToolContext): string {
   if (agentTools) {
     lines.push(
       '',
+      'Multi-agent mode is on. For broad read-only repo reconnaissance where a fast second pass can reduce wall-clock time,',
+      'use agents action=investigate for root-cause tracing, cross-file execution paths, repo-wide references, logs or dependency discovery.',
+      'A local deterministic router may decline trivial, mutation, deploy or final-verification work without starting Antigravity.',
+      'Its Antigravity Flash report is advisory: verify important claims yourself and never use it as the final verification gate.',
       'Multi-agent mode is on. As the prime agent you may use agents action=spawn, then keep working; worker',
       'messages are appended to your tool results as they arrive. A worker sees only what you send it, never this',
       'conversation, so spawn carries both halves: put the standing instructions every worker needs — repository',

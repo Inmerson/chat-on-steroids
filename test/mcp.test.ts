@@ -32,6 +32,11 @@ import { emptyEvidence, noteExec, noteOutcome, runInCallContext, type CallContex
 import { observeRequestCorrelation } from '../src/main/session/correlation.js';
 import { resetExecOwnershipForTests } from '../src/main/codex/ownership.js';
 import { IS_WINDOWS, makeTempDir, removeTempDir, writeTree } from './helpers.js';
+import {
+  ANTIGRAVITY_MODEL,
+  setAntigravityInvestigatorForTests,
+  type ParsedAntigravityInvestigation
+} from '../src/main/antigravity-worker.js';
 
 // ---------------------------------------------------------------- transport
 
@@ -260,6 +265,7 @@ afterAll(async () => {
 });
 
 beforeEach(async () => {
+  setAntigravityInvestigatorForTests(null);
   if (endpoint) await endpoint.stop();
   ctx.caps = withCaps({});
   ctx.readOnly = true;
@@ -674,6 +680,116 @@ describe('surface boundaries', () => {
     expect(failed(call1)).toBe(false);
   });
 
+  it('runs a bounded Antigravity Flash investigation in the approved workspace and marks it advisory', async () => {
+    everything();
+    let received: { task: string; cwd: string } | null = null;
+    const fake: ParsedAntigravityInvestigation = {
+      report: 'The request path may retain stale conversation state near src/main/index.ts:123.',
+      observedFiles: ['src/main/index.ts'],
+      toolErrors: [],
+      toolCalls: 2,
+      conversationId: 'agy-conv-1',
+      durationSeconds: 4.2,
+      totalTokens: 900,
+      partial: false,
+      budgetExceeded: false
+    };
+    setAntigravityInvestigatorForTests(async ({ task, cwd }) => {
+      received = { task, cwd };
+      return fake;
+    });
+
+    const reply = await core('tools/call', {
+      name: 'agents',
+      arguments: {
+        action: 'investigate',
+        task: 'Trace why MCP access can become stale in one conversation.',
+        workdir: '/workspace'
+      }
+    });
+
+    expect(failed(reply)).toBe(false);
+    expect(received).toEqual({
+      task: 'Trace why MCP access can become stale in one conversation.',
+      cwd: approved
+    });
+    expect(textOf(reply)).toContain('Antigravity Flash investigator');
+    expect(textOf(reply)).toContain('advisory');
+    expect(textOf(reply)).toContain('Prime must independently verify');
+    expect(reply.body?.result?.structuredContent).toMatchObject({
+      action: 'investigate',
+      provider: 'antigravity',
+      delegated: true,
+      model: ANTIGRAVITY_MODEL,
+      workdir: '/workspace',
+      conversation_id: 'agy-conv-1',
+      duration_seconds: 4.2,
+      total_tokens: 900,
+      report: fake.report,
+      observed_files: ['src/main/index.ts'],
+      tool_errors: [],
+      tool_calls: 2
+    });
+    expect(reply.body?.result?.structuredContent?.router_score).toBeGreaterThan(0);
+    expect(reply.body?.result?.structuredContent?.router_reasons).toEqual(expect.any(Array));
+  });
+
+  it('does not launch Antigravity for a trivial lookup and explains the router decision', async () => {
+    everything();
+    let calls = 0;
+    setAntigravityInvestigatorForTests(async () => {
+      calls += 1;
+      throw new Error('trivial work must not reach Antigravity');
+    });
+
+    const reply = await core('tools/call', {
+      name: 'agents',
+      arguments: {
+        action: 'investigate',
+        task: 'Read the npm package name from package.json.',
+        workdir: '/workspace'
+      }
+    });
+
+    expect(failed(reply)).toBe(false);
+    expect(calls).toBe(0);
+    expect(textOf(reply)).toMatch(/do directly|not delegated|router/i);
+    expect(reply.body?.result?.structuredContent).toMatchObject({
+      action: 'investigate',
+      provider: 'antigravity',
+      delegated: false
+    });
+    expect(reply.body?.result?.structuredContent?.router_score).toBeTypeOf('number');
+    expect(reply.body?.result?.structuredContent?.router_reasons).toEqual(expect.any(Array));
+  });
+
+  it('hard-blocks mutation and final-verification tasks before Antigravity can start', async () => {
+    everything();
+    let calls = 0;
+    setAntigravityInvestigatorForTests(async () => {
+      calls += 1;
+      throw new Error('blocked work must not reach Antigravity');
+    });
+
+    for (const task of [
+      'Implement the fix across src/main and update the tests.',
+      'Run the final verification and decide whether this release is safe to deploy.'
+    ]) {
+      const reply = await core('tools/call', {
+        name: 'agents',
+        arguments: { action: 'investigate', task, workdir: '/workspace' }
+      });
+      expect(failed(reply)).toBe(false);
+      expect(reply.body?.result?.structuredContent).toMatchObject({
+        action: 'investigate',
+        provider: 'antigravity',
+        delegated: false
+      });
+      expect(reply.body?.result?.structuredContent?.router_reasons.join(' ')).toMatch(/mutation|verification|release|deploy/i);
+    }
+
+    expect(calls).toBe(0);
+  });
   it('removes the agents tool entirely once multi-agent is switched off', async () => {
     everything();
     expect(toolNames(await core('tools/list'))).toContain('agents');

@@ -26,9 +26,19 @@ import { z } from 'zod';
 import { childEnv, terminateProcessTree } from '../exec.js';
 import { fail, guard, ok, type SurfaceRegistrar } from './kernel.js';
 import { readDurable, writeDurableSoon } from '../durable.js';
+import {
+  listCheckpointMetadata,
+  loadCheckpointSnapshot,
+  saveCheckpointSnapshot,
+  type CheckpointSnapshot
+} from '../checkpoints.js';
 
 const MAX_TEXT_BYTES = 2 * 1024 * 1024;
-const MAX_PROCESS_OUTPUT_BYTES = 2 * 1024 * 1024;
+// Model-facing subprocess output must stay in the same order of magnitude as the normal
+// exec surface. Multi-megabyte stdout can consume a chat context in one tool call before
+// Compact & Resume gets a chance to react. This is per stream, so stdout + stderr may each
+// retain up to this much before an explicit truncation marker is returned.
+const MAX_PROCESS_OUTPUT_BYTES = 100_000;
 const DEFAULT_COMMAND_TIMEOUT_MS = 120_000;
 const MAX_COMMAND_TIMEOUT_MS = 15 * 60_000;
 
@@ -306,26 +316,8 @@ export async function outlineSourceSymbols(filePath: string): Promise<string> {
 }
 
 // ---------------------------------------------------------------- Checkpoints & Snapshots
-export interface CheckpointSnapshot {
-  id: string;
-  name: string;
-  timestamp: string;
-  targetPath: string;
-  files: Record<string, string>; // relativePath -> content
-}
-
-interface CheckpointStoreState {
-  checkpoints: Record<string, CheckpointSnapshot>;
-}
-
-async function loadCheckpoints(): Promise<Record<string, CheckpointSnapshot>> {
-  const data = await readDurable<CheckpointStoreState>('agent-checkpoints');
-  return data?.checkpoints ?? {};
-}
-
-async function saveCheckpoints(checkpoints: Record<string, CheckpointSnapshot>): Promise<void> {
-  writeDurableSoon('agent-checkpoints', { checkpoints });
-}
+// Metadata stays in the tiny durable JSON index; source payloads live in compressed,
+// content-addressed blobs so listing or creating a checkpoint never rewrites old snapshots.
 
 // ---------------------------------------------------------------- Background Tasks Store
 export interface BackgroundTask {
@@ -465,15 +457,14 @@ $synth.Dispose();
             }
 
             const cpId = `cp_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
-            const checkpoints = await loadCheckpoints();
-            checkpoints[cpId] = {
+            const checkpoint: CheckpointSnapshot = {
               id: cpId,
               name,
               timestamp: new Date().toISOString(),
               targetPath: root,
               files: snapshotFiles
             };
-            await saveCheckpoints(checkpoints);
+            await saveCheckpointSnapshot(checkpoint);
             return ok(`Created checkpoint "${name}" [ID: ${cpId}] with ${Object.keys(snapshotFiles).length} files.`);
           } catch (error) {
             return fail(`Failed to create checkpoint: ${(error as Error).message}`);
@@ -495,11 +486,10 @@ $synth.Dispose();
       async () =>
         reg.guarded('read', 'checkpoint_list', async () => {
           try {
-            const checkpoints = await loadCheckpoints();
-            const list = Object.values(checkpoints);
+            const list = await listCheckpointMetadata();
             if (list.length === 0) return ok('No checkpoints saved.');
             const lines = list.map(
-              (cp) => `- [${cp.id}] "${cp.name}" (${Object.keys(cp.files).length} files) at ${cp.timestamp} [${cp.targetPath}]`
+              (cp) => `- [${cp.id}] "${cp.name}" (${cp.fileCount} files) at ${cp.timestamp} [${cp.targetPath}]`
             );
             return ok(`Saved Checkpoints (${list.length}):\n${lines.join('\n')}`);
           } catch (error) {
@@ -526,8 +516,7 @@ $synth.Dispose();
       async ({ checkpoint_id }) =>
         guard('checkpoint_restore', async () => {
           try {
-            const checkpoints = await loadCheckpoints();
-            const cp = checkpoints[checkpoint_id];
+            const cp = await loadCheckpointSnapshot(checkpoint_id);
             if (!cp) return fail(`Checkpoint "${checkpoint_id}" not found.`);
 
             let restoredCount = 0;

@@ -43,6 +43,16 @@ describe('Power Agent tools', () => {
     expect(result.exitCode).toBe(0);
     expect(result.stdout.trim()).toBe('Hello from System PowerShell');
   });
+  it('bounds system process output before it can flood one model turn', async () => {
+    const result = await runSystemProcess(
+      'powershell.exe',
+      ['-NoProfile', '-Command', "[Console]::Out.Write(('x' * 250000))"],
+      process.cwd(),
+      10_000
+    );
+    expect(Buffer.byteLength(result.stdout, 'utf8')).toBeLessThanOrEqual(100_000);
+    expect(result.truncated).toBe(true);
+  });
 
   it('reads, writes, and lists files across system temp paths', async () => {
     const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'clf-power-test-'));

@@ -40,6 +40,17 @@ export function durableStoreReady(): boolean {
   return root !== '';
 }
 
+/** Resolve a path inside the durable state root without permitting traversal outside it. */
+export function durableStatePath(...segments: string[]): string {
+  if (!root) throw new Error('Durable store is not initialized.');
+  const target = path.resolve(root, ...segments);
+  const relative = path.relative(root, target);
+  if (relative === '..' || relative.startsWith('..' + path.sep) || path.isAbsolute(relative)) {
+    throw new Error('Durable state path escapes the store root.');
+  }
+  return target;
+}
+
 function fileFor(name: string): string {
   if (!/^[a-z0-9-]{1,40}$/.test(name)) throw new Error(`Invalid durable state name: ${name}`);
   return path.join(root, `${name}.json`);
