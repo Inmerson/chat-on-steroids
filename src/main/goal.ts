@@ -31,9 +31,6 @@ const MAX_MESSAGE_CHARS = 12_000;
 /** How long a finished draft stays visible before only its spent tombstone remains. */
 const DRAFT_TTL_MS = 10 * 60_000;
 
-/** Temporary compatibility for the upstream picker until Task 7 removes that UI entirely. */
-export const MODEL_PAGE_SIZE = 20;
-
 export type GoalStage = 'sending' | 'answering' | 'ready' | 'no-reply' | 'failed';
 
 export interface GoalDraftView {
@@ -67,11 +64,6 @@ export function goalSettings(): {
   model: typeof ANTIGRAVITY_MODEL;
 } {
   return { enabled: getConfig().goal.enabled, provider: 'antigravity', model: ANTIGRAVITY_MODEL };
-}
-
-/** Compatibility only; Antigravity uses the already-authenticated local CLI session. */
-export async function goalKeyPresent(): Promise<boolean> {
-  return true;
 }
 
 function view(draft: GoalDraft): GoalDraftView {
@@ -488,22 +480,4 @@ function clip(text: string): string {
   const head = Math.ceil(contentBudget / 2);
   const tail = contentBudget - head;
   return `${trimmed.slice(0, head)}${marker}${trimmed.slice(-tail)}`;
-}
-
-
-export interface GoalModel {
-  id: string;
-  name: string;
-  created: number;
-  contextLength: number;
-}
-
-/** Network-free compatibility while the old picker is removed in Task 7. */
-export async function listGoalModels(offset = 0, limit = MODEL_PAGE_SIZE): Promise<{ models: GoalModel[]; total: number }> {
-  const all: GoalModel[] = [
-    { id: ANTIGRAVITY_MODEL, name: 'Gemini 3.7 Flash Low', created: 0, contextLength: 0 }
-  ];
-  const from = Math.max(0, Math.floor(offset));
-  const count = Math.max(1, Math.min(100, Math.floor(limit)));
-  return { models: all.slice(from, from + count), total: all.length };
 }

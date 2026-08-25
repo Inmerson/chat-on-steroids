@@ -539,15 +539,7 @@
                     <span class="sw"><input type="checkbox" id="autoCompact" /><i></i></span>
                   </div>
 
-                  <!--
-                    The goal loop.
-
-                    Four controls in one block because they are one decision: a second model,
-                    given this conversation, writing the next user message when ChatGPT stops.
-                    The key comes first because nothing below it works without one - the
-                    switch says so in its own hint rather than leaving somebody to find out
-                    from a failure in the browser.
-                  -->
+                  <!-- Goal authority only. Provider/model are fixed by this custom build. -->
                   <div class="setting">
                     <span class="setting-text">
                       <b>Goal</b>
@@ -556,51 +548,11 @@
                     <span class="sw"><input type="checkbox" id="goalEnabled" /><i></i></span>
                   </div>
 
-                  <div class="field">
-                    <label for="goalKey">OpenRouter API key</label>
-                    <input id="goalKey" type="password" spellcheck="false" placeholder="sk-or-v1-…" autocomplete="off" />
-                    <p class="hint" id="goalKeyState"></p>
-                    <div class="step-actions">
-                      <button class="btn" id="goalKeyRemove" type="button">Remove stored key</button>
-                      <button class="btn" type="button" data-link="https://openrouter.ai/settings/keys">
-                        <svg class="ico" viewBox="0 0 24 24"><use href="#i-out" /></svg>Open OpenRouter keys
-                      </button>
-                    </div>
-                  </div>
-
-                  <!--
-                    The catalogue is several hundred models long and changes weekly, so it is
-                    not fetched until somebody actually asks to change the one in use - and
-                    then twenty at a time, newest release first.
-                  -->
                   <div class="setting">
                     <span class="setting-text">
-                      <b>Model</b>
-                      <em id="goalModelName"></em>
+                      <b>Goal runtime</b>
+                      <em>Antigravity · Gemini 3.7 Flash Low</em>
                     </span>
-                    <button class="btn" id="goalPick" type="button">Select model</button>
-                  </div>
-
-                  <div class="field" id="goalModels" hidden>
-                    <div id="goalModelList" class="goal-models"></div>
-                    <p class="hint" id="goalModelsState"></p>
-                    <div class="step-actions">
-                      <button class="btn" id="goalMore" type="button">Load 20 more</button>
-                    </div>
-                  </div>
-
-                  <div class="setting">
-                    <span class="setting-text">
-                      <b>Reasoning</b>
-                      <em>Default lets the provider decide, which is right for nearly every model. The rest cost more and take longer.</em>
-                    </span>
-                    <select id="goalReasoning">
-                      <option value="default">Default</option>
-                      <option value="minimal">Minimal</option>
-                      <option value="low">Low</option>
-                      <option value="medium">Medium</option>
-                      <option value="high">High</option>
-                    </select>
                   </div>
 
                   <div class="setting">

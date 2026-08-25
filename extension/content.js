@@ -582,9 +582,8 @@
   /**
    * The goal loop, as this page sees it.
    *
-   * `goalConfig` is the app's answer to "is it on, and can it work" — the switch plus
-   * whether an OpenRouter key exists at all, because the second is the difference between a
-   * feature that is off and one that is broken, and only the app knows it.
+   * `goalConfig` is the app's live Goal switch and fixed local provider metadata.
+   * There is no provider credential or model-picker state in the browser contract.
    *
    * `goalDraft` is whatever draft the app currently holds for this chat: its stage, the text
    * as it streams in, and — once, at `ready` — the message to type. Both arrive on the same
@@ -4471,7 +4470,7 @@
       context = readContext(data.context);
       autoCompactReady = data.autoCompactReady === true;
       // The goal loop's settings and, while one is running, the draft itself: its stage, the
-      // text OpenRouter has streamed so far, and — once it is `ready` — the message to type.
+      // text Antigravity has produced so far, and — once it is `ready` — the message to type.
       // Nothing is typed here; maybeSendGoalReply below owns that, after the pull has
       // finished and the page has been repainted with what the draft is doing.
       goalConfig = data.goal && typeof data.goal === 'object' ? data.goal : null;
@@ -4629,14 +4628,13 @@
     const auto = Boolean(context && context.auto);
     const threshold = context && context.threshold > 0 ? context.threshold : 0;
     const goalOn = Boolean(goal && goal.enabled);
-    const hasKey = Boolean(goal && goal.hasKey);
     const from = threshold > 0 ? `from ${roundK(threshold)} tokens` : '';
     return {
       // Two short lines rather than a sentence: this is read while reaching for something
       // else, and the only questions it answers are "is it on" and "at what point".
       tip: [
         auto ? `Auto-compaction on${from ? `, ${from}` : ''}` : 'Auto-compaction off',
-        goalOn ? (hasKey ? 'Goal on' : 'Goal on — no API key') : 'Goal off'
+        goalOn ? 'Goal on' : 'Goal off'
       ].join('\n'),
       rows: [
         {
@@ -4649,15 +4647,11 @@
         {
           key: 'goal',
           label: 'Goal',
-          // The missing key is the note, not a separate warning line. It is the answer to
-          // the only question somebody switching this on has.
-          note: !hasKey
-            ? 'OpenRouter API key essential for goal feature'
-            : goalOn
-              ? `replies as you with ${modelLabel(goal.model)}`
-              : 'reply as you until the goal is met',
+          note: goalOn
+            ? 'Antigravity · Gemini 3.7 Flash Low'
+            : 'reply as you until the goal is met',
           on: goalOn,
-          warn: !hasKey
+          warn: false
         }
       ],
       // The button's old job, kept as a row rather than dropped: pressing the gear must not
@@ -5321,17 +5315,9 @@
     return goalStageView(goal);
   }
 
-  /**
-   * The short name of an OpenRouter model id, for a caption a person reads at a glance.
-   *
-   * `deepseek/deepseek-v4-flash` is the id the API wants and not what anybody calls it. The
-   * vendor prefix and the `:free`/`:nitro` variant suffix are both routing detail.
-   */
+  /** Human label for the fixed Goal runtime model. */
   function modelLabel(id) {
-    const name = String(id || '').trim();
-    if (!name) return 'the model';
-    const tail = name.slice(name.lastIndexOf('/') + 1);
-    return tail.split(':')[0] || tail;
+    return id === 'gemini-3.7-flash-low' ? 'Gemini 3.7 Flash Low' : String(id || 'Gemini 3.7 Flash Low');
   }
 
   /**
@@ -5371,7 +5357,7 @@
     const draft = goal.draft || null;
     const who = modelLabel(goal.model);
     const bar = (at, done = false) => ({ steps: GOAL_STEPS, at, done });
-    const failure = goal.error || (draft && draft.stage === 'failed' ? draft.error || 'OpenRouter did not answer' : '');
+    const failure = goal.error || (draft && draft.stage === 'failed' ? draft.error || 'Antigravity did not answer' : '');
     if (failure) {
       const at = draft && draft.stage === 'failed' ? 2 : (GOAL_STEP_AT[goal.phase] ?? 1);
       return { stage: 'The goal loop stopped', detail: failure, body: '', kind: 'goal-error', ...bar(at) };
@@ -5389,14 +5375,14 @@
       return { stage: 'Sending it to ChatGPT', detail: '', body: draft.reply, kind: 'goal', ...bar(3) };
     }
     if (goal.phase === 'requesting' && !draft) {
-      return { stage: 'Sending the answer to OpenRouter', detail: who, body: '', kind: 'goal', ...bar(1) };
+      return { stage: 'Sending the answer to Antigravity', detail: who, body: '', kind: 'goal', ...bar(1) };
     }
     if (!draft) return null;
     if (draft.stage === 'no-reply') {
       return { stage: 'Goal reached', detail: 'nothing was sent', body: '', kind: 'goal-done', ...bar(2, true) };
     }
     if (draft.stage === 'sending') {
-      return { stage: 'Sending the answer to OpenRouter', detail: who, body: '', kind: 'goal', ...bar(1) };
+      return { stage: 'Sending the answer to Antigravity', detail: who, body: '', kind: 'goal', ...bar(1) };
     }
     if (draft.stage === 'answering') {
       // Streamed, so the wait has something in it. The text is the message being written for
@@ -6267,7 +6253,6 @@
       conversationId &&
         goalConfig &&
         goalConfig.enabled === true &&
-        goalConfig.hasKey === true &&
         // A worker chat is already being driven — by the prime agent, through the agents
         // tool. A second author typing into it is two conversations in one composer.
         bootstrap !== 'worker'
@@ -6441,8 +6426,8 @@
       return;
     }
     if (!goalUsable()) {
-      // Settings are live. Turning Goal Mode off (or removing its key) while OpenRouter is
-      // drafting must revoke permission to type the result, even if that result becomes ready
+      // Settings are live. Turning Goal Mode off while Antigravity is drafting must revoke
+      // permission to type the result, even if that result becomes ready
       // on the very poll that carries the new setting.
       goalPhase = '';
       goalDraft = null;
@@ -6451,7 +6436,7 @@
     }
     if (draft.stage === 'failed') {
       goalPhase = 'drafting';
-      goalError = draft.error || 'OpenRouter did not answer';
+      goalError = draft.error || 'Antigravity did not answer';
       goalDraft = null;
       await ask({ type: 'goal_ack', conversationId, token: draft.token }).catch(() => undefined);
       return;

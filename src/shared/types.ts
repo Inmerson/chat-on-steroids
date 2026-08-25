@@ -139,32 +139,11 @@ export interface CompactionSettings {
 }
 
 /**
- * The reasoning budget asked of the goal model, in OpenRouter's own vocabulary.
- *
- * `default` sends no `reasoning` block at all, which is what the provider's own default
- * means. Every other value is passed through as `reasoning: { effort }` — a model that has
- * no reasoning mode ignores it, so the setting is safe to leave alone.
- */
-export const GOAL_REASONING_LEVELS = ['default', 'minimal', 'low', 'medium', 'high'] as const;
-export type GoalReasoning = (typeof GOAL_REASONING_LEVELS)[number];
-
-/**
- * The goal loop: a second model, standing in for the user, that keeps a chat going.
- *
- * When ChatGPT finishes a turn, the recorded conversation — every user message and every
- * final ChatGPT answer, and nothing else — is sent to an OpenRouter model with one
- * instruction: you are the user, say what is still missing. What it writes is typed into
- * the composer and sent. When it judges the task done it writes `NO_REPLY` and nothing is
- * sent at all, which is how the loop ends.
- *
- * Off by default, and useless without an OpenRouter API key: the key is the credential the
- * whole feature runs on, so the UI says so rather than failing quietly at the first turn.
+ * The unattended Goal loop. Provider/model are fixed by this build; durable config stores only
+ * whether the user granted the loop authority to type automatically.
  */
 export interface GoalSettings {
   enabled: boolean;
-  /** An OpenRouter model id, exactly as its `/models` listing spells it. */
-  model: string;
-  reasoning: GoalReasoning;
 }
 
 /**
@@ -336,8 +315,6 @@ export interface AppState {
   status: ConnectionStatus;
   /** True when an OpenAI control-plane API key is stored. The key itself never leaves the main process. */
   hasApiKey: boolean;
-  /** True when an OpenRouter key is stored, which is what the goal loop spends. Same rule: the key stays here. */
-  hasGoalKey: boolean;
   /** Resolved path of the tunnel binary we would run, or null if we cannot find one. */
   resolvedBinary: string | null;
   /** Version of the tunnel-client copy shipped inside the app, for diagnostics. */

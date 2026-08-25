@@ -39,12 +39,8 @@ function enqueue<T>(operation: () => Promise<T>): Promise<T> {
  * extension presents. It lives here anyway so it is encrypted at rest and stays out of
  * config.json, the log and the renderer.
  */
-/**
- * `bridgeToken` is not a user credential either way; `openRouterApiKey` is one, and is the
- * only credential in here that a *model* can cause to be spent, so it lives under the same
- * DPAPI blob as the rest and never leaves the main process.
- */
-export type SecretKey = 'openaiApiKey' | 'bridgeToken' | 'openRouterApiKey';
+/** Named encrypted slots currently used by the app. Unknown legacy JSON fields are ignored. */
+export type SecretKey = 'openaiApiKey' | 'bridgeToken';
 
 export function initSecretsPath(userDataDir: string): void {
   secretsPath = path.join(userDataDir, FILE_NAME);

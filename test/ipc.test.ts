@@ -282,55 +282,15 @@ describe('every link the window offers', () => {
     expect(offered.filter((url) => !allowed.has(url))).toEqual([]);
   });
 
-  it('opens the OpenRouter key page the goal loop sends people to', async () => {
-    const open = handlers.get('link:open')!;
-    expect(await open(null, { url: 'https://openrouter.ai/settings/keys' })).toEqual({ ok: true, data: true });
-    const refused = (await open(null, { url: 'https://example.com/' })) as { ok: boolean; error: string };
-    expect(refused.ok).toBe(false);
-    expect(refused.error).toMatch(/not allowed/i);
-  });
-
-  it('serializes non-Error throws into a real IPC error string', async () => {
-    vi.mocked(shell.openExternal).mockRejectedValueOnce('Windows shell refused the request');
-    const reply = (await handlers.get('link:open')!(null, {
-      url: 'https://openrouter.ai/settings/keys'
-    })) as { ok: boolean; error?: string };
-    expect(reply).toEqual({ ok: false, error: 'Windows shell refused the request' });
-  });
 });
 
-/**
- * OpenRouter publishes twelve ids that begin with `~` — `~deepseek/deepseek-v4-flash-latest`
- * and its siblings — and they are aliases that always resolve to the newest model in a
- * family. The picker lists them because the catalogue does, so a validator that refused the
- * `~` made the one kind of entry most worth choosing the one kind that could not be saved:
- * the click reported an error and the model in use silently stayed where it was.
- */
-describe('the goal model id', () => {
-  const withModel = (model: string) => ({ ...settings({ record: false, multiAgent: false }), goal: { ...defaultConfig().goal, model } });
-
-  it('accepts the family aliases OpenRouter marks with a tilde', async () => {
-    const reply = await save(withModel('~deepseek/deepseek-v4-flash-latest'));
+/** Goal provider/model are fixed runtime policy; settings IPC carries only authority. */
+describe('the goal settings contract', () => {
+  it('saves only the enabled switch', async () => {
+    const base = settings({ record: false, multiAgent: false });
+    const reply = await save({ ...base, goal: { enabled: true } });
     expect(reply.ok, reply.error).toBe(true);
-    expect(getConfig().goal.model).toBe('~deepseek/deepseek-v4-flash-latest');
-  });
-
-  it('still accepts an ordinary pinned id, with or without a variant suffix', async () => {
-    expect((await save(withModel('deepseek/deepseek-v4-flash-0731'))).ok).toBe(true);
-    expect((await save(withModel('openai/gpt-5.2-mini:nitro'))).ok).toBe(true);
-  });
-
-  it('refuses something that is not a model id at all', async () => {
-    const reply = await save(withModel('not a model'));
-    expect(reply.ok).toBe(false);
-    expect(reply.error).toMatch(/vendor\/model/);
-  });
-
-  /** The shipped default is one of those aliases, so it has to survive its own validator. */
-  it('accepts the default this app ships with', async () => {
-    const reply = await save(settings({ record: false, multiAgent: false }));
-    expect(reply.ok, reply.error).toBe(true);
-    expect(getConfig().goal.model).toBe(defaultConfig().goal.model);
+    expect(getConfig().goal).toEqual({ enabled: true });
   });
 });
 

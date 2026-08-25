@@ -12,7 +12,6 @@ import { z } from 'zod';
 import {
   CAPABILITIES,
   DEFAULT_CAPABILITIES,
-  GOAL_REASONING_LEVELS,
   WRITE_CAPABILITIES,
   type Capabilities,
   type CompactionSettings,
@@ -100,23 +99,10 @@ const DEFAULT_COMPACTION: CompactionSettings = {
   autoTokens: DEFAULT_SESSIONS.advisoryTokens
 };
 /**
- * The goal loop's defaults.
- *
- * Off, because it types into somebody's chat on its own and because it cannot work at all
- * until an OpenRouter API key exists. The model is a starting point rather than a
- * recommendation: the Chat settings picker lists what OpenRouter actually publishes,
- * newest first, and whatever is chosen there is stored here verbatim.
+ * Goal is off by default because it types into the user's chat without a fresh click for each
+ * turn. Antigravity provider/model selection is runtime policy, not durable user config.
  */
-/**
- * The `~` prefix is OpenRouter's marker for a family alias: this one always resolves to the
- * newest DeepSeek V4 Flash, so the default does not quietly rot into a snapshot from months
- * ago the way a pinned id does. `deepseek/deepseek-v4-flash` was such a pin — it reads like
- * "the flash model" but OpenRouter publishes it as V4 Flash 0423, and by August there were
- * two newer revisions the default would never have reached. The alias is also the cheaper
- * of the two: $0.04/M prompt against the pin's $0.057/M.
- */
-export const DEFAULT_GOAL_MODEL = '~deepseek/deepseek-v4-flash-latest';
-const DEFAULT_GOAL: GoalSettings = { enabled: false, model: DEFAULT_GOAL_MODEL, reasoning: 'default' };
+const DEFAULT_GOAL: GoalSettings = { enabled: false };
 // Two workers, not three: three concurrent workers reproducibly trips ChatGPT's rate limit
 // ("too many requests"), which strands the run rather than making it faster.
 const DEFAULT_MULTI_AGENT: MultiAgentSettings = { enabled: false, maxWorkers: 2 };
@@ -259,28 +245,11 @@ const configSchema = z.object({
     })
     .optional()
     .default({ ...DEFAULT_MULTI_AGENT }),
-  // An empty model id is repaired rather than rejected: the id is free text from a
-  // provider listing that changes weekly, and a config that lost it must still load with
-  // every root and permission in it intact.
+  // Legacy v2 files may still contain model/reasoning. z.object strips those unknown fields,
+  // preserving only the authority bit without rejecting roots or permissions around it.
   goal: z
     .object({
-      enabled: z.boolean().optional().default(DEFAULT_GOAL.enabled),
-      model: z
-        .string()
-        .max(160)
-        .optional()
-        .default(DEFAULT_GOAL.model)
-        .transform((model) => (model.trim() === '' ? DEFAULT_GOAL.model : model.trim())),
-      // Repaired for the same reason, and one this section is specifically exposed to: the
-      // set of levels is a provider's vocabulary, so a config written by a version that
-      // knows one more of them than this one does is a config this app will meet. Rejecting
-      // it would send the whole file — every root, every permission — through conservative
-      // recovery over a word in one field nobody would miss.
-      reasoning: z
-        .enum(GOAL_REASONING_LEVELS)
-        .optional()
-        .default(DEFAULT_GOAL.reasoning)
-        .catch(DEFAULT_GOAL.reasoning)
+      enabled: z.boolean().optional().default(DEFAULT_GOAL.enabled)
     })
     .optional()
     .default({ ...DEFAULT_GOAL })

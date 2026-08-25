@@ -48,11 +48,6 @@ const KIND_ICON: Record<ActivitySummary['kind'], string> = {
   other: 'i-bolt'
 };
 
-/**
- * How close to the end of the model list counts as asking for the next page, in pixels.
- * A little over one row, so the fetch starts while there is still something to read.
- */
-const GOAL_SCROLL_MARGIN = 72;
 /** Hard renderer budgets: durable history may be larger, but one paint may not be. */
 const MAX_TIMELINE_ROWS = 160;
 const MAX_TIMELINE_TEXT_CHARS = 2 * 1024 * 1024;
@@ -884,112 +879,12 @@ export function chatSettingsPatch(current: Config): {
       maxWorkers: number('maWorkers', current.multiAgent.maxWorkers, 1, 8)
     },
     goal: {
-      enabled: $<HTMLInputElement>('goalEnabled').checked,
-      // The chosen model is held here rather than in an input, because it is picked from a
-      // list and never typed. `current` is the fallback for the first save after a repaint.
-      model: goalModel || current.goal.model,
-      reasoning: $<HTMLSelectElement>('goalReasoning').value as Config['goal']['reasoning']
+      enabled: $<HTMLInputElement>('goalEnabled').checked
     }
   };
 }
 
 // --------------------------------------------------------------- the goal loop
-
-/**
- * The OpenRouter model this panel currently has chosen.
- *
- * Kept beside the controls rather than in one, because the picker is a list that is not
- * loaded most of the time: an `<input>` would have to hold an id nobody typed, and a
- * `<select>` would have to hold several hundred options nobody asked for.
- */
-let goalModel = '';
-/** The catalogue as far as it has been paged in, and how long it actually is. */
-let goalModels: Array<{ id: string; name: string; created: number; contextLength: number }> = [];
-let goalTotal = 0;
-let goalLoading = false;
-
-/** The release date OpenRouter publishes, as a person would date a model. */
-function releasedOn(created: number): string {
-  if (!created) return 'release date not published';
-  return new Date(created * 1000).toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric' });
-}
-
-/**
- * Loads the next twenty models, newest first.
- *
- * Paged rather than fetched whole because the catalogue is several hundred entries long and
- * the question this list answers — what is new — is answered by the first screen of it.
- */
-async function loadGoalModels(reset: boolean): Promise<void> {
-  if (goalLoading) return;
-  goalLoading = true;
-  if (reset) {
-    goalModels = [];
-    goalTotal = 0;
-  }
-  $('goalModelsState').textContent = 'Loading models from OpenRouter…';
-  $<HTMLButtonElement>('goalMore').disabled = true;
-  const page = await run(api.listGoalModels(goalModels.length));
-  goalLoading = false;
-  if (!page) {
-    // `run` has already shown the reason. Say what it means *here*: the list is empty and
-    // the model in use has not changed.
-    $('goalModelsState').textContent = 'OpenRouter could not be reached. The model in use is unchanged.';
-    $<HTMLButtonElement>('goalMore').disabled = goalModels.length === 0;
-    return;
-  }
-  goalModels = [...goalModels, ...page.models];
-  goalTotal = page.total;
-  paintGoalModels();
-}
-
-function paintGoalModels(): void {
-  const list = $('goalModelList');
-  // Emptying an element scrolls it back to the top, and this repaints the whole list every
-  // time a page lands. Without holding the offset, paging in the next twenty threw the
-  // reader back to the newest model — which is the one place they had already decided
-  // against by scrolling away from it.
-  const keep = list.scrollTop;
-  list.textContent = '';
-  for (const model of goalModels) {
-    const row = el('button', 'goal-model');
-    row.setAttribute('type', 'button');
-    row.dataset.model = model.id;
-    if (model.id === goalModel) row.dataset.chosen = '1';
-    row.append(el('b', 'goal-model-name', model.name));
-    const meta = [releasedOn(model.created), model.contextLength > 0 ? `${compactNumber(model.contextLength)} ctx` : '']
-      .filter(Boolean)
-      .join(' · ');
-    row.append(el('em', 'goal-model-meta', `${model.id} · ${meta}`));
-    list.append(row);
-  }
-  const shown = goalModels.length;
-  $('goalModelsState').textContent =
-    shown === 0 ? 'No models came back.' : `Showing the ${shown} newest of ${goalTotal}, newest release first.`;
-  $<HTMLButtonElement>('goalMore').disabled = shown >= goalTotal;
-  $<HTMLButtonElement>('goalMore').hidden = shown >= goalTotal;
-  list.scrollTop = keep;
-  // A page that did not fill the box leaves nothing to scroll, so the scroll handler can
-  // never fire and the list would stop at twenty with more still to come. Ask again here.
-  maybePageGoalModels();
-}
-
-/**
- * Pages the catalogue in as the list is scrolled.
- *
- * "Load 20 more" is the deliberate way to ask; scrolling to the bottom is the way people
- * actually ask. It fires a screenful early rather than at the exact bottom, so the next
- * twenty are usually already in place by the time the scroll arrives where they go.
- */
-function maybePageGoalModels(): void {
-  if (goalLoading || goalModels.length === 0 || goalModels.length >= goalTotal) return;
-  const list = $('goalModelList');
-  // A closed picker measures zero in every direction, which reads as "scrolled to the end"
-  // and would page the whole catalogue in behind a panel nobody has open.
-  if (list.clientHeight === 0) return;
-  if (list.scrollHeight - list.scrollTop - list.clientHeight > GOAL_SCROLL_MARGIN) return;
-  void loadGoalModels(false);
-}
 
 /** Keep an in-progress form edit when an unrelated main-process push carries the old value. */
 function applyChatValue(
@@ -1007,69 +902,14 @@ function applyChatChecked(input: HTMLInputElement, value: boolean, previous: boo
   input.checked = value;
 }
 
-/** Writes the goal block from app state. Called from chatApply, so it never guesses. */
+/** Writes the Goal authority switch from app state. Provider/model are fixed by this build. */
 function applyGoal(state: AppState, previous?: Config): void {
   const { config } = state;
-  goalModel = config.goal.model;
   applyChatChecked($<HTMLInputElement>('goalEnabled'), config.goal.enabled, previous?.goal.enabled);
-  applyChatValue($<HTMLSelectElement>('goalReasoning'), config.goal.reasoning, previous?.goal.reasoning);
-  // The one sentence somebody switching this on needs, and the exact words the extension
-  // shows under the same switch — two places saying the same thing differently is how a
-  // missing key turns into a support question.
-  $('goalHint').textContent = !state.hasGoalKey
-    ? 'OpenRouter API key essential for goal feature.'
-    : config.goal.enabled
-      ? 'A second model reads each finished answer and writes your next message, until it decides the goal is met.'
-      : 'Off — nothing is sent to OpenRouter and nothing is typed into your chats.';
-  $('goalHint').classList.toggle('is-warn', !state.hasGoalKey);
-  $('goalModelName').textContent = config.goal.model;
-  $<HTMLInputElement>('goalKey').placeholder = state.hasGoalKey ? '•••••••• stored' : 'sk-or-v1-…';
-  $('goalKeyState').textContent = state.hasGoalKey
-    ? 'A key is stored, encrypted by Windows. Type a new one to replace it.'
-    : 'Stored encrypted by Windows. It never leaves this app, and the browser is only ever handed the reply.';
-  $<HTMLButtonElement>('goalKeyRemove').disabled = !state.hasGoalKey;
-  if (goalModels.length > 0) paintGoalModels();
-}
-
-function wireGoal(save: () => Promise<void>): void {
-  // The catalogue is fetched on the first press and kept afterwards: the picker closing is
-  // not a reason to spend another round trip on a list that changes weekly.
-  $('goalPick').addEventListener('click', () => {
-    const panel = $('goalModels');
-    panel.hidden = !panel.hidden;
-    $('goalPick').textContent = panel.hidden ? 'Select model' : 'Close';
-    if (!panel.hidden && goalModels.length === 0) void loadGoalModels(true);
-  });
-  $('goalMore').addEventListener('click', () => void loadGoalModels(false));
-  $('goalModelList').addEventListener('scroll', maybePageGoalModels);
-  $('goalModelList').addEventListener('click', (event) => {
-    const row = (event.target as HTMLElement).closest<HTMLElement>('[data-model]');
-    if (!row?.dataset.model) return;
-    goalModel = row.dataset.model;
-    $('goalModelName').textContent = goalModel;
-    paintGoalModels();
-    void save();
-    toast(`Goal model set to ${goalModel}`);
-  });
-  // On blur, like every other key in this app: not saved keystroke by keystroke, and the
-  // field is emptied the moment it has been handed over.
-  $('goalKey').addEventListener('blur', async () => {
-    const input = $<HTMLInputElement>('goalKey');
-    if (input.value === '') return;
-    const next = await run(api.setGoalKey(input.value.trim()));
-    input.value = '';
-    if (next) {
-      applyGoal(next);
-      toast('OpenRouter key stored');
-    }
-  });
-  $('goalKeyRemove').addEventListener('click', async () => {
-    const next = await run(api.setGoalKey(''));
-    if (next) {
-      applyGoal(next);
-      toast('OpenRouter key removed');
-    }
-  });
+  $('goalHint').textContent = config.goal.enabled
+    ? 'Antigravity · Gemini 3.7 Flash Low reads each finished answer and may write the next user message.'
+    : 'Off — no automatic Goal message is typed into your chats.';
+  $('goalHint').classList.remove('is-warn');
 }
 
 /**
@@ -1091,7 +931,7 @@ function applyAutoCompactHint(config: Config): void {
  * `sessRecord` is deliberately absent — it lives in the Home permission list now, with
  * every other switch that decides what ChatGPT can reach, and saves from there.
  */
-const CHAT_INPUTS = ['sessRetain', 'autoCompact', 'autoCompactTokens', 'maWorkers', 'goalEnabled', 'goalReasoning'];
+const CHAT_INPUTS = ['sessRetain', 'autoCompact', 'autoCompactTokens', 'maWorkers', 'goalEnabled'];
 
 /** Writes app state into this panel's controls. Called from the renderer's apply(). */
 export function chatApply(state: AppState, previous?: Config): void {
@@ -1244,7 +1084,6 @@ export function initChat(next: Deps): void {
     $(id).addEventListener('change', () => void deps.save());
   }
 
-  wireGoal(() => deps.save());
 
   $('bridgeUnpair').addEventListener('click', async () => {
     const state = await run(api.unpairExtension());

@@ -10,10 +10,10 @@
 
 import { BrowserWindow, clipboard, dialog, ipcMain, shell } from 'electron';
 import { z } from 'zod';
-import { CAPABILITIES, GOAL_REASONING_LEVELS, type AppState, type Config } from '../shared/types.js';
+import { CAPABILITIES, type AppState, type Config } from '../shared/types.js';
 import { applySettings, connect, disconnect, getStatus, onStatusChange } from './connection.js';
 import { getConfig, updateConfig } from './config.js';
-import { listGoalModels, MODEL_PAGE_SIZE, retireGoalDrafts } from './goal.js';
+import { retireGoalDrafts } from './goal.js';
 import { forgetExposedSurface } from './mcp/server.js';
 import { runDiagnostics } from './diagnostics.js';
 import { formatLogAsJson, formatLogForClipboard, getLog, logInfo, onLog } from './logger.js';
@@ -60,10 +60,6 @@ const ALLOWED_LINKS = new Set([
   'https://github.com/totec448-spec/chat-on-steroids/releases/latest/download/Chat-On-Steroids-Extension.zip',
   'https://developers.openai.com/api/docs/guides/secure-mcp-tunnels',
   'https://developers.openai.com/api/docs/guides/developer-mode',
-  // Where the key for the goal loop comes from. The button beside the key field is useless
-  // without this: `link:open` refuses anything not named here, so it threw where nobody
-  // was looking and the button did nothing at all.
-  'https://openrouter.ai/settings/keys'
 ]);
 
 const capabilityPatch = z.object(
@@ -113,22 +109,7 @@ const settingsPatch = z.object({
     maxWorkers: z.number().int().min(1).max(8)
   }),
   goal: z.object({
-    enabled: z.boolean(),
-    // An OpenRouter model id, and validated only as a shape: the catalogue changes weekly,
-    // and an allow-list here would mean this app deciding which models exist.
-    // The leading `~` is OpenRouter's own marker for an alias that always resolves to the
-    // newest model in a family — `~deepseek/deepseek-v4-flash-latest` and eleven others. The
-    // picker lists them because the listing does, so refusing them here meant the one kind
-    // of entry most worth choosing was the one kind that could not be saved.
-    model: z
-      .string()
-      .min(1)
-      .max(160)
-      .regex(
-        /^~?[a-z0-9._\-]+\/[a-z0-9._\-]+(:[a-z0-9._\-]+)?$/i,
-        'Expected an OpenRouter model id like vendor/model'
-      ),
-    reasoning: z.enum(GOAL_REASONING_LEVELS)
+    enabled: z.boolean()
   })
 });
 
@@ -194,9 +175,7 @@ function mergeSettings(current: Config, base: SettingsSnapshot, wanted: Settings
       maxWorkers: pick(current.multiAgent.maxWorkers, base.multiAgent.maxWorkers, wanted.multiAgent.maxWorkers)
     },
     goal: {
-      enabled: pick(current.goal.enabled, base.goal.enabled, wanted.goal.enabled),
-      model: pick(current.goal.model, base.goal.model, wanted.goal.model),
-      reasoning: pick(current.goal.reasoning, base.goal.reasoning, wanted.goal.reasoning)
+      enabled: pick(current.goal.enabled, base.goal.enabled, wanted.goal.enabled)
     }
   };
 }
@@ -225,7 +204,6 @@ async function buildState(): Promise<AppState> {
     config,
     status: getStatus(),
     hasApiKey: await hasSecret('openaiApiKey'),
-    hasGoalKey: await hasSecret('openRouterApiKey'),
     resolvedBinary: resolvedBinary(config),
     bundledTunnelVersion: bundledVersion(),
     bridge: await bridgeStatus()
@@ -259,13 +237,7 @@ export function registerIpc(getWindow: () => BrowserWindow | null): void {
     const before = getConfig();
     const wasMultiAgent = before.multiAgent.enabled;
     const next = await updateConfig((config) => ({ ...config, ...mergeSettings(config, request.base, request.patch) }));
-    if (
-      before.goal.enabled !== next.goal.enabled ||
-      before.goal.model !== next.goal.model ||
-      before.goal.reasoning !== next.goal.reasoning
-    ) {
-      retireGoalDrafts();
-    }
+    if (before.goal.enabled !== next.goal.enabled) retireGoalDrafts();
     // Switching multi-agent mode off has to be able to remove the `agents` tool from the
     // schemas, and the exposed surface only ever widens by default. So the latch is
     // released here — the one place that knows the user made the decision
@@ -361,38 +333,19 @@ export function registerIpc(getWindow: () => BrowserWindow | null): void {
     return buildState();
   });
 
-  /**
-   * Stores one of the two keys the app holds, by name.
-   *
-   * The name is an enum rather than a string, so the renderer can choose *which* credential
-   * it is writing but cannot name a slot nobody defined — and the value still only ever
-   * travels inwards. Nothing reads a key back out over IPC; the state carries a boolean.
-   */
+  /** Stores the OpenAI tunnel credential; Goal uses local Antigravity auth and has no key slot. */
   handle('secret:set', async (payload) => {
-    const { value, key } = z
-      .object({ value: z.string().max(500), key: z.enum(['openaiApiKey', 'openRouterApiKey']).default('openaiApiKey') })
-      .parse(payload);
+    const { value } = z.object({ value: z.string().max(500) }).parse(payload);
+    const key = 'openaiApiKey' as const;
     if (!isEncryptionAvailable()) {
       throw new Error('Windows credential encryption is unavailable, so the key cannot be stored safely.');
     }
     await setSecret(key, value);
-    if (key === 'openRouterApiKey') retireGoalDrafts();
-    const what = key === 'openRouterApiKey' ? 'openrouter key' : 'api key';
-    logInfo(value.trim() === '' ? `${what} cleared` : `${what} stored`);
+    logInfo(value.trim() === '' ? 'api key cleared' : 'api key stored');
     return buildState();
   });
 
-  /**
-   * The OpenRouter catalogue, newest first, one page at a time.
-   *
-   * Fetched here rather than in the renderer for the same reason every other network call
-   * is: the key that authorises it never crosses this boundary. The page size is the
-   * module's own, so the renderer cannot ask for the whole catalogue in one call.
-   */
-  handle('goal:models', async (payload) => {
-    const { offset } = z.object({ offset: z.number().int().min(0).max(2000).default(0) }).parse(payload ?? {});
-    return listGoalModels(offset, MODEL_PAGE_SIZE);
-  });
+
 
   handle('binary:pick', async () => {
     const window = getWindow();

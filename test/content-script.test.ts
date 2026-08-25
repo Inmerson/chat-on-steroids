@@ -5845,7 +5845,7 @@ describe('the Compact & resume control', () => {
       ok: true,
       data: {
         context: { auto: true, threshold: 300_000, warn: 300_000, limit: 400_000 },
-        goal: { enabled: false, hasKey: false, model: 'deepseek/deepseek-v4-flash' }
+        goal: { enabled: false, provider: 'antigravity', model: 'gemini-3.7-flash-low' }
       }
     }));
     live.hook.injectControl();
@@ -5864,34 +5864,25 @@ describe('the Compact & resume control', () => {
     expect((after.querySelector('.clf-switch') as HTMLElement).dataset.clfOn).toBe('1');
   });
 
-  /** The missing credential is said where the switch is, in the words the app uses. */
-  it('says an OpenRouter key is needed before the goal switch can do anything', async () => {
+  it('shows Antigravity as the fixed Goal provider with no API-key warning', async () => {
     live = await harness(undefined, {
       activity: () => ({
         ok: true,
         data: {
-          entries: [],
-          stream: [],
-          nextSince: 0,
-          pendingTools: 0,
-          job: null,
-          goal: { enabled: true, hasKey: false, model: 'deepseek/deepseek-v4-flash', draft: null }
+          entries: [], stream: [], nextSince: 0, pendingTools: 0, job: null,
+          context: { auto: true, threshold: 300_000, warn: 300_000, limit: 400_000 },
+          goal: { enabled: true, provider: 'antigravity', model: 'gemini-3.7-flash-low', draft: null }
         }
       })
     });
     await live.hook.pullActivity();
-    live.hook.injectControl();
-    live.hook.toggleMenu();
-
-    const goal = live.document.querySelector('[data-clf-row="goal"]')!;
-    expect(goal.querySelector('.clf-menu-note')!.textContent).toBe(
-      'OpenRouter API key essential for goal feature'
-    );
-    expect((goal.querySelector('.clf-menu-note') as HTMLElement).dataset.clfWarn).toBe('1');
-    // The hover line says the same thing in one breath.
-    expect(live.document.querySelector('.clf-compact-btn')!.getAttribute('data-clf-tip')).toContain(
-      'Goal on — no API key'
-    );
+    await settle();
+    (live.document.querySelector('.clf-compact-btn') as HTMLButtonElement).click();
+    const goal = [...live.document.querySelectorAll('.clf-menu-row')].find((row) => row.textContent?.includes('Goal'))!;
+    expect(goal.querySelector('.clf-menu-note')!.textContent).toContain('Antigravity');
+    expect(goal.querySelector('.clf-menu-note')!.textContent).toContain('Gemini 3.7 Flash Low');
+    expect((goal.querySelector('.clf-menu-note') as HTMLElement).dataset.clfWarn).not.toBe('1');
+    expect(live.document.querySelector('.clf-compact-btn')!.getAttribute('data-clf-tip')).toContain('Goal on');
   });
 
   /**
@@ -7943,7 +7934,7 @@ describe('a request id ChatGPT reused across retries', () => {
  */
 describe('the goal loop', () => {
   const CHAT = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee';
-  const MODEL = 'deepseek/deepseek-v4-flash';
+  const MODEL = 'gemini-3.7-flash-low';
 
   /** The activity feed of a chat where the loop is on, with whatever draft a case needs. */
   function feed(draft: unknown = null, pendingTools: unknown = 0) {
@@ -7955,7 +7946,7 @@ describe('the goal loop', () => {
         nextSince: 0,
         pendingTools,
         job: null,
-        goal: { enabled: true, hasKey: true, model: MODEL, draft }
+        goal: { enabled: true, provider: 'antigravity', model: MODEL, draft }
       }
     });
   }
@@ -8115,24 +8106,20 @@ describe('the goal loop', () => {
   });
 
   /** The switch is the app's, and the page reads it on every poll rather than remembering. */
-  it('does nothing at all while the loop is off or has no key', async () => {
-    for (const goal of [
-      { enabled: false, hasKey: true, model: MODEL, draft: null },
-      { enabled: true, hasKey: false, model: MODEL, draft: null }
-    ]) {
-      const page = await harness(`https://chatgpt.com/c/${CHAT}`, {
-        activity: () => ({
-          ok: true,
-          data: { entries: [], stream: [], nextSince: 0, pendingTools: 0, job: null, goal }
-        })
-      });
-      try {
-        await page.hook.pullActivity();
-        await answerATurn(page);
-        expect(drafts(page), JSON.stringify(goal)).toEqual([]);
-      } finally {
-        page.close();
-      }
+  it('does nothing at all while the loop is off', async () => {
+    const disabled = { enabled: false, provider: 'antigravity', model: MODEL, draft: null };
+    const page = await harness(`https://chatgpt.com/c/${CHAT}`, {
+      activity: () => ({
+        ok: true,
+        data: { entries: [], stream: [], nextSince: 0, pendingTools: 0, job: null, goal: disabled }
+      })
+    });
+    try {
+      await page.hook.pullActivity();
+      await answerATurn(page);
+      expect(drafts(page)).toEqual([]);
+    } finally {
+      page.close();
     }
   });
 
@@ -8150,7 +8137,7 @@ describe('the goal loop', () => {
           nextSince: 0,
           pendingTools: 0,
           job: null,
-          goal: { enabled, hasKey: true, model: MODEL, draft }
+          goal: { enabled, provider: 'antigravity', model: MODEL, draft }
         }
       }),
       goal_ack: () => {
@@ -8228,7 +8215,7 @@ describe('the goal loop', () => {
         data: {
           entries: [], stream: [], nextSince: 0, pendingTools: 0,
           job: busy ? { sessionId: 's1', stage: 'opening', busy: true, handoffId: 'h1', error: null } : null,
-          goal: { enabled: true, hasKey: true, model: MODEL, draft }
+          goal: { enabled: true, provider: 'antigravity', model: MODEL, draft }
         }
       }),
       goal_ack: () => { draft = null; return { ok: true, data: { acknowledged: true } }; }
@@ -8400,17 +8387,15 @@ describe('the goal loop', () => {
       stage: 'Checking the answer is finished'
     });
     expect(view({ phase: 'requesting', error: '', model: MODEL, draft: null })).toMatchObject({
-      stage: 'Sending the answer to OpenRouter',
-      // The short name, because `deepseek/deepseek-v4-flash` is the id the API wants and not
-      // what anybody calls it.
-      detail: 'deepseek-v4-flash'
+      stage: 'Sending the answer to Antigravity',
+      detail: 'Gemini 3.7 Flash Low'
     });
     expect(
       view({ phase: 'drafting', error: '', model: MODEL, draft: { stage: 'answering', text: 'what about th' } })
-    ).toMatchObject({ stage: 'deepseek-v4-flash is answering', body: 'what about th' });
+    ).toMatchObject({ stage: 'Gemini 3.7 Flash Low is answering', body: 'what about th' });
     expect(
       view({ phase: 'drafting', error: '', model: MODEL, draft: { stage: 'ready', reply: 'what about the tests' } })
-    ).toMatchObject({ stage: 'deepseek-v4-flash wrote the next message', body: 'what about the tests' });
+    ).toMatchObject({ stage: 'Gemini 3.7 Flash Low wrote the next message', body: 'what about the tests' });
     expect(
       view({ phase: 'sending', error: '', model: MODEL, draft: { stage: 'ready', reply: 'what about the tests' } })
     ).toMatchObject({ stage: 'Sending it to ChatGPT', body: 'what about the tests' });

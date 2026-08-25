@@ -1752,7 +1752,7 @@ const HANDLERS = {
     if (!ownsDocument(source)) return { ok: false, error: 'stale_document' };
     // Goal builds its prompt from the app's durable session transcript. The final assistant
     // row that caused this request can still be only in this worker's storage.session journal
-    // when an earlier /events call was delayed or failed. Spend no OpenRouter request until
+    // when an earlier /events call was delayed or failed. Start no Goal Driver request until
     // that row has crossed the same /events boundary normal transcript delivery uses.
     if (!(await deliverConversationJournal(conversationId))) {
       return { ok: false, status: 503, error: 'transcript_not_delivered', retryable: true };

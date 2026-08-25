@@ -275,21 +275,18 @@ describe('the settings sheet', () => {
     }
   });
 
-  /**
-   * The goal loop is four controls and they belong together: the switch, the key that makes
-   * it work, the model it spends that key on, and how hard that model thinks. The key comes
-   * before the picker, because a picker that cannot reach OpenRouter without one is not the
-   * first thing to meet.
-   */
-  it('puts the goal key above the model picker', () => {
+  /** Goal has one authority switch; provider/model are fixed by this build. */
+  it('shows the fixed Antigravity Goal runtime without key, picker or reasoning controls', () => {
     const pane = document.querySelector('.view[data-view="settings"] .pane')!;
-    const order = [...pane.querySelectorAll('[id^="goal"]')].map((node) => node.id);
-    expect(order.indexOf('goalEnabled')).toBeGreaterThanOrEqual(0);
-    expect(order.indexOf('goalKey')).toBeLessThan(order.indexOf('goalPick'));
-    expect(order.indexOf('goalPick')).toBeLessThan(order.indexOf('goalReasoning'));
-    // Closed until asked for: the catalogue is several hundred long and costs a round trip.
-    expect(document.getElementById('goalModels')!.hasAttribute('hidden')).toBe(true);
+    expect(document.getElementById('goalEnabled')).not.toBeNull();
+    for (const id of ['goalKey', 'goalKeyRemove', 'goalPick', 'goalModels', 'goalModelList', 'goalMore', 'goalReasoning']) {
+      expect(document.getElementById(id), `#${id} is back`).toBeNull();
+    }
+    expect(pane.textContent).toContain('Antigravity');
+    expect(pane.textContent).toContain('Gemini 3.7 Flash Low');
+    expect(pane.textContent).not.toContain('OpenRouter');
   });
+
 
   /** One threshold. Three inputs for the same number is three ways to disagree. */
   it('asks for a single compaction threshold', () => {

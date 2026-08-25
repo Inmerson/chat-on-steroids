@@ -28,7 +28,6 @@ import { getConfig, updateConfig } from './config.js';
 import { getSecret, setSecret } from './secrets.js';
 import {
   ackGoalDraft,
-  goalKeyPresent,
   goalViewFor,
   retireGoalDrafts,
   startGoalDraft
@@ -685,7 +684,7 @@ function conversationId(value: unknown): string | null {
  * whole of the objective it was given. Letting the loop type into it too puts two hands on
  * one wheel: the worker answers a question its prime never asked, finishes against that
  * instead, and reports back work nobody ordered. Worse, every worker in a run would be
- * spending OpenRouter credit in parallel on drafts the prime is about to override anyway.
+ * generating competing Goal drafts in parallel while the prime is about to override them anyway.
  *
  * So: on for the prime, on for an ordinary solo chat that is not part of a run at all, and
  * off for every worker, whatever the global switch says. `agentForConversation` returns null
@@ -1186,13 +1185,13 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
         // How this chat's own Compact & Resume is going, so the page can say what is
         // happening instead of spinning.
         job: resumeJobFor(live.sessionId),
-        // The goal loop: whether it is on, whether it *can* be on, and whatever draft this
-        // chat currently has in flight. The draft's text grows on this feed, which is what
-        // the panel above the composer streams — there is no second connection to hold open.
+        // Goal provider/model are fixed runtime policy. Session state and draft are projected
+        // separately so the composer can show active/stopped/complete/failed without history.
         goal: {
           enabled: goalEnabledFor(id),
-          hasKey: await goalKeyPresent(),
-          model: getConfig().goal.model,
+          provider: 'antigravity',
+          model: 'gemini-3.7-flash-low',
+          state: goalForSession(live.sessionId),
           draft: goalViewFor(id, goalClient)
         },
         // Local calls still executing for *this chat*. ChatGPT-native compaction waits for
@@ -1561,7 +1560,7 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
     return json(
       res,
       200,
-      { context: contextView(), goal: { enabled: next.goal.enabled, hasKey: await goalKeyPresent(), model: next.goal.model } },
+      { context: contextView(), goal: { enabled: next.goal.enabled, provider: 'antigravity', model: 'gemini-3.7-flash-low' } },
       origin
     );
   }

@@ -349,68 +349,40 @@ describe('shipped defaults', () => {
  * consent question rather than a convenience one.
  */
 describe('the goal loop settings', () => {
-  it('is off out of the box', () => {
+  it('is off out of the box and has no provider knobs in durable config', () => {
     const config = defaultConfig();
-    expect(config.goal.enabled).toBe(false);
-    expect(config.goal.model).toBe('~deepseek/deepseek-v4-flash-latest');
-    expect(config.goal.reasoning).toBe('default');
+    expect(config.goal).toEqual({ enabled: false });
   });
 
-  it('keeps the model and reasoning level that were chosen', async () => {
-    await saveConfig({
-      ...defaultConfig(),
+  it('migrates old OpenRouter fields away while preserving enabled, roots and permissions', async () => {
+    const config = defaultConfig();
+    const legacy = {
+      ...config,
+      roots: [{ name: 'repo', path: 'C:\\repo' }],
+      readOnly: true,
       goal: { enabled: true, model: 'openai/gpt-5.2-mini:nitro', reasoning: 'high' }
-    });
-    expect((await loadConfig()).goal).toEqual({
-      enabled: true,
-      model: 'openai/gpt-5.2-mini:nitro',
-      reasoning: 'high'
-    });
-  });
-
-  /**
-   * The id is free text from a provider listing that changes weekly. A config that lost it
-   * still has every root and permission in it, and losing those to a blank string would be
-   * a far worse failure than starting the picker back at its default.
-   */
-  it('repairs a blank model id rather than refusing the whole config', async () => {
-    const config = defaultConfig();
-    await fs.writeFile(
-      path.join(dir, 'config.json'),
-      JSON.stringify({ ...config, goal: { enabled: true, model: '   ', reasoning: 'low' } }),
-      'utf8'
-    );
+    };
+    await fs.writeFile(path.join(dir, 'config.json'), JSON.stringify(legacy), 'utf8');
     const loaded = await loadConfig();
-    expect(loaded.goal.model).toBe('~deepseek/deepseek-v4-flash-latest');
-    expect(loaded.goal.enabled).toBe(true);
-    expect(loaded.roots).toEqual(config.roots);
+    expect(loaded.goal).toEqual({ enabled: true });
+    expect(loaded.roots).toEqual(legacy.roots);
+    expect(loaded.readOnly).toBe(true);
+    await saveConfig(loaded);
+    const saved = JSON.parse(await fs.readFile(path.join(dir, 'config.json'), 'utf8'));
+    expect(saved.goal).toEqual({ enabled: true });
+    expect(saved.goal.model).toBeUndefined();
+    expect(saved.goal.reasoning).toBeUndefined();
   });
 
   it('adds the section to a config written before the loop existed', async () => {
     const before = defaultConfig() as unknown as Record<string, unknown>;
     const { goal: _dropped, ...withoutGoal } = before;
     await fs.writeFile(path.join(dir, 'config.json'), JSON.stringify(withoutGoal), 'utf8');
-    expect((await loadConfig()).goal).toEqual({
-      enabled: false,
-      model: '~deepseek/deepseek-v4-flash-latest',
-      reasoning: 'default'
-    });
+    expect((await loadConfig()).goal).toEqual({ enabled: false });
   });
 
-  /** Corruption is not consent here either: a broken file must not switch the loop on. */
   it('leaves the loop off when the config cannot be read', async () => {
     await fs.writeFile(path.join(dir, 'config.json'), '{ definitely-not-json', 'utf8');
-    expect((await loadConfig()).goal.enabled).toBe(false);
-  });
-
-  /** An unknown reasoning level is somebody else's vocabulary, not a level to guess at. */
-  it('falls back rather than passing an unknown reasoning level to OpenRouter', async () => {
-    const config = defaultConfig();
-    await fs.writeFile(
-      path.join(dir, 'config.json'),
-      JSON.stringify({ ...config, goal: { enabled: true, model: 'x/y', reasoning: 'extreme' } }),
-      'utf8'
-    );
-    expect((await loadConfig()).goal.reasoning).toBe('default');
+    expect((await loadConfig()).goal).toEqual({ enabled: false });
   });
 });

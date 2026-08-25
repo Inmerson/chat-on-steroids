@@ -2274,9 +2274,8 @@ describe('restarting the bridge', () => {
 /**
  * The three routes the goal loop adds, and the refusals that matter most.
  *
- * The page decides *when* a turn is over; everything after that is the app's, because the
- * OpenRouter key is a real credential and never crosses into a browser. So these routes are
- * where somebody's credit gets spent, and each of them is checked before it spends any.
+ * The page decides *when* a turn is over; everything after that is the app's. The local
+ * Antigravity session stays inside the main process and these routes expose only bounded state.
  */
 describe('the goal loop over the bridge', () => {
   it('treats only newly stored manual user messages as session goal authority', async () => {
@@ -2313,9 +2312,8 @@ describe('the goal loop over the bridge', () => {
     await saveConfig({
       ...defaultConfig(),
       sessions: { ...defaultConfig().sessions, record: true },
-      goal: { enabled: true, model: 'deepseek/deepseek-v4-flash', reasoning: 'default' }
+      goal: { enabled: true }
     });
-    await setSecret('openRouterApiKey', 'sk-or-bridge');
     resetGoalStateForTests();
   });
 
@@ -2333,8 +2331,9 @@ describe('the goal loop over the bridge', () => {
     expect(reply.status).toBe(200);
     expect(reply.body.goal).toMatchObject({
       enabled: true,
-      hasKey: true,
-      model: 'deepseek/deepseek-v4-flash',
+      provider: 'antigravity',
+      model: 'gemini-3.7-flash-low',
+      state: expect.objectContaining({ status: 'active' }),
       draft: null
     });
   });
@@ -2350,7 +2349,7 @@ describe('the goal loop over the bridge', () => {
    * agents tool — and the brief it was handed is the whole of its objective. A second model
    * typing into it as well is two hands on one wheel: the worker answers a question its
    * prime never asked and finishes against that instead. And with the loop armed run-wide,
-   * every worker would be spending OpenRouter credit in parallel on drafts the prime is
+   * every worker would be generating competing Goal drafts in parallel while the prime is
    * about to override. So the worker is off whatever the global setting says, and a chat
    * that is no part of the run is untouched.
    */
@@ -2388,7 +2387,7 @@ describe('the goal loop over the bridge', () => {
     expect(getConfig().goal.enabled).toBe(true);
   });
 
-  it('refuses to draft when the loop is off and never requires an OpenRouter key', async () => {
+  it('refuses to draft when the loop is off and never requires a separate API key', async () => {
     await pair();
     await request('POST', '/events', {
       body: {
@@ -2411,7 +2410,6 @@ describe('the goal loop over the bridge', () => {
       sessions: { ...defaultConfig().sessions, record: true },
       goal: { ...defaultConfig().goal, enabled: true }
     });
-    await setSecret('openRouterApiKey', '');
     setGoalDriverForTests(async () => ({ kind: 'no-reply', raw: 'NO_REPLY' }));
     const keyless = await request('POST', '/goal/draft', { body: { conversationId: 'cafe0002-0000-4000-8000-000000000002', turnId: 'g-1' } });
     expect(keyless.status).toBe(200);
@@ -2443,7 +2441,6 @@ describe('the goal loop over the bridge', () => {
       sessions: { ...defaultConfig().sessions, record: true },
       goal: { ...defaultConfig().goal, enabled: true }
     });
-    await setSecret('openRouterApiKey', 'sk-or-test');
     const conversationId = 'cafe0099-0000-4000-8000-000000000099';
     const older = await createSession({ title: 'older but still owned', conversationId });
     noteManualGoal(older.id, 'continue this older recorded goal', 'm-old-goal');
@@ -2619,7 +2616,7 @@ describe('the goal loop over the bridge', () => {
     expect(getConfig().compaction.auto).toBe(true);
     expect(getConfig().goal.enabled).toBe(false);
     expect(reply.body.context.auto).toBe(true);
-    expect(reply.body.goal).toMatchObject({ enabled: false, hasKey: true });
+    expect(reply.body.goal).toMatchObject({ enabled: false, provider: 'antigravity', model: 'gemini-3.7-flash-low' });
 
     const readOnly = getConfig().readOnly;
     const capabilities = { ...getConfig().capabilities };

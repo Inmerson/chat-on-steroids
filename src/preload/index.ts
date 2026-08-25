@@ -33,12 +33,6 @@ export interface SettingsPatch {
   goal: Config['goal'];
 }
 
-/** One page of the OpenRouter catalogue, as the model picker asks for it. */
-export interface GoalModelPage {
-  models: Array<{ id: string; name: string; created: number; contextLength: number }>;
-  total: number;
-}
-
 export interface SessionList {
   sessions: SessionSummary[];
   activeId: string | null;
@@ -58,9 +52,6 @@ const api = {
   removeRoot: (name: string) => call<AppState>('roots:remove', { name }),
   renameRoot: (name: string, newName: string) => call<AppState>('roots:rename', { name, newName }),
   setApiKey: (value: string) => call<AppState>('secret:set', { value }),
-  // The goal loop's own credential. Same channel, named slot; the value only ever goes in.
-  setGoalKey: (value: string) => call<AppState>('secret:set', { value, key: 'openRouterApiKey' }),
-  listGoalModels: (offset: number) => call<GoalModelPage>('goal:models', { offset }),
   pickBinary: () => call<AppState>('binary:pick'),
   connect: () => call<AppState>('connection:connect'),
   disconnect: () => call<AppState>('connection:disconnect'),
