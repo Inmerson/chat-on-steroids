@@ -25,7 +25,8 @@ import type {
   StoredText,
   ToolCallRecord,
   ToolOutcome,
-  TurnOutcome
+  TurnOutcome,
+  UserMessageProvenance
 } from '../../shared/session.js';
 import { estimateTokens, originTitle } from '../../shared/session.js';
 import { getConfig } from '../config.js';
@@ -1288,6 +1289,8 @@ export interface ChatObservation {
   /** ChatGPT's already-rendered authored markup for this same logical message. */
   renderedHtml?: string;
   messageId?: string;
+  /** Browser-side producer identity for user rows. Missing only for legacy/direct recorder callers. */
+  provenance?: UserMessageProvenance;
   turnId?: string;
   final?: boolean;
   state?: 'streaming' | 'final';
@@ -1371,11 +1374,24 @@ async function recordPageTool(
 
 const observationChains = new Map<string, Promise<void>>();
 
+export interface StoredUserObservation {
+  messageId: string;
+  text: string;
+  provenance: UserMessageProvenance | undefined;
+}
+
+export interface RecordChatObservationsResult {
+  sessionId: string | null;
+  stored: number;
+  /** Newly created logical user rows only; revisions/replays never regain goal authority. */
+  storedUserMessages: StoredUserObservation[];
+}
+
 export function recordChatObservations(
   conversationId: string,
   observations: readonly ChatObservation[],
   agent?: string | null
-): Promise<{ sessionId: string | null; stored: number }> {
+): Promise<RecordChatObservationsResult> {
   const prior = observationChains.get(conversationId) ?? Promise.resolve();
   const work = prior.then(() => recordChatObservationsNow(conversationId, observations, agent));
   const tracked = work.then(
@@ -1393,8 +1409,8 @@ async function recordChatObservationsNow(
   conversationId: string,
   observations: readonly ChatObservation[],
   agent?: string | null
-): Promise<{ sessionId: string | null; stored: number }> {
-  if (!recordingEnabled()) return { sessionId: null, stored: 0 };
+): Promise<RecordChatObservationsResult> {
+  if (!recordingEnabled()) return { sessionId: null, stored: 0, storedUserMessages: [] };
   let firstUser: ChatObservation | undefined;
   let pageTitle: ChatObservation | undefined;
   const explicitEnds = new Set<string>();
@@ -1410,9 +1426,10 @@ async function recordChatObservationsNow(
     conversationId,
     pageTitle?.text?.trim() || (firstUser?.text ? firstUser.text.slice(0, 80) : undefined)
   );
-  if (!sessionId) return { sessionId: null, stored: 0 };
+  if (!sessionId) return { sessionId: null, stored: 0, storedUserMessages: [] };
   const live = conversations.get(conversationId);
   let stored = 0;
+  const storedUserMessages: StoredUserObservation[] = [];
   // A cold/reloaded page can discover that a turn finished while the content script was
   // absent. There is then a new final assistant message but no live `generating -> false`
   // transition for content.js to report, and nothing would close the turn.
@@ -1459,9 +1476,20 @@ async function recordChatObservationsNow(
           ...base,
           kind: 'user_message',
           message: await storeText(sessionId, item.text ?? '', MAX_USER_MESSAGE_CHARS),
-          messageId: item.messageId
+          messageId: item.messageId,
+          ...(item.provenance === undefined ? {} : { provenance: item.provenance })
         }, { preferTime: item.authoredTime === true });
         if (!written.changed) continue;
+        // Goal authority is a one-shot property of a newly created logical user message. A
+        // later correction/replay of the same stable ChatGPT id may update the transcript, but
+        // it must not create another goal revision. `origin === seq` identifies first creation.
+        if (written.event.kind === 'user_message' && written.event.origin === written.event.seq) {
+          storedUserMessages.push({
+            messageId: item.messageId,
+            text: item.text ?? '',
+            provenance: item.provenance
+          });
+        }
         break;
       }
       case 'assistant_message': {
@@ -1577,7 +1605,7 @@ async function recordChatObservationsNow(
     stored++;
   }
   notifyChanged();
-  return { sessionId, stored };
+  return { sessionId, stored, storedUserMessages };
 }
 
 /** Records something the app itself decided, e.g. a saved handoff. */

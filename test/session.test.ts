@@ -1057,6 +1057,42 @@ describe('handoff storage', () => {
 // ---------------------------------------------------------------- recorder
 
 describe('canonical recorder 1.8', () => {
+  it('stores explicit user-message provenance and reports only newly written user rows', async () => {
+    const conversationId = 'prov-recorder-0001';
+    const observation = {
+      kind: 'user_message' as const,
+      time: Date.now(),
+      text: 'continue automatically',
+      messageId: 'prov-user-1',
+      provenance: 'goal' as const
+    };
+
+    const first = await recordChatObservations(conversationId, [observation]);
+    expect(first.sessionId).toBeTruthy();
+    expect(first.storedUserMessages).toEqual([
+      { messageId: 'prov-user-1', text: 'continue automatically', provenance: 'goal' }
+    ]);
+    const stored = await readEvents(first.sessionId!, { kinds: ['user_message'] });
+    expect(stored).toHaveLength(1);
+    expect(stored[0]).toMatchObject({ kind: 'user_message', messageId: 'prov-user-1', provenance: 'goal' });
+
+    const replay = await recordChatObservations(conversationId, [observation]);
+    expect(replay.stored).toBe(0);
+    expect(replay.storedUserMessages).toEqual([]);
+  });
+
+  it('keeps legacy recorder input without provenance readable but non-authoritative', async () => {
+    const result = await recordChatObservations('prov-recorder-legacy', [
+      { kind: 'user_message', time: Date.now(), text: 'legacy context', messageId: 'legacy-prov-1' }
+    ]);
+    const stored = await readEvents(result.sessionId!, { kinds: ['user_message'] });
+    expect(stored[0]).toMatchObject({ kind: 'user_message', messageId: 'legacy-prov-1' });
+    expect(stored[0] && 'provenance' in stored[0] ? stored[0].provenance : undefined).toBeUndefined();
+    expect(result.storedUserMessages).toEqual([
+      { messageId: 'legacy-prov-1', text: 'legacy context', provenance: undefined }
+    ]);
+  });
+
   it('lets the store deduplicate repeated recorder assets instead of shadow-counting the same bytes toward quota', async () => {
     const conversationId = `conv-dedup-shot-${Date.now()}`;
     const sessionId = await sessionForConversation(conversationId);

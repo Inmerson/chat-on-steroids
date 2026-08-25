@@ -183,12 +183,17 @@ interface BaseEvent {
   turnId?: string;
 }
 
+/** Provenance of a user row observed by the browser extension. Legacy rows may omit it. */
+export type UserMessageProvenance = 'manual' | 'goal' | 'bootstrap';
+
 export type SessionEvent =
   | (BaseEvent & { kind: 'session_start'; conversationId: string | null; title: string })
   | (BaseEvent & {
       kind: 'user_message';
       message: StoredText;
       messageId?: string;
+      /** Explicit producer authority; omitted only by recordings created before provenance existed. */
+      provenance?: UserMessageProvenance;
       /** First sequence assigned to this stable website message; revisions keep this anchor. */
       origin?: number;
     })

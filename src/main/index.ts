@@ -35,6 +35,7 @@ import {
 } from './agents.js';
 import { flushDurable, initDurableStore, readDurable, writeDurableNow, writeDurableSoon } from './durable.js';
 import { restoreRequestCorrelations } from './session/correlation.js';
+import { GOALS_STATE, restoreGoalStates } from './goal-state.js';
 import { stopComputerHelper } from './computer/index.js';
 import {
   CONTINUATIONS_STATE,
@@ -193,6 +194,7 @@ void app.whenReady().then(async () => {
   initSessionStore(userData);
   initDurableStore(userData);
   await loadConfig();
+  restoreGoalStates(await readDurable(GOALS_STATE));
   // Request ownership must exist before either side of the bridge can race in. A request id
   // that was proved yesterday remains the same workflow today even if its ChatGPT tab closed.
   await restoreRequestCorrelations();

@@ -16,6 +16,16 @@ describe('runtime multi-agent enable regression', () => {
     expect(restoreGate).toBeGreaterThanOrEqual(0);
     expect(persistSink).toBeLessThan(restoreGate);
   });
+
+  it('restores durable session goal state after the durable store is initialized', async () => {
+    const source = await readFile(path.join(repo, 'src/main/index.ts'), 'utf8');
+    const durableInit = source.indexOf('initDurableStore(userData);');
+    const goalRestore = source.indexOf('restoreGoalStates(await readDurable(GOALS_STATE));');
+
+    expect(durableInit).toBeGreaterThanOrEqual(0);
+    expect(goalRestore).toBeGreaterThanOrEqual(0);
+    expect(durableInit).toBeLessThan(goalRestore);
+  });
 });
 
 describe('companion extension setup contract', () => {

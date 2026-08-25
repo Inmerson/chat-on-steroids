@@ -46,6 +46,7 @@ const {
 } = await import('../src/main/bridge.js');
 const { flushDurable, initDurableStore, readDurable, writeDurableNow, writeDurableSoon } = await import('../src/main/durable.js');
 const { humanReply, resetGoalStateForTests } = await import('../src/main/goal.js');
+const { goalForSession, resetGoalStatesForTests } = await import('../src/main/goal-state.js');
 const { createSession, getSession, initSessionStore, readEvents, resetSessionStoreForTests } = await import(
   '../src/main/session/store.js'
 );
@@ -111,7 +112,7 @@ async function compactedSession(from: string, brief: string): Promise<{ sessionI
   const reply = await request('POST', '/events', {
     body: {
       conversationId: from,
-      events: [{ kind: 'user_message', time: Date.now(), text: 'do the work', messageId: `m-${from}` }]
+      events: [{ kind: 'user_message', provenance: 'manual', time: Date.now(), text: 'do the work', messageId: `m-${from}` }]
     }
   });
   const sessionId = reply.body.sessionId as string;
@@ -247,6 +248,7 @@ beforeEach(async () => {
     opened.push(url);
   });
   resetRecorderForTests();
+  resetGoalStatesForTests();
   writeDurableSoon('bridge-commands', null);
   await flushDurable();
   await setSecret('bridgeToken', '');
@@ -381,6 +383,26 @@ describe('authorisation', () => {
 // ------------------------------------------------------------------ events
 
 describe('observations', () => {
+  it('accepts only explicit user-message provenance from the extension boundary', async () => {
+    await pair();
+    const conversationId = '6a805197-b090-83eb-bbd8-a32b482941db';
+    const reply = await request('POST', '/events', {
+      body: {
+        conversationId,
+        events: [
+          { kind: 'user_message', time: Date.now(), text: 'manual', messageId: 'prov-manual', provenance: 'manual' },
+          { kind: 'user_message', time: Date.now(), text: 'missing', messageId: 'prov-missing' },
+          { kind: 'user_message', time: Date.now(), text: 'unknown', messageId: 'prov-unknown', provenance: 'plugin' }
+        ]
+      }
+    });
+    expect(reply.status).toBe(200);
+    expect(reply.body.stored).toBe(1);
+    const events = await readEvents(reply.body.sessionId, { kinds: ['user_message'] });
+    expect(events).toHaveLength(1);
+    expect(events[0]).toMatchObject({ messageId: 'prov-manual', provenance: 'manual' });
+  });
+
   it('refuses anything that is not a conversation id', async () => {
     await pair();
     for (const conversationId of ['', 'not a uuid', '../../etc', 'x'.repeat(100)]) {
@@ -397,7 +419,7 @@ describe('observations', () => {
       body: {
         conversationId,
         events: [
-          { kind: 'user_message', time: Date.now(), text: 'first requirement', messageId: 'm1' },
+          { kind: 'user_message', provenance: 'manual', time: Date.now(), text: 'first requirement', messageId: 'm1' },
           { kind: 'turn_start', time: Date.now(), turnId: 'turn-1' },
           { kind: 'assistant_message', time: Date.now(), text: 'reading files', renderedHtml: '<p><strong>reading</strong> files</p>', messageId: 'a1', state: 'streaming' },
           { kind: 'invented_kind', time: Date.now(), text: 'should be dropped' },
@@ -451,7 +473,7 @@ describe('observations', () => {
   it('stores a message once when a reloaded tab reports it twice', async () => {
     await pair();
     const conversationId = '11111111-2222-3333-4444-555555555555';
-    const message = { kind: 'user_message', time: Date.now(), text: 'the original task', messageId: 'msg-a' };
+    const message = { kind: 'user_message', provenance: 'manual', time: Date.now(), text: 'the original task', messageId: 'msg-a' };
     const first = await request('POST', '/events', { body: { conversationId, events: [message] } });
     const second = await request('POST', '/events', { body: { conversationId, events: [message] } });
     expect(first.body.stored).toBe(1);
@@ -675,7 +697,7 @@ describe('activity feed', () => {
     const conversationId = '99999999-8888-7777-6666-555555555555';
     await request('POST', '/events', {
       body: { conversationId, events: [
-          { kind: 'user_message', time: Date.now(), text: 'private user text stays out of the render anchor', messageId: 'user-anchor-42' },
+          { kind: 'user_message', provenance: 'manual', time: Date.now(), text: 'private user text stays out of the render anchor', messageId: 'user-anchor-42' },
           { kind: 'turn_start', time: Date.now(), turnId: 'turn-42' },
           { kind: 'page_tool', time: Date.now(), turnId: 'turn-42', text: 'Searched the web', messageId: 'native-1' },
           { kind: 'tool_block', time: Date.now(), turnId: 'turn-42', count: 1 }
@@ -791,7 +813,7 @@ describe('activity feed', () => {
     // A later user message is not rendered in the assistant stream, but it still advances
     // the shared sequence cursor so the browser cannot re-read it forever.
     await request('POST', '/events', {
-      body: { conversationId, events: [{ kind: 'user_message', time: Date.now(), text: 'next question', messageId: 'next-q' }] }
+      body: { conversationId, events: [{ kind: 'user_message', provenance: 'manual', time: Date.now(), text: 'next question', messageId: 'next-q' }] }
     });
     const all = await request('GET', `/activity?conversationId=${conversationId}&since=0`);
     expect(all.body.entries).toHaveLength(3);
@@ -903,7 +925,7 @@ describe('activity feed', () => {
  */
 describe('automatic compaction', () => {
   const over = (): unknown[] => [
-    { kind: 'user_message', time: Date.now(), text: 'x'.repeat(44_000), messageId: 'over-the-line' }
+    { kind: 'user_message', provenance: 'manual', time: Date.now(), text: 'x'.repeat(44_000), messageId: 'over-the-line' }
   ];
 
   async function withThreshold(tokens: number, run: () => Promise<void>): Promise<void> {
@@ -1047,6 +1069,7 @@ describe('delivering a bootstrap', () => {
         events: [
           {
             kind: 'user_message',
+            provenance: 'bootstrap',
             time: Date.now(),
             text: 'Continue the previous Chat On Steroids session. Read the handoff below.',
             messageId: 'boot-resume'
@@ -1074,6 +1097,7 @@ describe('delivering a bootstrap', () => {
         events: [
           {
             kind: 'user_message',
+            provenance: 'bootstrap',
             time: Date.now(),
             text: 'Rewrite the recorder fixture',
             messageId: 'boot-worker'
@@ -1103,6 +1127,7 @@ describe('delivering a bootstrap', () => {
         events: [
           {
             kind: 'user_message',
+            provenance: 'bootstrap',
             time: Date.now(),
             text: 'Keep durable worker attribution',
             messageId: 'boot-worker-after-recorder-restart'
@@ -1134,7 +1159,7 @@ describe('delivering a bootstrap', () => {
     const reply = await request('POST', '/events', {
       body: {
         conversationId,
-        events: [{ kind: 'user_message', time: Date.now(), text: 'a chat the user started', messageId: 'm-own' }]
+        events: [{ kind: 'user_message', provenance: 'manual', time: Date.now(), text: 'a chat the user started', messageId: 'm-own' }]
       }
     });
     const summary = await getSession(reply.body.sessionId);
@@ -2251,6 +2276,36 @@ describe('restarting the bridge', () => {
  * where somebody's credit gets spent, and each of them is checked before it spends any.
  */
 describe('the goal loop over the bridge', () => {
+  it('treats only newly stored manual user messages as session goal authority', async () => {
+    await pair();
+    await saveConfig({
+      ...defaultConfig(),
+      sessions: { ...defaultConfig().sessions, record: true },
+      goal: { ...defaultConfig().goal, enabled: true }
+    });
+    const conversationId = 'cafe0091-0000-4000-8000-000000000091';
+    const send = (messageId: string, text: string, provenance: 'manual' | 'goal' | 'bootstrap') =>
+      request('POST', '/events', {
+        body: { conversationId, events: [{ kind: 'user_message', time: Date.now(), text, messageId, provenance }] }
+      });
+
+    const first = await send('goal-manual-1', 'build the feature', 'manual');
+    const sessionId = first.body.sessionId as string;
+    expect(goalForSession(sessionId)).toMatchObject({ revision: 1, status: 'active', text: 'build the feature' });
+
+    await send('goal-auto-1', 'check the failing test', 'goal');
+    await send('goal-bootstrap-1', 'Continue the previous session', 'bootstrap');
+    expect(goalForSession(sessionId)).toMatchObject({ revision: 1, text: 'build the feature' });
+
+    await send('goal-manual-2', 'prioritize the race test', 'manual');
+    expect(goalForSession(sessionId)).toMatchObject({ revision: 2, status: 'active', text: 'prioritize the race test' });
+    await send('goal-manual-2', 'prioritize the race test', 'manual');
+    expect(goalForSession(sessionId)?.revision).toBe(2);
+
+    await send('goal-stop-1', 'goal\u0131 durdur', 'manual');
+    expect(goalForSession(sessionId)).toMatchObject({ revision: 3, status: 'stopped', sourceMessageId: 'goal-stop-1' });
+  });
+
   beforeEach(async () => {
     await saveConfig({
       ...defaultConfig(),
@@ -2267,7 +2322,7 @@ describe('the goal loop over the bridge', () => {
     await request('POST', '/events', {
       body: {
         conversationId: 'cafe0001-0000-4000-8000-000000000001',
-        events: [{ kind: 'user_message', time: Date.now(), text: 'do the work', messageId: 'm-goal-1' }]
+        events: [{ kind: 'user_message', provenance: 'manual', time: Date.now(), text: 'do the work', messageId: 'm-goal-1' }]
       }
     });
 
@@ -2310,7 +2365,7 @@ describe('the goal loop over the bridge', () => {
       await request('POST', '/events', {
         body: {
           conversationId,
-          events: [{ kind: 'user_message', time: Date.now(), text: 'go', messageId: `m-${conversationId}` }]
+          events: [{ kind: 'user_message', provenance: 'manual', time: Date.now(), text: 'go', messageId: `m-${conversationId}` }]
         }
       });
     }
@@ -2335,7 +2390,7 @@ describe('the goal loop over the bridge', () => {
     await request('POST', '/events', {
       body: {
         conversationId: 'cafe0002-0000-4000-8000-000000000002',
-        events: [{ kind: 'user_message', time: Date.now(), text: 'go', messageId: 'm-goal-2' }]
+        events: [{ kind: 'user_message', provenance: 'manual', time: Date.now(), text: 'go', messageId: 'm-goal-2' }]
       }
     });
 
@@ -2407,7 +2462,7 @@ describe('the goal loop over the bridge', () => {
     await request('POST', '/events', {
       body: {
         conversationId: 'cafe0003-0000-4000-8000-000000000003',
-        events: [{ kind: 'user_message', time: Date.now(), text: 'write the parser', messageId: 'm-goal-3' }]
+        events: [{ kind: 'user_message', provenance: 'manual', time: Date.now(), text: 'write the parser', messageId: 'm-goal-3' }]
       }
     });
 

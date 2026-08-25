@@ -23,7 +23,7 @@
 import { randomBytes, timingSafeEqual } from 'node:crypto';
 import http from 'node:http';
 import type { BridgeStatus } from '../shared/types.js';
-import type { SessionOrigin } from '../shared/session.js';
+import type { SessionOrigin, UserMessageProvenance } from '../shared/session.js';
 import { getConfig, updateConfig } from './config.js';
 import { getSecret, setSecret } from './secrets.js';
 import {
@@ -33,6 +33,11 @@ import {
   retireGoalDrafts,
   startGoalDraft
 } from './goal.js';
+import {
+  isGoalStopCommand,
+  noteGoalStop,
+  noteManualGoal
+} from './goal-state.js';
 import { logInfo, logWarn } from './logger.js';
 import {
   closeConversation,
@@ -576,6 +581,13 @@ function parseObservations(input: unknown): ChatObservation[] {
     const item = raw as Record<string, unknown>;
     const kind = typeof item['kind'] === 'string' ? item['kind'] : '';
     if (!OBSERVATION_KINDS.has(kind)) continue;
+    // New extension user rows must carry producer authority explicitly. Missing provenance is
+    // still accepted by the recorder for old on-disk/direct callers, but never crosses this
+    // live browser trust boundary. Text equality is not an authority signal.
+    const provenance = item['provenance'];
+    if (kind === 'user_message' && provenance !== 'manual' && provenance !== 'goal' && provenance !== 'bootstrap') {
+      continue;
+    }
     const time = typeof item['time'] === 'number' && Number.isFinite(item['time']) ? item['time'] : now;
     const observation: ChatObservation = {
       kind: kind as ChatObservation['kind'],
@@ -587,6 +599,7 @@ function parseObservations(input: unknown): ChatObservation[] {
     // truncation point after Fiber/content.js accepted the whole message.
     if (typeof item['text'] === 'string') observation.text = item['text'].slice(0, 256_000);
     if (typeof item['messageId'] === 'string') observation.messageId = item['messageId'].slice(0, 100);
+    if (kind === 'user_message') observation.provenance = provenance as UserMessageProvenance;
     if (typeof item['turnId'] === 'string') observation.turnId = item['turnId'].slice(0, 100);
     if (typeof item['renderedHtml'] === 'string') observation.renderedHtml = item['renderedHtml'].slice(0, 120_000);
     if (item['state'] === 'streaming' || item['state'] === 'final') observation.state = item['state'];
@@ -905,6 +918,16 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
         }
       }
       const result = await recordChatObservations(id, observations, agent);
+      // A goal belongs to the durable session and only a freshly created, explicitly manual
+      // user row may revise it. Goal/Resume bootstrap rows remain transcript context; workers
+      // have their objective supplied by Prime and never gain session-goal authority here.
+      if (result.sessionId && getConfig().goal.enabled && (agent === null || agent === PRIME_ID)) {
+        for (const message of result.storedUserMessages) {
+          if (message.provenance !== 'manual') continue;
+          if (isGoalStopCommand(message.text)) noteGoalStop(result.sessionId, message.messageId);
+          else noteManualGoal(result.sessionId, message.text.slice(0, 16_000), message.messageId);
+        }
+      }
       // Workers are one-shot jobs. A settled assistant answer plus its matching turn_end is
       // first-hand page evidence that the worker has completed a turn; waiting for the model
       // to make another MCP call solely to say `finish` leaves normal final answers as zombie
