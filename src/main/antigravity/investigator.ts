@@ -5,7 +5,7 @@ import { ANTIGRAVITY_MODEL, runAntigravity, type AntigravityRunResult } from './
 
 const TARGET_TOOL_CALLS = 6;
 const MAX_TOOL_CALLS = 8;
-const DEFAULT_TIMEOUT_MS = 45_000;
+const DEFAULT_TIMEOUT_MS = 60_000;
 const MAX_PROJECT_FILES = 128;
 const MAX_PROJECT_FILE_BYTES = 64 * 1024;
 const HANDOFF_BYTES = 16 * 1024;

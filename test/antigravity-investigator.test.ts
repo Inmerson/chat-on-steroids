@@ -41,7 +41,7 @@ describe('Antigravity fast investigator', () => {
 
     expect(captured).not.toBeNull();
     expect(captured!.cwd).toBe(process.cwd());
-    expect(captured!.timeoutMs).toBe(45_000);
+    expect(captured!.timeoutMs).toBe(60_000);
     expect(captured!.hardToolCalls).toBe(8);
     expect(captured!.allowPartial).toBe(true);
     expect(captured!.prompt).toContain('Trace the request lifecycle across the repository.');
