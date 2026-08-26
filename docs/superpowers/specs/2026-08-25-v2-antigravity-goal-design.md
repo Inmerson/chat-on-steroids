@@ -1,7 +1,7 @@
 # v2 Antigravity Goal Loop and Fast Lane Design
 
 Date: 2026-08-25
-Status: design approved in chat; implementation pending written-spec review
+Status: implemented on `feature/v2-antigravity-goal-impl`; release candidate installed and verified as recorded below
 Base: upstream Chat On Steroids v2.0.0
 
 ## 1. Purpose
@@ -321,3 +321,20 @@ If context approaches the configured threshold, the sequence becomes:
 `... -> automatic Compact & Resume -> replacement ChatGPT conversation -> same durable session + same active goal revision -> continue -> NO_REPLY`.
 
 At any point a manual stop command halts the session goal, and any later normal manual message replaces it with a new revision.
+
+## 12. Implementation verification (2026-08-26)
+
+The approved design is implemented on the clean v2.0.0-derived branch. The implementation uses the cached Antigravity account only, keeps ChatGPT Prime as the final verifier, and does not add an OpenRouter or other paid API fallback.
+
+Deterministic coverage includes the shared Antigravity runtime, Delegation Router and `agents investigate`, durable session-scoped goal revisions, manual/goal/bootstrap provenance, exact `NO_REPLY`, stop/restart behavior, stale-generation fencing, the 32-turn runaway guard, Compact & Resume ownership races, browser at-most-once sending, restart restore and session rebind behavior.
+
+Live installed-build checks established:
+
+- the packaged and installed `app.asar` were byte-identical for the final candidate;
+- the ChatGPT connector schema was refreshed and exposed `agents action=investigate`;
+- Fast Investigator returned `delegated: true` on Gemini 3.7 Flash Low with four tool calls, `partial: false` and `budget_exceeded: false`;
+- a real Goal Driver turn reached exact `NO_REPLY` without sending another user message;
+- a manual stop moved the durable goal to `stopped`, and the next genuine manual user message created a newer active revision;
+- the browser companion was reloaded from the installed candidate and the Goal UI reported `Antigravity · Gemini 3.7 Flash Low`.
+
+The live Compact & Resume button was also invoked successfully. In the concurrent multi-chat test environment, unrelated MCP calls with as-yet-unproven ownership remained active, so the existing fail-closed settlement barrier correctly refused the handoff with `Local tools were still running after the settle timeout. Nothing was compacted.` The implementation deliberately does not weaken that safety rule. Compact/rebind success and the requirement that the same session-scoped goal revision survives the handoff are covered by deterministic browser/bridge/state tests; a clean live replacement-chat smoke requires a period with no unrelated unattributed tool calls and is therefore treated as environment-constrained rather than bypassed.
