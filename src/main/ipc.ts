@@ -52,6 +52,7 @@ import {
 import { tokenPressure } from '../shared/session.js';
 import { forgetWorkspaceRoot, renameWorkspaceRoot } from './workspace.js';
 import { hostPlatformInfo } from './platform.js';
+import { syncLoginStartup } from './background-startup.js';
 
 /** The only URLs the renderer may ask the OS to open. */
 const ALLOWED_LINKS = new Set([
@@ -279,6 +280,7 @@ export function registerIpc(getWindow: () => BrowserWindow | null): void {
     const before = getConfig();
     const wasMultiAgent = before.multiAgent.enabled;
     const next = await updateConfig((config) => ({ ...config, ...mergeSettings(config, request.base, request.patch) }));
+    syncLoginStartup(app, next.ui.autoConnect);
     // Renderer palette changes are immediate, so keep OS/Electron-owned chrome in lock-step too.
     // Without this, selecting Dark on macOS left the title bar, menus and file picker in the
     // system theme until restart (and startup still defaulted to system before index.ts applies it).

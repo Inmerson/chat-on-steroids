@@ -1,3 +1,4 @@
+import { readFileSync } from 'node:fs';
 import { describe, expect, it, vi } from 'vitest';
 import {
   BACKGROUND_START_ARG,
@@ -42,5 +43,17 @@ describe('browserless Core startup', () => {
     const setLoginItemSettings = vi.fn();
     syncLoginStartup({ isPackaged: packaged, setLoginItemSettings }, true, platform);
     expect(setLoginItemSettings).not.toHaveBeenCalled();
+  });
+
+  it('wires auto-connect into login startup and suppresses the login-time window', () => {
+    const main = readFileSync(new URL('../src/main/index.ts', import.meta.url), 'utf8');
+    const ipc = readFileSync(new URL('../src/main/ipc.ts', import.meta.url), 'utf8');
+
+    expect(main).toContain("import { isBackgroundStartup, syncLoginStartup } from './background-startup.js';");
+    expect(main).toContain('const backgroundStartup = isBackgroundStartup();');
+    expect(main).toContain('syncLoginStartup(app, getConfig().ui.autoConnect);');
+    expect(main).toContain('if (!backgroundStartup) windowActivation.request();');
+    expect(ipc).toContain("import { syncLoginStartup } from './background-startup.js';");
+    expect(ipc).toContain('syncLoginStartup(app, next.ui.autoConnect);');
   });
 });

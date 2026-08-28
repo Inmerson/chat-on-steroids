@@ -61,7 +61,7 @@ sha256sum Chat-On-Steroids-Linux-x64.AppImage   # Linux
 | Workers | Experimental prime/worker chats with deterministic local routing |
 | Goal loop | Optional: a second model writes your next message until the goal is met (needs an OpenRouter key) |
 
-The app has no replacement chat UI and does not host a model. It runs quietly in the system tray/menu bar and bridges ChatGPT to capabilities on the computer you already use.
+The app has no replacement chat UI and does not host a model. It runs quietly in the system tray/menu bar and bridges ChatGPT to capabilities on the computer you already use. **Core does not require Chrome to be open:** the MCP/tunnel process belongs to the desktop app, while the companion extension is only needed for browser-observed features such as session attribution and workers. On packaged Windows builds, enabling **Connect automatically at startup** also registers Chat On Steroids to start hidden when you sign in, so Core can reconnect before any browser window exists.
 
 ## Requirements
 
@@ -123,7 +123,7 @@ The important boundaries are simple:
 - **Desktop control is Windows-only and not folder-scoped.** Screen capture, mouse/keyboard input and clipboard access apply to the Windows desktop when their permissions are enabled.
 - **The MCP server is loopback-only.** A random secret path protects each local connector. ChatGPT reaches it through the tunnel you configure; treat any complete public tunnel URL as a secret.
 - **Secrets use Electron `safeStorage`**: DPAPI on Windows, Keychain on macOS, and a desktop secret store such as libsecret/KWallet on Linux. The app refuses Linux's unencrypted `basic_text` fallback and explains how to enable a keyring.
-- **The browser bridge is separate and loopback-only.** It exists for the companion extension and does not expose file, command or settings routes.
+- **The browser bridge is separate and loopback-only.** It exists for the companion extension and does not expose file, command or settings routes. Ordinary Core file/terminal calls do not depend on that bridge being present.
 
 Read-only mode is the fast kill switch for local mutation: it disables file writes, command execution, desktop control and clipboard writes while leaving read-only capabilities available. See [`SECURITY.md`](SECURITY.md) for reporting and scope.
 

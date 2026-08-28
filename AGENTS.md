@@ -179,6 +179,7 @@ Do not "restore" these from an older document:
 ```text
 ── shell / config ─────────────────────────────────────────────────────────
 src/main/index.ts             Electron startup, window/tray, shutdown, security shell
+src/main/background-startup.ts Windows login startup + hidden-launch contract for Core
 src/main/shutdown.ts          ordered teardown phases, each bounded, ending in the exit
 src/main/config.ts            validated settings, migrations, defaults, read-only caps
 src/main/connection.ts        MCP + tunnel lifecycle, per-surface publication & status
@@ -261,12 +262,20 @@ do not recreate parallel runtimes beside those live owners.
 ```text
 single-instance lock → userData paths (config/secrets/sessions/state)
   → load validated config + durable state
+  → on packaged Windows, mirror auto-connect into login startup (`--background`)
   → restore request correlations, repair deterministic attribution
   → restore swarm if multi-agent enabled
-  → hardened BrowserWindow → register fixed IPC handlers
+  → register fixed IPC handlers → create hardened BrowserWindow unless this is login background startup
   → start bridge if recording OR multi-agent → prune old sessions
   → auto-connect MCP/tunnel if configured
 ```
+
+The Core MCP/tunnel lifecycle is owned by the Electron main process, **not by Chrome**. A
+Windows login launch with `--background` deliberately creates the tray and connector runtime
+without creating the initial BrowserWindow; a tray click or ordinary second launch can still
+open it later. The extension bridge may be absent while ordinary Core tools continue to work.
+Only browser-observed/session and identity-sensitive agent features may require the extension.
+Keep this separation explicit: never make Core startup wait for a browser poll.
 
 **Must hold.** The window keeps context isolation on, Node integration off, renderer
 sandbox on, navigation and window creation constrained, permission requests denied unless
