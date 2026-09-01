@@ -3,6 +3,7 @@
 
   const LEASE_KEY = 'agentTabLeases';
   const MAX_CLOSE_ATTEMPTS = 3;
+  const MAX_DURABLE_COMMANDS = 400;
   const CHATGPT_HOSTS = new Set(['chatgpt.com', 'chat.openai.com']);
 
   let leases = {};
@@ -10,6 +11,15 @@
   let loading = null;
   let writes = Promise.resolve();
   const closing = new Set();
+  /**
+   * Worker command ids whose irreversible `sent` result became durable during this service-worker lifetime.
+   *
+   * `agent-tab-content.js` runs before the main recorder, but its registration request and the later ACK still
+   * cross asynchronous extension events. The storage change can therefore win by a few microtasks. Remembering
+   * the durable fact closes that race without inferring ownership: a late tab is still eligible only after its
+   * own marker has independently proved the exact same command id.
+   */
+  const durableCommands = new Set();
 
   function load() {
     if (loaded) return Promise.resolve();
@@ -112,13 +122,16 @@
       return { ok: false, error: 'agent_tab_command_mismatch' };
     }
 
-    leases[key] = existing ?? {
+    const lease = existing ?? {
       commandId,
       tabId,
       registeredAt: Date.now(),
       handoffDurable: false
     };
+    if (durableCommands.has(commandId)) lease.handoffDurable = true;
+    leases[key] = lease;
     await persist();
+    if (lease.handoffDurable) await closeDurableLease(tabId);
     return { ok: true };
   }
 
@@ -135,9 +148,22 @@
     return ids;
   }
 
+  function rememberDurableCommands(commandIds) {
+    for (const commandId of commandIds) {
+      durableCommands.delete(commandId);
+      durableCommands.add(commandId);
+    }
+    while (durableCommands.size > MAX_DURABLE_COMMANDS) {
+      const oldest = durableCommands.values().next().value;
+      if (typeof oldest !== 'string') break;
+      durableCommands.delete(oldest);
+    }
+  }
+
   async function noteDurableAcks(value) {
     const commandIds = durableWorkerCommandIds(value);
     if (commandIds.size === 0) return;
+    rememberDurableCommands(commandIds);
     await load();
 
     const close = [];
