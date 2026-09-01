@@ -113,6 +113,16 @@ describe('ephemeral agent tab lifecycle', () => {
     expect(h.sessionState.agentTabLeases?.['17']).toBeUndefined();
   });
 
+  it('closes when the durable sent ACK wins the race just before marker registration', async () => {
+    const h = makeHarness();
+
+    await h.storageChange([{ id: 'cmd-worker-1', status: 'sent', agent: 'worker-1' }]);
+    await h.message({ type: 'agent_tab_register', id: 'cmd-worker-1' }, marked('cmd-worker-1'));
+
+    expect(h.removed).toEqual([17]);
+    expect(h.sessionState.agentTabLeases?.['17']).toBeUndefined();
+  });
+
   it('never registers or closes an unmarked or marker-mismatched ChatGPT tab', async () => {
     const h = makeHarness();
     await h.message(
