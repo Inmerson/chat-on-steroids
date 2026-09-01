@@ -17,7 +17,11 @@ function pick(state: Record<string, any>, keys: string | string[] | Record<strin
   return Object.fromEntries(Object.entries(keys).map(([key, fallback]) => [key, state[key] ?? fallback]));
 }
 
-function makeHarness(sessionState: Record<string, any> = {}, removeFailures = 0) {
+function makeHarness(
+  sessionState: Record<string, any> = {},
+  removeFailures = 0,
+  browserTabs: Map<number, string> = new Map()
+) {
   const runtimeListeners = new Set<Listener>();
   const storageListeners = new Set<Listener>();
   const removedListeners = new Set<Listener>();
@@ -42,16 +46,22 @@ function makeHarness(sessionState: Record<string, any> = {}, removeFailures = 0)
       onChanged: { addListener: (listener: Listener) => storageListeners.add(listener) }
     },
     tabs: {
+      async get(tabId: number) {
+        const url = browserTabs.get(tabId);
+        if (!url) throw new Error(`No tab with id: ${tabId}`);
+        return { id: tabId, url };
+      },
       async remove(tabId: number) {
         if (failuresLeft > 0) {
           failuresLeft--;
           throw new Error('transient close failure');
         }
         removed.push(tabId);
+        browserTabs.delete(tabId);
       },
       onRemoved: { addListener: (listener: Listener) => removedListeners.add(listener) },
       async query() {
-        return [];
+        return [...browserTabs.entries()].map(([id, url]) => ({ id, url }));
       }
     },
     scripting: {
@@ -77,6 +87,9 @@ function makeHarness(sessionState: Record<string, any> = {}, removeFailures = 0)
     removed,
     executed,
     async message(message: Record<string, any>, sender: Record<string, any>) {
+      const tabId = sender?.tab?.id;
+      const url = sender?.tab?.url;
+      if (Number.isInteger(tabId) && typeof url === 'string') browserTabs.set(tabId, url);
       for (const listener of runtimeListeners) await listener(message, sender, () => undefined);
       await settle();
     },
@@ -85,7 +98,11 @@ function makeHarness(sessionState: Record<string, any> = {}, removeFailures = 0)
       for (const listener of storageListeners) await listener(change, 'local');
       await settle();
     },
+    navigate(tabId: number, url: string) {
+      browserTabs.set(tabId, url);
+    },
     async tabRemoved(tabId: number) {
+      browserTabs.delete(tabId);
       for (const listener of removedListeners) await listener(tabId, {});
       await settle();
     },
@@ -136,6 +153,17 @@ describe('ephemeral agent tab lifecycle', () => {
     expect(h.sessionState.agentTabLeases ?? {}).toEqual({});
   });
 
+  it('releases ownership instead of closing when a registered tab loses its command marker', async () => {
+    const h = makeHarness();
+    await h.message({ type: 'agent_tab_register', id: 'cmd-worker-1' }, marked('cmd-worker-1'));
+    h.navigate(17, 'https://chatgpt.com/c/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee');
+
+    await h.storageChange([{ id: 'cmd-worker-1', status: 'sent', agent: 'worker-1' }]);
+
+    expect(h.removed).toEqual([]);
+    expect(h.sessionState.agentTabLeases?.['17']).toBeUndefined();
+  });
+
   it('does not close on a failed ACK or on a Prime/resume ACK with no agent id', async () => {
     const h = makeHarness();
     await h.message({ type: 'agent_tab_register', id: 'cmd-worker-1' }, marked('cmd-worker-1'));
@@ -149,7 +177,8 @@ describe('ephemeral agent tab lifecycle', () => {
 
   it('keeps a durable lease after bounded close failures and recovers it on service-worker restart', async () => {
     const sessionState: Record<string, any> = {};
-    const first = makeHarness(sessionState, 3);
+    const browserTabs = new Map<number, string>();
+    const first = makeHarness(sessionState, 3, browserTabs);
     await first.message({ type: 'agent_tab_register', id: 'cmd-worker-1' }, marked('cmd-worker-1'));
     await first.storageChange([{ id: 'cmd-worker-1', status: 'sent', agent: 'worker-1' }]);
 
@@ -159,7 +188,7 @@ describe('ephemeral agent tab lifecycle', () => {
       handoffDurable: true
     });
 
-    const restarted = makeHarness(sessionState);
+    const restarted = makeHarness(sessionState, 0, browserTabs);
     await restarted.settle();
 
     expect(restarted.removed).toEqual([17]);
