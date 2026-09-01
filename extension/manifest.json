@@ -15,13 +15,13 @@
     "http://127.0.0.1:8769/*"
   ],
   "background": {
-    "service_worker": "background.js",
+    "service_worker": "background-entry.js",
     "type": "module"
   },
   "content_scripts": [
     {
       "matches": ["https://chatgpt.com/*", "https://chat.openai.com/*"],
-      "js": ["chatgpt-dom.js", "content.js"],
+      "js": ["agent-tab-content.js", "chatgpt-dom.js", "content.js"],
       "css": ["overlay.css"],
       "run_at": "document_idle"
     },
