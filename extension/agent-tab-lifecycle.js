@@ -82,6 +82,28 @@
     await persist();
   }
 
+  /**
+   * A lease proves that this extension once owned a tab, not that it owns whatever that numeric
+   * tab id shows forever. ChatGPT navigation can turn the same tab into an ordinary user view
+   * before the durable ACK arrives. Re-prove the exact command marker immediately before every
+   * destructive close attempt. Any missing/changed/unreadable tab fails closed: release the stale
+   * lease and leave browser state alone.
+   */
+  async function stillOwnsLease(lease) {
+    try {
+      const tab = await chrome.tabs.get(lease.tabId);
+      return markerFrom(tab?.url) === lease.commandId;
+    } catch {
+      return false;
+    }
+  }
+
+  async function releaseStaleLease(key, lease) {
+    if (leases[key] !== lease) return;
+    delete leases[key];
+    await persist();
+  }
+
   async function closeDurableLease(tabId) {
     await load();
     const key = leaseKey(tabId);
@@ -91,6 +113,10 @@
     closing.add(tabId);
     try {
       for (let attempt = 0; attempt < MAX_CLOSE_ATTEMPTS; attempt++) {
+        if (!(await stillOwnsLease(lease))) {
+          await releaseStaleLease(key, lease);
+          return false;
+        }
         try {
           await chrome.tabs.remove(tabId);
           if (leases[key] === lease) {
