@@ -92,12 +92,22 @@ describe('V3 Manager initial plan acceptance', () => {
     expect(recovered.state.tasks.T2).toMatchObject({ state: 'PLANNED', dependencies: ['T1'] });
   });
 
-  it('rejects a cyclic graph before writing any orchestration event', async () => {
+  it('rejects a cyclic dependency graph before writing any orchestration event', async () => {
     await tempStore();
     const cyclic = plan();
     cyclic.tasks[0]!.dependencies = ['T2'];
 
     await expect(acceptInitialManagerPlan(cyclic)).rejects.toThrow(/cycle/i);
+    expect(await readOrchestrationEvents()).toEqual([]);
+  });
+
+  it('rejects a cyclic parent hierarchy before writing any orchestration event', async () => {
+    await tempStore();
+    const cyclic = plan();
+    cyclic.tasks[0]!.parentTaskId = 'T2';
+    cyclic.tasks[1]!.parentTaskId = 'T1';
+
+    await expect(acceptInitialManagerPlan(cyclic)).rejects.toThrow(/parent.*cycle|cycle.*parent/i);
     expect(await readOrchestrationEvents()).toEqual([]);
   });
 
@@ -109,6 +119,17 @@ describe('V3 Manager initial plan acceptance', () => {
     const retried = await acceptInitialManagerPlan(plan());
 
     expect(retried).toEqual({ repeated: true, readyTaskIds: ['T1'] });
+    expect(await readOrchestrationEvents()).toEqual(before);
+  });
+
+  it('refuses the same planId with different content and leaves the accepted journal unchanged', async () => {
+    await tempStore();
+    await acceptInitialManagerPlan(plan());
+    const before = await readOrchestrationEvents();
+    const changed = plan();
+    changed.tasks[0]!.goal = 'A different goal under the same idempotency key.';
+
+    await expect(acceptInitialManagerPlan(changed)).rejects.toThrow(/different content|already accepted/i);
     expect(await readOrchestrationEvents()).toEqual(before);
   });
 
