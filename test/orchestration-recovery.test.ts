@@ -32,7 +32,11 @@ function task(state: TaskRecord['state']): TaskRecord {
     parentTaskId: null,
     title: 'Database schema',
     goal: 'Create schema',
+    allowedScope: ['src/db/**'],
     dependencies: [],
+    acceptanceCriteria: ['Schema is valid'],
+    expectedVerification: ['npm test -- test/db'],
+    forbiddenActions: ['push', 'deploy'],
     state,
     assignedWorkerId: null,
     reviewerId: null,
@@ -79,6 +83,8 @@ describe('V3 orchestration recovery', () => {
 
     const recovered = await recoverOrchestrationState();
     expect(recovered.lastSeq).toBe(4);
+    expect(recovered.state.managerAgentId).toBeNull();
+    expect(recovered.state.managerPlanId).toBeNull();
     expect(recovered.state.tasks.T1?.state).toBe('ACTIVE');
     expect(recovered.state.tasks.T1?.assignedWorkerId).toBe('worker-1');
   });
