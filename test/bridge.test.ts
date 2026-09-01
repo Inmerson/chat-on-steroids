@@ -114,7 +114,7 @@ const {
 } = await import(
   '../src/main/agents.js'
 );
-const { makeTempDir, removeTempDir, SAMPLE_BRIEF } = await import('./helpers.js');
+const { faultGate, makeTempDir, removeTempDir, SAMPLE_BRIEF } = await import('./helpers.js');
 const { resumeBootstrapText } = await import('../src/main/session/handoff.js');
 const { getLog } = await import('../src/main/logger.js');
 
@@ -1664,18 +1664,9 @@ describe('delivering a bootstrap', () => {
     const command = await redeem(undefined, 'ordered-worker-page');
     const conversationId = 'dddddddd-3456-7890-abcd-ef1234567890';
 
-    let release!: () => void;
-    const gate = new Promise<void>((resolve) => {
-      release = resolve;
-    });
-    let entered!: () => void;
-    const bindingWriteStarted = new Promise<void>((resolve) => {
-      entered = resolve;
-    });
+    const bindingPersist = faultGate();
     onSwarmPersistNow(async (snapshot) => {
-      bindingWriteStarted.then(() => undefined);
-      entered();
-      await gate;
+      await bindingPersist.hold();
       await writeDurableNow('swarm', snapshot);
     });
 
@@ -1693,7 +1684,7 @@ describe('delivering a bootstrap', () => {
         return reply;
       });
 
-      await bindingWriteStarted;
+      await bindingPersist.reached;
       // Binding is already published in memory, but the browser command remains the durable
       // retry point until the matching swarm generation reaches disk. A crash right here must
       // therefore restore the leased command rather than an invited worker with no command.
@@ -1706,14 +1697,14 @@ describe('delivering a bootstrap', () => {
       expect(before?.commands?.some((entry) => entry.id === command.id)).toBe(true);
       expect(before?.receipts?.some((entry) => entry.id === command.id)).toBe(false);
 
-      release();
+      bindingPersist.release();
       const reply = await ack;
       expect(reply.status).toBe(200);
       const after = await readDurable<{ commands?: Array<{ id?: string }>; receipts?: Array<{ id?: string }> }>('bridge-commands');
       expect(after?.commands?.some((entry) => entry.id === command.id)).toBe(false);
       expect(after?.receipts?.some((entry) => entry.id === command.id)).toBe(true);
     } finally {
-      release();
+      bindingPersist.release();
       onSwarmPersistNow((snapshot) => writeDurableNow('swarm', snapshot));
     }
   });
