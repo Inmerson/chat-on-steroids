@@ -68,6 +68,7 @@ import {
 } from './window-lifecycle.js';
 import { trayGuidArgsForPlatform, trayImageSpec } from './tray-image.js';
 import { browserWindowIconPath } from './window-icon.js';
+import { isBackgroundStartup, syncLoginStartup } from './background-startup.js';
 
 /** Durable state file holding the multi-agent run. Hashes only, never credentials. */
 const SWARM_STATE = 'swarm';
@@ -79,6 +80,7 @@ let quitting = false;
 let shutdownStarted = false;
 let shutdownComplete = false;
 let stopSessionRetention: (() => void) | null = null;
+const backgroundStartup = isBackgroundStartup();
 
 // One instance only: two copies would fight over the tunnel and the config file.
 const hasSingleInstanceLock = app.requestSingleInstanceLock();
@@ -224,7 +226,9 @@ function refreshTray(): void {
   );
 }
 
-app.on('second-instance', windowActivation.request);
+app.on('second-instance', (_event, argv) => {
+  if (!isBackgroundStartup(argv)) windowActivation.request();
+});
 
 void app.whenReady().then(async () => {
   // This guard is intentionally before even app.getPath/init* calls. A secondary instance, or a
@@ -237,6 +241,7 @@ void app.whenReady().then(async () => {
   initDurableStore(userData);
   await loadConfig();
   if (windowActivation.isDisabled()) return;
+  syncLoginStartup(app, getConfig().ui.startAtLogin);
   // The renderer has its own explicit light/dark palette, so native chrome must follow the same
   // user choice instead of Electron's default `system` theme. On macOS this controls the window
   // frame, application menus and OS dialogs; on Linux/Windows it covers Electron-native UI.
@@ -337,7 +342,7 @@ void app.whenReady().then(async () => {
   // is installed and the renderer's fixed IPC methods already have handlers before it can load.
   registerIpc(() => window);
   windowActivation.enable();
-  windowActivation.request();
+  if (!backgroundStartup) windowActivation.request();
   // macOS `activate` can fire on first launch, so do not wire it at module load where it could
   // create a BrowserWindow before Electron is ready. Once the initial window path is established,
   // Dock activation/re-launch can safely recreate or focus it.
