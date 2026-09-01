@@ -3,6 +3,7 @@ import path from 'node:path';
 
 export type OrchestrationEventType =
   | 'RUN_CREATED'
+  | 'MANAGER_ASSIGNED'
   | 'TASK_CREATED'
   | 'TASK_READY'
   | 'TASK_ASSIGNED'
@@ -119,16 +120,32 @@ async function currentSequence(): Promise<number> {
   return nextSeq;
 }
 
+/**
+ * Appends one logical orchestration mutation as a contiguous event range through one serialized
+ * store operation. Callers must finish all validation before invoking this function: once this
+ * append begins, every event in the supplied batch is part of the accepted durable history.
+ */
+export function appendOrchestrationEvents(
+  inputs: readonly NewOrchestrationEvent[]
+): Promise<OrchestrationEvent[]> {
+  if (inputs.length === 0) return Promise.resolve([]);
+  return enqueue(async () => {
+    const base = await currentSequence();
+    const events = inputs.map((input, index) => ({ ...input, seq: base + index + 1 })) as OrchestrationEvent[];
+    await fs.mkdir(requireRoot(), { recursive: true });
+    await fs.appendFile(journalFile(), events.map((event) => `${JSON.stringify(event)}\n`).join(''), 'utf8');
+    nextSeq = events.at(-1)?.seq ?? base;
+    return events;
+  });
+}
+
 export function appendOrchestrationEvent<Payload extends Record<string, unknown>>(
   input: NewOrchestrationEvent<Payload>
 ): Promise<OrchestrationEvent<Payload>> {
-  return enqueue(async () => {
-    const seq = (await currentSequence()) + 1;
-    const event: OrchestrationEvent<Payload> = { ...input, seq };
-    await fs.mkdir(requireRoot(), { recursive: true });
-    await fs.appendFile(journalFile(), `${JSON.stringify(event)}\n`, 'utf8');
-    nextSeq = seq;
-    return event;
+  return appendOrchestrationEvents([input as NewOrchestrationEvent]).then((events) => {
+    const event = events[0];
+    if (!event) throw new Error('Orchestration append returned no event');
+    return event as OrchestrationEvent<Payload>;
   });
 }
 
