@@ -87,6 +87,24 @@ function normalizeTask(task: ManagerTaskPlan, index: number): TaskRecord {
   };
 }
 
+function validateParentHierarchy(tasks: readonly TaskRecord[]): void {
+  const byId = new Map(tasks.map((task) => [task.taskId, task]));
+  for (const task of tasks) {
+    if (task.parentTaskId !== null && !byId.has(task.parentTaskId)) {
+      throw new Error(`Task ${task.taskId} has missing parent: ${task.parentTaskId}`);
+    }
+  }
+  for (const task of tasks) {
+    const seen = new Set<string>();
+    let currentId: string | null = task.taskId;
+    while (currentId !== null) {
+      if (seen.has(currentId)) throw new Error(`Task parent cycle includes ${currentId}`);
+      seen.add(currentId);
+      currentId = byId.get(currentId)?.parentTaskId ?? null;
+    }
+  }
+}
+
 function normalizePlan(input: InitialManagerPlan): {
   planId: string;
   runId: string;
@@ -101,12 +119,7 @@ function normalizePlan(input: InitialManagerPlan): {
   const tasks = input.tasks.map(normalizeTask);
 
   validateTaskGraph(tasks);
-  const byId = new Map(tasks.map((task) => [task.taskId, task]));
-  for (const task of tasks) {
-    if (task.parentTaskId === null) continue;
-    if (task.parentTaskId === task.taskId) throw new Error(`Task graph cycle: ${task.taskId} is its own parent`);
-    if (!byId.has(task.parentTaskId)) throw new Error(`Task ${task.taskId} has missing parent: ${task.parentTaskId}`);
-  }
+  validateParentHierarchy(tasks);
   return { planId, runId, managerAgentId, tasks };
 }
 
