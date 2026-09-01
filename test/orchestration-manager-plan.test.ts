@@ -3,7 +3,10 @@ import { promises as fs } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
-import { acceptInitialManagerPlan } from '../src/main/orchestration/manager-plan.js';
+import {
+  acceptInitialManagerPlan,
+  type InitialManagerPlan
+} from '../src/main/orchestration/manager-plan.js';
 import { recoverOrchestrationState } from '../src/main/orchestration/recovery.js';
 import {
   initOrchestrationStore,
@@ -24,7 +27,7 @@ async function tempStore(): Promise<void> {
   initOrchestrationStore(dir);
 }
 
-function plan(planId = 'plan-1') {
+function plan(planId = 'plan-1'): InitialManagerPlan {
   return {
     planId,
     runId: 'run-1',
@@ -40,7 +43,7 @@ function plan(planId = 'plan-1') {
         acceptanceCriteria: ['Schema migration is reversible', 'Database tests pass'],
         expectedVerification: ['npm test -- test/db'],
         forbiddenActions: ['push', 'deploy', 'production data changes'],
-        riskClass: 'high' as const
+        riskClass: 'high'
       },
       {
         taskId: 'T2',
@@ -52,7 +55,7 @@ function plan(planId = 'plan-1') {
         acceptanceCriteria: ['API uses the approved schema', 'API tests pass'],
         expectedVerification: ['npm test -- test/api'],
         forbiddenActions: ['push', 'deploy'],
-        riskClass: 'normal' as const
+        riskClass: 'normal'
       }
     ]
   };
