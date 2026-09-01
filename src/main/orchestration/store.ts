@@ -97,7 +97,8 @@ async function readSnapshotFromDisk<State = unknown>(): Promise<OrchestrationSna
 async function currentSequence(): Promise<number> {
   if (nextSeq !== null) return nextSeq;
   const [events, snapshot] = await Promise.all([readEventsFromDisk(), readSnapshotFromDisk()]);
-  const journalSeq = events.length > 0 ? events[events.length - 1].seq : 0;
+  const lastEvent = events.at(-1);
+  const journalSeq = lastEvent?.seq ?? 0;
   nextSeq = Math.max(journalSeq, snapshot?.lastSeq ?? 0);
   return nextSeq;
 }
