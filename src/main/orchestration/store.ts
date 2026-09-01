@@ -1,7 +1,23 @@
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
 
-export type OrchestrationEventType = 'RUN_CREATED' | 'TASK_CREATED';
+export type OrchestrationEventType =
+  | 'RUN_CREATED'
+  | 'TASK_CREATED'
+  | 'TASK_READY'
+  | 'TASK_ASSIGNED'
+  | 'TASK_ACTIVATED'
+  | 'TASK_BLOCKED'
+  | 'TASK_REVIEW_READY'
+  | 'TASK_REVIEWING'
+  | 'TASK_CHANGES_REQUESTED'
+  | 'TASK_APPROVED'
+  | 'TASK_INTEGRATING'
+  | 'TASK_INTEGRATED'
+  | 'TASK_VERIFIED'
+  | 'TASK_FAILED'
+  | 'TASK_CANCELLED'
+  | 'TASK_SUPERSEDED';
 
 export interface OrchestrationEvent<Payload extends Record<string, unknown> = Record<string, unknown>> {
   seq: number;
