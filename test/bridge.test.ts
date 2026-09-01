@@ -3271,19 +3271,11 @@ describe('delivering a bootstrap', () => {
     expect(workerCommand).toBeTruthy();
     await flushDurable();
 
-    let entered!: () => void;
-    const immediateEntered = new Promise<void>((resolve) => {
-      entered = resolve;
-    });
-    let release!: () => void;
-    const held = new Promise<void>((resolve) => {
-      release = resolve;
-    });
+    const brokerPersist = faultGate();
     let brokerProjection: ReturnType<typeof snapshotSwarm> = null;
     onSwarmPersistNow(async (snapshot) => {
       brokerProjection = snapshot;
-      entered();
-      await held;
+      await brokerPersist.hold();
       await writeDurableNow('swarm', snapshot);
     });
 
@@ -3292,7 +3284,7 @@ describe('delivering a bootstrap', () => {
       // but disk must retain that old transport until the failed worker/dormant owner snapshot
       // held above has crossed its independent durability boundary.
       for (let n = 0; n < 20; n++) queueResume(`crash-order-session-${n}`, `crash-order-token-${n}`);
-      await immediateEntered;
+      await brokerPersist.reached;
       expect(pendingCommands().some((entry) => entry.id === workerCommand.id)).toBe(false);
       expect(swarmState().running).toBe(false);
       expect(swarmStateForCaller({ conversationId: PRIME_CHAT }).agents.find((entry) => entry.id === 'worker-1')).toMatchObject({
@@ -3308,20 +3300,21 @@ describe('delivering a bootstrap', () => {
         )?.info.state
       ).toBe('failed');
 
-      release();
-      await Promise.resolve();
-      await Promise.resolve();
+      brokerPersist.release();
+      // Drain the exact critical broker flight that drop() started. Its bridge-side `.then`
+      // retires the held command only after this durability barrier resolves; awaiting the same
+      // flight is deterministic, whereas yielding an arbitrary number of microtasks was only a
+      // scheduler guess and became flaky under the full suite.
+      await persistCriticalSwarmNow();
       await flushDurable();
-      await vi.waitFor(async () => {
-        const after = await readDurable<any>('bridge-commands');
-        expect(after?.commands?.some((entry: any) => entry?.id === workerCommand.id)).toBe(false);
-      });
+      const after = await readDurable<any>('bridge-commands');
+      expect(after?.commands?.some((entry: any) => entry?.id === workerCommand.id)).toBe(false);
       const durableBroker = await readDurable<any>('swarm');
       expect(durableBroker?.dormantRuns?.[0]?.agents.find((entry: any) => entry?.info?.id === 'worker-1')?.info?.state).toBe(
         'failed'
       );
     } finally {
-      release();
+      brokerPersist.release();
       onSwarmPersistNow((snapshot) => writeDurableNow('swarm', snapshot));
     }
   });
