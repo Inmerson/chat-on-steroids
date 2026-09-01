@@ -4,11 +4,17 @@ import type { TaskRecord, TaskState } from './types.js';
 
 export interface OrchestrationState {
   runId: string | null;
+  managerAgentId: string | null;
+  managerPlanId: string | null;
+  managerPlanFingerprint: string | null;
   tasks: Record<string, TaskRecord>;
 }
 
 export const EMPTY_ORCHESTRATION_STATE: OrchestrationState = {
   runId: null,
+  managerAgentId: null,
+  managerPlanId: null,
+  managerPlanFingerprint: null,
   tasks: {}
 };
 
@@ -64,6 +70,20 @@ export function applyOrchestrationEvent(state: OrchestrationState, event: Orches
 
   if (event.type === 'RUN_CREATED') {
     return state.runId === event.runId ? state : { ...state, runId: event.runId };
+  }
+
+  if (event.type === 'MANAGER_ASSIGNED') {
+    if (state.runId === null) throw new Error('MANAGER_ASSIGNED requires an existing orchestration run');
+    const managerAgentId = payloadString(event, 'managerAgentId');
+    const managerPlanId = payloadString(event, 'planId');
+    const managerPlanFingerprint = payloadString(event, 'planFingerprint');
+    if (event.entityId !== managerAgentId) {
+      throw new Error(`MANAGER_ASSIGNED entity mismatch: ${event.entityId} != ${managerAgentId}`);
+    }
+    if (state.managerAgentId !== null || state.managerPlanId !== null || state.managerPlanFingerprint !== null) {
+      throw new Error('Orchestration Manager is already assigned');
+    }
+    return { ...state, managerAgentId, managerPlanId, managerPlanFingerprint };
   }
 
   if (event.type === 'TASK_CREATED') {
