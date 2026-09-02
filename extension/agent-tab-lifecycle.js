@@ -146,10 +146,11 @@
         if (durableCommands.has(entry.commandId)) await closeDurableLease(tabId);
       }
     })();
-    drainingQueue = work.finally(() => {
-      if (drainingQueue === work) drainingQueue = null;
+    const tracked = work.finally(() => {
+      if (drainingQueue === tracked) drainingQueue = null;
     });
-    return drainingQueue;
+    drainingQueue = tracked;
+    return tracked;
   }
 
   async function forget(tabId) {
