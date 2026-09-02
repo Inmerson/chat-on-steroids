@@ -30,6 +30,11 @@ export interface ManagerAuthority {
   agentId: string;
 }
 
+/** Kernel-private extension of Manager authority. ownerPrimeConversationId is never model input/output. */
+export interface ManagerRuntime extends ManagerAuthority {
+  ownerPrimeConversationId: string;
+}
+
 let authorityWrites: Promise<void> = Promise.resolve();
 
 function enqueueAuthority<T>(work: () => Promise<T>): Promise<T> {
@@ -173,6 +178,26 @@ export function managerForCaller(caller: Caller): Promise<ManagerAuthority> {
     };
     await writeAuthorityState(next);
     return authorityOf(claimedEntry);
+  });
+}
+
+export async function managerRuntimeForCaller(caller: Caller): Promise<ManagerRuntime> {
+  const authority = await managerForCaller(caller);
+  return enqueueAuthority(async () => {
+    if (!caller.conversationId) throw new IdentityLostError();
+    const state = await readAuthorityState();
+    const entry = state.entries.find(
+      (candidate) =>
+        candidate.orchestrationRunId === authority.runId &&
+        candidate.managerAgentId === authority.agentId &&
+        candidate.managerConversationId === caller.conversationId
+    );
+    if (!entry) throw new AgentError('MANAGER_AUTHORITY_CORRUPT: claimed Manager runtime row disappeared.');
+    return {
+      runId: entry.orchestrationRunId,
+      agentId: entry.managerAgentId,
+      ownerPrimeConversationId: entry.ownerPrimeConversationId
+    };
   });
 }
 
