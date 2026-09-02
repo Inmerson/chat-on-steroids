@@ -18,7 +18,7 @@ import {
 /**
  * The wire only describes the Manager package's structure. The orchestration kernel performs
  * the authoritative bounds, graph, hierarchy and duplicate validation immediately before the
- * first journal mutation, so duplicating every numeric limit here would only inflate discovery.
+ * first journal mutation, so duplicating numeric limits here would only inflate discovery.
  */
 const managerTaskWireSchema = z
   .object({
@@ -100,9 +100,9 @@ function extendAgentsSchema(base: z.ZodType): z.ZodType {
   return base
     .safeExtend({
       action: z.enum(['spawn', 'message', 'status', 'finish', 'assign_manager', 'plan']),
-      manager_agent_id: z.string().min(1).max(40).optional(),
-      plan_id: z.string().min(1).max(160).optional(),
-      tasks: z.array(managerTaskWireSchema).min(1).max(200).optional()
+      manager_agent_id: z.string().optional(),
+      plan_id: z.string().optional(),
+      tasks: z.array(managerTaskWireSchema).optional()
     })
     .superRefine((input, ctx) => {
       if (input.action === 'assign_manager') {
