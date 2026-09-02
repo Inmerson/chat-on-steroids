@@ -2,140 +2,118 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Make one broker-designated Manager conversation able to submit the V3 initial task graph through the existing `agents` MCP tool, with no model-supplied identity or run authority.
+**Goal:** Let exactly one Prime-authorized Manager conversation submit the V3 task graph through the existing `agents` MCP tool, without model-supplied identity or run authority.
 
-**Architecture:** Keep the V2 multi-agent broker as the authority for ChatGPT conversation identity and durable worker ownership. Add one durable `managerAgentId` designation to the broker, add a small orchestration bridge that derives `runId` and `managerAgentId` from the proven caller, and extend `agents` with `action=plan` instead of registering another Core tool. Initialize the orchestration store during normal app bootstrap before any connector can accept a Manager plan.
+**Architecture:** Keep `agents.ts` as the authority for exact ChatGPT conversation membership and worker ownership. Add a small durable Manager-authority layer keyed to a Prime-designated worker id; the first proven call from that worker durably locks the Manager conversation id, after which Compact & Resume of the Prime cannot transfer Manager authority. Generate a stable orchestration run id in this authority layer rather than reusing the broker's ephemeral run-incarnation UUID. Extend the existing `agents` registration through a registrar decorator, preserving the Core tool count and the existing V2 handler unchanged.
 
-**Tech Stack:** TypeScript, Electron main process, Zod, existing MCP server/registrar, durable swarm broker, append-only orchestration journal, Vitest, GitHub Actions matrix.
+**Tech Stack:** TypeScript, Zod, existing MCP registrar, durable JSON state, append-only orchestration journal, Vitest, GitHub Actions matrix.
 
 **Spec:** `docs/superpowers/specs/2026-09-02-agent-system-3-0-design.md`
 
 ## Global Constraints
 
 - Prime remains the only user-facing orchestration participant.
-- Exactly one Manager agent is designated for a V3 run; ordinary workers cannot acquire Manager authority by calling first.
-- Caller identity comes from the existing proven ChatGPT conversation path. No `run_id`, `manager_agent_id`, key, token, or equivalent authority field is accepted from the model.
-- Core remains a maximum-seven-live-schema surface. V3 planning extends `agents`; it does not register a new MCP tool.
-- Existing V2 `spawn`, `message`, `status`, and `finish` behavior stays backward compatible.
-- Graph validation, retry defaults, and durable journal ordering remain kernel-owned.
-- This slice introduces no push, merge, deploy, or destructive external side effect.
+- Manager authority can only be granted by a proven Prime to a worker already owned by that Prime history.
+- A Manager cannot self-designate by calling first.
+- The stable V3 orchestration run id is system-generated; it is never the broker's browser-incarnation fence and never model input.
+- No `run_id`, `manager_agent_id`, key, token, or equivalent authority field is accepted from the model.
+- Core remains a maximum-seven-live-schema surface: V3 extends `agents`; no new MCP tool name is registered.
+- Existing V2 `spawn`, `message`, `status`, and `finish` behavior stays unchanged.
+- This slice adds no push, merge, deploy, or destructive external side effect.
 
 ---
 
-### Task 1: Durable broker-owned Manager designation
+### Task 1: Durable broker-anchored Manager authority
 
 **Files:**
-- Modify: `src/main/agents.ts`
-- Modify: `test/agents.test.ts`
+- Create: `src/main/orchestration/manager-authority.ts`
+- Create: `test/agent-manager-authority.test.ts`
 
 **Interfaces:**
-- Consumes: existing `SpawnInput`, `stageSpawn`, `Caller`, swarm snapshot/restore code.
-- Produces:
 
 ```ts
-export interface SpawnInput {
-  workers: ReadonlyArray<{ label?: string; task: string; manager?: boolean }>;
-  // existing fields unchanged
+export interface ManagerAuthority {
+  runId: string;
+  agentId: string;
 }
 
-export function managerForCaller(caller: Caller): { runId: string; agentId: string };
+export async function assignManagerForPrime(caller: Caller, managerAgentId: string): Promise<ManagerAuthority>;
+export async function managerForCaller(caller: Caller): Promise<ManagerAuthority>;
+export async function resetManagerAuthorityForTests(): Promise<void>;
 ```
 
-Active and dormant broker state persist `managerAgentId: string | null`.
-
-- [ ] **Step 1: Write failing broker tests**
-
-Add focused tests that use real broker state:
+Durable record:
 
 ```ts
-it('durably designates exactly one spawned worker as Manager', () => {
-  // Spawn from a proven prime with one { manager: true } worker, commit,
-  // bind that worker conversation, then managerForCaller returns run/id.
-});
-
-it('refuses ordinary workers and the prime as Manager callers', () => {
-  // managerForCaller(prime/ordinaryWorker) rejects.
-});
-
-it('restores Manager designation from a current-format swarm snapshot', () => {
-  // Snapshot, restore, then the same bound Manager conversation retains authority.
-});
-
-it('rejects a spawn request that designates two Managers without publishing topology', () => {
-  // Snapshot/state remains unchanged.
-});
+{
+  version: 1,
+  orchestrationRunId: string,
+  ownerPrimeConversationId: string,
+  managerAgentId: string,
+  managerConversationId: string | null
+}
 ```
 
-- [ ] **Step 2: Verify RED**
+- [x] **Step 1: Write failing authority tests**
 
-Run `test/agents.test.ts`. Expected: tests fail because Manager designation and `managerForCaller` do not exist.
+The focused suite proves Prime-only designation, first-call conversation locking, refusal of Prime/ordinary/stranger callers, durable recovery, and idempotent same-manager retry.
 
-- [ ] **Step 3: Implement minimal broker changes**
+- [x] **Step 2: Verify RED**
+
+CI failed because `manager-authority.ts` does not yet exist. An earlier implementation assumption (`manager: true` embedded in `SpawnInput`) was deliberately replaced before production code because it would require churn in the mature broker and would couple V3 authority to the broker's ephemeral run-incarnation snapshot.
+
+- [ ] **Step 3: Implement minimal authority layer**
 
 Rules:
 
-- At most one `manager: true` worker may exist in a caller-owned run/history.
-- The designation is the created worker id, never its label, array position, or first caller.
-- `managerForCaller` requires an exact conversation id, resolves only that conversation's owned active/dormant run, and succeeds only when the resolved agent id equals `managerAgentId`.
-- Persist `managerAgentId` in active and dormant snapshots.
-- Bump the swarm snapshot version once. Restore the immediately previous version with `managerAgentId = null`; never invent Manager authority for legacy rows.
+1. `assignManagerForPrime` calls existing `statusForCaller(caller)` and requires `status.self.id === PRIME_ID`.
+2. The target must be a worker in that caller-scoped broker history; label/order/recency never grant authority.
+3. First designation generates `randomUUID()` as the stable orchestration run id and writes it with `writeDurableNow('manager-authority', ...)` before returning.
+4. Repeating the same Prime + worker designation is idempotent and preserves the orchestration run id; attempting to replace it with another worker fails closed.
+5. `managerForCaller` requires an exact conversation id and resolves membership through existing `statusForCaller`.
+6. Before `managerConversationId` is locked, the caller must resolve to `managerAgentId` and the currently active Prime conversation must equal the stored owner Prime. The successful first call durably records the Manager conversation before authority is returned.
+7. After the conversation is locked, every future authority check requires that exact conversation plus the same worker id; Prime Compact & Resume cannot transfer it.
+8. A stale record for another broker history cannot authorize a same-numbered worker in another Prime history.
 
 - [ ] **Step 4: Verify GREEN**
 
-Run `test/agents.test.ts` and the existing agent recovery/snapshot tests. Existing spawn retry, wake, sleep, and identity behavior must remain green.
+Run the focused suite plus `test/agents.test.ts` / `test/swarm.test.ts` to prove the sidecar does not alter V2 broker behavior.
 
 - [ ] **Step 5: Commit**
 
-Commit the broker designation slice only.
+Commit only the authority layer and its focused tests.
 
 ---
 
 ### Task 2: Production orchestration-store bootstrap
 
 **Files:**
-- Modify: `src/main/index.ts`
-- Modify: `test/runtime-enable-and-extension.test.ts`
+- Modify: `src/main/durable.ts`
+- Modify or create: focused orchestration bootstrap regression test.
 
 **Interfaces:**
-- Consumes: `initOrchestrationStore(userDataDir: string): void` from `src/main/orchestration/store.ts`.
-- Produces: guarded primary-instance startup initializes the orchestration store before MCP tools can mutate V3 state.
+- Consumes: `initOrchestrationStore(userDataDir)`.
+- Produces: the existing `initDurableStore(userDataDir)` startup call also initializes the append-only orchestration store under the same `userData/state` family before MCP is usable.
 
-- [ ] **Step 1: Write the failing startup wiring test**
+- [ ] **Step 1: Write failing bootstrap test**
 
-Extend the existing source-order regression:
-
-```ts
-expect(source).toContain("from './orchestration/store.js'");
-const orchestrationInit = source.indexOf('initOrchestrationStore(userData)');
-const loadConfig = source.indexOf('await loadConfig()');
-expect(orchestrationInit).toBeGreaterThanOrEqual(0);
-expect(orchestrationInit).toBeLessThan(loadConfig);
-```
+Prove that calling `initDurableStore(tempUserData)` is sufficient for a subsequent orchestration journal write, without directly calling `initOrchestrationStore` in the test.
 
 - [ ] **Step 2: Verify RED**
 
-Run `test/runtime-enable-and-extension.test.ts`. Expected: failure because production startup does not initialize the orchestration store.
+Expected: orchestration store reports it is not initialized.
 
-- [ ] **Step 3: Implement minimal startup wiring**
+- [ ] **Step 3: Implement minimal bootstrap coupling**
 
-```ts
-import { initOrchestrationStore } from './orchestration/store.js';
-
-initSessionStore(userData);
-initDurableStore(userData);
-initOrchestrationStore(userData);
-await loadConfig();
-```
-
-The store remains lazy-writing; startup only supplies its root.
+`durable.ts` imports `initOrchestrationStore` and invokes it from `initDurableStore(userDataDir)`. The orchestration store remains lazy-writing; this only supplies its root. No `index.ts` churn is needed because normal startup already initializes the durable store before loading/connecting the MCP runtime.
 
 - [ ] **Step 4: Verify GREEN**
 
-Run `test/runtime-enable-and-extension.test.ts` and typecheck.
+Run the focused bootstrap test, orchestration store tests, and typecheck.
 
 - [ ] **Step 5: Commit**
 
-Commit startup initialization and its regression test only.
+Commit bootstrap wiring only.
 
 ---
 
@@ -146,8 +124,6 @@ Commit startup initialization and its regression test only.
 - Create: `test/orchestration-manager-surface.test.ts`
 
 **Interfaces:**
-- Consumes: `managerForCaller(caller)`, `acceptInitialManagerPlan`, `ManagerTaskPlan`.
-- Produces:
 
 ```ts
 export interface ManagerPlanRequest {
@@ -161,156 +137,105 @@ export async function acceptManagerPlanForCaller(
 ): Promise<ManagerPlanAcceptance & { runId: string; managerAgentId: string }>;
 ```
 
-- [ ] **Step 1: Write failing authority tests**
+- [ ] **Step 1: Write failing authority/materialization tests**
 
-Use real broker and orchestration stores:
-
-```ts
-it('derives run and Manager identity from the proven broker caller', async () => {
-  // Request contains only planId + tasks.
-  // Recovered orchestration state records the broker run and designated Manager id.
-});
-
-it('refuses a prime or ordinary worker before writing orchestration events', async () => {
-  // readOrchestrationEvents() remains empty.
-});
-```
+Use real broker membership, Manager authority state, and orchestration journal. Request input contains only `planId + tasks`; persisted V3 state must receive the system-generated orchestration run id and the designated Manager id.
 
 - [ ] **Step 2: Verify RED**
 
-Run the new test. Expected: missing `manager-surface` module / Manager authority helper.
+Expected: missing bridge.
 
 - [ ] **Step 3: Implement minimal bridge**
 
 ```ts
-export async function acceptManagerPlanForCaller(caller: Caller, request: ManagerPlanRequest) {
-  const authority = managerForCaller(caller);
-  const accepted = await acceptInitialManagerPlan({
-    planId: request.planId,
-    runId: authority.runId,
-    managerAgentId: authority.agentId,
-    tasks: request.tasks
-  });
-  return { ...accepted, runId: authority.runId, managerAgentId: authority.agentId };
-}
+const authority = await managerForCaller(caller);
+const accepted = await acceptInitialManagerPlan({
+  planId: request.planId,
+  runId: authority.runId,
+  managerAgentId: authority.agentId,
+  tasks: request.tasks
+});
+return { ...accepted, runId: authority.runId, managerAgentId: authority.agentId };
 ```
 
-No fallback authority path is allowed.
+No fallback authority path.
 
 - [ ] **Step 4: Verify GREEN**
 
-Run manager-surface, manager-plan, DAG, recovery, and store tests together.
+Run Manager authority/plan/DAG/recovery/store tests together.
 
 - [ ] **Step 5: Commit**
 
-Commit the authority bridge only.
+Commit the bridge only.
 
 ---
 
-### Task 4: Extend the existing `agents` MCP action with V3 `plan`
+### Task 4: Decorate the existing `agents` registration with `assign_manager` and `plan`
 
 **Files:**
-- Modify: `src/main/mcp/tools-core.ts`
+- Create: `src/main/mcp/agents-v3.ts`
+- Modify: `src/main/mcp/tools.ts`
 - Modify: `test/mcp.test.ts`
 
-**Interfaces:**
-- Consumes: `acceptManagerPlanForCaller`, existing `callerNow(startedAt)` exact-conversation proof.
-- Produces: `agents action=plan` with model inputs `plan_id` and `tasks` only; output facts include `run_id`, `manager_agent_id`, `ready_task_ids`, and `repeated`.
+**Architecture:** `tools-core.ts` remains the source/handler for all V2 agent actions. `tools.ts` passes Core a registrar decorator. The decorator intercepts only registration of the existing `agents` tool, uses a union schema of the original V2 schema plus the two V3 action schemas, and delegates V2 calls back to the unchanged handler.
+
+**Model-facing V3 actions:**
+
+```ts
+{ action: 'assign_manager', manager_agent_id: string }
+{ action: 'plan', plan_id: string, tasks: ManagerTaskPlan[] }
+```
+
+`manager_agent_id` is permitted only on the Prime-only designation action; it does not let the Manager assert its own identity. `run_id` is never an input.
 
 - [ ] **Step 1: Write failing endpoint/schema tests**
 
-Add real MCP endpoint assertions:
+Prove:
 
-```ts
-const agents = toolList(await core('tools/list')).find((tool) => tool.name === 'agents');
-expect(agents).toBeDefined();
-// action enum contains 'plan'; input properties contain plan_id and tasks.
-// input properties do not contain run_id or manager_agent_id.
-
-const forged = await core('tools/call', {
-  name: 'agents',
-  arguments: { action: 'plan', plan_id: 'p1', tasks: validTasks, run_id: 'forged' }
-});
-expect(failed(forged)).toBe(true);
-```
-
-The positive authority/materialization path is already proven with real broker state in Task 3; this task proves the public wire contract and strict authority-injection rejection.
+- `tools/list` still contains exactly one `agents` tool and Core's tool count does not grow;
+- action enum includes `assign_manager` and `plan` in addition to the four V2 actions;
+- schema contains `manager_agent_id`, `plan_id`, `tasks`, but never `run_id`;
+- `manager_agent_id` on a `plan` call is rejected by the strict schema;
+- a forged `run_id` is rejected before any orchestration mutation;
+- existing V2 action schemas/strict field rejection remain intact.
 
 - [ ] **Step 2: Verify RED**
 
-Run the focused MCP tests. Expected: `plan` is absent from the action enum and plan fields do not exist.
+Expected: V3 actions absent.
 
-- [ ] **Step 3: Implement minimal `agents` extension**
+- [ ] **Step 3: Implement registrar decorator**
 
-Extend, do not replace, the existing schema:
+`decorateCoreRegistrarWithAgentV3(reg)` wraps only `reg.register('agents', ...)`:
 
-```ts
-action: z.enum(['spawn', 'message', 'status', 'finish', 'plan'])
-```
-
-Add `plan_id` and structured task contracts. In `superRefine`, make plan fields valid only for `action=plan`, and reject existing action-only fields on plan calls. The plan handler branch is:
-
-```ts
-if (input.action === 'plan') {
-  if (!input.plan_id || !input.tasks) return fail('agents action=plan requires plan_id and tasks.');
-  const caller = await callerNow(startedAt);
-  const accepted = await acceptManagerPlanForCaller(caller, {
-    planId: input.plan_id,
-    tasks: input.tasks
-  });
-  return {
-    content: [{ type: 'text' as const, text: `Manager plan ${input.plan_id} accepted.` }],
-    structuredContent: {
-      action: 'plan',
-      run_id: accepted.runId,
-      manager_agent_id: accepted.managerAgentId,
-      ready_task_ids: accepted.readyTaskIds,
-      repeated: accepted.repeated
-    }
-  };
-}
-```
-
-No input authority fields exist.
+- V2 branch: call original handler unchanged;
+- `assign_manager`: resolve caller using the same call context identity already proven by `agents`, then call `assignManagerForPrime`;
+- `plan`: resolve the exact caller, then call `acceptManagerPlanForCaller`;
+- all outputs expose run/manager ids as facts, never as caller authority inputs.
 
 - [ ] **Step 4: Verify GREEN**
 
-Run `test/mcp.test.ts`, Manager orchestration tests, `test/agents.test.ts`, and typecheck.
+Run MCP, Manager orchestration, agents/swarm, and typecheck suites.
 
 - [ ] **Step 5: Commit**
 
-Commit the MCP exposure slice only.
+Commit the MCP exposure slice.
 
 ---
 
 ### Task 5: Full verification and checkpoint hygiene
 
-**Files:**
-- Modify: PR #2 description after all code is green.
+- [ ] **Step 1: Require full CI GREEN on Linux x64, macOS arm64, and Windows x64.**
 
-**Interfaces:**
-- Consumes: Tasks 1–4.
-- Produces: a reviewable draft PR whose description matches the implemented checkpoint.
+A prior Windows-only timing failure in `agents.test.ts` was investigated with systematic-debugging; a fresh docs-only run then passed all three platforms, so it is tracked as a non-deterministic baseline test-harness flake rather than attributed to V3 code. New V3 commits still require a fresh all-green matrix before completion is claimed.
 
-- [ ] **Step 1: Run full verification**
+- [ ] **Step 2: Review the full diff**
 
-Require the repository `verify:ci` matrix to finish successfully on Linux x64, macOS arm64, and Windows x64. Do not infer Windows success from another platform.
+Check: no new Core tool name; no Manager self-asserted authority; no run-id input; no label/order/recency inference; V2 broker unchanged; no unrelated WIP; no push/merge/deploy behavior.
 
-- [ ] **Step 2: Review the changed-file diff**
+- [ ] **Step 3: Update draft PR #2 body**
 
-Verify:
+Replace the stale initial-RED description with the actual implemented checkpoint and fresh verification evidence.
 
-- no new Core tool name;
-- no model input authority fields;
-- no Manager inference by label/order/recency;
-- snapshot backward compatibility;
-- no unrelated active WIP changes;
-- no push/merge/deploy behavior.
-
-- [ ] **Step 3: Update the draft PR body**
-
-Replace the stale initial-RED description with the actual checkpoint: orchestration foundation, safe agent-tab lifecycle, Manager plan kernel, and broker-owned Manager surface bridge, plus fresh verification evidence.
-
-- [ ] **Step 4: Stop at the draft PR**
+- [ ] **Step 4: Stop at draft PR**
 
 Do not merge, mark ready, deploy, or modify `main` unless the user explicitly asks.
