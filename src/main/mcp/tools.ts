@@ -15,6 +15,7 @@
 
 import { McpServer } from '@modelcontextprotocol/server';
 import { createRegistrar, type ToolContext } from './kernel.js';
+import { decorateCoreRegistrarWithAgentV3 } from './agents-v3.js';
 import { registerCoreTools } from './tools-core.js';
 import { registerDesktopTools } from './tools-desktop.js';
 import { surfaceDefinition, type SurfaceId } from './surfaces.js';
@@ -31,7 +32,7 @@ export function buildServer(ctx: ToolContext, surface: SurfaceId): McpServer {
   );
 
   const registrar = createRegistrar(server, ctx, surface);
-  if (surface === 'core') registerCoreTools(registrar);
+  if (surface === 'core') registerCoreTools(decorateCoreRegistrarWithAgentV3(registrar));
   else registerDesktopTools(registrar);
 
   // Cheap self-check on a property the tests assert and the design depends on: a surface
