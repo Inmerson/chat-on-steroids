@@ -19,7 +19,9 @@ const { initDurableStore, resetDurableForTests } = await import('../src/main/dur
 const { assignManagerForPrime, resetManagerAuthorityForTests } = await import(
   '../src/main/orchestration/manager-authority.js'
 );
-const { acceptManagerPlanForCaller } = await import('../src/main/orchestration/manager-surface.js');
+const { acceptManagerPlanForCaller, acceptAndScheduleManagerPlanForCaller } = await import(
+  '../src/main/orchestration/manager-surface.js'
+);
 const { recoverOrchestrationState } = await import('../src/main/orchestration/recovery.js');
 const { readOrchestrationEvents, resetOrchestrationStoreForTests } = await import(
   '../src/main/orchestration/store.js'
@@ -108,6 +110,24 @@ describe('Agent System 3.0 Manager orchestration surface', () => {
     expect(recovered.state.runId).toBe(authority.runId);
     expect(recovered.state.managerAgentId).toBe(authority.agentId);
     expect(recovered.state.managerPlanId).toBe('plan-1');
+  });
+
+  it('runs one deterministic scheduler cycle immediately after plan acceptance using app-owned roots', async () => {
+    await startDesignatedManager();
+    const calls: unknown[] = [];
+    const roots = [{ name: 'project', path: '/safe/project' }];
+    const result = await acceptAndScheduleManagerPlanForCaller(
+      { conversationId: MANAGER_CHAT },
+      { planId: 'plan-scheduled', tasks: oneTask() },
+      roots,
+      async (caller, receivedRoots) => {
+        calls.push({ caller, roots: receivedRoots });
+        return { scheduled: [], stillReady: ['T1'], blocked: [], needsWorkspace: true };
+      }
+    );
+
+    expect(calls).toEqual([{ caller: { conversationId: MANAGER_CHAT }, roots }]);
+    expect(result.scheduling).toEqual({ scheduled: [], stillReady: ['T1'], blocked: [], needsWorkspace: true });
   });
 
   it('refuses Prime and ordinary-worker callers before writing orchestration events', async () => {
