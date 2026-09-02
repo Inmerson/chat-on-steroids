@@ -3,6 +3,7 @@ import { createHash } from 'node:crypto';
 import { readyTaskIds, validateTaskGraph } from './dag.js';
 import { recoverOrchestrationState } from './recovery.js';
 import { appendOrchestrationEvents, type NewOrchestrationEvent } from './store.js';
+import { assertTaskContractFits } from './task-contract.js';
 import type { TaskRecord, TaskRiskClass } from './types.js';
 
 export const DEFAULT_TASK_RETRY_BUDGET = 2;
@@ -120,6 +121,7 @@ function normalizePlan(input: InitialManagerPlan): {
 
   validateTaskGraph(tasks);
   validateParentHierarchy(tasks);
+  for (const task of tasks) assertTaskContractFits(task);
   return { planId, runId, managerAgentId, tasks };
 }
 
