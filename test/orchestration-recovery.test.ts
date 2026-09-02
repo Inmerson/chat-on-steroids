@@ -51,42 +51,75 @@ function task(state: TaskRecord['state']): TaskRecord {
 describe('V3 orchestration recovery', () => {
   it('replays journal events after the latest snapshot', async () => {
     const dir = await tempStore();
+    const readyTask = { ...task('READY'), worktreeId: 'wt-1' };
     await writeOrchestrationSnapshot({
       version: 1,
       lastSeq: 2,
-      state: { runId: 'run-1', tasks: { T1: task('READY') } }
+      state: {
+        runId: 'run-1',
+        tasks: { T1: readyTask },
+        worktrees: {
+          'wt-1': {
+            worktreeId: 'wt-1',
+            taskId: 'T1',
+            branch: 'as3/run-1/t1',
+            baseRevision: 'abc123',
+            realPath: '/safe/t1',
+            virtualPath: '/project/t1'
+          }
+        }
+      }
     });
 
+    const intent = await appendOrchestrationEvent({
+      eventId: 'assign-intent-T1',
+      runId: 'run-1',
+      time: 1_700_000_000_003,
+      type: 'TASK_ASSIGNMENT_INTENT',
+      actor: 'kernel',
+      entityId: 'T1',
+      payload: {
+        intent: {
+          operationId: 'assign-op-1',
+          taskId: 'T1',
+          strategy: 'spawn',
+          requestedWorkerId: null,
+          contractDigest: 'digest-1'
+        }
+      }
+    });
     const assigned = await appendOrchestrationEvent({
       eventId: 'assign-T1',
       runId: 'run-1',
-      time: 1_700_000_000_003,
+      time: 1_700_000_000_004,
       type: 'TASK_ASSIGNED',
-      actor: 'manager',
+      actor: 'kernel',
       entityId: 'T1',
-      payload: { workerId: 'worker-1' }
+      payload: { operationId: 'assign-op-1', workerId: 'worker-1' }
     });
     const activated = await appendOrchestrationEvent({
       eventId: 'activate-T1',
       runId: 'run-1',
-      time: 1_700_000_000_004,
+      time: 1_700_000_000_005,
       type: 'TASK_ACTIVATED',
       actor: 'kernel',
       entityId: 'T1',
       payload: {}
     });
 
-    expect([assigned.seq, activated.seq]).toEqual([3, 4]);
+    expect([intent.seq, assigned.seq, activated.seq]).toEqual([3, 4, 5]);
 
     resetOrchestrationStoreForTests();
     initOrchestrationStore(dir);
 
     const recovered = await recoverOrchestrationState();
-    expect(recovered.lastSeq).toBe(4);
+    expect(recovered.lastSeq).toBe(5);
     expect(recovered.state.managerAgentId).toBeNull();
     expect(recovered.state.managerPlanId).toBeNull();
     expect(recovered.state.tasks.T1?.state).toBe('ACTIVE');
     expect(recovered.state.tasks.T1?.assignedWorkerId).toBe('worker-1');
+    expect(recovered.state.assignmentIntents.T1).toBeUndefined();
+    expect(recovered.state.worktrees['wt-1']?.taskId).toBe('T1');
   });
 
   it('rejects a journal gap after the snapshot instead of guessing what happened', async () => {
