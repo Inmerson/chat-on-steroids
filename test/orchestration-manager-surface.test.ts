@@ -1,4 +1,6 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
+import { promises as fs } from 'node:fs';
+import path from 'node:path';
 
 vi.mock('electron', () => ({
   safeStorage: {
@@ -40,6 +42,7 @@ beforeAll(async () => {
 beforeEach(async () => {
   resetAgentsForTests();
   resetOrchestrationStoreForTests();
+  await fs.rm(path.join(dir, 'state', 'orchestration'), { recursive: true, force: true });
   initDurableStore(dir);
   await resetManagerAuthorityForTests();
 });
