@@ -146,10 +146,6 @@ export function decorateCoreRegistrarWithAgentV3(reg: SurfaceRegistrar): Surface
         name,
         {
           ...config,
-          description:
-            `${config.description} ` +
-            'Agent System 3.0: a proven Prime may designate one owned worker with action=assign_manager; ' +
-            'the designated Manager submits the dependency graph with action=plan. Run and Manager authority are derived by the app, never supplied on plan calls.',
           inputSchema
         },
         async (input) => {
