@@ -7,9 +7,16 @@ export interface RecoveredOrchestrationState {
   state: OrchestrationState;
 }
 
+function objectCopy<T>(value: T | null | undefined, fallback: Record<string, never>): Record<string, any> {
+  return value && typeof value === 'object' && !Array.isArray(value)
+    ? { ...(value as Record<string, unknown>) }
+    : { ...fallback };
+}
+
 /**
- * Foundation snapshots written before Manager planning existed have only runId + tasks. Treat
- * their missing Manager fields as explicitly unassigned rather than manufacturing V3 authority.
+ * Foundation snapshots written before Manager planning/assignment existed have only a subset of
+ * the current state. Missing fields are explicitly empty/unassigned; recovery never manufactures
+ * Manager authority, worktrees or external-operation evidence that was not durably recorded.
  */
 function normalizeState(snapshotState: Partial<OrchestrationState> | null | undefined): OrchestrationState {
   return {
@@ -18,11 +25,14 @@ function normalizeState(snapshotState: Partial<OrchestrationState> | null | unde
     managerPlanId: typeof snapshotState?.managerPlanId === 'string' ? snapshotState.managerPlanId : null,
     managerPlanFingerprint:
       typeof snapshotState?.managerPlanFingerprint === 'string' ? snapshotState.managerPlanFingerprint : null,
-    tasks:
-      snapshotState?.tasks && typeof snapshotState.tasks === 'object'
-        ? { ...snapshotState.tasks }
-        : { ...EMPTY_ORCHESTRATION_STATE.tasks }
-  };
+    tasks: objectCopy(snapshotState?.tasks, EMPTY_ORCHESTRATION_STATE.tasks),
+    assignmentIntents: objectCopy(
+      snapshotState?.assignmentIntents,
+      EMPTY_ORCHESTRATION_STATE.assignmentIntents
+    ),
+    worktreeIntents: objectCopy(snapshotState?.worktreeIntents, EMPTY_ORCHESTRATION_STATE.worktreeIntents),
+    worktrees: objectCopy(snapshotState?.worktrees, EMPTY_ORCHESTRATION_STATE.worktrees)
+  } as OrchestrationState;
 }
 
 export async function recoverOrchestrationState(): Promise<RecoveredOrchestrationState> {
