@@ -103,11 +103,15 @@ describe('Agent System 3.0 MCP surface', () => {
     expect(tools.length).toBeLessThanOrEqual(7);
 
     const schemaText = JSON.stringify(agents[0]?.inputSchema ?? {});
-    expect(schemaText).toContain('assign_manager');
-    expect(schemaText).toContain('plan');
-    expect(schemaText).toContain('manager_agent_id');
-    expect(schemaText).toContain('plan_id');
-    expect(schemaText).toContain('tasks');
+    for (const action of ['assign_manager', 'plan', 'complete_task', 'review_task', 'review_run', 'advance']) {
+      expect(schemaText).toContain(action);
+    }
+    for (const field of [
+      'manager_agent_id', 'plan_id', 'tasks', 'task_id', 'revision', 'changed_files',
+      'verification', 'risks', 'notes', 'verdict', 'findings'
+    ]) {
+      expect(schemaText).toContain(field);
+    }
     expect(schemaText).not.toContain('run_id');
   });
 
@@ -123,5 +127,25 @@ describe('Agent System 3.0 MCP surface', () => {
       arguments: { action: 'plan', plan_id: 'plan-1', tasks: validTasks, manager_agent_id: 'worker-999' }
     });
     expect(failed(forgedManager)).toBe(true);
+  });
+
+  it('rejects V3 action fields when they are attached to the wrong action', async () => {
+    const reviewFieldsOnPlan = await core('tools/call', {
+      name: 'agents',
+      arguments: { action: 'plan', plan_id: 'plan-1', tasks: validTasks, verdict: 'APPROVED', findings: [] }
+    });
+    expect(failed(reviewFieldsOnPlan)).toBe(true);
+
+    const completionFieldsOnReview = await core('tools/call', {
+      name: 'agents',
+      arguments: { action: 'review_task', task_id: 'T1', verdict: 'APPROVED', findings: [], revision: 'a'.repeat(40) }
+    });
+    expect(failed(completionFieldsOnReview)).toBe(true);
+
+    const taskReviewMissingVerdict = await core('tools/call', {
+      name: 'agents',
+      arguments: { action: 'review_task', task_id: 'T1', findings: [] }
+    });
+    expect(failed(taskReviewMissingVerdict)).toBe(true);
   });
 });
