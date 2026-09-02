@@ -15,90 +15,112 @@ const { defaultConfig, initConfigPath, saveConfig } = await import('../src/main/
 const {
   PRIME_ID,
   bindConversation,
-  managerForCaller,
   resetAgentsForTests,
   restoreSwarm,
   snapshotSwarm,
-  spawn,
-  swarmRunning
+  spawn
 } = await import('../src/main/agents.js');
+const { initDurableStore, readDurable, resetDurableForTests } = await import('../src/main/durable.js');
+const {
+  assignManagerForPrime,
+  managerForCaller,
+  resetManagerAuthorityForTests
+} = await import('../src/main/orchestration/manager-authority.js');
 const { makeTempDir, removeTempDir } = await import('./helpers.js');
 
 const PRIME_CHAT = 'manager-prime-chat';
+const prime = { conversationId: PRIME_CHAT };
 let dir: string;
 
 beforeAll(async () => {
   dir = await makeTempDir('clf-manager-authority-');
   initConfigPath(dir);
+  initDurableStore(dir);
   await saveConfig({ ...defaultConfig(), multiAgent: { enabled: true, maxWorkers: 4 } });
 });
 
-beforeEach(() => {
+beforeEach(async () => {
   resetAgentsForTests();
+  await resetManagerAuthorityForTests();
 });
 
 afterAll(async () => {
   resetAgentsForTests();
+  resetDurableForTests();
   await removeTempDir(dir);
 });
 
-function startManagerRun(): { runId: string; managerId: string; ordinaryId: string } {
+function startRun(): { managerId: string; ordinaryId: string; snapshot: NonNullable<ReturnType<typeof snapshotSwarm>> } {
   const result = spawn({
     workers: [
-      { label: 'Manager', task: 'Coordinate the run.', manager: true },
+      { label: 'Coordinator candidate', task: 'Coordinate the run.' },
       { label: 'Worker', task: 'Implement one task.' }
     ],
-    caller: { conversationId: PRIME_CHAT }
+    caller: prime
   });
   const [manager, ordinary] = result.created;
   if (!manager || !ordinary) throw new Error('expected two workers');
-  expect(bindConversation(manager.id, 'manager-chat')).toBe(true);
-  expect(bindConversation(ordinary.id, 'ordinary-chat')).toBe(true);
-  return { runId: result.runId, managerId: manager.id, ordinaryId: ordinary.id };
+  const snapshot = snapshotSwarm();
+  if (!snapshot) throw new Error('expected a durable swarm snapshot');
+  return { managerId: manager.id, ordinaryId: ordinary.id, snapshot };
 }
 
-describe('broker-owned Agent System 3.0 Manager authority', () => {
-  it('designates exactly one spawned worker as Manager and resolves authority from its bound conversation', () => {
-    const { runId, managerId } = startManagerRun();
+describe('broker-anchored Agent System 3.0 Manager authority', () => {
+  it('lets only the proven prime designate one worker, then binds authority to that worker conversation', async () => {
+    const { managerId } = startRun();
 
-    expect(managerForCaller({ conversationId: 'manager-chat' })).toEqual({ runId, agentId: managerId });
+    const assigned = await assignManagerForPrime(prime, managerId);
+    expect(assigned.agentId).toBe(managerId);
+    expect(assigned.runId).toMatch(/^[0-9a-f-]{36}$/i);
+
+    // Prime may designate before the browser has finished binding the new worker tab.
+    expect(bindConversation(managerId, 'manager-chat')).toBe(true);
+    const resolved = await managerForCaller({ conversationId: 'manager-chat' });
+    expect(resolved).toEqual(assigned);
+
+    const durable = await readDurable<Record<string, unknown>>('manager-authority');
+    expect(durable).toMatchObject({
+      version: 1,
+      managerAgentId: managerId,
+      managerConversationId: 'manager-chat',
+      ownerPrimeConversationId: PRIME_CHAT,
+      orchestrationRunId: assigned.runId
+    });
   });
 
-  it('refuses the prime and ordinary workers as Manager callers', () => {
-    startManagerRun();
+  it('refuses the prime, ordinary workers, strangers, and unidentified callers as Manager callers', async () => {
+    const { managerId, ordinaryId } = startRun();
+    await assignManagerForPrime(prime, managerId);
+    expect(bindConversation(managerId, 'manager-chat')).toBe(true);
+    expect(bindConversation(ordinaryId, 'ordinary-chat')).toBe(true);
 
-    expect(() => managerForCaller({ conversationId: PRIME_CHAT })).toThrow(/manager/i);
-    expect(() => managerForCaller({ conversationId: 'ordinary-chat' })).toThrow(/manager/i);
-    expect(() => managerForCaller({})).toThrow(/identity|conversation|manager/i);
+    await expect(managerForCaller(prime)).rejects.toThrow(/manager/i);
+    await expect(managerForCaller({ conversationId: 'ordinary-chat' })).rejects.toThrow(/manager/i);
+    await expect(managerForCaller({ conversationId: 'stranger-chat' })).rejects.toThrow(/manager|busy/i);
+    await expect(managerForCaller({})).rejects.toThrow(/identity|conversation|manager/i);
     expect(PRIME_ID).toBe('prime');
   });
 
-  it('persists and restores the Manager designation without re-inferring it', () => {
-    const { runId, managerId } = startManagerRun();
-    const snapshot = snapshotSwarm();
-    expect(snapshot).not.toBeNull();
-    expect(snapshot?.version).toBe(6);
-    expect(snapshot?.managerAgentId).toBe(managerId);
+  it('survives broker snapshot restore after the Manager conversation has been durably claimed', async () => {
+    const { managerId, snapshot } = startRun();
+    const assigned = await assignManagerForPrime(prime, managerId);
+    expect(bindConversation(managerId, 'manager-chat')).toBe(true);
+    expect(await managerForCaller({ conversationId: 'manager-chat' })).toEqual(assigned);
 
     resetAgentsForTests();
     restoreSwarm(snapshot);
 
-    expect(managerForCaller({ conversationId: 'manager-chat' })).toEqual({ runId, agentId: managerId });
-    expect(() => managerForCaller({ conversationId: 'ordinary-chat' })).toThrow(/manager/i);
+    expect(await managerForCaller({ conversationId: 'manager-chat' })).toEqual(assigned);
   });
 
-  it('rejects two Manager designations before publishing any run topology', () => {
-    expect(() =>
-      spawn({
-        workers: [
-          { label: 'Manager A', task: 'Coordinate A.', manager: true },
-          { label: 'Manager B', task: 'Coordinate B.', manager: true }
-        ],
-        caller: { conversationId: PRIME_CHAT }
-      })
-    ).toThrow(/one manager|manager.*one|multiple manager/i);
+  it('does not let the same Prime silently replace an already-designated Manager', async () => {
+    const { managerId, ordinaryId } = startRun();
+    const first = await assignManagerForPrime(prime, managerId);
+    const before = await readDurable('manager-authority');
 
-    expect(swarmRunning()).toBe(false);
-    expect(snapshotSwarm()).toBeNull();
+    await expect(assignManagerForPrime(prime, ordinaryId)).rejects.toThrow(/manager.*already|already.*manager/i);
+
+    expect(await readDurable('manager-authority')).toEqual(before);
+    expect((await assignManagerForPrime(prime, managerId)).runId).toBe(first.runId);
   });
 });
