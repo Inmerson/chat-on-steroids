@@ -15,33 +15,23 @@ import {
   type ToolResult
 } from './kernel.js';
 
-const managerTaskSchema = z
+/**
+ * The wire only describes the Manager package's structure. The orchestration kernel performs
+ * the authoritative bounds, graph, hierarchy and duplicate validation immediately before the
+ * first journal mutation, so duplicating every numeric limit here would only inflate discovery.
+ */
+const managerTaskWireSchema = z
   .object({
-    taskId: z.string().min(1).max(160),
-    parentTaskId: z.string().min(1).max(160).nullable(),
-    title: z.string().min(1).max(500),
-    goal: z.string().min(1).max(4000),
-    allowedScope: z.array(z.string().min(1).max(4000)).max(100),
-    dependencies: z.array(z.string().min(1).max(160)).max(100),
-    acceptanceCriteria: z.array(z.string().min(1).max(4000)).min(1).max(100),
-    expectedVerification: z.array(z.string().min(1).max(4000)).max(100),
-    forbiddenActions: z.array(z.string().min(1).max(4000)).max(100),
+    taskId: z.string(),
+    parentTaskId: z.string().nullable(),
+    title: z.string(),
+    goal: z.string(),
+    allowedScope: z.array(z.string()),
+    dependencies: z.array(z.string()),
+    acceptanceCriteria: z.array(z.string()),
+    expectedVerification: z.array(z.string()),
+    forbiddenActions: z.array(z.string()),
     riskClass: z.enum(['normal', 'high'])
-  })
-  .strict();
-
-const assignManagerSchema = z
-  .object({
-    action: z.literal('assign_manager'),
-    manager_agent_id: z.string().min(1).max(40)
-  })
-  .strict();
-
-const managerPlanSchema = z
-  .object({
-    action: z.literal('plan'),
-    plan_id: z.string().min(1).max(160),
-    tasks: z.array(managerTaskSchema).min(1).max(200)
   })
   .strict();
 
@@ -102,9 +92,45 @@ function planResult(
   };
 }
 
+function extendAgentsSchema(base: z.ZodType): z.ZodType {
+  if (!(base instanceof z.ZodObject)) {
+    throw new Error('Agent System 3.0 expected the existing agents input schema to remain a Zod object');
+  }
+
+  return base
+    .safeExtend({
+      action: z.enum(['spawn', 'message', 'status', 'finish', 'assign_manager', 'plan']),
+      manager_agent_id: z.string().min(1).max(40).optional(),
+      plan_id: z.string().min(1).max(160).optional(),
+      tasks: z.array(managerTaskWireSchema).min(1).max(200).optional()
+    })
+    .superRefine((input, ctx) => {
+      if (input.action === 'assign_manager') {
+        if (!input.manager_agent_id) {
+          ctx.addIssue({ code: 'custom', path: ['manager_agent_id'], message: 'action=assign_manager requires manager_agent_id' });
+        }
+      } else if (input.manager_agent_id !== undefined) {
+        ctx.addIssue({ code: 'custom', path: ['manager_agent_id'], message: 'manager_agent_id is only valid with action=assign_manager' });
+      }
+
+      if (input.action === 'plan') {
+        if (!input.plan_id) ctx.addIssue({ code: 'custom', path: ['plan_id'], message: 'action=plan requires plan_id' });
+        if (!input.tasks) ctx.addIssue({ code: 'custom', path: ['tasks'], message: 'action=plan requires tasks' });
+      } else {
+        if (input.plan_id !== undefined) {
+          ctx.addIssue({ code: 'custom', path: ['plan_id'], message: 'plan_id is only valid with action=plan' });
+        }
+        if (input.tasks !== undefined) {
+          ctx.addIssue({ code: 'custom', path: ['tasks'], message: 'tasks is only valid with action=plan' });
+        }
+      }
+    });
+}
+
 /**
  * Extends only the existing `agents` registration. Every V2 call still reaches the original
- * schema and handler unchanged; V3 adds two strict alternatives without adding another tool.
+ * handler unchanged; the base object's refinements stay attached through `safeExtend`, and V3
+ * remains one flat public schema rather than an `anyOf` expansion.
  */
 export function decorateCoreRegistrarWithAgentV3(reg: SurfaceRegistrar): SurfaceRegistrar {
   return {
@@ -115,7 +141,7 @@ export function decorateCoreRegistrarWithAgentV3(reg: SurfaceRegistrar): Surface
         return;
       }
 
-      const inputSchema = z.union([config.inputSchema, assignManagerSchema, managerPlanSchema]);
+      const inputSchema = extendAgentsSchema(config.inputSchema);
       reg.register(
         name,
         {
@@ -127,20 +153,20 @@ export function decorateCoreRegistrarWithAgentV3(reg: SurfaceRegistrar): Surface
           inputSchema
         },
         async (input) => {
-          const v3 = input as z.output<typeof assignManagerSchema> | z.output<typeof managerPlanSchema> | z.output<typeof config.inputSchema>;
-          if (typeof v3 === 'object' && v3 !== null && 'action' in v3 && v3.action === 'assign_manager') {
+          const value = input as Record<string, unknown>;
+          if (value['action'] === 'assign_manager') {
             const startedAt = currentCall()?.startedAt ?? Date.now();
             return guard('agents', async () => {
               if (!reg.agentToolsLive) {
                 return reg.featureDisabled('Multi-agent mode', 'Multi-agent mode (experimental)');
               }
               const caller = await callerNowForAgentV3(startedAt);
-              const authority = await assignManagerForPrime(caller, v3.manager_agent_id);
+              const authority = await assignManagerForPrime(caller, value['manager_agent_id'] as string);
               return assignManagerResult(authority.runId, authority.agentId);
             });
           }
 
-          if (typeof v3 === 'object' && v3 !== null && 'action' in v3 && v3.action === 'plan') {
+          if (value['action'] === 'plan') {
             const startedAt = currentCall()?.startedAt ?? Date.now();
             return guard('agents', async () => {
               if (!reg.agentToolsLive) {
@@ -148,10 +174,10 @@ export function decorateCoreRegistrarWithAgentV3(reg: SurfaceRegistrar): Surface
               }
               const caller = await callerNowForAgentV3(startedAt);
               const accepted = await acceptManagerPlanForCaller(caller, {
-                planId: v3.plan_id,
-                tasks: v3.tasks
+                planId: value['plan_id'] as string,
+                tasks: value['tasks'] as z.output<typeof managerTaskWireSchema>[]
               });
-              return planResult(v3.plan_id, accepted);
+              return planResult(value['plan_id'] as string, accepted);
             });
           }
 
