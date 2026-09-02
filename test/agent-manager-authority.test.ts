@@ -50,7 +50,7 @@ afterAll(async () => {
   await removeTempDir(dir);
 });
 
-function startRun(): { managerId: string; ordinaryId: string; snapshot: NonNullable<ReturnType<typeof snapshotSwarm>> } {
+function startRun(): { managerId: string; ordinaryId: string } {
   const result = spawn({
     workers: [
       { label: 'Coordinator candidate', task: 'Coordinate the run.' },
@@ -60,9 +60,7 @@ function startRun(): { managerId: string; ordinaryId: string; snapshot: NonNulla
   });
   const [manager, ordinary] = result.created;
   if (!manager || !ordinary) throw new Error('expected two workers');
-  const snapshot = snapshotSwarm();
-  if (!snapshot) throw new Error('expected a durable swarm snapshot');
-  return { managerId: manager.id, ordinaryId: ordinary.id, snapshot };
+  return { managerId: manager.id, ordinaryId: ordinary.id };
 }
 
 describe('broker-anchored Agent System 3.0 Manager authority', () => {
@@ -107,11 +105,15 @@ describe('broker-anchored Agent System 3.0 Manager authority', () => {
   });
 
   it('survives broker snapshot restore after the Manager conversation has been durably claimed', async () => {
-    const { managerId, snapshot } = startRun();
+    const { managerId } = startRun();
     const assigned = await assignManagerForPrime(prime, managerId);
     expect(bindConversation(managerId, 'manager-chat')).toBe(true);
     expect(await managerForCaller({ conversationId: 'manager-chat' })).toEqual(assigned);
 
+    // Recovery must restore the broker membership that actually existed at the durable
+    // Manager claim boundary. A pre-bind snapshot would correctly know nothing about this chat.
+    const snapshot = snapshotSwarm();
+    if (!snapshot) throw new Error('expected a durable swarm snapshot after Manager binding');
     resetAgentsForTests();
     restoreSwarm(snapshot);
 
