@@ -78,14 +78,19 @@ describe('broker-anchored Agent System 3.0 Manager authority', () => {
     const resolved = await managerForCaller({ conversationId: 'manager-chat' });
     expect(resolved).toEqual(assigned);
 
-    const durable = await readDurable<Record<string, unknown>>('manager-authority');
-    expect(durable).toMatchObject({
-      version: 1,
-      managerAgentId: managerId,
-      managerConversationId: 'manager-chat',
-      ownerPrimeConversationId: PRIME_CHAT,
-      orchestrationRunId: assigned.runId
-    });
+    const durable = await readDurable<{
+      version: number;
+      entries: Array<Record<string, unknown>>;
+    }>('manager-authority');
+    expect(durable?.version).toBe(1);
+    expect(durable?.entries).toEqual([
+      expect.objectContaining({
+        managerAgentId: managerId,
+        managerConversationId: 'manager-chat',
+        ownerPrimeConversationId: PRIME_CHAT,
+        orchestrationRunId: assigned.runId
+      })
+    ]);
   });
 
   it('refuses the prime, ordinary workers, strangers, and unidentified callers as Manager callers', async () => {
