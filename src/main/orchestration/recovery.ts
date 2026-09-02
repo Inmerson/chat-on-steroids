@@ -1,4 +1,4 @@
-import { applyOrchestrationEvent, EMPTY_ORCHESTRATION_STATE } from './reducer.js';
+import { applyOrchestrationEvent } from './reducer.js';
 import type { OrchestrationState } from './reducer.js';
 import { readOrchestrationEvents, readOrchestrationSnapshot } from './store.js';
 
@@ -7,10 +7,8 @@ export interface RecoveredOrchestrationState {
   state: OrchestrationState;
 }
 
-function objectCopy<T>(value: T | null | undefined, fallback: Record<string, never>): Record<string, any> {
-  return value && typeof value === 'object' && !Array.isArray(value)
-    ? { ...(value as Record<string, unknown>) }
-    : { ...fallback };
+function recordCopy<T>(value: Record<string, T> | null | undefined): Record<string, T> {
+  return value && typeof value === 'object' && !Array.isArray(value) ? { ...value } : {};
 }
 
 /**
@@ -25,14 +23,11 @@ function normalizeState(snapshotState: Partial<OrchestrationState> | null | unde
     managerPlanId: typeof snapshotState?.managerPlanId === 'string' ? snapshotState.managerPlanId : null,
     managerPlanFingerprint:
       typeof snapshotState?.managerPlanFingerprint === 'string' ? snapshotState.managerPlanFingerprint : null,
-    tasks: objectCopy(snapshotState?.tasks, EMPTY_ORCHESTRATION_STATE.tasks),
-    assignmentIntents: objectCopy(
-      snapshotState?.assignmentIntents,
-      EMPTY_ORCHESTRATION_STATE.assignmentIntents
-    ),
-    worktreeIntents: objectCopy(snapshotState?.worktreeIntents, EMPTY_ORCHESTRATION_STATE.worktreeIntents),
-    worktrees: objectCopy(snapshotState?.worktrees, EMPTY_ORCHESTRATION_STATE.worktrees)
-  } as OrchestrationState;
+    tasks: recordCopy(snapshotState?.tasks),
+    assignmentIntents: recordCopy(snapshotState?.assignmentIntents),
+    worktreeIntents: recordCopy(snapshotState?.worktreeIntents),
+    worktrees: recordCopy(snapshotState?.worktrees)
+  };
 }
 
 export async function recoverOrchestrationState(): Promise<RecoveredOrchestrationState> {
