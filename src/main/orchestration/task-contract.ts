@@ -8,14 +8,19 @@ import type { TaskRecord } from './types.js';
  */
 export const MAX_TASK_CONTRACT_CHARS = MAX_MESSAGE_CHARS;
 
+export function assignmentMarker(operationId: string): string {
+  const id = operationId.trim();
+  if (!id) throw new Error('Assignment marker requires an operation id');
+  return `AS3-Assignment: ${id}`;
+}
+
 function list(title: string, values: readonly string[], empty = '(none)'): string[] {
   return [title, ...(values.length > 0 ? values.map((value) => `- ${value}`) : [`- ${empty}`])];
 }
 
 export function formatTaskContract(task: TaskRecord, operationId: string): string {
-  if (!operationId.trim()) throw new Error('Task Contract requires an assignment operation id');
   const lines = [
-    `AS3-Assignment: ${operationId.trim()}`,
+    assignmentMarker(operationId),
     `Task: ${task.taskId}`,
     `Title: ${task.title}`,
     '',
