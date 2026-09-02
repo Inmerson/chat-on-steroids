@@ -16,6 +16,7 @@
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import { logWarn } from './logger.js';
+import { initOrchestrationStore } from './orchestration/store.js';
 
 const WRITE_DELAY_MS = 300;
 const RETRY_MAX_MS = 5_000;
@@ -34,6 +35,7 @@ let nextGeneration = 1;
 
 export function initDurableStore(userDataDir: string): void {
   root = path.join(userDataDir, 'state');
+  initOrchestrationStore(userDataDir);
 }
 
 export function durableStoreReady(): boolean {
