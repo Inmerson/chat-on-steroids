@@ -3,7 +3,6 @@ import { promises as fs } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
-import { MAX_TASK_CHARS } from '../src/main/agents.js';
 import { acceptInitialManagerPlan } from '../src/main/orchestration/manager-plan.js';
 import { EMPTY_ORCHESTRATION_STATE, type OrchestrationState } from '../src/main/orchestration/reducer.js';
 import {
@@ -11,7 +10,7 @@ import {
   readOrchestrationEvents,
   resetOrchestrationStoreForTests
 } from '../src/main/orchestration/store.js';
-import { formatTaskContract } from '../src/main/orchestration/task-contract.js';
+import { formatTaskContract, MAX_TASK_CONTRACT_CHARS } from '../src/main/orchestration/task-contract.js';
 import { selectWorkerAllocation } from '../src/main/orchestration/worker-allocation.js';
 import type { TaskRecord } from '../src/main/orchestration/types.js';
 import type { AgentInfo } from '../src/shared/session.js';
@@ -86,7 +85,7 @@ describe('V3 Task Contracts and worker allocation', () => {
     expect(text).toContain('Acceptance criteria:');
     expect(text).toContain('Expected verification:');
     expect(text).toContain('Forbidden actions:');
-    expect(text.length).toBeLessThanOrEqual(MAX_TASK_CHARS);
+    expect(text.length).toBeLessThanOrEqual(MAX_TASK_CONTRACT_CHARS);
   });
 
   it('rejects a Manager task whose complete worker contract cannot fit the broker limit before journal mutation', async () => {
