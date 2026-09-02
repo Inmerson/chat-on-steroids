@@ -27,7 +27,11 @@ import {
 } from './broker-assignment.js';
 import { recoverOrchestrationState } from './recovery.js';
 import { runSchedulerCycleForRuntime } from './scheduler.js';
-import { appendOrchestrationEvent, appendOrchestrationEvents } from './store.js';
+import {
+  appendOrchestrationEvent,
+  appendOrchestrationEvents,
+  type NewOrchestrationEvent
+} from './store.js';
 import { assignmentMarker } from './task-contract.js';
 import type { TaskCompletionPackage, TaskRecord, TaskWorktreeRecord } from './types.js';
 
@@ -829,7 +833,7 @@ export async function submitTaskCompletionForRuntime(
 
   const completion = await inspectCompletion(task, worktree, input);
   await updateRun(runtime.runId, (run) => ({ ...run, status: 'running', completions: { ...run.completions, [task.taskId]: completion } }));
-  const events = [] as Parameters<typeof appendOrchestrationEvents>[0];
+  const events: NewOrchestrationEvent[] = [];
   if (task.state === 'ASSIGNED') {
     events.push({ eventId: `completion-active:${task.taskId}:${randomUUID()}`, runId: runtime.runId, time: Date.now(), type: 'TASK_ACTIVATED', actor: 'kernel', entityId: task.taskId, payload: {} });
   }
