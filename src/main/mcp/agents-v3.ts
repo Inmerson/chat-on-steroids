@@ -2,7 +2,7 @@ import { z } from 'zod';
 
 import { agentForCaller, type Caller } from '../agents.js';
 import { assignManagerForPrime } from '../orchestration/manager-authority.js';
-import { acceptManagerPlanForCaller } from '../orchestration/manager-surface.js';
+import { acceptAndScheduleManagerPlanForCaller } from '../orchestration/manager-surface.js';
 import { repairPrimeFromResumeShadow } from '../session/continuation.js';
 import { awaitFreshCallOrigin } from '../session/recorder.js';
 import { currentCall, currentCaller } from './call-context.js';
@@ -71,15 +71,21 @@ function assignManagerResult(runId: string, managerAgentId: string): ToolResult 
 
 function planResult(
   planId: string,
-  accepted: Awaited<ReturnType<typeof acceptManagerPlanForCaller>>
+  accepted: Awaited<ReturnType<typeof acceptAndScheduleManagerPlanForCaller>>
 ): ToolResult {
+  const scheduledIds = accepted.scheduling.scheduled.map((entry) => entry.taskId);
+  const scheduleNote = accepted.scheduling.needsWorkspace
+    ? ' Scheduling is waiting for the Prime conversation to establish a proven approved workspace.'
+    : scheduledIds.length > 0
+      ? ` Scheduled now: ${scheduledIds.join(', ')}.`
+      : '';
   return {
     content: [
       {
         type: 'text',
-        text: accepted.repeated
+        text: (accepted.repeated
           ? `Manager plan ${planId} was already accepted with the same content.`
-          : `Manager plan ${planId} accepted.`
+          : `Manager plan ${planId} accepted.`) + scheduleNote
       }
     ],
     structuredContent: {
@@ -87,7 +93,11 @@ function planResult(
       run_id: accepted.runId,
       manager_agent_id: accepted.managerAgentId,
       ready_task_ids: accepted.readyTaskIds,
-      repeated: accepted.repeated
+      repeated: accepted.repeated,
+      scheduled: accepted.scheduling.scheduled,
+      still_ready_task_ids: accepted.scheduling.stillReady,
+      blocked: accepted.scheduling.blocked,
+      needs_workspace: accepted.scheduling.needsWorkspace
     }
   };
 }
@@ -169,10 +179,14 @@ export function decorateCoreRegistrarWithAgentV3(reg: SurfaceRegistrar): Surface
                 return reg.featureDisabled('Multi-agent mode', 'Multi-agent mode (experimental)');
               }
               const caller = await callerNowForAgentV3(startedAt);
-              const accepted = await acceptManagerPlanForCaller(caller, {
-                planId: value['plan_id'] as string,
-                tasks: value['tasks'] as z.output<typeof managerTaskWireSchema>[]
-              });
+              const accepted = await acceptAndScheduleManagerPlanForCaller(
+                caller,
+                {
+                  planId: value['plan_id'] as string,
+                  tasks: value['tasks'] as z.output<typeof managerTaskWireSchema>[]
+                },
+                reg.ctx.roots
+              );
               return planResult(value['plan_id'] as string, accepted);
             });
           }
