@@ -2,14 +2,19 @@
   'use strict';
 
   const LEASE_KEY = 'agentTabLeases';
+  const QUEUE_KEY = 'agentTabLeaseQueue';
+  const MAX_AGENT_TABS = 5;
+  const MAX_QUEUE = 400;
   const MAX_CLOSE_ATTEMPTS = 3;
   const MAX_DURABLE_COMMANDS = 400;
   const CHATGPT_HOSTS = new Set(['chatgpt.com', 'chat.openai.com']);
 
   let leases = {};
+  let queue = [];
   let loaded = false;
   let loading = null;
   let writes = Promise.resolve();
+  let drainingQueue = null;
   const closing = new Set();
   /**
    * Worker command ids whose irreversible `sent` result became durable during this service-worker lifetime.
@@ -25,10 +30,29 @@
     if (loaded) return Promise.resolve();
     if (!loading) {
       loading = chrome.storage.session
-        .get(LEASE_KEY)
+        .get([LEASE_KEY, QUEUE_KEY])
         .then((stored) => {
-          const value = stored?.[LEASE_KEY];
-          leases = value && typeof value === 'object' && !Array.isArray(value) ? { ...value } : {};
+          const storedLeases = stored?.[LEASE_KEY];
+          const storedQueue = stored?.[QUEUE_KEY];
+          leases = storedLeases && typeof storedLeases === 'object' && !Array.isArray(storedLeases) ? { ...storedLeases } : {};
+          queue = Array.isArray(storedQueue)
+            ? storedQueue
+                .filter(
+                  (entry) =>
+                    entry &&
+                    typeof entry === 'object' &&
+                    typeof entry.commandId === 'string' &&
+                    entry.commandId &&
+                    typeof entry.url === 'string' &&
+                    markerFrom(entry.url) === entry.commandId
+                )
+                .slice(-MAX_QUEUE)
+                .map((entry) => ({
+                  commandId: entry.commandId,
+                  url: entry.url,
+                  queuedAt: Number.isFinite(entry.queuedAt) ? entry.queuedAt : Date.now()
+                }))
+            : [];
           loaded = true;
         })
         .finally(() => {
@@ -39,8 +63,11 @@
   }
 
   function persist() {
-    const snapshot = { ...leases };
-    const write = writes.then(() => chrome.storage.session.set({ [LEASE_KEY]: snapshot }));
+    const leaseSnapshot = { ...leases };
+    const queueSnapshot = queue.map((entry) => ({ ...entry }));
+    const write = writes.then(() =>
+      chrome.storage.session.set({ [LEASE_KEY]: leaseSnapshot, [QUEUE_KEY]: queueSnapshot })
+    );
     writes = write.then(
       () => undefined,
       () => undefined
@@ -74,12 +101,64 @@
     return String(tabId);
   }
 
+  function liveLeaseCount() {
+    return Object.values(leases).filter(
+      (lease) => lease && typeof lease === 'object' && Number.isInteger(lease.tabId) && lease.tabId >= 0
+    ).length;
+  }
+
+  function queueCommand(commandId, url) {
+    if (!commandId || markerFrom(url) !== commandId) return false;
+    if (queue.some((entry) => entry.commandId === commandId)) return true;
+    queue = [...queue, { commandId, url, queuedAt: Date.now() }].slice(-MAX_QUEUE);
+    return true;
+  }
+
+  async function drainQueue() {
+    await load();
+    if (drainingQueue) return drainingQueue;
+    const work = (async () => {
+      while (queue.length > 0 && liveLeaseCount() < MAX_AGENT_TABS) {
+        const entry = queue[0];
+        if (!entry || markerFrom(entry.url) !== entry.commandId) {
+          queue.shift();
+          await persist();
+          continue;
+        }
+        let created = null;
+        try {
+          created = await chrome.tabs.create({ url: entry.url });
+        } catch {
+          break;
+        }
+        if (!created || !Number.isInteger(created.id) || created.id < 0) break;
+
+        queue.shift();
+        const tabId = created.id;
+        leases[leaseKey(tabId)] = {
+          commandId: entry.commandId,
+          tabId,
+          registeredAt: Date.now(),
+          handoffDurable: durableCommands.has(entry.commandId),
+          leaseManagerCreated: true
+        };
+        await persist();
+        if (durableCommands.has(entry.commandId)) await closeDurableLease(tabId);
+      }
+    })();
+    drainingQueue = work.finally(() => {
+      if (drainingQueue === work) drainingQueue = null;
+    });
+    return drainingQueue;
+  }
+
   async function forget(tabId) {
     await load();
     const key = leaseKey(tabId);
     if (!leases[key]) return;
     delete leases[key];
     await persist();
+    await drainQueue();
   }
 
   /**
@@ -102,6 +181,7 @@
     if (leases[key] !== lease) return;
     delete leases[key];
     await persist();
+    await drainQueue();
   }
 
   async function closeDurableLease(tabId) {
@@ -123,6 +203,7 @@
             delete leases[key];
             await persist();
           }
+          await drainQueue();
           return true;
         } catch {
           if (attempt + 1 < MAX_CLOSE_ATTEMPTS) {
@@ -134,6 +215,20 @@
     } finally {
       closing.delete(tabId);
     }
+  }
+
+  async function closeOverflowTab(tabId) {
+    for (let attempt = 0; attempt < MAX_CLOSE_ATTEMPTS; attempt++) {
+      try {
+        await chrome.tabs.remove(tabId);
+        return true;
+      } catch {
+        if (attempt + 1 < MAX_CLOSE_ATTEMPTS) {
+          await new Promise((resolve) => setTimeout(resolve, 100 * (attempt + 1)));
+        }
+      }
+    }
+    return false;
   }
 
   async function register(message, sender) {
@@ -148,6 +243,14 @@
       return { ok: false, error: 'agent_tab_command_mismatch' };
     }
 
+    if (!existing && !durableCommands.has(commandId) && liveLeaseCount() >= MAX_AGENT_TABS) {
+      const url = typeof sender?.url === 'string' && markerFrom(sender.url) === commandId ? sender.url : sender?.tab?.url;
+      if (!queueCommand(commandId, url)) return { ok: false, error: 'agent_tab_queue_rejected' };
+      await persist();
+      const closed = await closeOverflowTab(tabId);
+      return closed ? { ok: true, queued: true } : { ok: false, error: 'agent_tab_budget_close_failed' };
+    }
+
     const lease = existing ?? {
       commandId,
       tabId,
@@ -156,6 +259,7 @@
     };
     if (durableCommands.has(commandId)) lease.handoffDurable = true;
     leases[key] = lease;
+    queue = queue.filter((entry) => entry.commandId !== commandId);
     await persist();
     if (lease.handoffDurable) await closeDurableLease(tabId);
     return { ok: true };
@@ -203,8 +307,12 @@
       }
       close.push(lease.tabId);
     }
+    const beforeQueue = queue.length;
+    queue = queue.filter((entry) => !commandIds.has(entry.commandId));
+    if (queue.length !== beforeQueue) changed = true;
     if (changed) await persist();
     for (const tabId of close) await closeDurableLease(tabId);
+    await drainQueue();
   }
 
   async function recoverDurableLeases() {
@@ -214,6 +322,7 @@
       .map((lease) => lease.tabId)
       .filter((tabId) => Number.isInteger(tabId) && tabId >= 0);
     for (const tabId of durable) await closeDurableLease(tabId);
+    await drainQueue();
   }
 
   chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
