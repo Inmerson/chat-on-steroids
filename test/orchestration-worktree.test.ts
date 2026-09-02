@@ -11,6 +11,7 @@ import {
   reconcileTaskWorktree
 } from '../src/main/orchestration/worktree.js';
 import {
+  appendOrchestrationEvents,
   initOrchestrationStore,
   readOrchestrationEvents,
   resetOrchestrationStoreForTests
@@ -21,6 +22,7 @@ import type { Workspace } from '../src/main/workspace.js';
 
 const execFileAsync = promisify(execFile);
 const cleanup: string[] = [];
+const RUN_ID = 'run-12345678';
 
 afterEach(async () => {
   resetOrchestrationStoreForTests();
@@ -30,29 +32,6 @@ afterEach(async () => {
 async function git(cwd: string, args: readonly string[]): Promise<string> {
   const { stdout } = await execFileAsync('git', [...args], { cwd, windowsHide: true });
   return stdout.trim();
-}
-
-async function fixture(): Promise<{
-  rootDir: string;
-  repo: string;
-  roots: Root[];
-  workspace: Workspace;
-}> {
-  const rootDir = await fs.mkdtemp(path.join(os.tmpdir(), 'clf-as3-worktree-'));
-  cleanup.push(rootDir);
-  const repo = path.join(rootDir, 'repo');
-  await fs.mkdir(repo, { recursive: true });
-  await git(repo, ['init']);
-  await fs.writeFile(path.join(repo, 'seed.txt'), 'seed\n', 'utf8');
-  await git(repo, ['add', 'seed.txt']);
-  await git(repo, ['-c', 'user.name=Chat On Steroids Test', '-c', 'user.email=test@example.invalid', 'commit', '-m', 'seed']);
-  initOrchestrationStore(path.join(rootDir, 'user-data'));
-  return {
-    rootDir,
-    repo,
-    roots: [{ name: 'project', path: rootDir }],
-    workspace: { virtual: '/project/repo', real: repo, at: Date.now() }
-  };
 }
 
 function task(taskId = 'T1'): TaskRecord {
@@ -77,10 +56,41 @@ function task(taskId = 'T1'): TaskRecord {
   };
 }
 
+async function fixture(): Promise<{
+  rootDir: string;
+  repo: string;
+  roots: Root[];
+  workspace: Workspace;
+  baselineEvents: number;
+}> {
+  const rootDir = await fs.mkdtemp(path.join(os.tmpdir(), 'clf-as3-worktree-'));
+  cleanup.push(rootDir);
+  const repo = path.join(rootDir, 'repo');
+  await fs.mkdir(repo, { recursive: true });
+  await git(repo, ['init']);
+  await fs.writeFile(path.join(repo, 'seed.txt'), 'seed\n', 'utf8');
+  await git(repo, ['add', 'seed.txt']);
+  await git(repo, ['-c', 'user.name=Chat On Steroids Test', '-c', 'user.email=test@example.invalid', 'commit', '-m', 'seed']);
+  initOrchestrationStore(path.join(rootDir, 'user-data'));
+  const planned = { ...task(), state: 'PLANNED' as const };
+  await appendOrchestrationEvents([
+    { eventId: 'run', runId: RUN_ID, time: 1, type: 'RUN_CREATED', actor: 'kernel', entityId: RUN_ID, payload: {} },
+    { eventId: 'task', runId: RUN_ID, time: 2, type: 'TASK_CREATED', actor: 'manager', entityId: 'T1', payload: { task: planned } },
+    { eventId: 'ready', runId: RUN_ID, time: 3, type: 'TASK_READY', actor: 'kernel', entityId: 'T1', payload: {} }
+  ]);
+  return {
+    rootDir,
+    repo,
+    roots: [{ name: 'project', path: rootDir }],
+    workspace: { virtual: '/project/repo', real: repo, at: Date.now() },
+    baselineEvents: 3
+  };
+}
+
 describe('V3 task worktrees', () => {
   it('creates a task worktree from the exact committed base and a dedicated branch', async () => {
     const f = await fixture();
-    const record = await ensureTaskWorktree({ roots: f.roots, primeWorkspace: f.workspace, runId: 'run-12345678', task: task() });
+    const record = await ensureTaskWorktree({ roots: f.roots, primeWorkspace: f.workspace, runId: RUN_ID, task: task() });
 
     expect(record.taskId).toBe('T1');
     expect(record.baseRevision).toMatch(/^[0-9a-f]{40}$/);
@@ -90,22 +100,23 @@ describe('V3 task worktrees', () => {
     expect(await git(record.realPath, ['branch', '--show-current'])).toBe(record.branch);
 
     const events = await readOrchestrationEvents();
-    expect(events.map((event) => event.type)).toEqual(['TASK_WORKTREE_INTENT', 'TASK_WORKTREE_READY']);
+    expect(events.slice(f.baselineEvents).map((event) => event.type)).toEqual(['TASK_WORKTREE_INTENT', 'TASK_WORKTREE_READY']);
   });
 
-  it('refuses a dirty source workspace before writing durable intent or creating a worktree', async () => {
+  it('refuses a dirty source workspace before writing durable worktree intent or creating a worktree', async () => {
     const f = await fixture();
     await fs.writeFile(path.join(f.repo, 'user-wip.txt'), 'uncommitted\n', 'utf8');
+    const before = await readOrchestrationEvents();
 
     await expect(
-      ensureTaskWorktree({ roots: f.roots, primeWorkspace: f.workspace, runId: 'run-12345678', task: task() })
+      ensureTaskWorktree({ roots: f.roots, primeWorkspace: f.workspace, runId: RUN_ID, task: task() })
     ).rejects.toThrow(/dirty|uncommitted/i);
-    expect(await readOrchestrationEvents()).toEqual([]);
+    expect(await readOrchestrationEvents()).toEqual(before);
   });
 
   it('reconciles an exact already-created path, branch, and revision after a simulated crash', async () => {
     const f = await fixture();
-    const context = { roots: f.roots, primeWorkspace: f.workspace, runId: 'run-12345678', task: task() };
+    const context = { roots: f.roots, primeWorkspace: f.workspace, runId: RUN_ID, task: task() };
     const plan = await planTaskWorktree(context);
 
     await fs.mkdir(path.dirname(plan.record.realPath), { recursive: true });
@@ -116,7 +127,7 @@ describe('V3 task worktrees', () => {
 
   it('calls a mismatched existing path ambiguous and never overwrites it', async () => {
     const f = await fixture();
-    const plan = await planTaskWorktree({ roots: f.roots, primeWorkspace: f.workspace, runId: 'run-12345678', task: task() });
+    const plan = await planTaskWorktree({ roots: f.roots, primeWorkspace: f.workspace, runId: RUN_ID, task: task() });
     await fs.mkdir(plan.record.realPath, { recursive: true });
     await fs.writeFile(path.join(plan.record.realPath, 'keep-me.txt'), 'user data\n', 'utf8');
 
