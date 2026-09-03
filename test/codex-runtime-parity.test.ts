@@ -263,7 +263,11 @@ describe('Codex unified exec runtime parity', () => {
       shellType: process.platform === 'win32' ? 'powershell' : 'bash',
       hookCommand: 'pipe exit-code parity child',
       processId,
-      yieldTimeMs: 250,
+      // This assertion is about preserving the completed child's exit code and both output
+      // streams, not about the 250 ms background-yield boundary. Under a loaded full suite,
+      // even an immediate Node child can legitimately still be alive at 250 ms; give it the
+      // same completion window used by the Windows encoding parity test below.
+      yieldTimeMs: 10_000,
       maxOutputTokens: undefined,
       truncationPolicy,
       cwd: process.cwd(),
