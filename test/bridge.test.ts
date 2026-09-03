@@ -32,6 +32,7 @@ const { initSecretsPath, resetSecretsCacheForTests, setSecret } = await import('
 const {
   bridgePort,
   bridgeStatus,
+  browserAgentTabTelemetry,
   cancelResume,
   commandUrl,
   pendingCommands,
@@ -165,7 +166,13 @@ interface Reply {
 function request(
   method: string,
   path: string,
-  options: { body?: unknown; origin?: string | null; auth?: string | null; raw?: string } = {}
+  options: {
+    body?: unknown;
+    origin?: string | null;
+    auth?: string | null;
+    raw?: string;
+    headers?: Record<string, string>;
+  } = {}
 ): Promise<Reply> {
   const url = new URL(path, base);
   const payload = options.raw ?? (options.body === undefined ? null : JSON.stringify(options.body));
@@ -175,6 +182,7 @@ function request(
   // only produce confusing downstream failures.
   headers['x-extension-version'] = APP_VERSION;
   headers['x-extension-protocol'] = String(BRIDGE_PROTOCOL);
+  Object.assign(headers, options.headers ?? {});
   if (payload !== null) {
     headers['content-type'] = 'application/json';
     headers['content-length'] = String(Buffer.byteLength(payload));
@@ -325,6 +333,90 @@ describe('who is allowed to talk to it', () => {
     expect(reply.body.compatible).toBe(true);
   });
 
+  it('retains exact agent-tab telemetry only from an authenticated compatible extension request', async () => {
+    await pair();
+    const observedAt = Date.now() - 25;
+    const telemetryHeaders = {
+      'x-agent-tab-budget': '5',
+      'x-agent-tabs-used': '3',
+      'x-agent-tabs-queued': '2',
+      'x-agent-tabs-observed-at': String(observedAt)
+    };
+
+    expect(browserAgentTabTelemetry()).toBeNull();
+    expect((await request('GET', '/status', { headers: telemetryHeaders })).status).toBe(200);
+    expect(browserAgentTabTelemetry()).toMatchObject({
+      budget: 5,
+      used: 3,
+      queued: 2,
+      observedAt
+    });
+    expect(browserAgentTabTelemetry()?.receivedAt).toEqual(expect.any(Number));
+  });
+
+  it('does not accept agent-tab telemetry before authentication', async () => {
+    const observedAt = Date.now();
+    const reply = await request('GET', '/status', {
+      auth: null,
+      headers: {
+        'x-agent-tab-budget': '5',
+        'x-agent-tabs-used': '2',
+        'x-agent-tabs-queued': '1',
+        'x-agent-tabs-observed-at': String(observedAt)
+      }
+    });
+
+    expect(reply.status).toBe(401);
+    expect(browserAgentTabTelemetry()).toBeNull();
+  });
+
+  it('keeps the last good agent-tab telemetry when later headers are partial, impossible, or protocol-incompatible', async () => {
+    await pair();
+    const goodObservedAt = Date.now() - 50;
+    const goodHeaders = {
+      'x-agent-tab-budget': '5',
+      'x-agent-tabs-used': '4',
+      'x-agent-tabs-queued': '3',
+      'x-agent-tabs-observed-at': String(goodObservedAt)
+    };
+    expect((await request('GET', '/status', { headers: goodHeaders })).status).toBe(200);
+    const good = browserAgentTabTelemetry();
+    expect(good).toMatchObject({ budget: 5, used: 4, queued: 3, observedAt: goodObservedAt });
+
+    expect(
+      (await request('GET', '/status', {
+        headers: {
+          'x-agent-tab-budget': '5',
+          'x-agent-tabs-used': '1',
+          'x-agent-tabs-observed-at': String(Date.now())
+        }
+      })).status
+    ).toBe(200);
+    expect(browserAgentTabTelemetry()).toEqual(good);
+
+    expect(
+      (await request('GET', '/status', {
+        headers: {
+          'x-agent-tab-budget': '5',
+          'x-agent-tabs-used': '6',
+          'x-agent-tabs-queued': '0',
+          'x-agent-tabs-observed-at': String(Date.now())
+        }
+      })).status
+    ).toBe(200);
+    expect(browserAgentTabTelemetry()).toEqual(good);
+
+    expect(
+      (await request('GET', '/status', {
+        headers: {
+          ...goodHeaders,
+          'x-extension-protocol': String(BRIDGE_PROTOCOL - 1)
+        }
+      })).status
+    ).toBe(426);
+    expect(browserAgentTabTelemetry()).toEqual(good);
+  });
+
   it('refuses every web page origin, chatgpt.com included', async () => {
     for (const origin of ['https://chatgpt.com', 'https://evil.example.com', 'http://localhost:3000', 'null']) {
       const reply = await request('GET', '/hello', { origin, auth: null });
@@ -345,6 +437,15 @@ describe('who is allowed to talk to it', () => {
     expect(reply.status).toBe(204);
     expect(reply.headers['access-control-allow-origin']).toBe(EXTENSION_ORIGIN);
     expect(reply.headers['access-control-allow-private-network']).toBe('true');
+    const allowed = String(reply.headers['access-control-allow-headers'] ?? '');
+    for (const header of [
+      'x-agent-tab-budget',
+      'x-agent-tabs-used',
+      'x-agent-tabs-queued',
+      'x-agent-tabs-observed-at'
+    ]) {
+      expect(allowed).toContain(header);
+    }
   });
 
   it('refuses a preflight that arrives without an Origin', async () => {

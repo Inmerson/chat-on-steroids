@@ -140,6 +140,17 @@ const STALE_SWARM_SWEEP_MS = 30_000;
 let observationWritesInFlight = 0;
 /** Requests allowed per rolling minute, across all routes. */
 const RATE_LIMIT = 900;
+const AGENT_TAB_BUDGET = 5;
+const MAX_AGENT_TAB_QUEUE = 400;
+const MAX_TELEMETRY_CLOCK_SKEW_MS = 60_000;
+
+export interface BrowserAgentTabTelemetry {
+  budget: 5;
+  used: number;
+  queued: number;
+  observedAt: number;
+  receivedAt: number;
+}
 
 /**
  * How long the app waits for the tab it opened to do the job, before failing it.
@@ -364,6 +375,7 @@ export interface BridgeCommand {
 let server: http.Server | null = null;
 let port: number | null = null;
 let lastSeenAt: number | null = null;
+let agentTabTelemetry: BrowserAgentTabTelemetry | null = null;
 let browserPresenceTimer: NodeJS.Timeout | null = null;
 let commands: Command[] = [];
 let commandReceipts: CommandReceipt[] = [];
@@ -403,6 +415,30 @@ export async function bridgeStatus(): Promise<BridgeStatus> {
     present: browserPresent(),
     lastSeenAt
   };
+}
+
+export function browserAgentTabTelemetry(): BrowserAgentTabTelemetry | null {
+  return agentTabTelemetry ? { ...agentTabTelemetry } : null;
+}
+
+function exactIntegerHeader(req: http.IncomingMessage, name: string): number | null {
+  const raw = req.headers[name];
+  if (typeof raw !== 'string' || !/^-?\d+$/.test(raw)) return null;
+  const value = Number(raw);
+  return Number.isSafeInteger(value) ? value : null;
+}
+
+function noteAgentTabTelemetry(req: http.IncomingMessage): void {
+  const budget = exactIntegerHeader(req, 'x-agent-tab-budget');
+  const used = exactIntegerHeader(req, 'x-agent-tabs-used');
+  const queued = exactIntegerHeader(req, 'x-agent-tabs-queued');
+  const observedAt = exactIntegerHeader(req, 'x-agent-tabs-observed-at');
+  if (budget === null && used === null && queued === null && observedAt === null) return;
+  if (budget !== AGENT_TAB_BUDGET) return;
+  if (used === null || used < 0 || used > AGENT_TAB_BUDGET) return;
+  if (queued === null || queued < 0 || queued > MAX_AGENT_TAB_QUEUE) return;
+  if (observedAt === null || observedAt <= 0 || observedAt > Date.now() + MAX_TELEMETRY_CLOCK_SKEW_MS) return;
+  agentTabTelemetry = { budget: AGENT_TAB_BUDGET, used, queued, observedAt, receivedAt: Date.now() };
 }
 
 /**
@@ -851,7 +887,8 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
     if (!origin) return json(res, 403, { error: 'forbidden_origin' }, null);
     res.writeHead(204, {
       'access-control-allow-origin': origin,
-      'access-control-allow-headers': 'authorization, content-type, x-extension-version, x-extension-protocol',
+      'access-control-allow-headers':
+        'authorization, content-type, x-extension-version, x-extension-protocol, x-agent-tab-budget, x-agent-tabs-used, x-agent-tabs-queued, x-agent-tabs-observed-at',
       'access-control-allow-methods': 'GET, POST, OPTIONS',
       // Chrome asks for this before letting an extension reach a loopback address.
       'access-control-allow-private-network': 'true',
@@ -940,6 +977,7 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
   // Charge only an authenticated extension. A random local process must not be able to
   // consume the browser's shared budget before failing origin/authentication.
   if (rateLimited()) return json(res, 429, { error: 'rate_limited' }, origin);
+  noteAgentTabTelemetry(req);
   if (noteBrowserSeen()) changed();
 
   if (route === '/status') {
@@ -2733,6 +2771,7 @@ export async function stopBridge(): Promise<void> {
     // A stopped listener cannot currently see the extension. Require one fresh authenticated
     // request after the next start rather than carrying a recent sighting across bridge lifetimes.
     lastSeenAt = null;
+    agentTabTelemetry = null;
     for (const command of commands) {
       if (command.timer) clearTimeout(command.timer);
       command.timer = null;
@@ -4116,6 +4155,7 @@ export function resetBridgeForTests(): void {
   sessionTokens.clear();
   openInBrowser = null;
   lastSeenAt = null;
+  agentTabTelemetry = null;
   extensionVersion = null;
   versionWarned = false;
   requestWindow = { start: Date.now(), count: 0 };
