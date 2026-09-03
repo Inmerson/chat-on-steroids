@@ -38,8 +38,8 @@ describe('extension release metadata', () => {
     expect(lock.version).toBe(APP_VERSION);
     expect(lock.packages?.['']?.version).toBe(APP_VERSION);
     expect(manifest.version).toBe(APP_VERSION);
-    expect(BRIDGE_PROTOCOL).toBe(8);
-    expect(backgroundSource).toContain('const BRIDGE_PROTOCOL = 8;');
+    expect(BRIDGE_PROTOCOL).toBe(9);
+    expect(backgroundSource).toContain('const BRIDGE_PROTOCOL = 9;');
   });
 
   /**
@@ -415,6 +415,8 @@ interface WorkerHarness {
   navigateTab(tabId: number, url: string): Promise<void>;
   /** Fires the extension install/update lifecycle event. */
   installed(reason?: string): Promise<void>;
+  /** Fires one Chrome storage.onChanged notification. */
+  storageChange(areaName: 'local' | 'session', changes: Record<string, { oldValue?: unknown; newValue?: unknown }>): Promise<void>;
   /** Registers the browser document that owns subsequent tab-scoped messages. */
   registerTab(tabId: number, documentId?: string): Promise<any>;
   /** Fires Chrome's tab-created lifecycle event, the way opening a link in a new tab does. */
@@ -458,6 +460,7 @@ function loadWorker(options: {
   const tabCreatedListeners: Array<(tab: { id?: number; url?: string; pendingUrl?: string }) => void> = [];
   const tabUpdatedListeners: Array<(tabId: number, changeInfo: { url?: string; status?: string }) => void> = [];
   const installedListeners: Array<(details: { reason: string }) => void> = [];
+  const storageListeners: Array<(changes: Record<string, { oldValue?: unknown; newValue?: unknown }>, areaName: string) => void> = [];
   const tabsCreate = vi.fn(async () => ({ id: 99 }));
   const tabsQuery = vi.fn(options.tabsQuery ?? (async () => []));
   const tabsUpdate = vi.fn(async (id: number) => ({ id, windowId: 7 }));
@@ -480,7 +483,15 @@ function loadWorker(options: {
   };
   const event = () => ({ addListener: () => undefined });
   const chrome = {
-    storage: { local: options.local, session: options.session },
+    storage: {
+      local: options.local,
+      session: options.session,
+      onChanged: {
+        addListener(fn: (changes: Record<string, { oldValue?: unknown; newValue?: unknown }>, areaName: string) => void) {
+          storageListeners.push(fn);
+        }
+      }
+    },
     runtime: {
       getManifest: () => ({ version: '1.6.0' }),
       onMessage: {
@@ -558,6 +569,17 @@ function loadWorker(options: {
     async installed(reason = 'update') {
       for (const fn of installedListeners) fn({ reason });
       await new Promise((resolve) => setTimeout(resolve, 0));
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    },
+    async storageChange(areaName, changes) {
+      const area = areaName === 'session' ? options.session : options.local;
+      const values = Object.fromEntries(
+        Object.entries(changes)
+          .filter(([, change]) => Object.prototype.hasOwnProperty.call(change, 'newValue'))
+          .map(([key, change]) => [key, change.newValue])
+      );
+      if (Object.keys(values).length > 0) await area.set(values);
+      for (const fn of storageListeners) fn(changes, areaName);
       await new Promise((resolve) => setTimeout(resolve, 0));
     },
     async createTab(tab: { id: number; url?: string; pendingUrl?: string }) {
@@ -2446,6 +2468,102 @@ describe('extension connection', () => {
     const hellos = server.calls.filter((url) => url.endsWith('/hello'));
     expect(hellos.length).toBeLessThanOrEqual(1);
     expect(server.calls.filter((url) => url.includes('/activity'))).toHaveLength(5);
+  });
+
+  it('piggybacks a valid agent-tab telemetry snapshot on authenticated bridge requests', async () => {
+    const observedAt = Date.now() - 25;
+    const session = new FakeStorageArea({
+      agentTabLeaseTelemetry: { budget: 5, used: 3, queued: 2, observedAt }
+    });
+    let activityHeaders: Record<string, string> | null = null;
+    const fetch = vi.fn(async (input: string, init: Record<string, unknown> = {}) => {
+      const url = new URL(input);
+      if (url.pathname === '/hello') return response(200, { app: 'chat-on-steroids', paired: true });
+      if (url.pathname === '/activity') {
+        activityHeaders = { ...(init.headers as Record<string, string>) };
+        return response(200, { ok: true });
+      }
+      return response(404, {});
+    });
+    const worker = loadWorker({
+      local: new FakeStorageArea({ port: 8765, token: 'paired-token' }),
+      session,
+      fetch
+    });
+    const conversationId = 'abababab-cdcd-efef-1212-343434343434';
+    await worker.registerTab(1);
+
+    await worker.send({ type: 'activity', conversationId, since: 0 });
+
+    expect(activityHeaders).toMatchObject({
+      'x-agent-tab-budget': '5',
+      'x-agent-tabs-used': '3',
+      'x-agent-tabs-queued': '2',
+      'x-agent-tabs-observed-at': String(observedAt)
+    });
+  });
+
+  it('omits the entire agent-tab telemetry header set when the stored snapshot is malformed', async () => {
+    const session = new FakeStorageArea({
+      agentTabLeaseTelemetry: { budget: 5, used: 6, queued: 2, observedAt: Date.now() }
+    });
+    let activityHeaders: Record<string, string> | null = null;
+    const fetch = vi.fn(async (input: string, init: Record<string, unknown> = {}) => {
+      const url = new URL(input);
+      if (url.pathname === '/hello') return response(200, { app: 'chat-on-steroids', paired: true });
+      if (url.pathname === '/activity') {
+        activityHeaders = { ...(init.headers as Record<string, string>) };
+        return response(200, { ok: true });
+      }
+      return response(404, {});
+    });
+    const worker = loadWorker({
+      local: new FakeStorageArea({ port: 8765, token: 'paired-token' }),
+      session,
+      fetch
+    });
+    const conversationId = 'abababab-cdcd-efef-1212-343434343434';
+    await worker.registerTab(1);
+
+    await worker.send({ type: 'activity', conversationId, since: 0 });
+
+    expect(activityHeaders).not.toBeNull();
+    for (const key of ['x-agent-tab-budget', 'x-agent-tabs-used', 'x-agent-tabs-queued', 'x-agent-tabs-observed-at']) {
+      expect(activityHeaders).not.toHaveProperty(key);
+    }
+  });
+
+  it('uses the newest valid session telemetry after chrome.storage.onChanged', async () => {
+    const firstObservedAt = Date.now() - 50;
+    const secondObservedAt = Date.now();
+    const first = { budget: 5, used: 1, queued: 0, observedAt: firstObservedAt };
+    const second = { budget: 5, used: 4, queued: 3, observedAt: secondObservedAt };
+    const session = new FakeStorageArea({ agentTabLeaseTelemetry: first });
+    const usedHeaders: string[] = [];
+    const fetch = vi.fn(async (input: string, init: Record<string, unknown> = {}) => {
+      const url = new URL(input);
+      if (url.pathname === '/hello') return response(200, { app: 'chat-on-steroids', paired: true });
+      if (url.pathname === '/activity') {
+        usedHeaders.push(String((init.headers as Record<string, string>)?.['x-agent-tabs-used'] ?? ''));
+        return response(200, { ok: true });
+      }
+      return response(404, {});
+    });
+    const worker = loadWorker({
+      local: new FakeStorageArea({ port: 8765, token: 'paired-token' }),
+      session,
+      fetch
+    });
+    const conversationId = 'abababab-cdcd-efef-1212-343434343434';
+    await worker.registerTab(1);
+    await worker.send({ type: 'activity', conversationId, since: 0 });
+
+    await worker.storageChange('session', {
+      agentTabLeaseTelemetry: { oldValue: first, newValue: second }
+    });
+    await worker.send({ type: 'activity', conversationId, since: 1 });
+
+    expect(usedHeaders).toEqual(['1', '4']);
   });
 
   it('stays disconnected once it has been disconnected', async () => {
