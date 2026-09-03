@@ -23,7 +23,7 @@ describe('Control Center graph layout', () => {
     { id: 'task-b', dependencies: ['task-a'] }
   ];
 
-  it('places agents in one left lane and tasks into dependency-depth bands deterministically', () => {
+  it('places agents in one left lane and wraps deep dependency bands into two non-overlapping task columns', () => {
     const first = computeControlCenterLayout({ agents, tasks } as any);
     const second = computeControlCenterLayout({
       agents: [...agents].reverse(),
@@ -39,8 +39,27 @@ describe('Control Center graph layout', () => {
     });
     expect(new Set(Object.values(first.agents).map((position) => position.x))).toEqual(new Set([24]));
     expect(first.tasks['task-a']!.x).toBeLessThan(first.tasks['task-b']!.x);
-    expect(first.tasks['task-b']!.x).toBeLessThan(first.tasks['task-c']!.x);
-    expect(first.tasks['task-c']!.x).toBeLessThan(first.tasks['task-d']!.x);
+    expect(first.tasks['task-c']!.x).toBe(first.tasks['task-a']!.x);
+    expect(first.tasks['task-d']!.x).toBe(first.tasks['task-b']!.x);
+    expect(first.tasks['task-c']!.y).toBeGreaterThan(first.tasks['task-a']!.y + 68);
+    expect(first.tasks['task-d']!.y).toBeGreaterThan(first.tasks['task-b']!.y + 68);
+    expect(first.width).toBeLessThan(800);
+  });
+
+  it('keeps multiple tasks in the same wrapped depth from overlapping the next depth group', () => {
+    const layout = computeControlCenterLayout({
+      agents: [],
+      tasks: [
+        { id: 'root-a', dependencies: [] },
+        { id: 'root-b', dependencies: [] },
+        { id: 'middle-a', dependencies: ['root-a'] },
+        { id: 'middle-b', dependencies: ['root-b'] },
+        { id: 'deep', dependencies: ['middle-a', 'middle-b'] }
+      ]
+    } as any);
+
+    expect(layout.tasks.deep!.x).toBe(layout.tasks['root-a']!.x);
+    expect(layout.tasks.deep!.y).toBeGreaterThan(layout.tasks['root-b']!.y + 68);
   });
 
   it('bounds malformed dependency cycles instead of hanging or inventing unbounded depth', () => {

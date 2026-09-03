@@ -15,6 +15,12 @@ export interface ControlCenterLayout {
   taskDepths: Record<string, number>;
 }
 
+const TASK_COLUMN_COUNT = 2;
+const TASK_COLUMN_START_X = 250;
+const TASK_COLUMN_STEP_X = 220;
+const TASK_ROW_STEP_Y = 96;
+const TASK_GROUP_GAP_Y = 28;
+
 type UnknownRecord = Record<string, unknown>;
 
 function record(value: unknown): UnknownRecord {
@@ -77,8 +83,9 @@ export function computeControlCenterLayout(input: {
 
   const taskDepths = Object.fromEntries([...depths].sort(([a], [b]) => a.localeCompare(b)));
   const maxDepth = Math.max(0, ...Object.values(taskDepths));
+  const visibleTaskColumns = Math.min(TASK_COLUMN_COUNT, maxDepth + 1);
   const positions: ControlCenterLayout = {
-    width: 250 + (maxDepth + 1) * 220,
+    width: TASK_COLUMN_START_X + visibleTaskColumns * TASK_COLUMN_STEP_X,
     height: 140,
     agents: {},
     tasks: {},
@@ -89,17 +96,41 @@ export function computeControlCenterLayout(input: {
     positions.agents[idOf(agent)] = { x: 24, y: 26 + index * 84 };
   });
 
+  const depthCounts = new Map<number, number>();
+  for (const task of tasks) {
+    const depth = taskDepths[idOf(task)] ?? 0;
+    depthCounts.set(depth, (depthCounts.get(depth) ?? 0) + 1);
+  }
+
+  const groupOffsets = new Map<number, number>();
+  let taskSpan = 0;
+  const lastGroup = Math.floor(maxDepth / TASK_COLUMN_COUNT);
+  for (let group = 0; group <= lastGroup; group += 1) {
+    groupOffsets.set(group, taskSpan);
+    const firstDepth = group * TASK_COLUMN_COUNT;
+    const rows = Math.max(
+      1,
+      ...Array.from({ length: TASK_COLUMN_COUNT }, (_, column) => depthCounts.get(firstDepth + column) ?? 0)
+    );
+    taskSpan += rows * TASK_ROW_STEP_Y;
+    if (group < lastGroup) taskSpan += TASK_GROUP_GAP_Y;
+  }
+
   const bandCounts = new Map<number, number>();
   for (const task of tasks) {
     const id = idOf(task);
     const depth = taskDepths[id] ?? 0;
     const row = bandCounts.get(depth) ?? 0;
     bandCounts.set(depth, row + 1);
-    positions.tasks[id] = { x: 250 + depth * 220, y: 26 + row * 96 };
+    const group = Math.floor(depth / TASK_COLUMN_COUNT);
+    const column = depth % TASK_COLUMN_COUNT;
+    positions.tasks[id] = {
+      x: TASK_COLUMN_START_X + column * TASK_COLUMN_STEP_X,
+      y: 26 + (groupOffsets.get(group) ?? 0) + row * TASK_ROW_STEP_Y
+    };
   }
 
-  const tallestTaskBand = Math.max(0, ...bandCounts.values());
-  positions.height = Math.max(140, 52 + agents.length * 84, 52 + tallestTaskBand * 96);
+  positions.height = Math.max(140, 52 + agents.length * 84, 52 + taskSpan);
   return positions;
 }
 
