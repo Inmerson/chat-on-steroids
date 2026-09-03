@@ -306,7 +306,29 @@ export function controlCenterEdgeEndpoints(value: unknown): [string, string] | n
   return from && to ? [from, to] : null;
 }
 
-function renderEdges(status: ControlCenterStatus, layout: ControlCenterLayout): void {
+export interface ControlCenterSelection {
+  kind: 'agent' | 'task';
+  id: string;
+}
+
+/** One-hop graph focus: the selected node plus only nodes joined to it by a rendered edge. */
+export function controlCenterConnectedNodeIds(status: unknown, selection: ControlCenterSelection | null): string[] {
+  if (!selection) return [];
+  const ids = new Set<string>([selection.id]);
+  const edges = Array.isArray(record(status).edges) ? (record(status).edges as unknown[]) : [];
+  for (const edge of edges) {
+    const endpoints = controlCenterEdgeEndpoints(edge);
+    if (!endpoints) continue;
+    const [fromId, toId] = endpoints;
+    if (fromId === selection.id || toId === selection.id) {
+      ids.add(fromId);
+      ids.add(toId);
+    }
+  }
+  return [...ids].sort((a, b) => a.localeCompare(b));
+}
+
+function renderEdges(status: ControlCenterStatus, layout: ControlCenterLayout, focusedIds: ReadonlySet<string>): void {
   const svg = document.getElementById('controlEdges') as unknown as SVGSVGElement;
   svg.replaceChildren();
   svg.setAttribute('viewBox', `0 0 ${layout.width} ${layout.height}`);
@@ -326,7 +348,10 @@ function renderEdges(status: ControlCenterStatus, layout: ControlCenterLayout): 
     const toY = to.y + 34;
     const bend = Math.max(32, (toX - fromX) / 2);
     path.setAttribute('d', `M ${fromX} ${fromY} C ${fromX + bend} ${fromY}, ${toX - bend} ${toY}, ${toX} ${toY}`);
-    path.setAttribute('class', `control-edge is-${edgeType(edge)}`);
+    const focusClass = focusedIds.size > 0 && selected
+      ? (fromId === selected.id || toId === selected.id ? ' is-related' : ' is-dimmed')
+      : '';
+    path.setAttribute('class', `control-edge is-${edgeType(edge)}${focusClass}`);
     svg.append(path);
   }
 }
@@ -340,11 +365,22 @@ function renderGraph(status: ControlCenterStatus): void {
   nodes.style.height = `${layout.height}px`;
   const byAgent = new Map(agents.map((agent) => [idOf(agent), agent]));
   const byTask = new Map(tasks.map((task) => [idOf(task), task]));
+  const nodeIds = new Set([...byAgent.keys(), ...byTask.keys()]);
+  const focusIds = selected && nodeIds.has(selected.id)
+    ? new Set(controlCenterConnectedNodeIds(status, selected))
+    : new Set<string>();
   nodes.replaceChildren(
     ...Object.entries(layout.agents).map(([id, point]) => nodeButton('agent', byAgent.get(id), point, layout)),
     ...Object.entries(layout.tasks).map(([id, point]) => nodeButton('task', byTask.get(id), point, layout))
   );
-  renderEdges(status, layout);
+  if (focusIds.size > 0) {
+    for (const button of nodes.querySelectorAll<HTMLButtonElement>('.control-node')) {
+      const id = button.dataset.nodeId ?? '';
+      button.classList.toggle('is-dimmed', !focusIds.has(id));
+      button.classList.toggle('is-related', focusIds.has(id) && id !== selected?.id);
+    }
+  }
+  renderEdges(status, layout, focusIds);
 
   const idle = $('controlEmpty');
   idle.hidden = statusRecord.run !== null && statusRecord.run !== undefined;

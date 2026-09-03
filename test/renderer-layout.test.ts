@@ -358,6 +358,10 @@ describe('the window as a whole', () => {
     expect(document.getElementById('controlGraph')).not.toBeNull();
     expect(document.getElementById('controlNodes')).not.toBeNull();
     expect(document.getElementById('controlEdges')?.tagName.toLowerCase()).toBe('svg');
+    expect(document.getElementById('controlLegend')).not.toBeNull();
+    expect(document.getElementById('controlLegend')?.textContent).toContain('Verified');
+    expect(document.getElementById('controlLegend')?.textContent).toContain('Active');
+    expect(document.getElementById('controlLegend')?.textContent).toContain('Blocked');
   });
 
   it('keeps stable inspector anchors beside the graph for selected agent/task detail', () => {

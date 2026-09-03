@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 
 import {
+  controlCenterConnectedNodeIds,
   controlCenterEdgeEndpoints,
   controlCenterNodeTone,
   controlCenterRunMetrics,
@@ -88,6 +89,26 @@ describe('Control Center graph layout', () => {
       'reviewer-1',
       'task-a'
     ]);
+  });
+
+  it('focuses only the selected node and its directly connected graph neighbours', () => {
+    const status = {
+      edges: [
+        { kind: 'dependency', fromTaskId: 'task-a', toTaskId: 'task-b' },
+        { kind: 'assignment', agentId: 'worker-1', taskId: 'task-b' },
+        { kind: 'review', agentId: 'reviewer-1', taskId: 'task-b' },
+        { kind: 'assignment', agentId: 'worker-2', taskId: 'task-c' }
+      ]
+    };
+
+    expect(controlCenterConnectedNodeIds(status, { kind: 'task', id: 'task-b' })).toEqual([
+      'reviewer-1',
+      'task-a',
+      'task-b',
+      'worker-1'
+    ]);
+    expect(controlCenterConnectedNodeIds(status, { kind: 'agent', id: 'worker-1' })).toEqual(['task-b', 'worker-1']);
+    expect(controlCenterConnectedNodeIds(status, null)).toEqual([]);
   });
 
   it('reads run progress and task ownership from the concrete projector wire contract', () => {
