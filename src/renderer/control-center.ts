@@ -311,6 +311,13 @@ export interface ControlCenterSelection {
   id: string;
 }
 
+export function nextControlCenterSelection(
+  current: ControlCenterSelection | null,
+  activated: ControlCenterSelection
+): ControlCenterSelection | null {
+  return current?.kind === activated.kind && current.id === activated.id ? null : activated;
+}
+
 /** One-hop graph focus: the selected node plus only nodes joined to it by a rendered edge. */
 export function controlCenterConnectedNodeIds(status: unknown, selection: ControlCenterSelection | null): string[] {
   if (!selection) return [];
@@ -328,7 +335,30 @@ export function controlCenterConnectedNodeIds(status: unknown, selection: Contro
   return [...ids].sort((a, b) => a.localeCompare(b));
 }
 
-function renderEdges(status: ControlCenterStatus, layout: ControlCenterLayout, focusedIds: ReadonlySet<string>): void {
+export function applyControlCenterGraphFocus(
+  root: ParentNode,
+  status: unknown,
+  selection: ControlCenterSelection | null
+): void {
+  const focusedIds = new Set(controlCenterConnectedNodeIds(status, selection));
+  const focusActive = focusedIds.size > 0;
+  for (const button of root.querySelectorAll<HTMLButtonElement>('.control-node')) {
+    const id = button.dataset.nodeId ?? '';
+    const isSelected = Boolean(selection && selection.kind === button.dataset.nodeKind && selection.id === id);
+    button.setAttribute('aria-pressed', isSelected ? 'true' : 'false');
+    button.classList.toggle('is-dimmed', focusActive && !focusedIds.has(id));
+    button.classList.toggle('is-related', focusActive && focusedIds.has(id) && !isSelected);
+  }
+  for (const edge of root.querySelectorAll<SVGPathElement>('.control-edge')) {
+    const fromId = edge.dataset.fromId ?? '';
+    const toId = edge.dataset.toId ?? '';
+    const isRelated = Boolean(selection && (fromId === selection.id || toId === selection.id));
+    edge.classList.toggle('is-related', focusActive && isRelated);
+    edge.classList.toggle('is-dimmed', focusActive && !isRelated);
+  }
+}
+
+function renderEdges(status: ControlCenterStatus, layout: ControlCenterLayout): void {
   const svg = document.getElementById('controlEdges') as unknown as SVGSVGElement;
   svg.replaceChildren();
   svg.setAttribute('viewBox', `0 0 ${layout.width} ${layout.height}`);
@@ -348,10 +378,9 @@ function renderEdges(status: ControlCenterStatus, layout: ControlCenterLayout, f
     const toY = to.y + 34;
     const bend = Math.max(32, (toX - fromX) / 2);
     path.setAttribute('d', `M ${fromX} ${fromY} C ${fromX + bend} ${fromY}, ${toX - bend} ${toY}, ${toX} ${toY}`);
-    const focusClass = focusedIds.size > 0 && selected
-      ? (fromId === selected.id || toId === selected.id ? ' is-related' : ' is-dimmed')
-      : '';
-    path.setAttribute('class', `control-edge is-${edgeType(edge)}${focusClass}`);
+    path.setAttribute('class', `control-edge is-${edgeType(edge)}`);
+    path.dataset.fromId = fromId;
+    path.dataset.toId = toId;
     svg.append(path);
   }
 }
@@ -366,21 +395,13 @@ function renderGraph(status: ControlCenterStatus): void {
   const byAgent = new Map(agents.map((agent) => [idOf(agent), agent]));
   const byTask = new Map(tasks.map((task) => [idOf(task), task]));
   const nodeIds = new Set([...byAgent.keys(), ...byTask.keys()]);
-  const focusIds = selected && nodeIds.has(selected.id)
-    ? new Set(controlCenterConnectedNodeIds(status, selected))
-    : new Set<string>();
+  if (selected && !nodeIds.has(selected.id)) selected = null;
   nodes.replaceChildren(
     ...Object.entries(layout.agents).map(([id, point]) => nodeButton('agent', byAgent.get(id), point, layout)),
     ...Object.entries(layout.tasks).map(([id, point]) => nodeButton('task', byTask.get(id), point, layout))
   );
-  if (focusIds.size > 0) {
-    for (const button of nodes.querySelectorAll<HTMLButtonElement>('.control-node')) {
-      const id = button.dataset.nodeId ?? '';
-      button.classList.toggle('is-dimmed', !focusIds.has(id));
-      button.classList.toggle('is-related', focusIds.has(id) && id !== selected?.id);
-    }
-  }
-  renderEdges(status, layout, focusIds);
+  renderEdges(status, layout);
+  applyControlCenterGraphFocus(document, status, selected);
 
   const idle = $('controlEmpty');
   idle.hidden = statusRecord.run !== null && statusRecord.run !== undefined;
@@ -518,11 +539,8 @@ function renderInspector(): void {
 }
 
 function selectNode(kind: 'agent' | 'task', id: string): void {
-  selected = { kind, id };
-  for (const button of document.querySelectorAll<HTMLButtonElement>('.control-node')) {
-    const isSelected = button.dataset.nodeKind === kind && button.dataset.nodeId === id;
-    button.setAttribute('aria-pressed', isSelected ? 'true' : 'false');
-  }
+  selected = nextControlCenterSelection(selected, { kind, id });
+  if (lastStatus) applyControlCenterGraphFocus(document, lastStatus, selected);
   renderInspector();
 }
 

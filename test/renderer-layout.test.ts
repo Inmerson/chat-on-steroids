@@ -21,16 +21,19 @@ import { beforeAll, describe, expect, it } from 'vitest';
 let document: Document;
 let css = '';
 let chatSource = '';
+let controlCenterSource = '';
 
 beforeAll(async () => {
-  const [html, styles, chat] = await Promise.all([
+  const [html, styles, chat, controlCenter] = await Promise.all([
     fs.readFile(path.join(process.cwd(), 'src', 'renderer', 'index.html'), 'utf8'),
     fs.readFile(path.join(process.cwd(), 'src', 'renderer', 'styles.css'), 'utf8'),
-    fs.readFile(path.join(process.cwd(), 'src', 'renderer', 'chat.ts'), 'utf8')
+    fs.readFile(path.join(process.cwd(), 'src', 'renderer', 'chat.ts'), 'utf8'),
+    fs.readFile(path.join(process.cwd(), 'src', 'renderer', 'control-center.ts'), 'utf8')
   ]);
   document = new JSDOM(html).window.document;
   css = styles;
   chatSource = chat;
+  controlCenterSource = controlCenter;
 });
 
 /** The declarations of one selector, whitespace-normalised. */
@@ -374,6 +377,15 @@ describe('the window as a whole', () => {
     expect(panel.contains(inspector)).toBe(true);
     expect(document.getElementById('controlInspectorTitle')).not.toBeNull();
     expect(document.getElementById('controlInspectorBody')).not.toBeNull();
+  });
+
+  it('applies graph focus in the selection handler instead of waiting for a polling repaint', () => {
+    const start = controlCenterSource.indexOf("function selectNode(kind: 'agent' | 'task', id: string): void {");
+    const end = controlCenterSource.indexOf('\n}', start);
+    expect(start).toBeGreaterThan(-1);
+    expect(end).toBeGreaterThan(start);
+    const body = controlCenterSource.slice(start, end);
+    expect(body).toContain('applyControlCenterGraphFocus(document, lastStatus, selected)');
   });
 
   it('keeps the Home activity strip shorter than the three setup/status cards', () => {
