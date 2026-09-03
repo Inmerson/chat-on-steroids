@@ -155,6 +155,7 @@ let visible = false;
 let poll: number | null = null;
 let selected: { kind: 'agent' | 'task'; id: string } | null = null;
 let activeFilter: ControlCenterFilter | null = null;
+let searchQuery = '';
 let lastStatus: ControlCenterStatus | null = null;
 
 function textList(value: unknown): string[] {
@@ -356,6 +357,61 @@ export function nextControlCenterFilter(
   return current === activated ? null : activated;
 }
 
+function normalizedSearchQuery(value: string): string {
+  return value.trim().toLocaleLowerCase();
+}
+
+function controlCenterSearchFields(kind: 'agent' | 'task', value: unknown): string[] {
+  const item = record(value);
+  return (kind === 'agent'
+    ? [idOf(value), stringValue(item.label)]
+    : [idOf(value), stringValue(item.title) ?? stringValue(item.name)])
+    .filter((entry): entry is string => Boolean(entry))
+    .map((entry) => entry.toLocaleLowerCase());
+}
+
+export function controlCenterSearchMatches(status: unknown, query: string): ControlCenterSelection[] {
+  const needle = normalizedSearchQuery(query);
+  if (!needle) return [];
+  const statusRecord = record(status);
+  const candidates: Array<{ selection: ControlCenterSelection; score: number }> = [];
+  for (const kind of ['agent', 'task'] as const) {
+    const list = kind === 'agent' ? statusRecord.agents : statusRecord.tasks;
+    if (!Array.isArray(list)) continue;
+    for (const value of list) {
+      const id = idOf(value);
+      if (!id) continue;
+      const fields = controlCenterSearchFields(kind, value);
+      if (!fields.some((field) => field.includes(needle))) continue;
+      const score = fields.some((field) => field === needle)
+        ? 0
+        : fields.some((field) => field.startsWith(needle))
+          ? 1
+          : 2;
+      candidates.push({ selection: { kind, id }, score });
+    }
+  }
+  return candidates
+    .sort((a, b) => a.score - b.score || a.selection.id.localeCompare(b.selection.id) || a.selection.kind.localeCompare(b.selection.kind))
+    .map(({ selection }) => selection);
+}
+
+export function controlCenterSearchNodeIds(status: unknown, query: string): string[] {
+  const matchIds = new Set(controlCenterSearchMatches(status, query).map((match) => match.id));
+  const ids = new Set(matchIds);
+  const edges = Array.isArray(record(status).edges) ? (record(status).edges as unknown[]) : [];
+  for (const edge of edges) {
+    const endpoints = controlCenterEdgeEndpoints(edge);
+    if (!endpoints) continue;
+    const [fromId, toId] = endpoints;
+    if (matchIds.has(fromId) || matchIds.has(toId)) {
+      ids.add(fromId);
+      ids.add(toId);
+    }
+  }
+  return [...ids].sort((a, b) => a.localeCompare(b));
+}
+
 function controlCenterTaskFilter(value: unknown): ControlCenterFilter {
   const task = record(value);
   if (textList(task.blockers).length > 0) return 'blocked';
@@ -453,6 +509,26 @@ export function applyControlCenterGraphFilter(
   }
 }
 
+export function applyControlCenterGraphSearch(root: ParentNode, status: unknown, query: string): void {
+  const needle = normalizedSearchQuery(query);
+  const matches = new Set(controlCenterSearchMatches(status, query).map((match) => match.id));
+  const focusedIds = new Set(controlCenterSearchNodeIds(status, query));
+  const searchActive = needle.length > 0;
+  for (const button of root.querySelectorAll<HTMLButtonElement>('.control-node')) {
+    const id = button.dataset.nodeId ?? '';
+    button.setAttribute('aria-pressed', 'false');
+    button.classList.toggle('is-dimmed', searchActive && !focusedIds.has(id));
+    button.classList.toggle('is-related', searchActive && focusedIds.has(id));
+  }
+  for (const edge of root.querySelectorAll<SVGPathElement>('.control-edge')) {
+    const fromId = edge.dataset.fromId ?? '';
+    const toId = edge.dataset.toId ?? '';
+    const isRelated = matches.has(fromId) || matches.has(toId);
+    edge.classList.toggle('is-related', searchActive && isRelated);
+    edge.classList.toggle('is-dimmed', searchActive && !isRelated);
+  }
+}
+
 function syncFilterControls(status: ControlCenterStatus): void {
   for (const button of document.querySelectorAll<HTMLButtonElement>('[data-control-filter]')) {
     const filter = button.dataset.controlFilter as ControlCenterFilter | undefined;
@@ -511,6 +587,7 @@ function renderGraph(status: ControlCenterStatus): void {
   );
   renderEdges(status, layout);
   if (selected) applyControlCenterGraphFocus(document, status, selected);
+  else if (normalizedSearchQuery(searchQuery)) applyControlCenterGraphSearch(document, status, searchQuery);
   else applyControlCenterGraphFilter(document, status, activeFilter);
 
   const idle = $('controlEmpty');
@@ -650,6 +727,9 @@ function renderInspector(): void {
 
 function selectNode(kind: 'agent' | 'task', id: string): void {
   activeFilter = null;
+  searchQuery = '';
+  const search = document.getElementById('controlSearch') as HTMLInputElement | null;
+  if (search) search.value = '';
   selected = nextControlCenterSelection(selected, { kind, id });
   if (lastStatus) {
     applyControlCenterGraphFocus(document, lastStatus, selected);
@@ -660,6 +740,9 @@ function selectNode(kind: 'agent' | 'task', id: string): void {
 
 function activateFilter(filter: ControlCenterFilter): void {
   selected = null;
+  searchQuery = '';
+  const search = document.getElementById('controlSearch') as HTMLInputElement | null;
+  if (search) search.value = '';
   activeFilter = nextControlCenterFilter(activeFilter, filter);
   if (lastStatus) {
     applyControlCenterGraphFilter(document, lastStatus, activeFilter);
@@ -701,6 +784,41 @@ function stopPoll(): void {
 export function initControlCenter(nextApi: AppApi): void {
   api = nextApi;
   $('controlRefresh').addEventListener('click', () => void refreshControlCenter());
+  $('controlSearch').addEventListener('input', (event) => {
+    const input = event.currentTarget as HTMLInputElement;
+    searchQuery = input.value;
+    selected = null;
+    activeFilter = null;
+    if (lastStatus) {
+      applyControlCenterGraphSearch(document, lastStatus, searchQuery);
+      syncFilterControls(lastStatus);
+    }
+    renderInspector();
+  });
+  $('controlSearch').addEventListener('keydown', (rawEvent) => {
+    const event = rawEvent as KeyboardEvent;
+    const input = event.currentTarget as HTMLInputElement;
+    if (event.key === 'Enter') {
+      if (!lastStatus) return;
+      const first = controlCenterSearchMatches(lastStatus, input.value)[0];
+      if (!first) return;
+      event.preventDefault();
+      selectNode(first.kind, first.id);
+      return;
+    }
+    if (event.key === 'Escape') {
+      event.preventDefault();
+      input.value = '';
+      searchQuery = '';
+      selected = null;
+      activeFilter = null;
+      if (lastStatus) {
+        applyControlCenterGraphSearch(document, lastStatus, '');
+        syncFilterControls(lastStatus);
+      }
+      renderInspector();
+    }
+  });
   for (const button of document.querySelectorAll<HTMLButtonElement>('#controlLegend [data-control-filter]')) {
     const filter = button.dataset.controlFilter as ControlCenterFilter | undefined;
     if (filter) button.addEventListener('click', () => activateFilter(filter));

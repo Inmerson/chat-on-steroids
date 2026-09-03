@@ -4,12 +4,15 @@ import { JSDOM } from 'jsdom';
 import {
   applyControlCenterGraphFilter,
   applyControlCenterGraphFocus,
+  applyControlCenterGraphSearch,
   controlCenterConnectedNodeIds,
   controlCenterEdgeEndpoints,
   controlCenterFilterNodeIds,
   controlCenterFilterTaskIds,
   controlCenterNodeTone,
   controlCenterRunMetrics,
+  controlCenterSearchMatches,
+  controlCenterSearchNodeIds,
   controlCenterTaskInspectorDetails,
   controlCenterTaskMeta,
   computeControlCenterLayout,
@@ -218,6 +221,86 @@ describe('Control Center graph layout', () => {
     expect(nextControlCenterFilter(null, 'blocked')).toBe('blocked');
     expect(nextControlCenterFilter('blocked', 'blocked')).toBeNull();
     expect(nextControlCenterFilter('blocked', 'verified')).toBe('verified');
+  });
+
+  it('finds agents and tasks by durable id or visible label/title without case sensitivity', () => {
+    const status = {
+      agents: [
+        { id: 'worker-2', label: 'Reviewer Alpha' },
+        { id: 'manager', label: 'Manager' }
+      ],
+      tasks: [
+        { id: 'task-control', title: 'Build Control Center projector' },
+        { id: 'task-render', title: 'Render agent canvas' }
+      ]
+    };
+
+    expect(controlCenterSearchMatches(status, ' CONTROL ')).toEqual([{ kind: 'task', id: 'task-control' }]);
+    expect(controlCenterSearchMatches(status, 'WORKER-2')).toEqual([{ kind: 'agent', id: 'worker-2' }]);
+    expect(controlCenterSearchMatches(status, 'reviewer alpha')).toEqual([{ kind: 'agent', id: 'worker-2' }]);
+    expect(controlCenterSearchMatches(status, '')).toEqual([]);
+  });
+
+  it('keeps direct graph context around search matches instead of hiding unrelated structure', () => {
+    const status = {
+      agents: [
+        { id: 'worker-1', label: 'Worker 1' },
+        { id: 'worker-2', label: 'Worker 2' }
+      ],
+      tasks: [
+        { id: 'task-a', title: 'Foundation' },
+        { id: 'task-b', title: 'Control Center projector' },
+        { id: 'task-c', title: 'Unrelated docs' }
+      ],
+      edges: [
+        { kind: 'dependency', fromTaskId: 'task-a', toTaskId: 'task-b' },
+        { kind: 'assignment', agentId: 'worker-2', taskId: 'task-b' },
+        { kind: 'assignment', agentId: 'worker-1', taskId: 'task-c' }
+      ]
+    };
+
+    expect(controlCenterSearchNodeIds(status, 'projector')).toEqual(['task-a', 'task-b', 'worker-2']);
+  });
+
+  it('applies search focus without marking any node as a selected inspector target', () => {
+    const dom = new JSDOM(`
+      <button class="control-node" data-node-kind="task" data-node-id="task-a" aria-pressed="true"></button>
+      <button class="control-node" data-node-kind="task" data-node-id="task-b" aria-pressed="false"></button>
+      <button class="control-node" data-node-kind="agent" data-node-id="worker-1" aria-pressed="false"></button>
+      <button class="control-node" data-node-kind="agent" data-node-id="worker-2" aria-pressed="false"></button>
+      <svg>
+        <path class="control-edge" data-from-id="task-a" data-to-id="task-b"></path>
+        <path class="control-edge" data-from-id="worker-2" data-to-id="task-b"></path>
+        <path class="control-edge" data-from-id="worker-1" data-to-id="task-c"></path>
+      </svg>
+    `);
+    const status = {
+      agents: [
+        { id: 'worker-1', label: 'Worker 1' },
+        { id: 'worker-2', label: 'Worker 2' }
+      ],
+      tasks: [
+        { id: 'task-a', title: 'Foundation' },
+        { id: 'task-b', title: 'Control Center projector' },
+        { id: 'task-c', title: 'Unrelated docs' }
+      ],
+      edges: [
+        { kind: 'dependency', fromTaskId: 'task-a', toTaskId: 'task-b' },
+        { kind: 'assignment', agentId: 'worker-2', taskId: 'task-b' },
+        { kind: 'assignment', agentId: 'worker-1', taskId: 'task-c' }
+      ]
+    };
+
+    applyControlCenterGraphSearch(dom.window.document, status, 'projector');
+
+    const taskB = dom.window.document.querySelector<HTMLElement>('[data-node-id="task-b"]')!;
+    const worker2 = dom.window.document.querySelector<HTMLElement>('[data-node-id="worker-2"]')!;
+    const worker1 = dom.window.document.querySelector<HTMLElement>('[data-node-id="worker-1"]')!;
+    expect(taskB.classList.contains('is-related')).toBe(true);
+    expect(worker2.classList.contains('is-related')).toBe(true);
+    expect(worker1.classList.contains('is-dimmed')).toBe(true);
+    expect(taskB.getAttribute('aria-pressed')).toBe('false');
+    expect(dom.window.document.querySelector<HTMLElement>('[data-node-id="task-a"]')!.getAttribute('aria-pressed')).toBe('false');
   });
 
   it('reads run progress and task ownership from the concrete projector wire contract', () => {

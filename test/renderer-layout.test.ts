@@ -367,6 +367,11 @@ describe('the window as a whole', () => {
     expect(document.getElementById('controlLegend')?.textContent).toContain('Blocked');
     expect(document.querySelectorAll('#controlLegend button[data-control-filter]')).toHaveLength(4);
     expect(document.querySelector('#controlLegend [data-control-filter="attention"]')).toBeNull();
+    const search = document.getElementById('controlSearch') as HTMLInputElement | null;
+    expect(search).not.toBeNull();
+    expect(search?.type).toBe('text');
+    expect(search?.getAttribute('role')).toBe('searchbox');
+    expect(search?.placeholder).toBe('Find agent or task…');
   });
 
   it('keeps stable inspector anchors beside the graph for selected agent/task detail', () => {
@@ -393,6 +398,13 @@ describe('the window as a whole', () => {
   it('makes blockers an honest read-only filter without inventing a Needs you action', () => {
     expect(controlCenterSource).toMatch(/addSummaryAction\(\s*'Blockers'/);
     expect(controlCenterSource).not.toMatch(/addSummaryAction\(\s*'Needs you'/);
+  });
+
+  it('wires Control search for incremental focus, Enter selection and Escape reset', () => {
+    expect(controlCenterSource).toContain("$('controlSearch').addEventListener('input'");
+    expect(controlCenterSource).toContain("$('controlSearch').addEventListener('keydown'");
+    expect(controlCenterSource).toContain("event.key === 'Enter'");
+    expect(controlCenterSource).toContain("event.key === 'Escape'");
   });
 
   it('keeps the Home activity strip shorter than the three setup/status cards', () => {

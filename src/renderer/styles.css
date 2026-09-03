@@ -380,6 +380,23 @@ main {
   color: var(--red);
 }
 
+.control-search {
+  width: clamp(120px, 18vw, 180px);
+  min-width: 0;
+  padding: 6px 9px;
+  border: 1px solid var(--line);
+  border-radius: var(--pill);
+  background: var(--wash);
+  color: var(--ink);
+  font: inherit;
+  font-size: 11px;
+}
+
+.control-search:focus {
+  outline: 1px solid var(--soft);
+  outline-offset: 1px;
+}
+
 .control-body {
   min-width: 0;
   min-height: 0;
