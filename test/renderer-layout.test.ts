@@ -365,6 +365,8 @@ describe('the window as a whole', () => {
     expect(document.getElementById('controlLegend')?.textContent).toContain('Verified');
     expect(document.getElementById('controlLegend')?.textContent).toContain('Active');
     expect(document.getElementById('controlLegend')?.textContent).toContain('Blocked');
+    expect(document.querySelectorAll('#controlLegend button[data-control-filter]')).toHaveLength(4);
+    expect(document.querySelector('#controlLegend [data-control-filter="attention"]')).toBeNull();
   });
 
   it('keeps stable inspector anchors beside the graph for selected agent/task detail', () => {
@@ -386,6 +388,11 @@ describe('the window as a whole', () => {
     expect(end).toBeGreaterThan(start);
     const body = controlCenterSource.slice(start, end);
     expect(body).toContain('applyControlCenterGraphFocus(document, lastStatus, selected)');
+  });
+
+  it('makes blockers an honest read-only filter without inventing a Needs you action', () => {
+    expect(controlCenterSource).toMatch(/addSummaryAction\(\s*'Blockers'/);
+    expect(controlCenterSource).not.toMatch(/addSummaryAction\(\s*'Needs you'/);
   });
 
   it('keeps the Home activity strip shorter than the three setup/status cards', () => {

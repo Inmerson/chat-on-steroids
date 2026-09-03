@@ -2,15 +2,19 @@ import { describe, expect, it } from 'vitest';
 import { JSDOM } from 'jsdom';
 
 import {
+  applyControlCenterGraphFilter,
   applyControlCenterGraphFocus,
   controlCenterConnectedNodeIds,
   controlCenterEdgeEndpoints,
+  controlCenterFilterNodeIds,
+  controlCenterFilterTaskIds,
   controlCenterNodeTone,
   controlCenterRunMetrics,
   controlCenterTaskInspectorDetails,
   controlCenterTaskMeta,
   computeControlCenterLayout,
   createControlCenterGenerationGate,
+  nextControlCenterFilter,
   nextControlCenterSelection
 } from '../src/renderer/control-center.js';
 
@@ -151,6 +155,69 @@ describe('Control Center graph layout', () => {
     const selected = { kind: 'task' as const, id: 'task-b' };
     expect(nextControlCenterSelection(selected, selected)).toBeNull();
     expect(nextControlCenterSelection(null, selected)).toEqual(selected);
+  });
+
+  it('groups task filters by observable state while treating explicit task blockers as blocked', () => {
+    const status = {
+      tasks: [
+        { id: 'task-v', state: 'VERIFIED', blockers: [] },
+        { id: 'task-a', state: 'ACTIVE', blockers: [] },
+        { id: 'task-b', state: 'INTEGRATED', blockers: ['Verification failed'] },
+        { id: 'task-n', state: 'READY', blockers: [] }
+      ],
+      edges: [
+        { kind: 'dependency', fromTaskId: 'task-a', toTaskId: 'task-b' },
+        { kind: 'assignment', agentId: 'worker-2', taskId: 'task-b' }
+      ]
+    };
+
+    expect(controlCenterFilterTaskIds(status, 'verified')).toEqual(['task-v']);
+    expect(controlCenterFilterTaskIds(status, 'active')).toEqual(['task-a']);
+    expect(controlCenterFilterTaskIds(status, 'blocked')).toEqual(['task-b']);
+    expect(controlCenterFilterTaskIds(status, 'neutral')).toEqual(['task-n']);
+    expect(controlCenterFilterNodeIds(status, 'blocked')).toEqual(['task-a', 'task-b', 'worker-2']);
+  });
+
+  it('applies a task-state filter to the existing graph without pretending it is a node selection', () => {
+    const dom = new JSDOM(`
+      <button class="control-node" data-node-kind="task" data-node-id="task-a" aria-pressed="false"></button>
+      <button class="control-node" data-node-kind="task" data-node-id="task-b" aria-pressed="false"></button>
+      <button class="control-node" data-node-kind="agent" data-node-id="worker-1" aria-pressed="false"></button>
+      <button class="control-node" data-node-kind="agent" data-node-id="worker-2" aria-pressed="false"></button>
+      <svg>
+        <path class="control-edge" data-from-id="worker-1" data-to-id="task-a"></path>
+        <path class="control-edge" data-from-id="worker-2" data-to-id="task-b"></path>
+      </svg>
+    `);
+    const status = {
+      tasks: [
+        { id: 'task-a', state: 'ACTIVE', blockers: [] },
+        { id: 'task-b', state: 'INTEGRATED', blockers: ['Verification failed'] }
+      ],
+      edges: [
+        { kind: 'assignment', agentId: 'worker-1', taskId: 'task-a' },
+        { kind: 'assignment', agentId: 'worker-2', taskId: 'task-b' }
+      ]
+    };
+
+    applyControlCenterGraphFilter(dom.window.document, status, 'blocked');
+
+    const taskA = dom.window.document.querySelector<HTMLElement>('[data-node-id="task-a"]')!;
+    const taskB = dom.window.document.querySelector<HTMLElement>('[data-node-id="task-b"]')!;
+    const worker2 = dom.window.document.querySelector<HTMLElement>('[data-node-id="worker-2"]')!;
+    const edges = [...dom.window.document.querySelectorAll<HTMLElement>('.control-edge')];
+    expect(taskA.classList.contains('is-dimmed')).toBe(true);
+    expect(taskB.classList.contains('is-related')).toBe(true);
+    expect(worker2.classList.contains('is-related')).toBe(true);
+    expect(taskB.getAttribute('aria-pressed')).toBe('false');
+    expect(edges[0]!.classList.contains('is-dimmed')).toBe(true);
+    expect(edges[1]!.classList.contains('is-related')).toBe(true);
+  });
+
+  it('toggles the same task-state filter off without manufacturing an attention filter', () => {
+    expect(nextControlCenterFilter(null, 'blocked')).toBe('blocked');
+    expect(nextControlCenterFilter('blocked', 'blocked')).toBeNull();
+    expect(nextControlCenterFilter('blocked', 'verified')).toBe('verified');
   });
 
   it('reads run progress and task ownership from the concrete projector wire contract', () => {

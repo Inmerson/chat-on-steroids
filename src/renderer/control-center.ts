@@ -154,6 +154,7 @@ let api: AppApi | null = null;
 let visible = false;
 let poll: number | null = null;
 let selected: { kind: 'agent' | 'task'; id: string } | null = null;
+let activeFilter: ControlCenterFilter | null = null;
 let lastStatus: ControlCenterStatus | null = null;
 
 function textList(value: unknown): string[] {
@@ -168,6 +169,26 @@ function addSummary(label: string, value: string, tone = '', title = ''): HTMLEl
   const item = el('div', `control-summary-item${tone ? ` ${tone}` : ''}`);
   if (title) item.title = title;
   item.append(el('span', '', label), el('b', '', value));
+  return item;
+}
+
+function addSummaryAction(
+  label: string,
+  value: string,
+  filter: ControlCenterFilter,
+  tone = '',
+  title = '',
+  enabled = true
+): HTMLButtonElement {
+  const item = document.createElement('button');
+  item.type = 'button';
+  item.className = `control-summary-item control-summary-action${tone ? ` ${tone}` : ''}`;
+  item.dataset.controlFilter = filter;
+  item.setAttribute('aria-pressed', activeFilter === filter ? 'true' : 'false');
+  item.disabled = !enabled;
+  if (title) item.title = title;
+  item.append(el('span', '', label), el('b', '', value));
+  item.addEventListener('click', () => activateFilter(filter));
   return item;
 }
 
@@ -215,12 +236,20 @@ export function controlCenterRunMetrics(status: unknown): ControlCenterRunMetric
 
 function renderSummary(status: ControlCenterStatus): void {
   const metrics = controlCenterRunMetrics(status);
+  const blockedTaskCount = controlCenterFilterTaskIds(status, 'blocked').length;
 
   $('controlSummary').replaceChildren(
     addSummary('Run', metrics.health, metrics.health === 'blocked' || metrics.health === 'failed' ? 'is-bad' : metrics.health === 'verified' ? 'is-good' : ''),
     addSummary('Verified', `${metrics.verified} / ${metrics.total}`),
     addSummary('Active agents', String(metrics.activeAgents)),
-    addSummary('Blockers', String(metrics.blockers), metrics.blockers ? 'is-bad' : ''),
+    addSummaryAction(
+      'Blockers',
+      String(metrics.blockers),
+      'blocked',
+      metrics.blockers ? 'is-bad' : '',
+      metrics.blockers > 0 && blockedTaskCount === 0 ? 'The current blocker is global and has no task node to focus.' : '',
+      blockedTaskCount > 0
+    ),
     addSummary('Needs you', String(metrics.attention), metrics.attention ? 'is-bad' : ''),
     addSummary('Browser agents', metrics.browser, '', metrics.browserNote)
   );
@@ -311,11 +340,54 @@ export interface ControlCenterSelection {
   id: string;
 }
 
+export type ControlCenterFilter = 'verified' | 'active' | 'blocked' | 'neutral';
+
 export function nextControlCenterSelection(
   current: ControlCenterSelection | null,
   activated: ControlCenterSelection
 ): ControlCenterSelection | null {
   return current?.kind === activated.kind && current.id === activated.id ? null : activated;
+}
+
+export function nextControlCenterFilter(
+  current: ControlCenterFilter | null,
+  activated: ControlCenterFilter
+): ControlCenterFilter | null {
+  return current === activated ? null : activated;
+}
+
+function controlCenterTaskFilter(value: unknown): ControlCenterFilter {
+  const task = record(value);
+  if (textList(task.blockers).length > 0) return 'blocked';
+  const tone = controlCenterNodeTone(stringValue(task.state));
+  if (tone.includes('is-good')) return 'verified';
+  if (tone.includes('is-bad')) return 'blocked';
+  if (tone.includes('is-active')) return 'active';
+  return 'neutral';
+}
+
+export function controlCenterFilterTaskIds(status: unknown, filter: ControlCenterFilter): string[] {
+  const tasks = Array.isArray(record(status).tasks) ? (record(status).tasks as unknown[]) : [];
+  return tasks
+    .filter((task) => idOf(task) && controlCenterTaskFilter(task) === filter)
+    .map(idOf)
+    .sort((a, b) => a.localeCompare(b));
+}
+
+export function controlCenterFilterNodeIds(status: unknown, filter: ControlCenterFilter): string[] {
+  const taskIds = new Set(controlCenterFilterTaskIds(status, filter));
+  const ids = new Set(taskIds);
+  const edges = Array.isArray(record(status).edges) ? (record(status).edges as unknown[]) : [];
+  for (const edge of edges) {
+    const endpoints = controlCenterEdgeEndpoints(edge);
+    if (!endpoints) continue;
+    const [fromId, toId] = endpoints;
+    if (taskIds.has(fromId) || taskIds.has(toId)) {
+      ids.add(fromId);
+      ids.add(toId);
+    }
+  }
+  return [...ids].sort((a, b) => a.localeCompare(b));
 }
 
 /** One-hop graph focus: the selected node plus only nodes joined to it by a rendered edge. */
@@ -355,6 +427,43 @@ export function applyControlCenterGraphFocus(
     const isRelated = Boolean(selection && (fromId === selection.id || toId === selection.id));
     edge.classList.toggle('is-related', focusActive && isRelated);
     edge.classList.toggle('is-dimmed', focusActive && !isRelated);
+  }
+}
+
+export function applyControlCenterGraphFilter(
+  root: ParentNode,
+  status: unknown,
+  filter: ControlCenterFilter | null
+): void {
+  const taskIds = filter ? new Set(controlCenterFilterTaskIds(status, filter)) : new Set<string>();
+  const focusedIds = filter ? new Set(controlCenterFilterNodeIds(status, filter)) : new Set<string>();
+  const filterActive = taskIds.size > 0;
+  for (const button of root.querySelectorAll<HTMLButtonElement>('.control-node')) {
+    const id = button.dataset.nodeId ?? '';
+    button.setAttribute('aria-pressed', 'false');
+    button.classList.toggle('is-dimmed', filterActive && !focusedIds.has(id));
+    button.classList.toggle('is-related', filterActive && focusedIds.has(id));
+  }
+  for (const edge of root.querySelectorAll<SVGPathElement>('.control-edge')) {
+    const fromId = edge.dataset.fromId ?? '';
+    const toId = edge.dataset.toId ?? '';
+    const isRelated = taskIds.has(fromId) || taskIds.has(toId);
+    edge.classList.toggle('is-related', filterActive && isRelated);
+    edge.classList.toggle('is-dimmed', filterActive && !isRelated);
+  }
+}
+
+function syncFilterControls(status: ControlCenterStatus): void {
+  for (const button of document.querySelectorAll<HTMLButtonElement>('[data-control-filter]')) {
+    const filter = button.dataset.controlFilter as ControlCenterFilter | undefined;
+    if (!filter) continue;
+    const count = controlCenterFilterTaskIds(status, filter).length;
+    button.setAttribute('aria-pressed', activeFilter === filter ? 'true' : 'false');
+    if (button.closest('#controlLegend')) {
+      button.disabled = count === 0;
+      const counter = button.querySelector<HTMLElement>('.control-filter-count');
+      if (counter) counter.textContent = String(count);
+    }
   }
 }
 
@@ -401,7 +510,8 @@ function renderGraph(status: ControlCenterStatus): void {
     ...Object.entries(layout.tasks).map(([id, point]) => nodeButton('task', byTask.get(id), point, layout))
   );
   renderEdges(status, layout);
-  applyControlCenterGraphFocus(document, status, selected);
+  if (selected) applyControlCenterGraphFocus(document, status, selected);
+  else applyControlCenterGraphFilter(document, status, activeFilter);
 
   const idle = $('controlEmpty');
   idle.hidden = statusRecord.run !== null && statusRecord.run !== undefined;
@@ -539,15 +649,31 @@ function renderInspector(): void {
 }
 
 function selectNode(kind: 'agent' | 'task', id: string): void {
+  activeFilter = null;
   selected = nextControlCenterSelection(selected, { kind, id });
-  if (lastStatus) applyControlCenterGraphFocus(document, lastStatus, selected);
+  if (lastStatus) {
+    applyControlCenterGraphFocus(document, lastStatus, selected);
+    syncFilterControls(lastStatus);
+  }
+  renderInspector();
+}
+
+function activateFilter(filter: ControlCenterFilter): void {
+  selected = null;
+  activeFilter = nextControlCenterFilter(activeFilter, filter);
+  if (lastStatus) {
+    applyControlCenterGraphFilter(document, lastStatus, activeFilter);
+    syncFilterControls(lastStatus);
+  }
   renderInspector();
 }
 
 function paint(status: ControlCenterStatus): void {
   lastStatus = status;
+  if (activeFilter && controlCenterFilterTaskIds(status, activeFilter).length === 0) activeFilter = null;
   renderSummary(status);
   renderGraph(status);
+  syncFilterControls(status);
   renderInspector();
   const observedAt = numberValue(record(status).observedAt);
   $('controlObserved').textContent = observedAt === null ? '' : `Observed ${new Date(observedAt).toLocaleTimeString()}`;
@@ -575,6 +701,10 @@ function stopPoll(): void {
 export function initControlCenter(nextApi: AppApi): void {
   api = nextApi;
   $('controlRefresh').addEventListener('click', () => void refreshControlCenter());
+  for (const button of document.querySelectorAll<HTMLButtonElement>('#controlLegend [data-control-filter]')) {
+    const filter = button.dataset.controlFilter as ControlCenterFilter | undefined;
+    if (filter) button.addEventListener('click', () => activateFilter(filter));
+  }
   api.onSwarmChanged(() => {
     if (visible) void refreshControlCenter();
   });

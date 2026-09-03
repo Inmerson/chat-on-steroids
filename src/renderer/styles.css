@@ -332,6 +332,23 @@ main {
   background: var(--card);
 }
 
+.control-summary-action {
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.control-summary-action:hover:not(:disabled),
+.control-summary-action[aria-pressed='true'] {
+  border-color: var(--soft);
+  background: var(--hover);
+}
+
+.control-summary-action:disabled {
+  cursor: default;
+}
+
 .control-summary-item span,
 .control-summary-item b {
   display: block;
@@ -549,7 +566,34 @@ main {
   font-size: 10px;
 }
 
-.control-legend span::before {
+.control-legend button {
+  border: 0;
+  border-radius: var(--pill);
+  padding: 3px 6px;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  cursor: pointer;
+}
+
+.control-legend button:hover:not(:disabled),
+.control-legend button[aria-pressed='true'] {
+  background: var(--hover);
+  color: var(--ink);
+}
+
+.control-legend button:disabled {
+  opacity: 0.42;
+  cursor: default;
+}
+
+.control-filter-count {
+  margin-left: 2px;
+  font-weight: 650;
+  font-variant-numeric: tabular-nums;
+}
+
+.control-legend button::before {
   content: '';
   display: inline-block;
   width: 7px;
@@ -560,17 +604,17 @@ main {
   vertical-align: 0;
 }
 
-.control-legend .is-good::before {
+.control-legend button.is-good::before {
   border-color: var(--green-line);
   background: var(--green-wash);
 }
 
-.control-legend .is-active::before {
+.control-legend button.is-active::before {
   border-color: var(--soft);
   background: var(--wash);
 }
 
-.control-legend .is-bad::before {
+.control-legend button.is-bad::before {
   border-color: var(--red-line);
   background: var(--red-wash);
 }
