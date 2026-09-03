@@ -57,6 +57,7 @@
         <g id="i-chat">
           <path d="M4 5.5h16a1 1 0 0 1 1 1v8.5a1 1 0 0 1-1 1h-8.5L7 19.5V16H4a1 1 0 0 1-1-1V6.5a1 1 0 0 1 1-1Z" />
         </g>
+        <g id="i-control"><circle cx="6" cy="12" r="2.5" /><circle cx="18" cy="6" r="2.5" /><circle cx="18" cy="18" r="2.5" /><path d="M8.3 10.9 15.6 7.1M8.3 13.1l7.3 3.8" /></g>
         <g id="i-search"><circle cx="11" cy="11" r="6" /><path d="M15.4 15.4 20 20" /></g>
         <g id="i-gear">
           <circle cx="12" cy="12" r="3" />
@@ -657,6 +658,36 @@
           </section>
         </section>
 
+        <!-- ========================================================= Control -->
+        <section class="panel" data-panel="control">
+          <div class="control-summary" id="controlSummary" aria-label="Run summary"></div>
+          <div class="control-body">
+            <section class="card control-canvas-card">
+              <h2>
+                <span>Agent system</span>
+                <span class="acts">
+                  <span class="control-observed" id="controlObserved"></span>
+                  <button class="btn" id="controlRefresh" type="button">
+                    <svg class="ico" viewBox="0 0 24 24"><use href="#i-pulse" /></svg>Refresh
+                  </button>
+                </span>
+              </h2>
+              <div class="control-canvas-scroll" id="controlGraph">
+                <p class="control-degraded" id="controlDegraded" hidden></p>
+                <p class="empty control-empty" id="controlEmpty">No Agent System 3.0 run is active.</p>
+                <div class="control-canvas-stage">
+                  <svg id="controlEdges" class="control-edges" aria-hidden="true" preserveAspectRatio="none"></svg>
+                  <div id="controlNodes" class="control-nodes"></div>
+                </div>
+              </div>
+            </section>
+            <aside class="card control-inspector" id="controlInspector">
+              <h2><span id="controlInspectorTitle">Inspector</span></h2>
+              <div class="scroll control-inspector-body" id="controlInspectorBody"></div>
+            </aside>
+          </div>
+        </section>
+
         <!-- ======================================================== Activity -->
         <section class="panel" data-panel="activity">
           <section class="card">
@@ -694,6 +725,9 @@
         </button>
         <button data-tab="chat" type="button">
           <svg class="ico" viewBox="0 0 24 24"><use href="#i-chat" /></svg>Chat
+        </button>
+        <button data-tab="control" type="button">
+          <svg class="ico" viewBox="0 0 24 24"><use href="#i-control" /></svg>Control
         </button>
         <button data-tab="activity" type="button">
           <svg class="ico" viewBox="0 0 24 24"><use href="#i-pulse" /></svg>Activity

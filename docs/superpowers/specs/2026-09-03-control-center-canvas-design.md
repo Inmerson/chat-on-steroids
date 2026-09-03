@@ -32,10 +32,11 @@ The renderer must not reconstruct orchestration truth from chat text or Activity
 
 1. `recoverOrchestrationState()` — run, Manager, tasks, assignments, worktrees;
 2. `workflowStateForRun()` — completion packages, reviews, integration, verification, System Review;
-3. `swarmState()` — current broker-visible agents and liveness;
+3. durable Manager authority → owner Prime → `swarmStateForCaller()` — broker-visible agents and liveness scoped to the exact Prime history that owns this orchestration run;
 4. no browser guesses.
 
 No native filesystem path is sent to the renderer. Worktree data is reduced to id, branch, and virtual path.
+Known native task/integration worktree spellings are also scrubbed from runtime error/findings text at the final projection boundary.
 
 ## Renderer wire contract
 

@@ -24,6 +24,7 @@ const { initDurableStore, readDurable, resetDurableForTests } = await import('..
 const {
   assignManagerForPrime,
   managerForCaller,
+  managerRuntimeForRun,
   resetManagerAuthorityForTests
 } = await import('../src/main/orchestration/manager-authority.js');
 const { makeTempDir, removeTempDir } = await import('./helpers.js');
@@ -129,5 +130,17 @@ describe('broker-anchored Agent System 3.0 Manager authority', () => {
 
     expect(await readDurable('manager-authority')).toEqual(before);
     expect((await assignManagerForPrime(prime, managerId)).runId).toBe(first.runId);
+  });
+
+  it('resolves the durable owner Prime for an orchestration run without adopting the currently active broker', async () => {
+    const { managerId } = startRun();
+    const assigned = await assignManagerForPrime(prime, managerId);
+
+    await expect(managerRuntimeForRun(assigned.runId)).resolves.toEqual({
+      runId: assigned.runId,
+      agentId: managerId,
+      ownerPrimeConversationId: PRIME_CHAT
+    });
+    await expect(managerRuntimeForRun('run-that-does-not-exist')).resolves.toBeNull();
   });
 });

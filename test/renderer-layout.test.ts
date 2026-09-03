@@ -347,6 +347,31 @@ describe('the session timeline', () => {
 });
 
 describe('the window as a whole', () => {
+  it('exposes Control as a normal fifth destination with one bounded canvas panel', () => {
+    const controlTab = document.querySelector<HTMLButtonElement>('nav button[data-tab="control"]');
+    const controlPanel = document.querySelector<HTMLElement>('.panel[data-panel="control"]');
+    expect(controlTab).not.toBeNull();
+    expect(controlTab?.textContent).toContain('Control');
+    expect(controlPanel).not.toBeNull();
+    expect(document.querySelectorAll('.panel[data-panel="control"]')).toHaveLength(1);
+    expect(document.getElementById('controlSummary')).not.toBeNull();
+    expect(document.getElementById('controlGraph')).not.toBeNull();
+    expect(document.getElementById('controlNodes')).not.toBeNull();
+    expect(document.getElementById('controlEdges')?.tagName.toLowerCase()).toBe('svg');
+  });
+
+  it('keeps stable inspector anchors beside the graph for selected agent/task detail', () => {
+    const panel = document.querySelector<HTMLElement>('.panel[data-panel="control"]')!;
+    const graph = document.getElementById('controlGraph');
+    const inspector = document.getElementById('controlInspector');
+    expect(graph).not.toBeNull();
+    expect(inspector).not.toBeNull();
+    expect(panel.contains(graph)).toBe(true);
+    expect(panel.contains(inspector)).toBe(true);
+    expect(document.getElementById('controlInspectorTitle')).not.toBeNull();
+    expect(document.getElementById('controlInspectorBody')).not.toBeNull();
+  });
+
   it('keeps the Home activity strip shorter than the three setup/status cards', () => {
     expect(rule("[data-panel='home']")).toContain('grid-template-rows: 300px minmax(0, 1fr)');
   });
@@ -370,6 +395,8 @@ describe('the window as a whole', () => {
     expect(css).not.toMatch(/overflow:\s*(auto|scroll)\s+/);
     // The one scrolling surface in the app is vertical only.
     expect(rule('.scroll')).toContain('overflow: hidden auto');
+    expect(rule("[data-panel='control']")).not.toContain('overflow-x: auto');
+    expect(rule('.control-canvas-scroll')).toContain('overflow: hidden auto');
   });
 
   it('keeps setup and settings vertically reachable when the window is short', () => {

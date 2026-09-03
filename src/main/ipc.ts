@@ -52,6 +52,7 @@ import {
 import { tokenPressure } from '../shared/session.js';
 import { forgetWorkspaceRoot, renameWorkspaceRoot } from './workspace.js';
 import { hostPlatformInfo } from './platform.js';
+import { controlCenterStatus } from './orchestration/control-center.js';
 
 /** The only URLs the renderer may ask the OS to open. */
 const ALLOWED_LINKS = new Set([
@@ -591,6 +592,12 @@ export function registerIpc(getWindow: () => BrowserWindow | null): void {
   });
 
   handle('bridge:extensionPath', async () => extensionDir());
+
+  // -------------------------------------------------------- Control Center
+
+  // Read-only, input-free projection of already-authoritative orchestration/broker state.
+  // The renderer never receives native worktree paths and gains no mutation primitive here.
+  handle('control-center:get', async () => controlCenterStatus());
 
   // ----------------------------------------------------------------- swarm
 

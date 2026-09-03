@@ -226,6 +226,7 @@ src/main/session/handoff-prompt.ts  the brief injected into the old chat
 src/main/session/summarize.ts human-readable activity summaries
 src/shared/chronology.ts      timeline ordering and folding
 src/shared/session.ts         session/activity/swarm wire types
+src/shared/control-center.ts Control Center read-only Agent System 3.0 wire projection
 src/shared/goal.ts            Goal prompts (continuation + specific goal) and their bounds
 src/shared/types.ts           config/app/IPC types and Capabilities
 
@@ -233,6 +234,7 @@ src/shared/types.ts           config/app/IPC types and Capabilities
 src/main/bridge.ts            extension HTTP bridge + compaction/worker orchestration
 src/main/goal.ts              the goal loop: OpenRouter request, context, one draft per turn
 src/main/agents.ts            the one global star-topology multi-agent broker
+src/main/orchestration/*      Agent System 3.0 task DAG, Manager authority, worktrees, review/integration/verification
 extension/chatgpt-dom.js      EVERY ChatGPT selector and DOM-shape assumption
 extension/content.js          page recorder, turn lifecycle, Overwrite, compact UI
 extension/fiber.js            MAIN-world React/Fiber evidence reader (least trusted)
@@ -242,6 +244,7 @@ extension/popup.*             status/reconnect UI
 ── other ──────────────────────────────────────────────────────────────────
 src/renderer/main.ts          setup/settings/connection/activity UI
 src/renderer/chat.ts          session timeline, handoff, swarm UI
+src/renderer/control-center.ts read-only Agent System 3.0 graph/inspector with stale-refresh generations
 src/main/computer/*           screenshots, UI Automation, SendInput/clipboard helper
 src/main/tunnel/*             index.ts lifecycle · health.ts metrics · locate.ts binaries
 test/*.test.ts                49 suites, named for the subsystem they cover
@@ -725,7 +728,12 @@ A retained live regression shows four consecutive prime turns ending `interrupte
 that said work was unfinished, none of which drew anything at all.
 
 **Renderer/IPC.** `renderer/main.ts` is setup/permissions/connection/activity;
-`renderer/chat.ts` is session timeline, handoff, swarm. To add a capability: narrow
+`renderer/chat.ts` is session timeline, handoff, swarm; `renderer/control-center.ts` is the
+read-only Agent System 3.0 graph/inspector. Control Center joins live broker rows only through
+the durable orchestration run → Manager authority → owner Prime identity; reusable worker slot
+names alone are never enough. Its main-process projector removes native worktree paths (including
+known native path spellings embedded in runtime error text) before the named `control-center:get`
+IPC response crosses into the renderer. To add a capability: narrow
 main-process action → validate in `ipc.ts` → expose exactly that method in
 `preload/index.ts` → call it. **Never add a generic `invoke(method, args)` escape hatch.**
 Async loads use generation counters so a slow load for session A cannot paint over the B the

@@ -201,6 +201,24 @@ export async function managerRuntimeForCaller(caller: Caller): Promise<ManagerRu
   });
 }
 
+/**
+ * Resolves the durable Prime owner for a specific orchestration run without consulting or
+ * adopting whichever broker run happens to be active now. Worker slot ids are reused across
+ * Prime histories, so Control Center must join live broker state through this owner identity.
+ */
+export function managerRuntimeForRun(runId: string): Promise<ManagerRuntime | null> {
+  return enqueueAuthority(async () => {
+    const state = await readAuthorityState();
+    const entry = state.entries.find((candidate) => candidate.orchestrationRunId === runId);
+    if (!entry) return null;
+    return {
+      runId: entry.orchestrationRunId,
+      agentId: entry.managerAgentId,
+      ownerPrimeConversationId: entry.ownerPrimeConversationId
+    };
+  });
+}
+
 export function resetManagerAuthorityForTests(): Promise<void> {
   return enqueueAuthority(async () => {
     await writeDurableNow(MANAGER_AUTHORITY_STATE, null);
