@@ -248,8 +248,8 @@ function renderSummary(status: ControlCenterStatus): void {
       String(metrics.blockers),
       'blocked',
       metrics.blockers ? 'is-bad' : '',
-      metrics.blockers > 0 && blockedTaskCount === 0 ? 'The current blocker is global and has no task node to focus.' : '',
-      blockedTaskCount > 0
+      metrics.blockers > 0 && blockedTaskCount === 0 ? 'The current blocker is global; details are available in Inspector.' : '',
+      metrics.blockers > 0
     ),
     addSummary('Needs you', String(metrics.attention), metrics.attention ? 'is-bad' : ''),
     addSummary('Browser agents', metrics.browser, '', metrics.browserNote)
@@ -430,6 +430,11 @@ export function controlCenterFilterTaskIds(status: unknown, filter: ControlCente
     .sort((a, b) => a.localeCompare(b));
 }
 
+export function controlCenterFilterAvailable(status: unknown, filter: ControlCenterFilter): boolean {
+  if (controlCenterFilterTaskIds(status, filter).length > 0) return true;
+  return filter === 'blocked' && controlCenterBlockerInspectorDetails(status).length > 0;
+}
+
 export function controlCenterFilterNodeIds(status: unknown, filter: ControlCenterFilter): string[] {
   const taskIds = new Set(controlCenterFilterTaskIds(status, filter));
   const ids = new Set(taskIds);
@@ -444,6 +449,25 @@ export function controlCenterFilterNodeIds(status: unknown, filter: ControlCente
     }
   }
   return [...ids].sort((a, b) => a.localeCompare(b));
+}
+
+export interface ControlCenterBlockerInspectorDetail {
+  id: string;
+  kind: string;
+  taskId: string | null;
+  summary: string;
+}
+
+export function controlCenterBlockerInspectorDetails(status: unknown): ControlCenterBlockerInspectorDetail[] {
+  const blockers = Array.isArray(record(status).blockers) ? (record(status).blockers as unknown[]) : [];
+  return blockers.flatMap((value) => {
+    const blocker = record(value);
+    const id = stringValue(blocker.id);
+    const kind = stringValue(blocker.kind);
+    const summary = stringValue(blocker.summary);
+    if (!id || !kind || !summary) return [];
+    return [{ id, kind, taskId: stringValue(blocker.taskId), summary }];
+  });
 }
 
 /** One-hop graph focus: the selected node plus only nodes joined to it by a rendered edge. */
@@ -706,7 +730,22 @@ function inspectTask(item: UnknownRecord): HTMLElement[] {
 function renderInspector(): void {
   const title = $('controlInspectorTitle');
   const body = $('controlInspectorBody');
-  if (!lastStatus || !selected) {
+  if (!lastStatus) {
+    title.textContent = 'Inspector';
+    body.replaceChildren(el('p', 'empty', 'Select an agent or task to inspect its read-only details.'));
+    return;
+  }
+  if (!selected && activeFilter === 'blocked') {
+    const blockers = controlCenterBlockerInspectorDetails(lastStatus);
+    if (blockers.length > 0) {
+      title.textContent = 'Blockers';
+      body.replaceChildren(
+        ...blockers.map((blocker) => detailRow(`${blocker.kind}${blocker.taskId ? ` · ${blocker.taskId}` : ''}`, blocker.summary)!)
+      );
+      return;
+    }
+  }
+  if (!selected) {
     title.textContent = 'Inspector';
     body.replaceChildren(el('p', 'empty', 'Select an agent or task to inspect its read-only details.'));
     return;
@@ -753,7 +792,7 @@ function activateFilter(filter: ControlCenterFilter): void {
 
 function paint(status: ControlCenterStatus): void {
   lastStatus = status;
-  if (activeFilter && controlCenterFilterTaskIds(status, activeFilter).length === 0) activeFilter = null;
+  if (activeFilter && !controlCenterFilterAvailable(status, activeFilter)) activeFilter = null;
   renderSummary(status);
   renderGraph(status);
   syncFilterControls(status);

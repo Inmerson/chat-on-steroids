@@ -400,6 +400,12 @@ describe('the window as a whole', () => {
     expect(controlCenterSource).not.toMatch(/addSummaryAction\(\s*'Needs you'/);
   });
 
+  it('shows authoritative blocker reasons in the Inspector when blocked focus is active', () => {
+    expect(controlCenterSource).toContain("activeFilter === 'blocked'");
+    expect(controlCenterSource).toContain("title.textContent = 'Blockers'");
+    expect(controlCenterSource).toContain('controlCenterBlockerInspectorDetails(lastStatus)');
+  });
+
   it('wires Control search for incremental focus, Enter selection and Escape reset', () => {
     expect(controlCenterSource).toContain("$('controlSearch').addEventListener('input'");
     expect(controlCenterSource).toContain("$('controlSearch').addEventListener('keydown'");

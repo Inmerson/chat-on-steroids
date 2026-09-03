@@ -5,10 +5,12 @@ import {
   applyControlCenterGraphFilter,
   applyControlCenterGraphFocus,
   applyControlCenterGraphSearch,
+  controlCenterBlockerInspectorDetails,
   controlCenterConnectedNodeIds,
   controlCenterEdgeEndpoints,
   controlCenterFilterNodeIds,
   controlCenterFilterTaskIds,
+  controlCenterFilterAvailable,
   controlCenterNodeTone,
   controlCenterRunMetrics,
   controlCenterSearchMatches,
@@ -221,6 +223,31 @@ describe('Control Center graph layout', () => {
     expect(nextControlCenterFilter(null, 'blocked')).toBe('blocked');
     expect(nextControlCenterFilter('blocked', 'blocked')).toBeNull();
     expect(nextControlCenterFilter('blocked', 'verified')).toBe('verified');
+  });
+
+  it('keeps a blocked focus available for global blockers even when no task node is blocked', () => {
+    const status = {
+      tasks: [{ id: 'task-a', state: 'ACTIVE', blockers: [] }],
+      blockers: [{ id: 'integration:failed', kind: 'integration', taskId: null, summary: 'Integration failed.' }]
+    };
+
+    expect(controlCenterFilterTaskIds(status, 'blocked')).toEqual([]);
+    expect(controlCenterFilterAvailable(status, 'blocked')).toBe(true);
+    expect(controlCenterFilterAvailable(status, 'verified')).toBe(false);
+  });
+
+  it('whitelists authoritative blocker detail for the Inspector', () => {
+    const details = controlCenterBlockerInspectorDetails({
+      blockers: [
+        { id: 'task:task-b:blocked', kind: 'task', taskId: 'task-b', summary: 'Waiting for dependency.' },
+        { id: 'verification:failed', kind: 'verification', taskId: null, summary: 'Verification failed.' }
+      ]
+    });
+
+    expect(details).toEqual([
+      { id: 'task:task-b:blocked', kind: 'task', taskId: 'task-b', summary: 'Waiting for dependency.' },
+      { id: 'verification:failed', kind: 'verification', taskId: null, summary: 'Verification failed.' }
+    ]);
   });
 
   it('finds agents and tasks by durable id or visible label/title without case sensitivity', () => {
