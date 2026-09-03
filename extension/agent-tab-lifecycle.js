@@ -3,6 +3,7 @@
 
   const LEASE_KEY = 'agentTabLeases';
   const QUEUE_KEY = 'agentTabLeaseQueue';
+  const TELEMETRY_KEY = 'agentTabLeaseTelemetry';
   const MAX_AGENT_TABS = 5;
   const MAX_QUEUE = 400;
   const MAX_CLOSE_ATTEMPTS = 3;
@@ -66,8 +67,18 @@
   function persist() {
     const leaseSnapshot = { ...leases };
     const queueSnapshot = queue.map((entry) => ({ ...entry }));
+    const telemetrySnapshot = {
+      budget: MAX_AGENT_TABS,
+      used: liveLeaseCount(),
+      queued: queue.length,
+      observedAt: Date.now()
+    };
     const write = writes.then(() =>
-      chrome.storage.session.set({ [LEASE_KEY]: leaseSnapshot, [QUEUE_KEY]: queueSnapshot })
+      chrome.storage.session.set({
+        [LEASE_KEY]: leaseSnapshot,
+        [QUEUE_KEY]: queueSnapshot,
+        [TELEMETRY_KEY]: telemetrySnapshot
+      })
     );
     writes = write.then(
       () => undefined,
@@ -342,7 +353,10 @@
         changed = true;
       }
     }
-    if (changed) await persist();
+    // Publish one synchronized snapshot on every service-worker start even when recovery found
+    // nothing to repair. Without this, a cold browser session with zero agent tabs stays
+    // indistinguishable from "telemetry unavailable" until the first worker opens.
+    await persist();
     const durable = Object.values(leases)
       .filter((lease) => lease && typeof lease === 'object' && lease.handoffDurable === true)
       .map((lease) => lease.tabId)

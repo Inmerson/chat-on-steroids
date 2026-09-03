@@ -141,6 +141,32 @@ function makeHarness(
 }
 
 describe('agent tab hard budget', () => {
+  it('publishes zero browser lease telemetry on a cold service-worker start', async () => {
+    const h = makeHarness();
+    await h.settle();
+
+    expect(h.sessionState.agentTabLeaseTelemetry).toMatchObject({
+      budget: 5,
+      used: 0,
+      queued: 0
+    });
+    expect(Number.isFinite(h.sessionState.agentTabLeaseTelemetry?.observedAt)).toBe(true);
+  });
+
+  it('persists exact browser lease telemetry from marker-owned leases and the durable queue', async () => {
+    const h = makeHarness();
+    h.browserTabs.set(90, 'https://chatgpt.com/c/user-owned-conversation');
+    for (let i = 1; i <= 6; i++) await h.register(i, `cmd-${i}`);
+
+    expect(h.sessionState.agentTabLeaseTelemetry).toMatchObject({
+      budget: 5,
+      used: 5,
+      queued: 1
+    });
+    expect(Number.isFinite(h.sessionState.agentTabLeaseTelemetry?.observedAt)).toBe(true);
+    expect(h.browserTabs.has(90)).toBe(true);
+  });
+
   it('keeps at most five system-owned agent leases and queues the sixth until capacity is released', async () => {
     const h = makeHarness();
     for (let i = 1; i <= 6; i++) await h.register(i, `cmd-${i}`);
