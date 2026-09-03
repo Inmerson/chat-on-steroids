@@ -1,4 +1,5 @@
 import { swarmStateForCaller } from '../agents.js';
+import { browserAgentTabTelemetry, browserPresent, type BrowserAgentTabTelemetry } from '../bridge.js';
 import type { AgentInfo, SwarmState } from '../../shared/session.js';
 import {
   CONTROL_CENTER_BROWSER_BUDGET,
@@ -19,6 +20,8 @@ import type { TaskRecord } from './types.js';
 import { workflowStateForRun, type ReviewRecord, type RunWorkflowState } from './workflow.js';
 
 const BROWSER_NOTE = 'Agent-tab lease telemetry is unavailable; unmanaged user ChatGPT tabs are never inferred as agent usage.';
+// Keep telemetry no older than the bridge's existing one-minute browser-presence evidence window.
+const BROWSER_TELEMETRY_FRESH_MS = 60_000;
 const ROLE_ORDER: readonly ControlCenterAgentRole[] = ['prime', 'manager', 'worker', 'reviewer', 'system_reviewer'];
 
 interface ReviewProjection {
@@ -75,7 +78,17 @@ function redactProjectionValue<T>(value: T, paths: readonly string[]): T {
   return value;
 }
 
-function browserStatus(): ControlCenterStatus['browser'] {
+function browserStatus(telemetry: BrowserAgentTabTelemetry | null, observedAt: number): ControlCenterStatus['browser'] {
+  const age = telemetry ? observedAt - telemetry.receivedAt : Number.POSITIVE_INFINITY;
+  if (telemetry && age >= 0 && age < BROWSER_TELEMETRY_FRESH_MS) {
+    return {
+      budget: CONTROL_CENTER_BROWSER_BUDGET,
+      used: telemetry.used,
+      queued: telemetry.queued,
+      status: 'available',
+      note: null
+    };
+  }
   return {
     budget: CONTROL_CENTER_BROWSER_BUDGET,
     used: null,
@@ -346,7 +359,8 @@ export function projectControlCenterStatus(
   state: OrchestrationState,
   workflowState: RunWorkflowState | null,
   swarm: SwarmState,
-  observedAt: number
+  observedAt: number,
+  browserTelemetry: BrowserAgentTabTelemetry | null = null
 ): ControlCenterStatus {
   if (!state.runId) {
     return {
@@ -358,7 +372,7 @@ export function projectControlCenterStatus(
       edges: [],
       blockers: [],
       needsAttention: [],
-      browser: browserStatus()
+      browser: browserStatus(browserTelemetry, observedAt)
     };
   }
 
@@ -391,7 +405,7 @@ export function projectControlCenterStatus(
     // No current durable orchestration/workflow record proves an L4 user-authority decision.
     // A blocked task therefore stays a blocker instead of being promoted by wording or guesswork.
     needsAttention: [],
-    browser: browserStatus()
+    browser: browserStatus(browserTelemetry, observedAt)
   };
   // Error/findings text is less trusted than structural worktree fields. Scrub every known
   // native task/integration worktree spelling at the final projection boundary so a Git/runtime
@@ -409,5 +423,7 @@ export async function controlCenterStatus(): Promise<ControlCenterStatus> {
   const broker = runtime
     ? swarmStateForCaller({ conversationId: runtime.ownerPrimeConversationId })
     : { enabled: false, running: false, agents: [] };
-  return projectControlCenterStatus(recovered.state, workflow, broker, Date.now());
+  const observedAt = Date.now();
+  const browserTelemetry = browserPresent() ? browserAgentTabTelemetry() : null;
+  return projectControlCenterStatus(recovered.state, workflow, broker, observedAt, browserTelemetry);
 }

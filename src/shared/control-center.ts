@@ -115,8 +115,8 @@ export interface ControlCenterBrowserStatus {
   budget: typeof CONTROL_CENTER_BROWSER_BUDGET;
   used: number | null;
   queued: number | null;
-  status: 'unavailable';
-  note: string;
+  status: 'available' | 'unavailable';
+  note: string | null;
 }
 
 export interface ControlCenterStatus {

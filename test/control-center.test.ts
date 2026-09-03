@@ -9,13 +9,19 @@ const loaders = vi.hoisted(() => ({
   recover: vi.fn(),
   workflow: vi.fn(),
   runtime: vi.fn(),
-  swarmForCaller: vi.fn()
+  swarmForCaller: vi.fn(),
+  browserPresent: vi.fn(),
+  browserTelemetry: vi.fn()
 }));
 
 vi.mock('../src/main/orchestration/recovery.js', () => ({ recoverOrchestrationState: loaders.recover }));
 vi.mock('../src/main/orchestration/workflow.js', () => ({ workflowStateForRun: loaders.workflow }));
 vi.mock('../src/main/orchestration/manager-authority.js', () => ({ managerRuntimeForRun: loaders.runtime }));
 vi.mock('../src/main/agents.js', () => ({ swarmStateForCaller: loaders.swarmForCaller }));
+vi.mock('../src/main/bridge.js', () => ({
+  browserPresent: loaders.browserPresent,
+  browserAgentTabTelemetry: loaders.browserTelemetry
+}));
 
 import { controlCenterStatus, projectControlCenterStatus } from '../src/main/orchestration/control-center.js';
 
@@ -109,6 +115,8 @@ afterEach(() => {
   loaders.workflow.mockReset();
   loaders.runtime.mockReset();
   loaders.swarmForCaller.mockReset();
+  loaders.browserPresent.mockReset();
+  loaders.browserTelemetry.mockReset();
   vi.restoreAllMocks();
 });
 
@@ -139,6 +147,42 @@ describe('Control Center projector', () => {
       }
     });
     expect(JSON.parse(JSON.stringify(status))).toEqual(status);
+  });
+
+  it('projects fresh authenticated browser lease telemetry without inferring user tabs', () => {
+    const observedAt = 1_777_777;
+    const status = projectControlCenterStatus(
+      orchestration(),
+      null,
+      swarm([]),
+      observedAt,
+      { budget: 5, used: 3, queued: 2, observedAt: observedAt - 10, receivedAt: observedAt - 20 }
+    );
+
+    expect(status.browser).toEqual({
+      budget: 5,
+      used: 3,
+      queued: 2,
+      status: 'available',
+      note: null
+    });
+  });
+
+  it('keeps stale browser lease telemetry unavailable', () => {
+    const observedAt = 1_777_777;
+    const status = projectControlCenterStatus(
+      orchestration(),
+      null,
+      swarm([]),
+      observedAt,
+      { budget: 5, used: 4, queued: 1, observedAt: observedAt - 70_000, receivedAt: observedAt - 60_001 }
+    );
+
+    expect(status.browser).toMatchObject({
+      used: null,
+      queued: null,
+      status: 'unavailable'
+    });
   });
 
   it('projects deterministic dependency, assignment and review edges while aggregating agent roles', () => {
@@ -418,6 +462,8 @@ describe('Control Center loader', () => {
     loaders.workflow.mockResolvedValue(workflow('run-loader'));
     loaders.runtime.mockResolvedValue({ runId: 'run-loader', agentId: 'manager', ownerPrimeConversationId: 'prime-owner' });
     loaders.swarmForCaller.mockReturnValue(swarm([]));
+    loaders.browserPresent.mockReturnValue(true);
+    loaders.browserTelemetry.mockReturnValue({ budget: 5, used: 2, queued: 1, observedAt: 99_980, receivedAt: 99_990 });
     vi.spyOn(Date, 'now').mockReturnValue(99_999);
 
     const status = await controlCenterStatus();
@@ -426,7 +472,13 @@ describe('Control Center loader', () => {
     expect(loaders.workflow).toHaveBeenCalledWith('run-loader');
     expect(loaders.runtime).toHaveBeenCalledWith('run-loader');
     expect(loaders.swarmForCaller).toHaveBeenCalledWith({ conversationId: 'prime-owner' });
-    expect(status).toMatchObject({ observedAt: 99_999, run: { id: 'run-loader', planId: 'plan-loader' } });
+    expect(loaders.browserPresent).toHaveBeenCalledTimes(1);
+    expect(loaders.browserTelemetry).toHaveBeenCalledTimes(1);
+    expect(status).toMatchObject({
+      observedAt: 99_999,
+      run: { id: 'run-loader', planId: 'plan-loader' },
+      browser: { status: 'available', used: 2, queued: 1 }
+    });
   });
 
   it('fails closed instead of borrowing same-named worker liveness when the durable owner row is missing', async () => {

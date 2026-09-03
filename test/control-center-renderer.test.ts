@@ -343,6 +343,17 @@ describe('Control Center graph layout', () => {
     ).toMatchObject({ health: 'blocked', verified: 2, total: 5, activeAgents: 4, blockers: 1, browser: '— / 5' });
 
     expect(
+      controlCenterRunMetrics({
+        run: { health: 'running', activeAgents: 2, progress: { verified: 1, total: 3 } },
+        tasks: [],
+        agents: [],
+        blockers: [],
+        needsAttention: [],
+        browser: { budget: 5, used: 3 }
+      })
+    ).toMatchObject({ browser: '3 / 5' });
+
+    expect(
       controlCenterTaskMeta({
         riskClass: 'high',
         assignedWorkerId: 'worker-2',
