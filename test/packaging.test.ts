@@ -278,6 +278,17 @@ describe('cross-platform packaging targets', () => {
     expect(willQuitOwner).toBeLessThan(preventDefault);
   });
 
+  it('allows an explicitly isolated dev userData before the single-instance lock without changing packaged behavior', () => {
+    const main = readFileSync(path.join(root, 'src', 'main', 'index.ts'), 'utf8');
+    const devGuard = main.indexOf("if (!app.isPackaged && process.env.COS_DEV_USER_DATA?.trim()) {");
+    const setUserData = main.indexOf("app.setPath('userData', isolatedUserData);", devGuard);
+    const lock = main.indexOf('const hasSingleInstanceLock = app.requestSingleInstanceLock();');
+
+    expect(devGuard).toBeGreaterThan(-1);
+    expect(setUserData).toBeGreaterThan(devGuard);
+    expect(setUserData).toBeLessThan(lock);
+  });
+
   it('applies the persisted native theme before the first packaged BrowserWindow can be created', () => {
     const main = readFileSync(path.join(root, 'src', 'main', 'index.ts'), 'utf8');
     const ready = main.indexOf('void app.whenReady().then(async () => {');
