@@ -10,6 +10,7 @@ import type {
 
 export interface OrchestrationState {
   runId: string | null;
+  runStatus: 'RUNNING' | 'RUN_VERIFIED';
   managerAgentId: string | null;
   managerPlanId: string | null;
   managerPlanFingerprint: string | null;
@@ -21,6 +22,7 @@ export interface OrchestrationState {
 
 export const EMPTY_ORCHESTRATION_STATE: OrchestrationState = {
   runId: null,
+  runStatus: 'RUNNING',
   managerAgentId: null,
   managerPlanId: null,
   managerPlanFingerprint: null,
@@ -165,6 +167,12 @@ export function applyOrchestrationEvent(state: OrchestrationState, event: Orches
 
   if (event.type === 'RUN_CREATED') {
     return state.runId === event.runId ? state : { ...state, runId: event.runId };
+  }
+
+  if (event.type === 'RUN_VERIFIED') {
+    if (state.runId === null) throw new Error('RUN_VERIFIED requires an existing orchestration run');
+    if (event.entityId !== event.runId) throw new Error('RUN_VERIFIED entity must be the orchestration run id');
+    return state.runStatus === 'RUN_VERIFIED' ? state : { ...state, runStatus: 'RUN_VERIFIED' };
   }
 
   if (event.type === 'MANAGER_ASSIGNED') {

@@ -69,6 +69,7 @@ export interface ReviewInput {
 
 export interface VerificationRecord {
   gate: string;
+  command: string;
   passed: boolean;
   revision: string;
   outputDigest: string;
@@ -81,6 +82,23 @@ export interface IntegrationWorktreeMeta {
   virtualPath: string;
   branch: string;
   baseRevision: string;
+  headRevision: string;
+}
+
+export interface IntegrationOperationRecord {
+  operationId: string;
+  sourceRevision: string;
+  startingRevision: string;
+  integrationRevision: string | null;
+  status: 'pending' | 'complete' | 'ambiguous';
+  error: string | null;
+}
+
+export interface VerificationOperationRecord {
+  operationId: string;
+  revision: string;
+  status: 'pending' | 'complete' | 'failed';
+  error: string | null;
 }
 
 export interface ReviewRecord {
@@ -105,8 +123,9 @@ export interface RunWorkflowState {
   reviews: Record<string, ReviewRecord>;
   reviewHistory: Record<string, ReviewRecord[]>;
   integrationWorktree: IntegrationWorktreeMeta | null;
-  integrations: Record<string, { operationId: string; sourceRevision: string; integrationRevision: string | null; error: string | null }>;
+  integrations: Record<string, IntegrationOperationRecord>;
   verifications: Record<string, VerificationRecord[]>;
+  verificationOperations: Record<string, VerificationOperationRecord>;
   systemReview: SystemReviewRecord | null;
 }
 
@@ -140,7 +159,8 @@ export interface WorkflowDependencies {
     task: TaskRecord,
     completion: TaskCompletionPackage,
     taskWorktree: TaskWorktreeRecord,
-    existingIntegration: IntegrationWorktreeMeta | null
+    existingIntegration: IntegrationWorktreeMeta | null,
+    operation: IntegrationOperationRecord
   ): Promise<IntegrationResult>;
   verifyTask(
     runtime: WorkflowRuntime,
@@ -176,6 +196,7 @@ function emptyRun(runId: string): RunWorkflowState {
     integrationWorktree: null,
     integrations: {},
     verifications: {},
+    verificationOperations: {},
     systemReview: null
   };
 }
@@ -191,7 +212,8 @@ function validRun(value: unknown, runId: string): RunWorkflowState {
     reviews: run.reviews && typeof run.reviews === 'object' ? run.reviews : {},
     reviewHistory: run.reviewHistory && typeof run.reviewHistory === 'object' ? run.reviewHistory : {},
     integrations: run.integrations && typeof run.integrations === 'object' ? run.integrations : {},
-    verifications: run.verifications && typeof run.verifications === 'object' ? run.verifications : {}
+    verifications: run.verifications && typeof run.verifications === 'object' ? run.verifications : {},
+    verificationOperations: run.verificationOperations && typeof run.verificationOperations === 'object' ? run.verificationOperations : {}
   } as RunWorkflowState;
 }
 
@@ -489,6 +511,8 @@ async function ensureIntegrationWorktree(
     const top = path.resolve(await git(existing.realPath, ['rev-parse', '--show-toplevel']));
     const branch = await git(existing.realPath, ['branch', '--show-current']);
     if (top !== path.resolve(existing.realPath) || branch !== existing.branch) throw new Error('INTEGRATION_WORKTREE_AMBIGUOUS');
+    const baseIsAncestor = await gitSucceeds(existing.realPath, ['merge-base', '--is-ancestor', existing.baseRevision, 'HEAD']);
+    if (!baseIsAncestor) throw new Error('INTEGRATION_BASE_MISMATCH');
     return existing;
   }
   const target = integrationPath(taskWorktree, runtime.runId);
@@ -508,33 +532,69 @@ async function ensureIntegrationWorktree(
   if (!(await gitSucceeds(target.realPath, ['merge-base', '--is-ancestor', taskWorktree.baseRevision, head]))) {
     throw new Error('INTEGRATION_BASE_MISMATCH');
   }
-  return { ...target, baseRevision: taskWorktree.baseRevision.toLowerCase() };
+  return { ...target, baseRevision: taskWorktree.baseRevision.toLowerCase(), headRevision: head };
 }
 
-async function defaultIntegrateTask(
+async function exactCherryPickResult(cwd: string, sourceRevision: string, startingRevision: string, currentRevision: string): Promise<boolean> {
+  let parent: string;
+  let message: string;
+  try {
+    parent = (await git(cwd, ['rev-parse', `${currentRevision}^`])).toLowerCase();
+    message = await git(cwd, ['show', '-s', '--format=%B', currentRevision]);
+  } catch {
+    return false;
+  }
+  return parent === startingRevision && message.includes(`(cherry picked from commit ${sourceRevision})`);
+}
+
+export async function integrateTaskWithGit(
   runtime: WorkflowRuntime,
   _task: TaskRecord,
   completion: TaskCompletionPackage,
   taskWorktree: TaskWorktreeRecord,
-  existingIntegration: IntegrationWorktreeMeta | null
+  existingIntegration: IntegrationWorktreeMeta | null,
+  operation: IntegrationOperationRecord
 ): Promise<IntegrationResult> {
-  const sourceRevision = completion.revision;
+  const sourceRevision = completion.revision?.toLowerCase() ?? null;
   if (!sourceRevision) throw new Error('INTEGRATION_SOURCE_REVISION_MISSING');
+  if (sourceRevision !== operation.sourceRevision.toLowerCase()) throw new Error('INTEGRATION_SOURCE_CHANGED');
+  const startingRevision = operation.startingRevision.toLowerCase();
   const integrationWorktree = await ensureIntegrationWorktree(runtime, taskWorktree, existingIntegration);
   const status = await git(integrationWorktree.realPath, ['status', '--porcelain=v1', '--untracked-files=normal']);
   if (status) throw new Error('INTEGRATION_WORKTREE_DIRTY');
-  const already = await gitSucceeds(integrationWorktree.realPath, ['merge-base', '--is-ancestor', sourceRevision, 'HEAD']);
-  if (!already && sourceRevision !== taskWorktree.baseRevision) {
+  const currentRevision = (await git(integrationWorktree.realPath, ['rev-parse', 'HEAD'])).toLowerCase();
+
+  if (currentRevision !== startingRevision) {
+    if (!(await exactCherryPickResult(integrationWorktree.realPath, sourceRevision, startingRevision, currentRevision))) {
+      throw new Error('INTEGRATION_AMBIGUOUS: integration HEAD changed outside the pending operation');
+    }
+    return {
+      integrationRevision: currentRevision,
+      integrationWorktree: { ...integrationWorktree, headRevision: currentRevision }
+    };
+  }
+
+  if (sourceRevision !== startingRevision) {
     try {
-      await git(integrationWorktree.realPath, ['cherry-pick', sourceRevision]);
+      await git(integrationWorktree.realPath, ['cherry-pick', '-x', sourceRevision]);
     } catch (error) {
-      try { await git(integrationWorktree.realPath, ['cherry-pick', '--abort']); } catch { /* fail closed below */ }
+      try { await git(integrationWorktree.realPath, ['cherry-pick', '--abort']); } catch { /* verify exact recovery below */ }
+      const recoveredHead = (await git(integrationWorktree.realPath, ['rev-parse', 'HEAD'])).toLowerCase();
+      const recoveredStatus = await git(integrationWorktree.realPath, ['status', '--porcelain=v1', '--untracked-files=normal']);
+      if (recoveredHead !== startingRevision || recoveredStatus) {
+        throw new Error('INTEGRATION_AMBIGUOUS: failed cherry-pick could not be restored to its starting revision');
+      }
       throw new Error(`INTEGRATION_CONFLICT: ${error instanceof Error ? error.message : String(error)}`);
     }
   }
   const integrationRevision = (await git(integrationWorktree.realPath, ['rev-parse', 'HEAD'])).toLowerCase();
-  return { integrationRevision, integrationWorktree };
+  if (sourceRevision !== startingRevision && !(await exactCherryPickResult(integrationWorktree.realPath, sourceRevision, startingRevision, integrationRevision))) {
+    throw new Error('INTEGRATION_AMBIGUOUS: completed cherry-pick could not be proven');
+  }
+  return { integrationRevision, integrationWorktree: { ...integrationWorktree, headRevision: integrationRevision } };
 }
+
+const defaultIntegrateTask = integrateTaskWithGit;
 
 function digestOutput(value: string): string {
   return createHash('sha256').update(value).digest('hex');
@@ -542,11 +602,12 @@ function digestOutput(value: string): string {
 
 async function gitVerification(cwd: string, base: string, revision: string): Promise<VerificationRecord> {
   const startedAt = Date.now();
+  const command = `git diff --check ${base}..${revision}`;
   try {
     const output = await git(cwd, ['diff', '--check', `${base}..${revision}`]);
-    return { gate: 'git diff --check', passed: true, revision, outputDigest: digestOutput(output), startedAt, finishedAt: Date.now() };
+    return { gate: 'git diff --check', command, passed: true, revision, outputDigest: digestOutput(output), startedAt, finishedAt: Date.now() };
   } catch (error) {
-    return { gate: 'git diff --check', passed: false, revision, outputDigest: digestOutput(error instanceof Error ? error.message : String(error)), startedAt, finishedAt: Date.now() };
+    return { gate: 'git diff --check', command, passed: false, revision, outputDigest: digestOutput(error instanceof Error ? error.message : String(error)), startedAt, finishedAt: Date.now() };
   }
 }
 
@@ -560,10 +621,10 @@ async function runGate(cwd: string, gate: string, file: string, args: string[], 
       maxBuffer: 8 * 1024 * 1024,
       timeout: GATE_TIMEOUT_MS
     });
-    return { gate, passed: true, revision, outputDigest: digestOutput(`${stdout}\n${stderr}`), startedAt, finishedAt: Date.now() };
+    return { gate, command: gate, passed: true, revision, outputDigest: digestOutput(`${stdout}\n${stderr}`), startedAt, finishedAt: Date.now() };
   } catch (error) {
     const held = error as Error & { stdout?: string; stderr?: string };
-    return { gate, passed: false, revision, outputDigest: digestOutput(`${held.message}\n${held.stdout ?? ''}\n${held.stderr ?? ''}`), startedAt, finishedAt: Date.now() };
+    return { gate, command: gate, passed: false, revision, outputDigest: digestOutput(`${held.message}\n${held.stdout ?? ''}\n${held.stderr ?? ''}`), startedAt, finishedAt: Date.now() };
   }
 }
 
@@ -602,11 +663,17 @@ async function defaultVerifyTask(
   await maybeShareNodeModules(integration.integrationWorktree.realPath);
   const scripts = pkg.scripts && typeof pkg.scripts === 'object' ? pkg.scripts as Record<string, unknown> : {};
   const gates: Array<[string, string[]]> = [];
-  for (const name of ['typecheck', 'lint', 'build']) {
-    if (typeof scripts[name] === 'string') gates.push([`npm run ${name}`, ['run', name]]);
+  if (typeof scripts['verify:ci'] === 'string') {
+    gates.push(['npm run verify:ci', ['run', 'verify:ci']]);
+  } else if (typeof scripts.verify === 'string') {
+    gates.push(['npm run verify', ['run', 'verify']]);
+  } else {
+    for (const name of ['typecheck', 'lint', 'build']) {
+      if (typeof scripts[name] === 'string') gates.push([`npm run ${name}`, ['run', name]]);
+    }
+    const dependencies = { ...(pkg.dependencies ?? {}), ...(pkg.devDependencies ?? {}) } as Record<string, unknown>;
+    if (typeof scripts.test === 'string' && dependencies.vitest !== undefined) gates.push(['npm test -- --run', ['test', '--', '--run']]);
   }
-  const dependencies = { ...(pkg.dependencies ?? {}), ...(pkg.devDependencies ?? {}) } as Record<string, unknown>;
-  if (typeof scripts.test === 'string' && dependencies.vitest !== undefined) gates.push(['npm test -- --run', ['test', '--', '--run']]);
   for (const [gate, args] of gates) {
     const record = await runGate(integration.integrationWorktree.realPath, gate, process.platform === 'win32' ? 'npm.cmd' : 'npm', args, revision);
     records.push(record);
@@ -700,10 +767,14 @@ async function routePendingReviews(runtime: WorkflowRuntime, deps: WorkflowDepen
   }
 }
 
+function recordsFreshForRevision(records: readonly VerificationRecord[], revision: string): boolean {
+  return records.length > 0 && records.every((record) => record.passed && record.revision === revision);
+}
+
 async function integrateAndVerify(runtime: WorkflowRuntime, roots: readonly Root[], allowCommands: boolean, deps: WorkflowDependencies): Promise<void> {
   let orchestration = await recoverOrchestrationState();
   for (const task of Object.values(orchestration.state.tasks)) {
-    if (task.state !== 'APPROVED' && task.state !== 'INTEGRATING' && task.state !== 'INTEGRATED') continue;
+    if (task.state !== 'APPROVED' && task.state !== 'INTEGRATING') continue;
     const run = (await workflowStateForRun(runtime.runId)) ?? emptyRun(runtime.runId);
     const completion = run.completions[task.taskId];
     if (!completion?.revision || !task.worktreeId) continue;
@@ -711,53 +782,172 @@ async function integrateAndVerify(runtime: WorkflowRuntime, roots: readonly Root
     if (!taskWorktree) throw new Error(`INTEGRATION_TASK_WORKTREE_MISSING: ${task.taskId}`);
     let integrationMeta = run.integrations[task.taskId];
     if (!integrationMeta) {
-      integrationMeta = { operationId: randomUUID(), sourceRevision: completion.revision, integrationRevision: null, error: null };
+      const startingRevision = (run.integrationWorktree?.headRevision ?? taskWorktree.baseRevision).toLowerCase();
+      integrationMeta = {
+        operationId: randomUUID(),
+        sourceRevision: completion.revision,
+        startingRevision,
+        integrationRevision: null,
+        status: 'pending',
+        error: null
+      };
       await updateRun(runtime.runId, (current) => ({ ...current, integrations: { ...current.integrations, [task.taskId]: integrationMeta! } }));
     }
     if (integrationMeta.sourceRevision !== completion.revision) throw new Error(`INTEGRATION_SOURCE_CHANGED: ${task.taskId}`);
+    if (!integrationMeta.startingRevision || !integrationMeta.status) {
+      await updateRun(runtime.runId, (current) => ({
+        ...current,
+        status: 'blocked',
+        integrations: {
+          ...current.integrations,
+          [task.taskId]: {
+            ...(current.integrations[task.taskId] as IntegrationOperationRecord),
+            status: 'ambiguous',
+            error: 'INTEGRATION_AMBIGUOUS: legacy pending integration is missing recovery coordinates'
+          }
+        }
+      }));
+      await deps.notifyManager(runtime, `[${task.taskId} integration blocked] INTEGRATION_AMBIGUOUS: missing recovery coordinates`);
+      return;
+    }
     if (task.state === 'APPROVED') await appendTaskEvent(runtime, task.taskId, 'TASK_INTEGRATING', { operationId: integrationMeta.operationId, revision: completion.revision });
 
-    let integration: IntegrationResult;
+    let integration: IntegrationResult | null = null;
+    if (integrationMeta.status === 'complete' && integrationMeta.integrationRevision && run.integrationWorktree) {
+      integration = {
+        integrationRevision: integrationMeta.integrationRevision,
+        integrationWorktree: run.integrationWorktree
+      };
+    } else {
+      try {
+        integration = await deps.integrateTask(runtime, task, completion, taskWorktree, run.integrationWorktree, integrationMeta);
+      } catch (error) {
+        const reason = error instanceof Error ? error.message : String(error);
+        const ambiguous = /INTEGRATION_.*AMBIGUOUS|INTEGRATION_AMBIGUOUS/i.test(reason);
+        await updateRun(runtime.runId, (current) => ({
+          ...current,
+          status: 'blocked',
+          integrations: {
+            ...current.integrations,
+            [task.taskId]: {
+              ...(current.integrations[task.taskId] as IntegrationOperationRecord),
+              status: ambiguous ? 'ambiguous' : 'pending',
+              error: reason
+            }
+          }
+        }));
+        await deps.notifyManager(runtime, `[${task.taskId} integration blocked] ${reason}`);
+        return;
+      }
+      await updateRun(runtime.runId, (current) => ({
+        ...current,
+        integrationWorktree: integration!.integrationWorktree,
+        integrations: {
+          ...current.integrations,
+          [task.taskId]: {
+            ...(current.integrations[task.taskId] as IntegrationOperationRecord),
+            integrationRevision: integration!.integrationRevision,
+            status: 'complete',
+            error: null
+          }
+        }
+      }));
+    }
+    orchestration = await recoverOrchestrationState();
+    if (orchestration.state.tasks[task.taskId]?.state === 'INTEGRATING') {
+      await appendTaskEvent(runtime, task.taskId, 'TASK_INTEGRATED', { revision: integration.integrationRevision, operationId: integrationMeta.operationId });
+    }
+    orchestration = await recoverOrchestrationState();
+  }
+
+  orchestration = await recoverOrchestrationState();
+  let run = (await workflowStateForRun(runtime.runId)) ?? emptyRun(runtime.runId);
+  const finalIntegration = run.integrationWorktree;
+  const finalRevision = finalIntegration?.headRevision;
+  if (!finalIntegration || !finalRevision) return;
+
+  for (const task of Object.values(orchestration.state.tasks)) {
+    if (task.state !== 'INTEGRATED' && task.state !== 'VERIFIED') continue;
+    const integrationMeta = run.integrations[task.taskId];
+    if (!integrationMeta || integrationMeta.status !== 'complete' || integrationMeta.error) continue;
+    const currentRecords = run.verifications[task.taskId] ?? [];
+    if (recordsFreshForRevision(currentRecords, finalRevision)) {
+      if (task.state === 'INTEGRATED') {
+        await appendTaskEvent(runtime, task.taskId, 'TASK_VERIFIED', { revision: finalRevision });
+        await deps.schedule(runtime, roots);
+        orchestration = await recoverOrchestrationState();
+      }
+      continue;
+    }
+
+    let verificationOperation = run.verificationOperations[task.taskId];
+    if (!verificationOperation || verificationOperation.revision !== finalRevision) {
+      verificationOperation = {
+        operationId: randomUUID(),
+        revision: finalRevision,
+        status: 'pending',
+        error: null
+      };
+    } else {
+      verificationOperation = { ...verificationOperation, status: 'pending', error: null };
+    }
+    await updateRun(runtime.runId, (current) => ({
+      ...current,
+      verificationOperations: { ...current.verificationOperations, [task.taskId]: verificationOperation! }
+    }));
+
+    let verified: VerificationResult;
     try {
-      integration = await deps.integrateTask(runtime, task, completion, taskWorktree, run.integrationWorktree);
+      verified = await deps.verifyTask(
+        runtime,
+        task,
+        { integrationRevision: finalRevision, integrationWorktree: finalIntegration },
+        allowCommands
+      );
     } catch (error) {
       const reason = error instanceof Error ? error.message : String(error);
       await updateRun(runtime.runId, (current) => ({
         ...current,
-        status: 'blocked',
-        integrations: { ...current.integrations, [task.taskId]: { ...(current.integrations[task.taskId] as any), error: reason } }
+        status: 'needs_verification',
+        verificationOperations: {
+          ...current.verificationOperations,
+          [task.taskId]: { ...(current.verificationOperations[task.taskId] as VerificationOperationRecord), status: 'failed', error: reason }
+        }
       }));
-      await deps.notifyManager(runtime, `[${task.taskId} integration blocked] ${reason}`);
-      return;
-    }
-    await updateRun(runtime.runId, (current) => ({
-      ...current,
-      integrationWorktree: integration.integrationWorktree,
-      integrations: { ...current.integrations, [task.taskId]: { ...(current.integrations[task.taskId] as any), integrationRevision: integration.integrationRevision, error: null } }
-    }));
-    orchestration = await recoverOrchestrationState();
-    if (orchestration.state.tasks[task.taskId]?.state === 'INTEGRATING') {
-      await appendTaskEvent(runtime, task.taskId, 'TASK_INTEGRATED', { revision: integration.integrationRevision });
+      await deps.notifyManager(runtime, `[${task.taskId} verification failed] ${reason}`);
+      run = (await workflowStateForRun(runtime.runId)) ?? emptyRun(runtime.runId);
+      continue;
     }
 
-    const verified = await deps.verifyTask(runtime, task, integration, allowCommands);
+    const fresh = recordsFreshForRevision(verified.records, finalRevision);
+    const acceptedVerification = verified.passed && fresh;
+    const blockedReason = verified.blockedReason ?? (!fresh ? 'Verification evidence is stale or not bound to the final integration revision.' : undefined);
     await updateRun(runtime.runId, (current) => ({
       ...current,
-      status: verified.passed ? current.status : (verified.blockedReason ? 'needs_verification' : current.status),
-      verifications: { ...current.verifications, [task.taskId]: verified.records }
+      status: acceptedVerification && current.status === 'needs_verification' ? 'running' : (acceptedVerification ? current.status : 'needs_verification'),
+      verifications: { ...current.verifications, [task.taskId]: verified.records },
+      verificationOperations: {
+        ...current.verificationOperations,
+        [task.taskId]: {
+          ...(current.verificationOperations[task.taskId] as VerificationOperationRecord),
+          status: acceptedVerification ? 'complete' : 'failed',
+          error: acceptedVerification ? null : (blockedReason ?? 'verification gate failed')
+        }
+      }
     }));
-    if (verified.passed) {
+    if (acceptedVerification) {
       const latest = await recoverOrchestrationState();
       if (latest.state.tasks[task.taskId]?.state === 'INTEGRATED') {
-        await appendTaskEvent(runtime, task.taskId, 'TASK_VERIFIED', { revision: integration.integrationRevision });
+        await appendTaskEvent(runtime, task.taskId, 'TASK_VERIFIED', { revision: finalRevision });
         await deps.schedule(runtime, roots);
       }
-    } else if (verified.blockedReason) {
-      await deps.notifyManager(runtime, `[${task.taskId} needs verification] ${verified.blockedReason}`);
+    } else if (blockedReason) {
+      await deps.notifyManager(runtime, `[${task.taskId} needs verification] ${blockedReason}`);
     } else {
       await deps.notifyManager(runtime, `[${task.taskId} verification failed] Inspect the recorded verification evidence before retrying integration or replanning.`);
     }
     orchestration = await recoverOrchestrationState();
+    run = (await workflowStateForRun(runtime.runId)) ?? emptyRun(runtime.runId);
   }
 }
 
@@ -955,11 +1145,49 @@ export async function submitRunReviewForRuntime(
   const review = run.systemReview;
   if (!review?.reviewerId || review.reviewerId !== actorAgentId) throw new Error(`${actorAgentId} is not the assigned System Reviewer`);
   const boundedFindings = boundedList(findings, 'findings');
+  if (verdict === 'APPROVED') {
+    const orchestration = await recoverOrchestrationState();
+    const tasks = Object.values(orchestration.state.tasks);
+    if (
+      orchestration.state.runId !== runtime.runId ||
+      orchestration.state.managerAgentId !== runtime.managerAgentId ||
+      tasks.length === 0 ||
+      tasks.some((task) => task.state !== 'VERIFIED')
+    ) {
+      throw new Error('SYSTEM_REVIEW_NOT_READY: all required tasks must be VERIFIED under the current run before approval');
+    }
+    for (const task of tasks) {
+      const integration = run.integrations[task.taskId];
+      const records = run.verifications[task.taskId] ?? [];
+      if (
+        !integration?.integrationRevision ||
+        integration.error ||
+        records.length === 0 ||
+        records.some((record) => !record.passed || record.revision !== integration.integrationRevision)
+      ) {
+        throw new Error(`SYSTEM_REVIEW_NOT_READY: ${task.taskId} does not have fresh passing verification for its integrated revision`);
+      }
+    }
+  }
   await updateRun(runtime.runId, (current) => ({
     ...current,
     status: verdict === 'APPROVED' ? 'verified' : 'blocked',
     systemReview: { ...(current.systemReview as SystemReviewRecord), verdict, findings: boundedFindings }
   }));
+  if (verdict === 'APPROVED') {
+    const orchestration = await recoverOrchestrationState();
+    if (orchestration.state.runStatus !== 'RUN_VERIFIED') {
+      await appendOrchestrationEvent({
+        eventId: `workflow:RUN_VERIFIED:${runtime.runId}:${review.operationId}`,
+        runId: runtime.runId,
+        time: Date.now(),
+        type: 'RUN_VERIFIED',
+        actor: actorAgentId,
+        entityId: runtime.runId,
+        payload: { systemReviewOperationId: review.operationId }
+      });
+    }
+  }
   await deps.notifyManager(
     runtime,
     verdict === 'APPROVED'

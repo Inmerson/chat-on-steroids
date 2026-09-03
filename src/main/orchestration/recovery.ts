@@ -19,6 +19,7 @@ function recordCopy<T>(value: Record<string, T> | null | undefined): Record<stri
 function normalizeState(snapshotState: Partial<OrchestrationState> | null | undefined): OrchestrationState {
   return {
     runId: typeof snapshotState?.runId === 'string' ? snapshotState.runId : null,
+    runStatus: snapshotState?.runStatus === 'RUN_VERIFIED' ? 'RUN_VERIFIED' : 'RUNNING',
     managerAgentId: typeof snapshotState?.managerAgentId === 'string' ? snapshotState.managerAgentId : null,
     managerPlanId: typeof snapshotState?.managerPlanId === 'string' ? snapshotState.managerPlanId : null,
     managerPlanFingerprint:

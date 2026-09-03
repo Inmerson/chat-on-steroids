@@ -318,6 +318,22 @@
 
   async function recoverDurableLeases() {
     await load();
+    let changed = false;
+    for (const [key, lease] of Object.entries(leases)) {
+      if (
+        !lease ||
+        typeof lease !== 'object' ||
+        !Number.isInteger(lease.tabId) ||
+        lease.tabId < 0 ||
+        typeof lease.commandId !== 'string' ||
+        !lease.commandId ||
+        !(await stillOwnsLease(lease))
+      ) {
+        delete leases[key];
+        changed = true;
+      }
+    }
+    if (changed) await persist();
     const durable = Object.values(leases)
       .filter((lease) => lease && typeof lease === 'object' && lease.handoffDurable === true)
       .map((lease) => lease.tabId)

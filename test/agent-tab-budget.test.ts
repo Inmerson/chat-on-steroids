@@ -17,11 +17,13 @@ function pick(state: Record<string, any>, keys: string | string[] | Record<strin
   return Object.fromEntries(Object.entries(keys).map(([key, fallback]) => [key, state[key] ?? fallback]));
 }
 
-function makeHarness(sessionState: Record<string, any> = {}) {
+function makeHarness(
+  sessionState: Record<string, any> = {},
+  browserTabs: Map<number, string> = new Map()
+) {
   const runtimeListeners = new Set<Listener>();
   const storageListeners = new Set<Listener>();
   const removedListeners = new Set<Listener>();
-  const browserTabs = new Map<number, string>();
   const removed: number[] = [];
   const created: Array<{ id: number; url: string }> = [];
   let nextTabId = 100;
@@ -127,5 +129,62 @@ describe('agent tab hard budget', () => {
     expect(Object.keys(h.sessionState.agentTabLeases ?? {})).toHaveLength(5);
     expect(h.browserTabs.has(90)).toBe(true);
     expect(h.removed).not.toContain(90);
+  });
+
+  it('releases the queue-drain lock after one drain so a later freed lease can drain again', async () => {
+    const h = makeHarness();
+    for (let i = 1; i <= 7; i++) await h.register(i, `cmd-${i}`);
+
+    expect((h.sessionState.agentTabLeaseQueue ?? []).map((entry: any) => entry.commandId)).toEqual(['cmd-6', 'cmd-7']);
+
+    await h.ack('cmd-1', 'worker-1');
+    expect(h.created.map((tab) => tab.url)).toEqual([expect.stringContaining('clf=cmd-6')]);
+    expect((h.sessionState.agentTabLeaseQueue ?? []).map((entry: any) => entry.commandId)).toEqual(['cmd-7']);
+
+    await h.ack('cmd-2', 'worker-2');
+    expect(h.created.map((tab) => tab.url)).toEqual([
+      expect.stringContaining('clf=cmd-6'),
+      expect.stringContaining('clf=cmd-7')
+    ]);
+    expect(h.sessionState.agentTabLeaseQueue ?? []).toEqual([]);
+    expect(Object.keys(h.sessionState.agentTabLeases ?? {})).toHaveLength(5);
+  });
+
+  it('reconciles stale persisted leases after service-worker restart before draining queued work', async () => {
+    const sessionState: Record<string, any> = {
+      agentTabLeases: Object.fromEntries(
+        Array.from({ length: 5 }, (_, index) => {
+          const tabId = index + 1;
+          return [String(tabId), {
+            commandId: `cmd-${tabId}`,
+            tabId,
+            registeredAt: 1,
+            handoffDurable: false,
+            leaseManagerCreated: true
+          }];
+        })
+      ),
+      agentTabLeaseQueue: [{
+        commandId: 'cmd-6',
+        url: 'https://chatgpt.com/?clf=cmd-6#clf=cmd-6',
+        queuedAt: 2
+      }]
+    };
+    const browserTabs = new Map<number, string>(
+      Array.from({ length: 4 }, (_, index) => {
+        const tabId = index + 1;
+        return [tabId, `https://chatgpt.com/?clf=cmd-${tabId}#clf=cmd-${tabId}`];
+      })
+    );
+
+    const restarted = makeHarness(sessionState, browserTabs);
+    await restarted.settle();
+
+    expect(sessionState.agentTabLeases?.['5']).toBeUndefined();
+    expect(restarted.created).toHaveLength(1);
+    expect(restarted.created[0]?.url).toContain('clf=cmd-6');
+    expect(sessionState.agentTabLeaseQueue ?? []).toEqual([]);
+    expect(Object.keys(sessionState.agentTabLeases ?? {})).toHaveLength(5);
+    expect(restarted.removed).not.toContain(5);
   });
 });

@@ -3,6 +3,7 @@ import path from 'node:path';
 
 export type OrchestrationEventType =
   | 'RUN_CREATED'
+  | 'RUN_VERIFIED'
   | 'MANAGER_ASSIGNED'
   | 'TASK_CREATED'
   | 'TASK_READY'

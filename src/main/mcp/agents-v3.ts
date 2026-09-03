@@ -3,6 +3,12 @@ import { z } from 'zod';
 import { agentForCaller, type Caller } from '../agents.js';
 import { assignManagerForPrime } from '../orchestration/manager-authority.js';
 import { acceptAndScheduleManagerPlanForCaller } from '../orchestration/manager-surface.js';
+import {
+  advanceWorkflowForCaller,
+  submitRunReviewForCaller,
+  submitTaskCompletionForCaller,
+  submitTaskReviewForCaller
+} from '../orchestration/workflow.js';
 import { repairPrimeFromResumeShadow } from '../session/continuation.js';
 import { awaitFreshCallOrigin } from '../session/recorder.js';
 import { currentCall, currentCaller } from './call-context.js';
@@ -32,6 +38,17 @@ const managerTaskWireSchema = z
     expectedVerification: z.array(z.string()),
     forbiddenActions: z.array(z.string()),
     riskClass: z.enum(['normal', 'high'])
+  })
+  .strict();
+
+const boundedWireText = z.string().min(1).max(1000);
+const boundedWireList = z.array(boundedWireText).max(100);
+const revisionWireSchema = z.string().regex(/^[0-9a-fA-F]{40}$/);
+const completionVerificationWireSchema = z
+  .object({
+    command: boundedWireText,
+    outcome: z.enum(['passed', 'failed']),
+    revision: revisionWireSchema
   })
   .strict();
 
@@ -102,6 +119,13 @@ function planResult(
   };
 }
 
+function workflowResult(action: string, text: string, structuredContent: Record<string, unknown>): ToolResult {
+  return {
+    content: [{ type: 'text', text }],
+    structuredContent: { action, ...structuredContent }
+  };
+}
+
 function extendAgentsSchema(base: z.ZodType): z.ZodType {
   if (!(base instanceof z.ZodObject)) {
     throw new Error('Agent System 3.0 expected the existing agents input schema to remain a Zod object');
@@ -109,10 +133,21 @@ function extendAgentsSchema(base: z.ZodType): z.ZodType {
 
   return base
     .safeExtend({
-      action: z.enum(['spawn', 'message', 'status', 'finish', 'assign_manager', 'plan']),
+      action: z.enum([
+        'spawn', 'message', 'status', 'finish', 'assign_manager', 'plan',
+        'complete_task', 'review_task', 'review_run', 'advance'
+      ]),
       manager_agent_id: z.string().optional(),
       plan_id: z.string().optional(),
-      tasks: z.array(managerTaskWireSchema).optional()
+      tasks: z.array(managerTaskWireSchema).optional(),
+      task_id: z.string().min(1).max(160).optional(),
+      revision: revisionWireSchema.optional(),
+      changed_files: z.array(z.string().min(1).max(1000)).max(100).optional(),
+      verification: z.array(completionVerificationWireSchema).max(100).optional(),
+      risks: boundedWireList.optional(),
+      notes: boundedWireList.optional(),
+      verdict: z.enum(['APPROVED', 'CHANGES_REQUESTED', 'BLOCKED']).optional(),
+      findings: boundedWireList.optional()
     })
     .superRefine((input, ctx) => {
       if (input.action === 'assign_manager') {
@@ -133,6 +168,38 @@ function extendAgentsSchema(base: z.ZodType): z.ZodType {
         if (input.tasks !== undefined) {
           ctx.addIssue({ code: 'custom', path: ['tasks'], message: 'tasks is only valid with action=plan' });
         }
+      }
+
+
+      const completionAction = input.action === 'complete_task';
+      const taskReviewAction = input.action === 'review_task';
+      const runReviewAction = input.action === 'review_run';
+      if (completionAction || taskReviewAction) {
+        if (!input.task_id) ctx.addIssue({ code: 'custom', path: ['task_id'], message: `${input.action} requires task_id` });
+      } else if (input.task_id !== undefined) {
+        ctx.addIssue({ code: 'custom', path: ['task_id'], message: 'task_id is only valid with action=complete_task or action=review_task' });
+      }
+
+      const completionFields = ['revision', 'changed_files', 'verification', 'risks', 'notes'] as const;
+      if (completionAction) {
+        for (const field of completionFields) {
+          if (input[field] === undefined) ctx.addIssue({ code: 'custom', path: [field], message: `action=complete_task requires ${field}` });
+        }
+      } else {
+        for (const field of completionFields) {
+          if (input[field] !== undefined) ctx.addIssue({ code: 'custom', path: [field], message: `${field} is only valid with action=complete_task` });
+        }
+      }
+
+      if (taskReviewAction || runReviewAction) {
+        if (!input.verdict) ctx.addIssue({ code: 'custom', path: ['verdict'], message: `${input.action} requires verdict` });
+        if (input.findings === undefined) ctx.addIssue({ code: 'custom', path: ['findings'], message: `${input.action} requires findings` });
+        if (runReviewAction && input.verdict === 'CHANGES_REQUESTED') {
+          ctx.addIssue({ code: 'custom', path: ['verdict'], message: 'action=review_run accepts only APPROVED or BLOCKED' });
+        }
+      } else {
+        if (input.verdict !== undefined) ctx.addIssue({ code: 'custom', path: ['verdict'], message: 'verdict is only valid with a review action' });
+        if (input.findings !== undefined) ctx.addIssue({ code: 'custom', path: ['findings'], message: 'findings is only valid with a review action' });
       }
     });
 }
@@ -188,6 +255,77 @@ export function decorateCoreRegistrarWithAgentV3(reg: SurfaceRegistrar): Surface
                 reg.ctx.roots
               );
               return planResult(value['plan_id'] as string, accepted);
+            });
+          }
+
+          if (value['action'] === 'complete_task') {
+            const startedAt = currentCall()?.startedAt ?? Date.now();
+            return guard('agents', async () => {
+              if (!reg.agentToolsLive) return reg.featureDisabled('Multi-agent mode', 'Multi-agent mode (experimental)');
+              const caller = await callerNowForAgentV3(startedAt);
+              const result = await submitTaskCompletionForCaller(
+                caller,
+                {
+                  taskId: value['task_id'] as string,
+                  revision: value['revision'] as string,
+                  changedFiles: value['changed_files'] as string[],
+                  verification: value['verification'] as Array<{ command: string; outcome: 'passed' | 'failed'; revision: string }>,
+                  risks: value['risks'] as string[],
+                  notes: value['notes'] as string[]
+                },
+                reg.ctx.roots,
+                reg.caps.command
+              );
+              return workflowResult('complete_task', `Task ${result.taskId} completion evidence was accepted for review.`, {
+                task_id: result.taskId,
+                reviewer_id: result.reviewerId
+              });
+            });
+          }
+
+          if (value['action'] === 'review_task') {
+            const startedAt = currentCall()?.startedAt ?? Date.now();
+            return guard('agents', async () => {
+              if (!reg.agentToolsLive) return reg.featureDisabled('Multi-agent mode', 'Multi-agent mode (experimental)');
+              const caller = await callerNowForAgentV3(startedAt);
+              const result = await submitTaskReviewForCaller(
+                caller,
+                {
+                  taskId: value['task_id'] as string,
+                  verdict: value['verdict'] as 'APPROVED' | 'CHANGES_REQUESTED' | 'BLOCKED',
+                  findings: value['findings'] as string[]
+                },
+                reg.ctx.roots,
+                reg.caps.command
+              );
+              return workflowResult('review_task', `Review verdict ${result.verdict} recorded for task ${result.taskId}.`, {
+                task_id: result.taskId,
+                verdict: result.verdict
+              });
+            });
+          }
+
+          if (value['action'] === 'review_run') {
+            const startedAt = currentCall()?.startedAt ?? Date.now();
+            return guard('agents', async () => {
+              if (!reg.agentToolsLive) return reg.featureDisabled('Multi-agent mode', 'Multi-agent mode (experimental)');
+              const caller = await callerNowForAgentV3(startedAt);
+              const result = await submitRunReviewForCaller(
+                caller,
+                value['verdict'] as 'APPROVED' | 'BLOCKED',
+                value['findings'] as string[]
+              );
+              return workflowResult('review_run', `System Review verdict ${result.verdict} recorded.`, { verdict: result.verdict });
+            });
+          }
+
+          if (value['action'] === 'advance') {
+            const startedAt = currentCall()?.startedAt ?? Date.now();
+            return guard('agents', async () => {
+              if (!reg.agentToolsLive) return reg.featureDisabled('Multi-agent mode', 'Multi-agent mode (experimental)');
+              const caller = await callerNowForAgentV3(startedAt);
+              await advanceWorkflowForCaller(caller, reg.ctx.roots, reg.caps.command);
+              return workflowResult('advance', 'The deterministic Agent System 3.0 kernel advanced every currently eligible step.', {});
             });
           }
 
