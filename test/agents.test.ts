@@ -1719,9 +1719,10 @@ describe('through the MCP endpoint', () => {
     await endpoint.stop();
   });
 
-  // One flat tool with six actions. The names it replaced are gone outright, not aliased,
+  // One flat tool. V3 extends the existing broker contract with deterministic orchestration
+  // actions; the names V2 replaced are still gone outright, not aliased,
   // so a chat still holding the old instructions gets an honest unknown-tool error.
-  it('publishes one agents tool with exactly six actions', async () => {
+  it('publishes one agents tool with the V2 broker and V3 orchestration actions', async () => {
     const reply = await post({ jsonrpc: '2.0', id: nextId++, method: 'tools/list', params: {} });
     const names = (reply.result.tools as Array<{ name: string }>).map((tool) => tool.name);
     expect(names).toContain('agents');
@@ -1741,10 +1742,14 @@ describe('through the MCP endpoint', () => {
       (tool) => tool.name === 'agents'
     )!.inputSchema;
     expect(schema.properties.action.enum.slice().sort()).toEqual([
+      'advance',
       'assign_manager',
+      'complete_task',
       'finish',
       'message',
       'plan',
+      'review_run',
+      'review_task',
       'spawn',
       'status'
     ]);
