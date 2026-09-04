@@ -3,6 +3,7 @@
 
   const LEASE_KEY = 'agentTabLeases';
   const QUEUE_KEY = 'agentTabLeaseQueue';
+  const TELEMETRY_KEY = 'agentTabLeaseTelemetry';
   const MAX_AGENT_TABS = 5;
   const MAX_QUEUE = 400;
   const MAX_CLOSE_ATTEMPTS = 3;
@@ -15,6 +16,7 @@
   let loading = null;
   let writes = Promise.resolve();
   let drainingQueue = null;
+  let openingLeaseReservations = 0;
   const closing = new Set();
   /**
    * Worker command ids whose irreversible `sent` result became durable during this service-worker lifetime.
@@ -65,8 +67,18 @@
   function persist() {
     const leaseSnapshot = { ...leases };
     const queueSnapshot = queue.map((entry) => ({ ...entry }));
+    const telemetrySnapshot = {
+      budget: MAX_AGENT_TABS,
+      used: liveLeaseCount(),
+      queued: queue.length,
+      observedAt: Date.now()
+    };
     const write = writes.then(() =>
-      chrome.storage.session.set({ [LEASE_KEY]: leaseSnapshot, [QUEUE_KEY]: queueSnapshot })
+      chrome.storage.session.set({
+        [LEASE_KEY]: leaseSnapshot,
+        [QUEUE_KEY]: queueSnapshot,
+        [TELEMETRY_KEY]: telemetrySnapshot
+      })
     );
     writes = write.then(
       () => undefined,
@@ -107,6 +119,10 @@
     ).length;
   }
 
+  function leaseCapacityUsed() {
+    return liveLeaseCount() + openingLeaseReservations;
+  }
+
   function queueCommand(commandId, url) {
     if (!commandId || markerFrom(url) !== commandId) return false;
     if (queue.some((entry) => entry.commandId === commandId)) return true;
@@ -118,7 +134,7 @@
     await load();
     if (drainingQueue) return drainingQueue;
     const work = (async () => {
-      while (queue.length > 0 && liveLeaseCount() < MAX_AGENT_TABS) {
+      while (queue.length > 0 && leaseCapacityUsed() < MAX_AGENT_TABS) {
         const entry = queue[0];
         if (!entry || markerFrom(entry.url) !== entry.commandId) {
           queue.shift();
@@ -126,14 +142,17 @@
           continue;
         }
         let created = null;
+        openingLeaseReservations += 1;
         try {
           created = await chrome.tabs.create({ url: entry.url });
         } catch {
           break;
+        } finally {
+          openingLeaseReservations -= 1;
         }
         if (!created || !Number.isInteger(created.id) || created.id < 0) break;
 
-        queue.shift();
+        queue = queue.filter((queued) => queued.commandId !== entry.commandId);
         const tabId = created.id;
         leases[leaseKey(tabId)] = {
           commandId: entry.commandId,
@@ -143,7 +162,7 @@
           leaseManagerCreated: true
         };
         await persist();
-        if (durableCommands.has(entry.commandId)) await closeDurableLease(tabId);
+        if (durableCommands.has(entry.commandId)) await closeDurableLease(tabId, false);
       }
     })();
     const tracked = work.finally(() => {
@@ -178,14 +197,14 @@
     }
   }
 
-  async function releaseStaleLease(key, lease) {
+  async function releaseStaleLease(key, lease, drainAfter = true) {
     if (leases[key] !== lease) return;
     delete leases[key];
     await persist();
-    await drainQueue();
+    if (drainAfter) await drainQueue();
   }
 
-  async function closeDurableLease(tabId) {
+  async function closeDurableLease(tabId, drainAfter = true) {
     await load();
     const key = leaseKey(tabId);
     const lease = leases[key];
@@ -195,7 +214,7 @@
     try {
       for (let attempt = 0; attempt < MAX_CLOSE_ATTEMPTS; attempt++) {
         if (!(await stillOwnsLease(lease))) {
-          await releaseStaleLease(key, lease);
+          await releaseStaleLease(key, lease, drainAfter);
           return false;
         }
         try {
@@ -204,7 +223,7 @@
             delete leases[key];
             await persist();
           }
-          await drainQueue();
+          if (drainAfter) await drainQueue();
           return true;
         } catch {
           if (attempt + 1 < MAX_CLOSE_ATTEMPTS) {
@@ -218,8 +237,9 @@
     }
   }
 
-  async function closeOverflowTab(tabId) {
+  async function closeOverflowTab(tabId, commandId) {
     for (let attempt = 0; attempt < MAX_CLOSE_ATTEMPTS; attempt++) {
+      if (!(await stillOwnsLease({ tabId, commandId }))) return false;
       try {
         await chrome.tabs.remove(tabId);
         return true;
@@ -244,11 +264,11 @@
       return { ok: false, error: 'agent_tab_command_mismatch' };
     }
 
-    if (!existing && !durableCommands.has(commandId) && liveLeaseCount() >= MAX_AGENT_TABS) {
+    if (!existing && !durableCommands.has(commandId) && leaseCapacityUsed() >= MAX_AGENT_TABS) {
       const url = typeof sender?.url === 'string' && markerFrom(sender.url) === commandId ? sender.url : sender?.tab?.url;
       if (!queueCommand(commandId, url)) return { ok: false, error: 'agent_tab_queue_rejected' };
       await persist();
-      const closed = await closeOverflowTab(tabId);
+      const closed = await closeOverflowTab(tabId, commandId);
       return closed ? { ok: true, queued: true } : { ok: false, error: 'agent_tab_budget_close_failed' };
     }
 
@@ -333,7 +353,10 @@
         changed = true;
       }
     }
-    if (changed) await persist();
+    // Publish one synchronized snapshot on every service-worker start even when recovery found
+    // nothing to repair. Without this, a cold browser session with zero agent tabs stays
+    // indistinguishable from "telemetry unavailable" until the first worker opens.
+    await persist();
     const durable = Object.values(leases)
       .filter((lease) => lease && typeof lease === 'object' && lease.handoffDurable === true)
       .map((lease) => lease.tabId)

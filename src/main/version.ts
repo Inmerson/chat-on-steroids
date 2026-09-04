@@ -47,5 +47,8 @@ export function extensionDownloadUrl(version = APP_VERSION): string {
  *     `disconnected`, protected routes distinguish that revocation from a stale token, and
  *     /pair accepts `reconnect: true` only for an explicit browser-side reconnect. An older
  *     extension would otherwise silently undo the user's app-side Disconnect on its next 401.
+ * 9 — authenticated extension requests may carry the exact agent-tab lease/queue telemetry
+ *     snapshot owned by the browser service worker, so Control Center can report the five-tab
+ *     budget without inferring browser state from app-side command queues or ordinary user tabs.
  */
-export const BRIDGE_PROTOCOL = 8;
+export const BRIDGE_PROTOCOL = 9;

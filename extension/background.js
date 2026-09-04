@@ -23,8 +23,9 @@
 const PORTS = [8765, 8766, 8767, 8768, 8769];
 const HELLO_TIMEOUT_MS = 1200;
 const REQUEST_TIMEOUT_MS = 10_000;
-/** Bumped only when the request/response shape changes; the app compares it. */
-const BRIDGE_PROTOCOL = 7;
+const BRIDGE_PROTOCOL = 9;
+const AGENT_TAB_BUDGET = 5;
+const MAX_AGENT_TAB_QUEUE = 400;
 
 /**
  * Journal caps. The byte figure is what actually matters — chrome.storage.session has a
@@ -124,6 +125,8 @@ let closing = false;
  */
 let commandAckOutbox = [];
 let ackingCommands = false;
+/** Exact browser-session lease snapshot published by agent-tab-lifecycle.js. */
+let agentTabLeaseTelemetry = null;
 
 /**
  * Which ChatGPT conversation each browser tab currently represents.
@@ -187,7 +190,9 @@ async function loadOnce() {
     'terminalDocuments',
     'closeOutbox',
     'commandAckOutbox',
-    'delivery'
+    'revivalPreferences',
+    'delivery',
+    'agentTabLeaseTelemetry'
   ]);
   settled = Array.isArray(live.settled) ? live.settled : [];
   journal = Array.isArray(live.journal) ? live.journal : [];
@@ -206,8 +211,38 @@ async function loadOnce() {
   if (live.delivery && typeof live.delivery === 'object' && !Array.isArray(live.delivery)) {
     delivery = { ...delivery, ...live.delivery };
   }
+  agentTabLeaseTelemetry = parseAgentTabLeaseTelemetry(live.agentTabLeaseTelemetry);
   loaded = true;
 }
+
+function parseAgentTabLeaseTelemetry(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const budget = value.budget;
+  const used = value.used;
+  const queued = value.queued;
+  const observedAt = value.observedAt;
+  if (budget !== AGENT_TAB_BUDGET) return null;
+  if (!Number.isInteger(used) || used < 0 || used > AGENT_TAB_BUDGET) return null;
+  if (!Number.isInteger(queued) || queued < 0 || queued > MAX_AGENT_TAB_QUEUE) return null;
+  if (!Number.isFinite(observedAt) || observedAt <= 0) return null;
+  return { budget, used, queued, observedAt };
+}
+
+function agentTabTelemetryHeaders() {
+  const telemetry = agentTabLeaseTelemetry;
+  if (!telemetry) return {};
+  return {
+    'x-agent-tab-budget': String(telemetry.budget),
+    'x-agent-tabs-used': String(telemetry.used),
+    'x-agent-tabs-queued': String(telemetry.queued),
+    'x-agent-tabs-observed-at': String(telemetry.observedAt)
+  };
+}
+
+chrome.storage.onChanged.addListener((changes, areaName) => {
+  if (areaName !== 'session' || !changes?.agentTabLeaseTelemetry) return;
+  agentTabLeaseTelemetry = parseAgentTabLeaseTelemetry(changes.agentTabLeaseTelemetry.newValue);
+});
 
 async function persist() {
   await chrome.storage.local.set({ port, token, disconnected });
@@ -765,6 +800,7 @@ async function call(path, init = {}, retried = false) {
       headers: {
         ...(init.body ? { 'content-type': 'application/json' } : {}),
         ...versionHeaders(),
+        ...agentTabTelemetryHeaders(),
         authorization: `Bearer ${token}`
       }
     });

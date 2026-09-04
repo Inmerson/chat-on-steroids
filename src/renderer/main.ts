@@ -26,6 +26,7 @@ import {
 import type { SwarmState } from '../shared/session.js';
 import { $, ago, el, icon, run, shortAgo, toast } from './dom.js';
 import { chatApply, chatSettingsPatch, chatVisible, initChat } from './chat.js';
+import { controlCenterVisible, initControlCenter } from './control-center.js';
 
 declare global {
   interface Window {
@@ -113,9 +114,10 @@ function showTab(name: string): void {
   for (const panel of document.querySelectorAll<HTMLElement>('.panel')) {
     panel.classList.toggle('is-active', panel.dataset.panel === name);
   }
-  // The Chat panel is the only one that costs anything to keep fresh, so it only
-  // reloads while it is on screen.
+  // Live panels only poll while they are on screen. Their modules own the cadence and
+  // stale-result guards; the tab switcher owns visibility only.
   chatVisible(name === 'chat');
+  controlCenterVisible(name === 'control');
   // A feed that was appended to while its panel was hidden could not be scrolled then —
   // a hidden element has no scroll height. Pin it now that it has one, so a panel always
   // opens on the newest line rather than on whatever was oldest in the buffer.
@@ -1399,6 +1401,7 @@ async function refresh(): Promise<void> {
 
 buildGroups();
 initChat({ save: () => save(), state: () => state });
+initControlCenter(api);
 
 void (async () => {
   await refresh();

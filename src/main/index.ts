@@ -3,6 +3,7 @@
  */
 
 import path from 'node:path';
+import { mkdirSync } from 'node:fs';
 import { app, BrowserWindow, Menu, Tray, nativeImage, nativeTheme, screen, session, shell } from 'electron';
 import { getConfig, initConfigPath, loadConfig } from './config.js';
 import { connect, disconnect, getStatus, onStatusChange, shutdownConnection } from './connection.js';
@@ -70,6 +71,15 @@ let shutdownStarted = false;
 let shutdownComplete = false;
 let stopSessionRetention: (() => void) | null = null;
 const backgroundStartup = isBackgroundStartup();
+
+// Development previews can opt into an isolated Electron profile so they do not collide with
+// the user's normal Chat On Steroids instance or touch its config/durable state. Packaged builds
+// intentionally ignore this escape hatch.
+if (!app.isPackaged && process.env.COS_DEV_USER_DATA?.trim()) {
+  const isolatedUserData = path.resolve(process.env.COS_DEV_USER_DATA.trim());
+  mkdirSync(isolatedUserData, { recursive: true });
+  app.setPath('userData', isolatedUserData);
+}
 
 // One instance only: two copies would fight over the tunnel and the config file.
 const hasSingleInstanceLock = app.requestSingleInstanceLock();

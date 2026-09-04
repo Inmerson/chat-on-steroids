@@ -8,6 +8,7 @@
 
 import { contextBridge, ipcRenderer } from 'electron';
 import type { AppState, Capabilities, Config, Diagnosis, LogEntry } from '../shared/types.js';
+import type { ControlCenterStatus } from '../shared/control-center.js';
 import type {
   Handoff,
   SessionEvent,
@@ -97,6 +98,9 @@ const api = {
   // against a folder the renderer never chose.
   extensionPath: () => call<string | null>('bridge:extensionPath'),
   openExtensionFolder: () => call<string>('bridge:openExtensionFolder'),
+
+  // One read-only orchestration projection. No generic IPC escape hatch and no renderer input.
+  getControlCenter: () => call<ControlCenterStatus>('control-center:get'),
 
   getSwarm: () => call<SwarmState>('swarm:get'),
   resetSwarm: () => call<SwarmState>('swarm:reset'),

@@ -769,10 +769,10 @@ describe('surface boundaries', () => {
     // discriminated action variants, each spelling out its own arguments, is what keeps
     // its validation errors small and its action set explicit. `exec_command` earns a narrow
     // exception for the `cmds` contract that removes whole connector round trips, including
-    // the one-shell and per-command-exit semantics. `agents` is the other exception: its description is where the prime learns to write
-    // shared context once instead of per worker, to batch messages into one call, and to
-    // hand back RESULT/CHANGES/VALIDATION/BLOCKERS — bytes spent once at discovery to save
-    // a great many in every run that follows.
+    // the one-shell and per-command-exit semantics. `agents` is the other exception: V3 keeps
+    // the broker actions and adds explicit plan/completion/review/advance fields to the same
+    // flat tool, while its description teaches batching and structured handoff. Keep its cap
+    // tight around that deliberate surface rather than the pre-V3 six-action size.
     for (const tool of [...coreTools, ...desktopTools]) {
       const bytes = Buffer.byteLength(JSON.stringify(tool), 'utf8');
       const budget =
@@ -781,7 +781,7 @@ describe('surface boundaries', () => {
           : tool.name === 'apply_patch'
             ? 5_000
             : tool.name === 'agents'
-              ? 3_400
+              ? 4_400
               : tool.name === 'exec_command'
                 ? 3_500
                 : 3_000;

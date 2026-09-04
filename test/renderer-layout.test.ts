@@ -21,16 +21,19 @@ import { beforeAll, describe, expect, it } from 'vitest';
 let document: Document;
 let css = '';
 let chatSource = '';
+let controlCenterSource = '';
 
 beforeAll(async () => {
-  const [html, styles, chat] = await Promise.all([
+  const [html, styles, chat, controlCenter] = await Promise.all([
     fs.readFile(path.join(process.cwd(), 'src', 'renderer', 'index.html'), 'utf8'),
     fs.readFile(path.join(process.cwd(), 'src', 'renderer', 'styles.css'), 'utf8'),
-    fs.readFile(path.join(process.cwd(), 'src', 'renderer', 'chat.ts'), 'utf8')
+    fs.readFile(path.join(process.cwd(), 'src', 'renderer', 'chat.ts'), 'utf8'),
+    fs.readFile(path.join(process.cwd(), 'src', 'renderer', 'control-center.ts'), 'utf8')
   ]);
   document = new JSDOM(html).window.document;
   css = styles;
   chatSource = chat;
+  controlCenterSource = controlCenter;
 });
 
 /** The declarations of one selector, whitespace-normalised. */
@@ -347,6 +350,69 @@ describe('the session timeline', () => {
 });
 
 describe('the window as a whole', () => {
+  it('exposes Control as a normal fifth destination with one bounded canvas panel', () => {
+    const controlTab = document.querySelector<HTMLButtonElement>('nav button[data-tab="control"]');
+    const controlPanel = document.querySelector<HTMLElement>('.panel[data-panel="control"]');
+    expect(controlTab).not.toBeNull();
+    expect(controlTab?.textContent).toContain('Control');
+    expect(controlPanel).not.toBeNull();
+    expect(document.querySelectorAll('.panel[data-panel="control"]')).toHaveLength(1);
+    expect(document.getElementById('controlSummary')).not.toBeNull();
+    expect(document.getElementById('controlGraph')).not.toBeNull();
+    expect(document.getElementById('controlNodes')).not.toBeNull();
+    expect(document.getElementById('controlEdges')?.tagName.toLowerCase()).toBe('svg');
+    expect(document.getElementById('controlLegend')).not.toBeNull();
+    expect(document.getElementById('controlLegend')?.textContent).toContain('Verified');
+    expect(document.getElementById('controlLegend')?.textContent).toContain('Active');
+    expect(document.getElementById('controlLegend')?.textContent).toContain('Blocked');
+    expect(document.querySelectorAll('#controlLegend button[data-control-filter]')).toHaveLength(4);
+    expect(document.querySelector('#controlLegend [data-control-filter="attention"]')).toBeNull();
+    const search = document.getElementById('controlSearch') as HTMLInputElement | null;
+    expect(search).not.toBeNull();
+    expect(search?.type).toBe('text');
+    expect(search?.getAttribute('role')).toBe('searchbox');
+    expect(search?.placeholder).toBe('Find agent or task…');
+  });
+
+  it('keeps stable inspector anchors beside the graph for selected agent/task detail', () => {
+    const panel = document.querySelector<HTMLElement>('.panel[data-panel="control"]')!;
+    const graph = document.getElementById('controlGraph');
+    const inspector = document.getElementById('controlInspector');
+    expect(graph).not.toBeNull();
+    expect(inspector).not.toBeNull();
+    expect(panel.contains(graph)).toBe(true);
+    expect(panel.contains(inspector)).toBe(true);
+    expect(document.getElementById('controlInspectorTitle')).not.toBeNull();
+    expect(document.getElementById('controlInspectorBody')).not.toBeNull();
+  });
+
+  it('applies graph focus in the selection handler instead of waiting for a polling repaint', () => {
+    const start = controlCenterSource.indexOf("function selectNode(kind: 'agent' | 'task', id: string): void {");
+    const end = controlCenterSource.indexOf('\n}', start);
+    expect(start).toBeGreaterThan(-1);
+    expect(end).toBeGreaterThan(start);
+    const body = controlCenterSource.slice(start, end);
+    expect(body).toContain('applyControlCenterGraphFocus(document, lastStatus, selected)');
+  });
+
+  it('makes blockers an honest read-only filter without inventing a Needs you action', () => {
+    expect(controlCenterSource).toMatch(/addSummaryAction\(\s*'Blockers'/);
+    expect(controlCenterSource).not.toMatch(/addSummaryAction\(\s*'Needs you'/);
+  });
+
+  it('shows authoritative blocker reasons in the Inspector when blocked focus is active', () => {
+    expect(controlCenterSource).toContain("activeFilter === 'blocked'");
+    expect(controlCenterSource).toContain("title.textContent = 'Blockers'");
+    expect(controlCenterSource).toContain('controlCenterBlockerInspectorDetails(lastStatus)');
+  });
+
+  it('wires Control search for incremental focus, Enter selection and Escape reset', () => {
+    expect(controlCenterSource).toContain("$('controlSearch').addEventListener('input'");
+    expect(controlCenterSource).toContain("$('controlSearch').addEventListener('keydown'");
+    expect(controlCenterSource).toContain("event.key === 'Enter'");
+    expect(controlCenterSource).toContain("event.key === 'Escape'");
+  });
+
   it('keeps the Home activity strip shorter than the three setup/status cards', () => {
     expect(rule("[data-panel='home']")).toContain('grid-template-rows: 300px minmax(0, 1fr)');
   });
@@ -370,6 +436,8 @@ describe('the window as a whole', () => {
     expect(css).not.toMatch(/overflow:\s*(auto|scroll)\s+/);
     // The one scrolling surface in the app is vertical only.
     expect(rule('.scroll')).toContain('overflow: hidden auto');
+    expect(rule("[data-panel='control']")).not.toContain('overflow-x: auto');
+    expect(rule('.control-canvas-scroll')).toContain('overflow: hidden auto');
   });
 
   it('keeps setup and settings vertically reachable when the window is short', () => {

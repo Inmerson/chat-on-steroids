@@ -151,6 +151,26 @@ describe('startup state without secure storage', () => {
   });
 });
 
+describe('Control Center read surface', () => {
+  it('publishes one named read-only projection endpoint and returns an idle status before a V3 run exists', async () => {
+    const handler = handlers.get('control-center:get');
+    expect(handler, 'Control Center IPC handler is not registered').toBeDefined();
+
+    const reply = (await handler!(null, undefined)) as any;
+    expect(reply.ok).toBe(true);
+    expect(reply.data.version).toBe(1);
+    expect(reply.data.run).toBeNull();
+    expect(reply.data.tasks).toEqual([]);
+    expect(reply.data.agents).toEqual([]);
+    expect(reply.data.browser).toMatchObject({
+      budget: 5,
+      used: null,
+      queued: null,
+      status: 'unavailable'
+    });
+  });
+});
+
 describe('turning multi-agent mode off', () => {
   /**
    * Pausing execution must withdraw queued browser work before the bridge goes away. The
