@@ -1389,6 +1389,41 @@ function deferredRevivalId(value) {
   return id && id.length <= 128 ? id : null;
 }
 
+/**
+ * Opens a fresh worker beside the prime without activating the new tab or focusing a window.
+ *
+ * This is intentionally narrower than the managed-window router below. The bridge gives the
+ * offer only to the exact prime conversation that created the worker; using that source tab's
+ * current window avoids `chrome.exe <url>` foreground selection. Once the worker redeems its
+ * marker, the ordinary command lifecycle may move it into the managed Agent window with
+ * `focused:false` as usual.
+ */
+async function placeBackgroundWorker(raw, tabId) {
+  const id = deferredRevivalId(raw?.id);
+  if (!id || raw?.background !== true || !Number.isInteger(tabId)) return false;
+  let home = null;
+  try {
+    home = await chrome.tabs.get(tabId);
+  } catch {
+    return false;
+  }
+  if (!home || !Number.isInteger(home.windowId)) return false;
+  const marker = `clf=${encodeURIComponent(id)}`;
+  const create = {
+    url: `https://chatgpt.com/?${marker}#${marker}`,
+    windowId: home.windowId,
+    active: false
+  };
+  if (Number.isInteger(home.index)) create.index = home.index + 1;
+  try {
+    await chrome.tabs.create(create);
+    return true;
+  } catch {
+    // The app keeps a bounded OS-open fallback armed until the marked page actually redeems.
+    return false;
+  }
+}
+
 async function rememberDeferredRevival(idValue, conversationValue) {
   await load();
   const id = deferredRevivalId(idValue);
@@ -2407,7 +2442,11 @@ const HANDLERS = {
       `&since=${Number(message.since) || 0}` +
       `&goalClient=${encodeURIComponent(String(source.tab))}`;
     const result = await call(`/activity${query}`);
-    return ownsDocument(source) ? result : { ok: false, error: 'stale_document' };
+    if (!ownsDocument(source)) return { ok: false, error: 'stale_document' };
+    if (result.ok && result.data?.placement?.background === true) {
+      await placeBackgroundWorker(result.data.placement, source.tab);
+    }
+    return result;
   },
   /** Reinstall the least-trusted MAIN-world reader when a live content script loses it. */
   async repair_fiber(_message, _sender, source) {

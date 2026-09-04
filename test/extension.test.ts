@@ -719,6 +719,36 @@ describe('worker settings authority', () => {
   const paired = { port: 8765, token: 'paired-token' };
   const CHAT = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee';
 
+  it('opens a fresh worker placement in the prime window without activating it or focusing the window', async () => {
+    const fetch = vi.fn(async (input: string) => {
+      const url = new URL(input);
+      if (url.pathname === '/hello') return response(200, { app: 'chat-on-steroids', paired: true });
+      if (url.pathname === '/activity') {
+        return response(200, { placement: { id: 'cmd-worker', background: true } });
+      }
+      return response(404, {});
+    });
+    const worker = loadWorker({
+      local: new FakeStorageArea(paired),
+      session: new FakeStorageArea(),
+      fetch,
+      tabsGet: async () => ({ id: 47, windowId: 9, index: 4 }) as never
+    });
+    await worker.registerTab(47);
+    await worker.send({ type: 'bind', conversationId: CHAT }, 47);
+
+    await worker.send({ type: 'activity', conversationId: CHAT, since: 0 }, 47);
+
+    expect(worker.tabsCreate).toHaveBeenCalledTimes(1);
+    expect(worker.tabsCreate).toHaveBeenCalledWith({
+      url: 'https://chatgpt.com/?clf=cmd-worker#clf=cmd-worker',
+      windowId: 9,
+      index: 5,
+      active: false
+    });
+    expect(worker.windowsUpdate).not.toHaveBeenCalled();
+  });
+
   it('forwards auto-compaction writes with the source tab conversation so the app can reject worker authority', async () => {
     const posted: Record<string, unknown>[] = [];
     const fetch = vi.fn(async (input: string, init: Record<string, unknown> = {}) => {

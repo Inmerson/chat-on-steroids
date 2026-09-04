@@ -26,6 +26,7 @@ function makeHarness(
   const storageListeners = new Set<Listener>();
   const removedListeners = new Set<Listener>();
   const removed: number[] = [];
+  const created: Array<Record<string, any>> = [];
   const executed: Array<{ tabId: number; files: string[] }> = [];
   let failuresLeft = removeFailures;
 
@@ -46,6 +47,12 @@ function makeHarness(
       onChanged: { addListener: (listener: Listener) => storageListeners.add(listener) }
     },
     tabs: {
+      async create(options: Record<string, any>) {
+        created.push({ ...options });
+        const id = 100 + created.length;
+        browserTabs.set(id, String(options.url ?? ''));
+        return { id, url: options.url };
+      },
       async get(tabId: number) {
         const url = browserTabs.get(tabId);
         if (!url) throw new Error(`No tab with id: ${tabId}`);
@@ -85,6 +92,7 @@ function makeHarness(
   return {
     sessionState,
     removed,
+    created,
     executed,
     async message(message: Record<string, any>, sender: Record<string, any>) {
       const tabId = sender?.tab?.id;
@@ -113,6 +121,30 @@ function makeHarness(
 const marked = (id: string) => ({ tab: { id: 17, url: `https://chatgpt.com/?clf=${encodeURIComponent(id)}#clf=${encodeURIComponent(id)}` } });
 
 describe('ephemeral agent tab lifecycle', () => {
+  it('opens a queued agent tab in the background when capacity becomes available', async () => {
+    const h = makeHarness();
+    for (let index = 0; index < 5; index++) {
+      const id = `cmd-worker-${index + 1}`;
+      await h.message(
+        { type: 'agent_tab_register', id },
+        { tab: { id: 20 + index, url: `https://chatgpt.com/?clf=${id}#clf=${id}` } }
+      );
+    }
+    const queuedId = 'cmd-worker-6';
+    await h.message(
+      { type: 'agent_tab_register', id: queuedId },
+      { tab: { id: 30, url: `https://chatgpt.com/?clf=${queuedId}#clf=${queuedId}` } }
+    );
+    expect(h.removed).toContain(30);
+    expect(h.created).toEqual([]);
+
+    await h.tabRemoved(20);
+
+    expect(h.created).toEqual([
+      { url: `https://chatgpt.com/?clf=${queuedId}#clf=${queuedId}`, active: false }
+    ]);
+  });
+
   it('keeps a marker-owned worker tab open after bootstrap ACK and closes only after broker lifecycle says releasable', async () => {
     const h = makeHarness();
     await h.message({ type: 'agent_tab_register', id: 'cmd-worker-1' }, marked('cmd-worker-1'));

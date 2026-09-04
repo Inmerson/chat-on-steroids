@@ -326,6 +326,11 @@ interface Command {
    * Memory only: a command restored from a previous run has no page waiting for it.
    */
   owner: string | null;
+  /**
+   * Exact prime conversation that may place a brand-new worker tab in its own Chrome window.
+   * Memory-only: restored/replayed commands deliberately lose this hint and use the OS opener.
+   */
+  placementHome: string | null;
 }
 
 type CommandPhase = 'queued' | 'leased';
@@ -1267,6 +1272,7 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
         job: null,
         execution: executionView,
         workerLifecycle,
+        placement: takeWorkerPlacement(id),
         ...(workerBlocked
           ? {
               // Worker conversations are never Compact & Resume sources. Keep the page's
@@ -1474,6 +1480,9 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
         // The browser may destroy a worker view only after the broker has durably stopped it.
         // Active/detached/waking workers keep their tab even when the bootstrap ACK is durable.
         workerLifecycle,
+        // Fresh worker creation is a one-shot handoff to this exact prime page. The extension
+        // creates the marked tab inactive; restart/recovery commands carry no placement hint.
+        placement: takeWorkerPlacement(id),
         // The goal loop: whether it is on, whether it *can* be on, and whatever draft this
         // chat currently has in flight. The draft's text grows on this feed, which is what
         // the panel above the composer streams — there is no second connection to hold open.
@@ -2121,6 +2130,7 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
       }
       return json(res, 503, { error: 'command_lease_not_durable', retryable: true }, origin);
     }
+    clearWorkerPlacement(command.id);
     // `claim()` armed the original browser-open deadline. A page can legitimately spend a
     // large part of that window just getting Chrome/ChatGPT started before it redeems the
     // marker, and content.js then has its own bounded composer + conversation-id wait. Merely
@@ -2904,8 +2914,8 @@ async function startBridgeOnce(epoch: number): Promise<number | null> {
       // a still-live lease can sit forever with no timer to end it.
       rearmRetainedCommandDeadlines();
       dropSpawnRequestListener?.();
-      dropSpawnRequestListener = onSpawnRequest((workers) => {
-        for (const worker of workers) queueWorkerBootstrap(worker.id, worker.task);
+      dropSpawnRequestListener = onSpawnRequest((workers, placementHome) => {
+        for (const worker of workers) queueWorkerBootstrap(worker.id, worker.task, placementHome);
       });
       // The same replay contract for waking a worker that already has a chat. A run restored
       // from disk can hold a worker left in `waking` by a crash mid-revival; registering here
@@ -2967,6 +2977,7 @@ export async function stopBridge(): Promise<void> {
     if (!instance) return;
     if (browserPresenceTimer) clearTimeout(browserPresenceTimer);
     browserPresenceTimer = null;
+    clearWorkerPlacement();
     server = null;
     port = null;
     // A stopped listener cannot currently see the extension. Require one fresh authenticated
@@ -3263,10 +3274,11 @@ async function finalizeCommand(command: Command, receipt: CommandReceipt): Promi
   return true;
 }
 
-function queue(spec: CommandSpec): Command {
+function queue(spec: CommandSpec, placementHome: string | null = null): Command {
   const key = commandKey(spec);
   const existing = commands.find((command) => commandKey(command.spec) === key);
   if (existing) {
+    if (spec.type === 'worker' && placementHome) existing.placementHome = placementHome;
     // The same bootstrap arriving twice — a restart re-requesting a worker whose chat was
     // never bound, or the user pressing Compact & Resume again — is one job, not two tabs.
     const superseded = JSON.stringify(existing.spec) !== JSON.stringify(spec);
@@ -3300,7 +3312,8 @@ function queue(spec: CommandSpec): Command {
     claimedAt: null,
     timer: null,
     lastError: null,
-    owner: null
+    owner: null,
+    placementHome
   };
   commands.push(command);
   if (commands.length > MAX_COMMANDS) {
@@ -3502,13 +3515,17 @@ export async function cancelResumeNow(sessionId: string): Promise<boolean> {
  * stored: the chat this opens is bound to the slot by the extension's report, and the
  * recovery key exists only if the user asks the app for one after that has failed.
  */
-export function queueWorkerBootstrap(agent: string, task: string): BridgeCommand | null {
+export function queueWorkerBootstrap(
+  agent: string,
+  task: string,
+  placementHome: string | null = null
+): BridgeCommand | null {
   const runId = currentRunId();
   // A worker bootstrap is authority for one concrete broker incarnation. There is no safe
   // meaning for one outside a run, and manufacturing an unscoped command here is exactly how
   // stale durable work later becomes somebody else's `worker-1`.
   if (!runId) return null;
-  const command = queue({ type: 'worker', agent, task, runId });
+  const command = queue({ type: 'worker', agent, task, runId }, placementHome);
   deliver();
   return describe(command, null);
 }
@@ -3645,6 +3662,10 @@ function queueResumeCommand(sessionId: string, token: string): Command {
  */
 let openInBrowser: ((url: string) => Promise<void>) | null = null;
 let windowPresenter: (() => void) | null = null;
+/** How long a live prime page gets to place its fresh worker before the OS opener takes over. */
+export const WORKER_PLACEMENT_MS = 20_000;
+let workerPlacementOffer: { id: string; conversationId: string } | null = null;
+let workerPlacementTimer: NodeJS.Timeout | null = null;
 
 export function setWindowPresenter(presenter: (() => void) | null): void {
   windowPresenter = presenter;
@@ -3652,6 +3673,54 @@ export function setWindowPresenter(presenter: (() => void) | null): void {
 
 export function setBrowserOpener(open: ((url: string) => Promise<void>) | null): void {
   openInBrowser = open;
+}
+
+function clearWorkerPlacement(commandId?: string): void {
+  if (commandId && workerPlacementOffer?.id !== commandId) return;
+  workerPlacementOffer = null;
+  if (workerPlacementTimer) clearTimeout(workerPlacementTimer);
+  workerPlacementTimer = null;
+}
+
+/**
+ * Gives a fresh worker to the prime page that requested it rather than asking the OS to choose
+ * a Chrome window. The bridge lease is already durable here; this only chooses who creates the
+ * tab. If the page disappears or an older extension ignores the offer, the normal OS opener is
+ * used after a bounded grace period.
+ */
+function offerWorkerPlacement(command: Command): boolean {
+  if (command.spec.type !== 'worker' || !command.placementHome) return false;
+  clearWorkerPlacement();
+  workerPlacementOffer = { id: command.id, conversationId: command.placementHome };
+  workerPlacementTimer = setTimeout(() => {
+    workerPlacementTimer = null;
+    workerPlacementOffer = null;
+    const pending = commands.find((entry) => entry.id === command.id && entry.owner === null);
+    if (!pending || !openInBrowser) return;
+    logInfo(`bridge: background worker placement timed out; using the OS opener for ${specKey(pending.spec)}`);
+    void openInBrowser(commandUrl(pending.id)).catch((err) => {
+      const why = `the browser could not be opened (${err instanceof Error ? err.message : String(err)})`;
+      pending.lastError = why;
+      drop(pending, why);
+      void deliver();
+    });
+  }, WORKER_PLACEMENT_MS);
+  workerPlacementTimer.unref?.();
+  logInfo(`bridge: offering ${specKey(command.spec)} to its prime page as a background tab`);
+  return true;
+}
+
+/** One-shot handout. The fallback stays armed until the created page actually redeems the id. */
+function takeWorkerPlacement(conversationId: string): { id: string; background: true } | null {
+  const offer = workerPlacementOffer;
+  if (!offer || offer.conversationId !== conversationId) return null;
+  const command = commands.find((entry) => entry.id === offer.id && entry.owner === null);
+  if (!command) {
+    clearWorkerPlacement(offer.id);
+    return null;
+  }
+  workerPlacementOffer = null;
+  return { id: offer.id, background: true };
 }
 
 /** Where the app sends the browser. The marker is an id, not a credential. */
@@ -3721,6 +3790,7 @@ async function deliverOne(): Promise<void> {
   // commit quite correctly refuses to overwrite it. The later durable redeem refreshes the same
   // gate; commit/abort/drop clears it through the continuation state machine.
   if (command.spec.type === 'resume') noteResumeOpening(command.spec.token);
+  if (offerWorkerPlacement(command)) return;
   logInfo(
     command.spec.type === 'revive'
       ? `bridge: reopening the ChatGPT chat of ${specKey(command.spec)}`
@@ -3875,6 +3945,7 @@ function expire(command: Command): void {
 function retire(command: Command, why: string): void {
   if (command.timer) clearTimeout(command.timer);
   command.timer = null;
+  clearWorkerPlacement(command.id);
   if (!commands.includes(command)) return;
   commands = commands.filter((entry) => entry !== command);
   logInfo(`bridge: ${specKey(command.spec)} is done — ${why}`);
@@ -4503,7 +4574,8 @@ function planCommandRestore(
       claimedAt,
       timer: null,
       lastError: typeof raw.lastError === 'string' ? raw.lastError : null,
-      owner: leased && typeof raw.owner === 'string' ? raw.owner.slice(0, 64) : null
+      owner: leased && typeof raw.owner === 'string' ? raw.owner.slice(0, 64) : null,
+      placementHome: null
     });
     restored += 1;
   }
@@ -4628,6 +4700,7 @@ export function resetBridgeForTests(): void {
   for (const command of commands) if (command.timer) clearTimeout(command.timer);
   if (browserPresenceTimer) clearTimeout(browserPresenceTimer);
   browserPresenceTimer = null;
+  clearWorkerPlacement();
   commands = [];
   commandReceipts = [];
   commandRetirementsAwaitingBroker.clear();

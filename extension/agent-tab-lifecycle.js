@@ -183,7 +183,7 @@
         let created = null;
         openingLeaseReservations += 1;
         try {
-          created = await chrome.tabs.create({ url: entry.url });
+          created = await chrome.tabs.create({ url: entry.url, active: false });
         } catch {
           break;
         } finally {

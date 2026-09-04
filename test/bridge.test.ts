@@ -1367,6 +1367,41 @@ describe('automatic compaction', () => {
 });
 
 describe('delivering a bootstrap', () => {
+  it('offers a fresh worker to its prime page as a background placement instead of foregrounding the OS browser', async () => {
+    const home = 'c0c0c0c0-1111-4222-8333-000000000b01';
+    await pair();
+    await request('POST', '/events', {
+      body: {
+        conversationId: home,
+        events: [{ kind: 'user_message', time: Date.now(), text: 'spawn a worker', messageId: 'm-worker-home' }]
+      }
+    });
+    const staged = spawn(
+      { workers: [{ task: 'audit the background tab path' }], caller: { conversationId: home } },
+      { deferDelivery: true }
+    );
+    requestWorkerBootstraps(staged.created.map((worker) => worker.id), home);
+
+    await vi.waitFor(() => expect(pendingCommands()).toHaveLength(1));
+    const [command] = pendingCommands();
+    expect(command?.what).toContain('worker:worker-1');
+    await vi.waitFor(async () => {
+      const durable = await readDurable<any>('bridge-commands');
+      expect(durable?.commands?.find((entry: any) => entry?.id === command?.id)?.phase).toBe('leased');
+    });
+    // The durable lease is written before the in-memory offer is published. Give that same
+    // delivery continuation one turn to cross the publication boundary before the page polls.
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    const feed = await request('GET', `/activity?conversationId=${home}`);
+    expect(feed.body.placement).toEqual({ id: command?.id, background: true });
+    expect(opened).toEqual([]);
+
+    // One offer, one tab. A later poll cannot manufacture a duplicate.
+    const second = await request('GET', `/activity?conversationId=${home}`);
+    expect(second.body.placement).toBeNull();
+  });
+
   async function prepareExpiredDocumentOwnedRevivalRestoreFixture(options: {
     workerConversation: string;
     resumeConversation: string;
