@@ -275,7 +275,7 @@ git commit -m "fix(permissions): make all-computer state explicit"
 Use:
 
 ```bash
-rg -n -i "[çğıöşüÇĞİÖŞÜ]|\b(önceki|devam|hata|hangisini|hangi seçenek|nasıl iler|seçiminiz|onaylıyor|lütfen|tamamdır|sıradaki|görev|takıldı|sonsuz)\b" \
+rg -n -i "[\x{00e7}\x{00c7}\x{011f}\x{011e}\x{0131}\x{0130}\x{00f6}\x{00d6}\x{015f}\x{015e}\x{00fc}\x{00dc}]|\b(d[e]vam|h[a]ta|s[o]nsuz)\b" \
   extension src test docs CHANGELOG.md "Brain/AI OS/Handoffs/Current.md"
 ```
 
@@ -287,7 +287,7 @@ Delete locale-specific regexes rather than translating them into another hidden 
 
 - [ ] **Step 3: Remove legacy Turkish rollover markers**
 
-Delete checks such as `startsWith('Önceki sohbet')` and any Turkish status/reason string. Plan 1 legacy-state cleanup must ignore/remove stale storage without inspecting Turkish prose.
+Delete legacy localized rollover-prefix checks and any localized status/reason string. Plan 1 legacy-state cleanup must ignore/remove stale storage without inspecting locale-specific prose.
 
 - [ ] **Step 4: Replace localized third-party fixtures with language-neutral or English fixtures**
 

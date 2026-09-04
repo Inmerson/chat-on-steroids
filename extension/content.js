@@ -5466,12 +5466,12 @@
 
   function parseLoopStatusAndStep(text) {
     if (!text || typeof text !== 'string') return { status: 'UNKNOWN', nextStep: null };
-    const completed = /\[(?:STATUS|DURUM):\s*(?:COMPLETED|TAMAMLANDI)\s*\]/i.test(text);
+    const completed = /\[STATUS:\s*COMPLETED\s*\]/i.test(text);
     if (completed) {
       return { status: 'COMPLETED', nextStep: null };
     }
-    const inProgress = /\[(?:STATUS|DURUM):\s*(?:IN_PROGRESS|DEVAM)\s*\]/i.test(text);
-    const match = text.match(/\[(?:NEXT_STEP|SIRADAKI_ADIM):\s*([^\]\r\n]+?)\s*\]/i);
+    const inProgress = /\[STATUS:\s*IN_PROGRESS\s*\]/i.test(text);
+    const match = text.match(/\[NEXT_STEP:\s*([^\]\r\n]+?)\s*\]/i);
     const nextStep = match ? match[1].trim() : null;
     return {
       status: inProgress ? 'IN_PROGRESS' : 'UNKNOWN',
@@ -5715,16 +5715,7 @@
       /please\s+(?:choose|select|pick)\s+(?:an\s+option|one)/i,
       /(?:option\s+1|option\s+a)[\s\S]*?(?:option\s+2|option\s+b)/i,
       /let\s+me\s+know\s+(?:what|how|which)/i,
-      /would\s+you\s+prefer/i,
-      /hangisini\s+(?:tercih\s+edersiniz|seçersiniz|istersiniz)/i,
-      /hangi\s+seçene(?:ği|k)/i,
-      /nasıl\s+ilerlememizi\s+istersiniz/i,
-      /nasıl\s+devam\s+edelim/i,
-      /ne\s+yapmak\s+istersiniz/i,
-      /seçiminiz\s+nedir/i,
-      /bir\s+seçenek\s+seçin/i,
-      /onayl(?:ıyor|ar)\s*mısınız/i,
-      /devam\s+etmemi\s+ister\s+misiniz/i
+      /would\s+you\s+prefer/i
     ];
 
     return decisionPatterns.some((pattern) => pattern.test(lower));
@@ -5737,7 +5728,6 @@
     const errorPatterns = [
       /rate\s+limit\s+exceeded/i,
       /too\s+many\s+requests/i,
-      /hata\s+oluştu/i,
       /something\s+went\s+wrong/i,
       /please\s+try\s+again\s+later/i
     ];
@@ -5779,7 +5769,6 @@
 
       const genuineUserPrompts = userTexts.filter((txt) =>
         !txt.startsWith('Transferred to this clean session') &&
-        !txt.startsWith('Önceki sohbet') &&
         !txt.startsWith('Milestone completed') &&
         !txt.startsWith('Goal achieved')
       );
@@ -7973,12 +7962,8 @@
   function dismissRequestLimitDialog() {
     const dialogs = [...document.querySelectorAll('[role="dialog"]')];
     for (const dialog of dialogs) {
-      const text = String(dialog.textContent || '').replace(/\s+/g, ' ').trim().toLocaleLowerCase();
-      const requestLimited =
-        text.includes('too many requests') ||
-        text.includes('rate limit') ||
-        text.includes('çok fazla istek') ||
-        text.includes('çok hızlı istek');
+      const text = String(dialog.textContent || '').replace(/\s+/g, ' ').trim().toLowerCase();
+      const requestLimited = text.includes('too many requests') || text.includes('rate limit');
       if (!requestLimited) continue;
       const button = [...dialog.querySelectorAll('button')].find((candidate) => !candidate.disabled);
       if (!button) return false;

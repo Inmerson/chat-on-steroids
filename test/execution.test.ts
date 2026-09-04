@@ -106,7 +106,7 @@ describe('execution bootstrap framing', () => {
     expect(text).toContain('Execute only the approved plan below autonomously.');
     expect(text).toContain('Do not expand into unrelated feature work.');
     expect(text).toContain(`APPROVED PLAN\n${plan}`);
-    expect(text).not.toMatch(/[çğıöşüİ]/i);
+    expect(text).not.toMatch(/[\u00e7\u011f\u0131\u00f6\u015f\u00fc\u0130]/i);
   });
 
   it('allows infinite mode to choose a new improvement only after the current milestone is verified', async () => {

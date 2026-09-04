@@ -7780,10 +7780,10 @@ describe('the fresh chat the app opened', () => {
             const dialog = document.createElement('div');
             dialog.setAttribute('role', 'dialog');
             dialog.innerHTML = `
-              <h2>Çok fazla istek</h2>
-              <p>Çok hızlı istek gönderiyorsun. Verilerini korumak için konuşmalarına erişimi geçici olarak sınırladık.</p>
-              <p>Lütfen tekrar denemeden önce birkaç dakika bekleyin.</p>
-              <button type="button">Anladım</button>
+              <h2>Too many requests</h2>
+              <p>You are sending requests too quickly. Access is temporarily limited.</p>
+              <p>Please wait a few minutes before trying again.</p>
+              <button type="button">Got it</button>
             `;
             dialog.querySelector('button')!.addEventListener('click', () => {
               dismissals++;
@@ -7835,9 +7835,9 @@ describe('the fresh chat the app opened', () => {
             const dialog = document.createElement('div');
             dialog.setAttribute('role', 'dialog');
             dialog.innerHTML = `
-              <h2>Çok fazla istek</h2>
-              <p>Çok hızlı istek gönderiyorsun. Verilerini korumak için konuşmalarına erişimi geçici olarak sınırladık.</p>
-              <button type="button">Anladım</button>
+              <h2>Too many requests</h2>
+              <p>You are sending requests too quickly. Access is temporarily limited.</p>
+              <button type="button">Got it</button>
             `;
             dialog.querySelector('button')!.addEventListener('click', () => {
               dismissals++;
