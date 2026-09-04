@@ -3790,6 +3790,30 @@ describe('delivering a bootstrap', () => {
 describe('which browser opens the replacement chat', () => {
   const HOME = 'c0c0c0c0-1111-4222-8333-000000000b01';
 
+  it('offers a fresh worker to the prime page in the background instead of opening it through the OS', async () => {
+    await pair();
+    await request('POST', '/events', {
+      body: {
+        conversationId: HOME,
+        events: [{ kind: 'user_message', time: Date.now(), text: 'spawn a worker', messageId: 'm-worker-home' }]
+      }
+    });
+    const staged = spawn(
+      { workers: [{ task: 'audit the background tab path' }], caller: { conversationId: HOME } },
+      { deferDelivery: true }
+    );
+    requestWorkerBootstraps(staged.created.map((worker) => worker.id), HOME);
+
+    await vi.waitFor(() => expect(pendingCommands()).toHaveLength(1));
+    const [command] = pendingCommands();
+    expect(command?.what).toContain('worker:worker-1');
+    expect(opened).toEqual([]);
+
+    const feed = await request('GET', `/activity?conversationId=${HOME}`);
+    expect(feed.body.placement).toEqual({ id: command?.id, background: true });
+    expect(opened).toEqual([]);
+  });
+
   /** The real capture path: A's page files the ticket and then hands over its brief. */
   async function captureFrom(conversationId: string): Promise<Reply> {
     await request('POST', '/events', {

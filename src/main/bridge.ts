@@ -414,6 +414,8 @@ interface Command {
    * Memory only: a command restored from a previous run has no page waiting for it.
    */
   owner: string | null;
+  /** Fresh worker publication may be placed by the prime page that just requested it. Memory only. */
+  placementHome: string | null;
 }
 
 type CommandPhase = 'queued' | 'leased';
@@ -3508,8 +3510,8 @@ async function startBridgeOnce(epoch: number): Promise<number | null> {
       // a still-live lease can sit forever with no timer to end it.
       rearmRetainedCommandDeadlines();
       dropSpawnRequestListener?.();
-      dropSpawnRequestListener = onSpawnRequest((workers) => {
-        for (const worker of workers) queueWorkerBootstrap(worker.id, worker.task);
+      dropSpawnRequestListener = onSpawnRequest((workers, placementHome) => {
+        for (const worker of workers) queueWorkerBootstrap(worker.id, worker.task, placementHome);
       });
       // The same replay contract for waking a worker that already has a chat. A run restored
       // from disk can hold a worker left in `waking` by a crash mid-revival; registering here
@@ -3874,10 +3876,11 @@ async function finalizeCommand(command: Command, receipt: CommandReceipt): Promi
   return true;
 }
 
-function queue(spec: CommandSpec): Command {
+function queue(spec: CommandSpec, placementHome: string | null = null): Command {
   const key = commandKey(spec);
   const existing = commands.find((command) => commandKey(command.spec) === key);
   if (existing) {
+    if (spec.type === 'worker' && placementHome) existing.placementHome = placementHome;
     // The same bootstrap arriving twice — a restart re-requesting a worker whose chat was
     // never bound, or the user pressing Compact & Resume again — is one job, not two tabs.
     const superseded = JSON.stringify(existing.spec) !== JSON.stringify(spec);
@@ -3912,7 +3915,8 @@ function queue(spec: CommandSpec): Command {
     retriedAt: null,
     timer: null,
     lastError: null,
-    owner: null
+    owner: null,
+    placementHome
   };
   commands.push(command);
   if (commands.length > MAX_COMMANDS) {
@@ -4146,13 +4150,17 @@ async function cancelAutomaticResumesNow(): Promise<number> {
  * stored: the chat this opens is bound to the slot by the extension's report, and the
  * recovery key exists only if the user asks the app for one after that has failed.
  */
-export function queueWorkerBootstrap(agent: string, task: string): BridgeCommand | null {
+export function queueWorkerBootstrap(
+  agent: string,
+  task: string,
+  placementHome: string | null = null
+): BridgeCommand | null {
   const runId = currentRunId();
   // A worker bootstrap is authority for one concrete broker incarnation. There is no safe
   // meaning for one outside a run, and manufacturing an unscoped command here is exactly how
   // stale durable work later becomes somebody else's `worker-1`.
   if (!runId) return null;
-  const command = queue({ type: 'worker', agent, task, runId });
+  const command = queue({ type: 'worker', agent, task, runId }, placementHome);
   // Start the clock at broker admission, exactly as a revival does. A bootstrap that never
   // reaches a page is the case that has no other clock at all.
   armDeadline(command);
@@ -4373,7 +4381,7 @@ export const BROWSER_PLACEMENT_MS = 20_000;
 let placementCollector: string | null = null;
 
 /** The one fresh chat currently offered to its home page, and the fallback that outlives it. */
-let placementOffer: { id: string; conversationId: string } | null = null;
+let placementOffer: { id: string; conversationId: string; background: boolean } | null = null;
 let placementTimer: NodeJS.Timeout | null = null;
 
 /** Drops the standing offer and its fallback. Called by every path that ends a command. */
@@ -4391,10 +4399,14 @@ function clearPlacementOffer(): void {
  * opener exactly as before, because there is genuinely nothing better to know about them.
  */
 function offerPlacement(command: Command): boolean {
-  const home = commandHomeConversation(command.spec);
-  if (!home || home !== placementCollector) return false;
+  const home = command.spec.type === 'worker' ? command.placementHome : commandHomeConversation(command.spec);
+  if (!home) return false;
+  // A resume is placeable only while its source page's capture request is in flight. A worker
+  // gets a one-shot home only from the fresh spawn publication callback; restored worker
+  // commands deliberately have placementHome=null and fall through to the OS opener.
+  if (command.spec.type !== 'worker' && home !== placementCollector) return false;
   clearPlacementOffer();
-  placementOffer = { id: command.id, conversationId: home };
+  placementOffer = { id: command.id, conversationId: home, background: command.spec.type === 'worker' };
   placementTimer = setTimeout(() => {
     placementTimer = null;
     placementOffer = null;
@@ -4415,7 +4427,7 @@ function offerPlacement(command: Command): boolean {
  * a second one. If that page fails to act, the fallback above is what recovers it, not a
  * repeated offer.
  */
-function pendingBrowserPlacement(conversationId: string): { id: string } | null {
+function pendingBrowserPlacement(conversationId: string): { id: string; background?: true } | null {
   const offer = placementOffer;
   if (!offer || offer.conversationId !== conversationId) return null;
   if (!commands.some((entry) => entry.id === offer.id && entry.owner === null)) {
@@ -4423,7 +4435,7 @@ function pendingBrowserPlacement(conversationId: string): { id: string } | null 
     return null;
   }
   placementOffer = null;
-  return { id: offer.id };
+  return offer.background ? { id: offer.id, background: true } : { id: offer.id };
 }
 
 // -------------------------------------------------------- exact browser recovery
@@ -6847,7 +6859,8 @@ function planCommandRestore(
       retriedAt: null,
       timer: null,
       lastError: typeof raw.lastError === 'string' ? raw.lastError : null,
-      owner: leased && typeof raw.owner === 'string' ? raw.owner.slice(0, 64) : null
+      owner: leased && typeof raw.owner === 'string' ? raw.owner.slice(0, 64) : null,
+      placementHome: null
     });
     restored += 1;
   }
