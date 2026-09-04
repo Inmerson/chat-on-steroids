@@ -141,6 +141,8 @@ let closing = false;
  */
 let commandAckOutbox = [];
 let ackingCommands = false;
+/** Bounded worker-lifetime terminal ACK receipts, covering ACK-before-source-map rollover races. */
+const recentTerminalCommandAcks = new Map();
 /** Exact browser-session lease snapshot published by agent-tab-lifecycle.js. */
 let agentTabLeaseTelemetry = null;
 
@@ -170,7 +172,12 @@ let loopTransfers = {};
 let completedLoopTransfers = {};
 /** Consecutive recovery attempts survive service-worker and tab replacement lifetimes. */
 let loopRecoveryCounters = {};
+/** Browser-session-only dedicated windows for Core-owned execution and worker tabs. */
+let managedWindows = { execution: null, agent: null };
+/** Core-owned clean-rollover commands whose old execution tab stays open until durable sent ACK. */
+let executionRolloverSources = {};
 const LOOP_TRANSFER_TTL_MS = 5 * 60_000;
+const EXECUTION_ROLLOVER_SOURCE_TTL_MS = 30 * 60_000;
 let loopTransferWriteQueue = Promise.resolve();
 let loopCounterWriteQueue = Promise.resolve();
 
@@ -246,7 +253,9 @@ async function loadOnce() {
     'delivery',
     'agentTabLeaseTelemetry',
     'loopTransfers',
-    'completedLoopTransfers'
+    'completedLoopTransfers',
+    'managedWindows',
+    'executionRolloverSources'
   ]);
   settled = Array.isArray(live.settled) ? live.settled : [];
   journal = Array.isArray(live.journal) ? live.journal : [];
@@ -278,6 +287,8 @@ async function loadOnce() {
   }
   loopTransfers = parseLoopTransfers(live.loopTransfers);
   completedLoopTransfers = parseCompletedLoopTransfers(live.completedLoopTransfers);
+  managedWindows = parseManagedWindows(live.managedWindows);
+  executionRolloverSources = parseExecutionRolloverSources(live.executionRolloverSources);
   agentTabLeaseTelemetry = parseAgentTabLeaseTelemetry(live.agentTabLeaseTelemetry);
   await cleanupLoopTransferState({ checkTabs: true });
   loaded = true;
@@ -294,6 +305,43 @@ function parseAgentTabLeaseTelemetry(value) {
   if (!Number.isInteger(queued) || queued < 0 || queued > MAX_AGENT_TAB_QUEUE) return null;
   if (!Number.isFinite(observedAt) || observedAt <= 0) return null;
   return { budget, used, queued, observedAt };
+}
+
+function parseManagedWindows(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return { execution: null, agent: null };
+  const windowId = (candidate) => (Number.isInteger(candidate) && candidate >= 0 ? candidate : null);
+  return { execution: windowId(value.execution), agent: windowId(value.agent) };
+}
+
+function parseExecutionRolloverSources(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return {};
+  const now = Date.now();
+  const out = {};
+  for (const [commandId, raw] of Object.entries(value)) {
+    if (typeof commandId !== 'string' || !commandId || commandId.length > 128) continue;
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) continue;
+    const sourceConversationId = cleanConversationId(raw.sourceConversationId);
+    const executionRunId =
+      typeof raw.executionRunId === 'string' && raw.executionRunId.length > 0 && raw.executionRunId.length <= 100
+        ? raw.executionRunId
+        : null;
+    const createdAt = Number.isFinite(raw.createdAt) ? Number(raw.createdAt) : null;
+    if (
+      !Number.isInteger(raw.sourceTabId) ||
+      raw.sourceTabId < 0 ||
+      !sourceConversationId ||
+      !executionRunId ||
+      createdAt === null ||
+      now - createdAt > EXECUTION_ROLLOVER_SOURCE_TTL_MS
+    ) continue;
+    out[commandId] = {
+      sourceTabId: raw.sourceTabId,
+      sourceConversationId,
+      executionRunId,
+      createdAt
+    };
+  }
+  return out;
 }
 
 function agentTabTelemetryHeaders() {
@@ -331,6 +379,8 @@ function persistLive() {
         closeOutbox: closeOutbox.slice(-200),
         commandAckOutbox: commandAckOutbox.slice(-200),
         revivalPreferences,
+        managedWindows,
+        executionRolloverSources,
         delivery
       }),
       // Only small command-control metadata crosses browser restarts. No transcript and no
@@ -1127,6 +1177,56 @@ async function redeemCommand(id, client, conversationId = null) {
   return { ok: true, command };
 }
 
+function managedWindowKind(commandType) {
+  if (commandType === 'execution' || commandType === 'execution-resume' || commandType === 'execution-rollover') {
+    return 'execution';
+  }
+  if (commandType === 'worker' || commandType === 'revive') return 'agent';
+  return null;
+}
+
+/**
+ * Makes one browser-session window the home of one class of Core-owned tabs.
+ *
+ * The first proven command tab becomes the seed of a dedicated Chrome window. Later command
+ * tabs are moved into that same window. Numeric Chrome window ids die with the browser and are
+ * kept only in storage.session; a missing id is cleared and recreated rather than treated as
+ * durable authority.
+ */
+async function ensureManagedWindow(kind, ownedTabId) {
+  if ((kind !== 'execution' && kind !== 'agent') || !Number.isInteger(ownedTabId)) return null;
+  const current = managedWindows[kind];
+  if (Number.isInteger(current)) {
+    try {
+      const existing = await chrome.windows.get(current);
+      if (existing && existing.id === current) {
+        await chrome.tabs.move(ownedTabId, { windowId: current, index: -1 });
+        return current;
+      }
+    } catch {
+      // Chrome may have closed the last tab/window while this worker was asleep. Recreate below.
+    }
+    if (managedWindows[kind] === current) {
+      managedWindows = { ...managedWindows, [kind]: null };
+      await persistLive();
+    }
+  }
+
+  const created = await chrome.windows.create({ tabId: ownedTabId, focused: false });
+  const createdId = created && Number.isInteger(created.id) ? created.id : null;
+  if (createdId === null) throw new Error(`Chrome did not return a managed ${kind} window id`);
+  managedWindows = { ...managedWindows, [kind]: createdId };
+  await persistLive();
+  return createdId;
+}
+
+async function routeOwnedCommandTab(tabId, commandId, commandType) {
+  if (!Number.isInteger(tabId) || typeof commandId !== 'string' || !commandId) return null;
+  const kind = managedWindowKind(commandType);
+  if (!kind) return null;
+  return ensureManagedWindow(kind, tabId);
+}
+
 function commandAckPayload(id, status, error, conversationId, agent, client) {
   return {
     id,
@@ -1136,6 +1236,54 @@ function commandAckPayload(id, status, error, conversationId, agent, client) {
     agent: agent || undefined,
     client: client || undefined
   };
+}
+
+/**
+ * Retires the old source-tab hold for one Core-owned execution rollover.
+ *
+ * Only a durable successful `sent` ACK may close the old presentation. Every terminal failure
+ * merely retires the source record and leaves that tab alone. Chrome's current URL is re-read at
+ * the closing boundary so a user navigation can never be mistaken for the stalled conversation.
+ */
+function rememberTerminalCommandAck(commandId, payload, result) {
+  if (typeof commandId !== 'string' || !commandId) return;
+  const committedSent = result?.ok === true && result?.data?.committed !== false && payload?.status === 'sent';
+  recentTerminalCommandAcks.delete(commandId);
+  recentTerminalCommandAcks.set(commandId, { committedSent, at: Date.now() });
+  while (recentTerminalCommandAcks.size > 100) {
+    const oldest = recentTerminalCommandAcks.keys().next();
+    if (oldest.done) break;
+    recentTerminalCommandAcks.delete(oldest.value);
+  }
+}
+
+async function settleExecutionRolloverSource(commandId, committedSent) {
+  const source = executionRolloverSources[commandId];
+  if (!source) return false;
+
+  if (committedSent) {
+    let tab = null;
+    try {
+      tab = await chrome.tabs.get(source.sourceTabId);
+    } catch {
+      tab = null;
+    }
+    const urlConversation = conversationFromUrl(tab?.url);
+    const registeredConversation = cleanConversationId(tabConversations[String(source.sourceTabId)]);
+    if (
+      urlConversation === source.sourceConversationId &&
+      (!registeredConversation || registeredConversation === source.sourceConversationId)
+    ) {
+      try {
+        await chrome.tabs.remove(source.sourceTabId);
+      } catch {
+        // It may have closed after the re-proof. The durable replacement is already committed.
+      }
+    }
+  }
+
+  delete executionRolloverSources[commandId];
+  return true;
 }
 
 /**
@@ -1173,6 +1321,9 @@ async function drainCommandAcks(targetId = null) {
       if (entry.id === targetId) targetResult = result;
 
       if (result.ok || result.status === 404 || result.status === 409) {
+        rememberTerminalCommandAck(entry.id, payload, result);
+        const terminal = recentTerminalCommandAcks.get(entry.id);
+        if (await settleExecutionRolloverSource(entry.id, terminal?.committedSent === true)) changed = true;
         commandAckOutbox = commandAckOutbox.filter((candidate) => candidate !== entry);
         changed = true;
         if (result.ok && result.data?.committed !== false && payload.status === 'sent' && !payload.agent) {
@@ -1187,6 +1338,9 @@ async function drainCommandAcks(targetId = null) {
       // answers above. Do not spin forever if the bridge explicitly rejects one, but preserve
       // the statuses that can become valid after auth/version/backoff recovery.
       if (result.status >= 400 && result.status < 500 && ![401, 408, 426, 429].includes(result.status)) {
+        rememberTerminalCommandAck(entry.id, payload, result);
+        const terminal = recentTerminalCommandAcks.get(entry.id);
+        if (await settleExecutionRolloverSource(entry.id, terminal?.committedSent === true)) changed = true;
         commandAckOutbox = commandAckOutbox.filter((candidate) => candidate !== entry);
         changed = true;
         continue;
@@ -2464,12 +2618,19 @@ const HANDLERS = {
     return ownsDocument(source) ? result : { ok: false, error: 'stale_document' };
   },
   /** The marked page asking for the one command it was opened for. */
-  async redeem(message) {
-    return redeemCommand(
+  async redeem(message, _sender, source) {
+    const result = await redeemCommand(
       String(message.id || ''),
       String(message.client || ''),
       typeof message.conversationId === 'string' ? message.conversationId : null
     );
+    if (!result.ok || !result.command) return result;
+    try {
+      await routeOwnedCommandTab(source?.tab, result.command.id, result.command.type);
+    } catch (err) {
+      return { ok: false, error: 'managed_window_routing_failed', message: String(err && err.message ? err.message : err) };
+    }
+    return ownsDocument(source) ? result : { ok: false, error: 'stale_document' };
   },
   /**
    * A revival page has positively identified the exact target chat but it is not submit-ready
@@ -2590,7 +2751,44 @@ const HANDLERS = {
     const forceRollover = message?.forceRollover === true;
     const kind = forceRollover || previousCount >= 3 ? 'rollover' : 'recovery';
     if (kind === 'rollover' && loop.executionRunId) {
-      return { ok: false, error: 'core_rollover_required' };
+      const reason = typeof message?.reason === 'string' ? message.reason.slice(0, 500) : loop.lastReason;
+      const result = await call('/execution/rollover', {
+        method: 'POST',
+        body: JSON.stringify({
+          executionRunId: loop.executionRunId,
+          conversationId: provenConversation,
+          reason
+        })
+      });
+      if (!result.ok) {
+        return {
+          ok: false,
+          error: result.data?.error || result.error || `HTTP ${result.status || 0}`
+        };
+      }
+      const commandId =
+        result.data && typeof result.data.commandId === 'string' && result.data.commandId.length <= 128
+          ? result.data.commandId
+          : null;
+      if (!commandId) return { ok: false, error: 'core_rollover_command_missing' };
+      executionRolloverSources[commandId] = {
+        sourceTabId: source.tab,
+        sourceConversationId: provenConversation,
+        executionRunId: loop.executionRunId,
+        createdAt: Date.now()
+      };
+      try {
+        await persistLive();
+      } catch (err) {
+        delete executionRolloverSources[commandId];
+        return { ok: false, error: String(err && err.message ? err.message : err) };
+      }
+      const terminal = recentTerminalCommandAcks.get(commandId);
+      if (terminal || settled.includes(commandId)) {
+        await settleExecutionRolloverSource(commandId, terminal?.committedSent === true || settled.includes(commandId));
+        await persistLive();
+      }
+      return { ok: true, kind: 'core-rollover', commandId };
     }
     const rolloverText =
       kind === 'rollover' && typeof message?.rolloverText === 'string'
@@ -3232,6 +3430,28 @@ async function restoreOpenChatgptTabs() {
       // cover the next eligible document, so there is nothing useful to retry here.
     }
   }
+}
+
+if (chrome.windows && chrome.windows.onRemoved && typeof chrome.windows.onRemoved.addListener === 'function') {
+  chrome.windows.onRemoved.addListener((windowId) => {
+    void load()
+      .then(async () => {
+        let changed = false;
+        const next = { ...managedWindows };
+        if (next.execution === windowId) {
+          next.execution = null;
+          changed = true;
+        }
+        if (next.agent === windowId) {
+          next.agent = null;
+          changed = true;
+        }
+        if (!changed) return;
+        managedWindows = next;
+        await persistLive();
+      })
+      .catch(() => undefined);
+  });
 }
 
 chrome.runtime.onInstalled.addListener(() => {

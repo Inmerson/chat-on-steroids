@@ -432,11 +432,16 @@ interface WorkerHarness {
   ): Promise<any>;
   /** Fires Chrome's tab-created lifecycle event, the way opening a link in a new tab does. */
   createTab(tab: { id: number; url?: string; pendingUrl?: string }): Promise<void>;
+  /** Fires Chrome's window-removed lifecycle event. */
+  closeWindow(windowId: number): Promise<void>;
   tabsCreate: ReturnType<typeof vi.fn>;
+  tabsMove: ReturnType<typeof vi.fn>;
   tabsQuery: ReturnType<typeof vi.fn>;
   tabsUpdate: ReturnType<typeof vi.fn>;
   tabsSendMessage: ReturnType<typeof vi.fn>;
   tabsRemove: ReturnType<typeof vi.fn>;
+  windowsCreate: ReturnType<typeof vi.fn>;
+  windowsGet: ReturnType<typeof vi.fn>;
   windowsUpdate: ReturnType<typeof vi.fn>;
   scriptingExecuteScript: ReturnType<typeof vi.fn>;
   scriptingInsertCSS: ReturnType<typeof vi.fn>;
@@ -462,9 +467,12 @@ function loadWorker(options: {
   local: FakeStorageArea;
   session: FakeStorageArea;
   fetch?: (input: string, init?: Record<string, unknown>) => Promise<ReturnType<typeof response>>;
-  tabsGet?: (tabId: number) => Promise<{ id?: number; url?: string; pendingUrl?: string; status?: string }>;
+  tabsGet?: (tabId: number) => Promise<{ id?: number; windowId?: number; url?: string; pendingUrl?: string; status?: string }>;
   tabsQuery?: () => Promise<Array<{ id?: number; windowId?: number; url?: string; pendingUrl?: string }>>;
   tabsSendMessage?: (tabId: number, message: Record<string, unknown>) => Promise<unknown>;
+  tabsMove?: (tabId: number, moveProperties: { windowId: number; index: number }) => Promise<unknown>;
+  windowsGet?: (windowId: number) => Promise<{ id?: number }>;
+  windowsCreate?: (createData: { tabId?: number; focused?: boolean }) => Promise<{ id?: number }>;
 }): WorkerHarness {
   let listener: ((message: any, sender: any, sendResponse: (value: any) => void) => boolean) | null = null;
   const tabRemovedListeners: Array<(tabId: number) => void> = [];
@@ -472,7 +480,9 @@ function loadWorker(options: {
   const tabUpdatedListeners: Array<(tabId: number, changeInfo: { url?: string; status?: string }) => void> = [];
   const installedListeners: Array<(details: { reason: string }) => void> = [];
   const storageListeners: Array<(changes: Record<string, { oldValue?: unknown; newValue?: unknown }>, areaName: string) => void> = [];
+  const windowRemovedListeners: Array<(windowId: number) => void> = [];
   const tabsCreate = vi.fn(async () => ({ id: 99 }));
+  const tabsMove = vi.fn(options.tabsMove ?? (async (id: number, moveProperties: { windowId: number }) => ({ id, windowId: moveProperties.windowId })));
   const tabsQuery = vi.fn(options.tabsQuery ?? (async () => []));
   const tabsUpdate = vi.fn(async (id: number) => ({ id, windowId: 7 }));
   const tabsSendMessage = vi.fn(options.tabsSendMessage ?? (async () => ({ ok: true })));
@@ -481,6 +491,11 @@ function loadWorker(options: {
   const scriptingInsertCSS = vi.fn(async () => undefined);
   const alarmCreate = vi.fn(() => undefined);
   const alarmClear = vi.fn(async () => true);
+  let nextManagedWindowId = 70;
+  const windowsGet = vi.fn(options.windowsGet ?? (async (id: number) => ({ id })));
+  const windowsCreate = vi.fn(
+    options.windowsCreate ?? (async () => ({ id: nextManagedWindowId++ }))
+  );
   const windowsUpdate = vi.fn(async () => ({ id: 7 }));
   const documentNumbers = new Map<number, number>();
   const currentDocuments = new Map<number, string>();
@@ -517,7 +532,16 @@ function loadWorker(options: {
       },
       onStartup: event()
     },
-    windows: { update: windowsUpdate },
+    windows: {
+      create: windowsCreate,
+      get: windowsGet,
+      update: windowsUpdate,
+      onRemoved: {
+        addListener(fn: (windowId: number) => void) {
+          windowRemovedListeners.push(fn);
+        }
+      }
+    },
     scripting: {
       executeScript: scriptingExecuteScript,
       insertCSS: scriptingInsertCSS
@@ -529,6 +553,7 @@ function loadWorker(options: {
     },
     tabs: {
       create: tabsCreate,
+      move: tabsMove,
       query: tabsQuery,
       update: tabsUpdate,
       get: options.tabsGet ?? vi.fn(async () => {
@@ -568,10 +593,13 @@ function loadWorker(options: {
 
   return {
     tabsCreate,
+    tabsMove,
     tabsQuery,
     tabsUpdate,
     tabsSendMessage,
     tabsRemove,
+    windowsCreate,
+    windowsGet,
     windowsUpdate,
     scriptingExecuteScript,
     scriptingInsertCSS,
@@ -596,6 +624,11 @@ function loadWorker(options: {
     async createTab(tab: { id: number; url?: string; pendingUrl?: string }) {
       for (const fn of tabCreatedListeners) fn(tab);
       for (let turn = 0; turn < 6; turn += 1) await new Promise((resolve) => setTimeout(resolve, 0));
+    },
+    async closeWindow(windowId: number) {
+      for (const fn of windowRemovedListeners) fn(windowId);
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      await new Promise((resolve) => setTimeout(resolve, 0));
     },
     async closeTab(tabId: number) {
       for (const fn of tabRemovedListeners) fn(tabId);
@@ -1035,15 +1068,35 @@ describe('Loop recovery transfer contract', () => {
     expect(local.data.loopRecoveryCounters).toBeUndefined();
   });
 
-  it('requires Core-owned rollover when a managed execution run asks for an explicit manual rollover', async () => {
-    const local = new FakeStorageArea();
+  it('hands managed execution rollover to Core and closes the old tab only after durable sent ACK', async () => {
+    const local = new FakeStorageArea({ port: 8765, token: 'paired-token' });
     const session = new FakeStorageArea();
     const tabs = new Map<number, { id: number; url: string; status: string; windowId: number }>([
       [93, { id: 93, url: SOURCE_URL, status: 'complete', windowId: 7 }]
     ]);
+    const rolloverBodies: Array<Record<string, unknown>> = [];
+    const commandId = 'execution-rollover-command-1';
+    const fetch = vi.fn(async (input: string, init: Record<string, unknown> = {}) => {
+      const url = new URL(input);
+      if (url.pathname === '/hello') return response(200, { app: 'chat-on-steroids', paired: true });
+      if (url.pathname === '/execution/rollover') {
+        rolloverBodies.push(JSON.parse(String(init.body || '{}')));
+        return response(200, { ok: true, commandId });
+      }
+      if (url.pathname === '/commands/ack') {
+        return response(200, {
+          ok: true,
+          final: true,
+          committed: true,
+          conversationId: '11111111-2222-4333-8444-555555555555'
+        });
+      }
+      return response(404, {});
+    });
     const worker = loadWorker({
       local,
       session,
+      fetch,
       tabsGet: async (tabId) => {
         const tab = tabs.get(tabId);
         if (!tab) throw new Error('tab not found');
@@ -1065,9 +1118,183 @@ describe('Loop recovery transfer contract', () => {
       sourceDocument
     );
 
-    expect(started).toEqual({ ok: false, error: 'core_rollover_required' });
+    expect(started).toEqual({ ok: true, kind: 'core-rollover', commandId });
     expect(worker.tabsCreate).not.toHaveBeenCalled();
+    expect(worker.tabsRemove).not.toHaveBeenCalledWith(sourceTab.id);
     expect(local.data.loopRecoveryCounters).toBeUndefined();
+    expect(rolloverBodies).toEqual([
+      {
+        executionRunId: 'execution-run-1',
+        conversationId: CHAT,
+        reason: REASON
+      }
+    ]);
+    expect(JSON.stringify(rolloverBodies)).not.toContain(ROLLOVER_TEXT);
+    expect((session.data.executionRolloverSources as Record<string, unknown>)[commandId]).toMatchObject({
+      sourceTabId: 93,
+      sourceConversationId: CHAT,
+      executionRunId: 'execution-run-1'
+    });
+
+    const replacementTab = {
+      id: 94,
+      status: 'complete',
+      windowId: 7,
+      url: 'https://chatgpt.com/c/11111111-2222-4333-8444-555555555555'
+    };
+    const replacementDocument = 'document-managed-rollover-replacement';
+    await worker.registerDocument(replacementTab, replacementDocument);
+    await worker.sendFrom(
+      {
+        type: 'ack',
+        id: commandId,
+        status: 'sent',
+        conversationId: '11111111-2222-4333-8444-555555555555',
+        client: replacementDocument
+      },
+      replacementTab,
+      replacementDocument
+    );
+    expect(worker.tabsRemove).toHaveBeenCalledWith(sourceTab.id);
+    expect((session.data.executionRolloverSources as Record<string, unknown>)[commandId]).toBeUndefined();
+  });
+
+  it('uses Core rollover on the fourth managed stall and leaves the old tab open when replacement fails', async () => {
+    const commandId = 'execution-rollover-command-failed';
+    const local = new FakeStorageArea({
+      port: 8765,
+      token: 'paired-token',
+      loopRecoveryCounters: {
+        'run:execution-run-2': { count: 3, updatedAt: Date.now() }
+      }
+    });
+    const session = new FakeStorageArea();
+    const tabs = new Map<number, { id: number; url: string; status: string; windowId: number }>([
+      [95, { id: 95, url: SOURCE_URL, status: 'complete', windowId: 17 }]
+    ]);
+    const calls: string[] = [];
+    const fetch = vi.fn(async (input: string) => {
+      const url = new URL(input);
+      calls.push(url.pathname);
+      if (url.pathname === '/hello') return response(200, { app: 'chat-on-steroids', paired: true });
+      if (url.pathname === '/execution/rollover') return response(200, { ok: true, commandId });
+      if (url.pathname === '/commands/ack') {
+        return response(200, { ok: true, final: true, committed: false, outcome: 'terminal-failure' });
+      }
+      return response(404, {});
+    });
+    const worker = loadWorker({
+      local,
+      session,
+      fetch,
+      tabsGet: async (tabId) => {
+        const tab = tabs.get(tabId);
+        if (!tab) throw new Error('tab not found');
+        return { ...tab };
+      }
+    });
+    const sourceTab = { id: 95, status: 'complete', windowId: 17 };
+    const sourceDocument = 'document-managed-ceiling-source';
+    await worker.registerDocument(sourceTab, sourceDocument);
+    await worker.sendFrom({ type: 'bind', conversationId: CHAT }, sourceTab, sourceDocument);
+
+    const started = await worker.sendFrom(
+      {
+        ...recoveryMessage(),
+        loop: { ...LOOP, executionRunId: 'execution-run-2' }
+      },
+      sourceTab,
+      sourceDocument
+    );
+    expect(started).toEqual({ ok: true, kind: 'core-rollover', commandId });
+    expect(worker.tabsCreate).not.toHaveBeenCalled();
+    expect(calls).toContain('/execution/rollover');
+
+    const replacementTab = { id: 96, status: 'complete', windowId: 17, url: 'https://chatgpt.com/' };
+    const replacementDocument = 'document-managed-ceiling-failed';
+    await worker.registerDocument(replacementTab, replacementDocument);
+    await worker.sendFrom(
+      { type: 'ack', id: commandId, status: 'failed', error: 'bootstrap failed', client: replacementDocument },
+      replacementTab,
+      replacementDocument
+    );
+    expect(worker.tabsRemove).not.toHaveBeenCalledWith(sourceTab.id);
+    expect((session.data.executionRolloverSources as Record<string, unknown>)[commandId]).toBeUndefined();
+  });
+
+  it('settles a managed rollover even when the replacement ACK wins the race with the rollover response', async () => {
+    const commandId = 'execution-rollover-command-race';
+    const local = new FakeStorageArea({ port: 8765, token: 'paired-token' });
+    const session = new FakeStorageArea();
+    const tabs = new Map<number, { id: number; url: string; status: string; windowId: number }>([
+      [97, { id: 97, url: SOURCE_URL, status: 'complete', windowId: 27 }]
+    ]);
+    const replacementTab = {
+      id: 98,
+      url: 'https://chatgpt.com/c/22222222-3333-4444-8555-666666666666',
+      status: 'complete',
+      windowId: 27
+    };
+    const replacementDocument = 'document-managed-rollover-race-target';
+    let worker!: WorkerHarness;
+    const fetch = vi.fn(async (input: string) => {
+      const url = new URL(input);
+      if (url.pathname === '/hello') return response(200, { app: 'chat-on-steroids', paired: true });
+      if (url.pathname === '/execution/rollover') {
+        // The app opens the new browser tab before its route returns commandId. Model the new
+        // page completing quickly enough that its durable ACK reaches this same worker first.
+        await worker.registerDocument(replacementTab, replacementDocument);
+        await worker.sendFrom(
+          {
+            type: 'ack',
+            id: commandId,
+            status: 'sent',
+            conversationId: '22222222-3333-4444-8555-666666666666',
+            client: replacementDocument
+          },
+          replacementTab,
+          replacementDocument
+        );
+        return response(200, { ok: true, commandId });
+      }
+      if (url.pathname === '/commands/ack') {
+        return response(200, {
+          ok: true,
+          final: true,
+          committed: true,
+          conversationId: '22222222-3333-4444-8555-666666666666'
+        });
+      }
+      return response(404, {});
+    });
+    worker = loadWorker({
+      local,
+      session,
+      fetch,
+      tabsGet: async (tabId) => {
+        const tab = tabs.get(tabId);
+        if (!tab) throw new Error('tab not found');
+        return { ...tab };
+      }
+    });
+    const sourceTab = { id: 97, status: 'complete', windowId: 27 };
+    const sourceDocument = 'document-managed-rollover-race-source';
+    await worker.registerDocument(sourceTab, sourceDocument);
+    await worker.sendFrom({ type: 'bind', conversationId: CHAT }, sourceTab, sourceDocument);
+
+    expect(
+      await worker.sendFrom(
+        {
+          ...recoveryMessage(),
+          forceRollover: true,
+          loop: { ...LOOP, executionRunId: 'execution-run-race' }
+        },
+        sourceTab,
+        sourceDocument
+      )
+    ).toEqual({ ok: true, kind: 'core-rollover', commandId });
+    expect(worker.tabsRemove).toHaveBeenCalledWith(sourceTab.id);
+    expect((session.data.executionRolloverSources as Record<string, unknown>)[commandId]).toBeUndefined();
   });
 });
 
@@ -1082,6 +1309,89 @@ describe('Loop recovery transfer contract', () => {
  */
 describe('extension command delivery', () => {
   const paired = { port: 8765, token: 'paired-token' };
+
+  it('routes only redeemed owned commands into session-scoped Execution and Agent windows', async () => {
+    const local = new FakeStorageArea(paired);
+    const session = new FakeStorageArea();
+    const commandTypes: Record<string, string> = {
+      'cmd-execution': 'execution',
+      'cmd-execution-resume': 'execution-resume',
+      'cmd-execution-rollover': 'execution-rollover',
+      'cmd-worker': 'worker',
+      'cmd-revive': 'revive',
+      'cmd-execution-after-close': 'execution'
+    };
+    const fetch = vi.fn(async (input: string, init: Record<string, unknown> = {}) => {
+      const url = new URL(input);
+      if (url.pathname === '/hello') return response(200, { app: 'chat-on-steroids', paired: true });
+      if (url.pathname === '/commands/redeem') {
+        const body = JSON.parse(String(init.body));
+        const type = commandTypes[body.id];
+        if (!type) return response(404, { error: 'gone' });
+        return response(200, {
+          command: {
+            id: body.id,
+            kind: 'open-chat',
+            type,
+            text: type === 'execution-resume' || type === 'revive' ? '' : 'owned work',
+            agent: type === 'worker' || type === 'revive' ? 'worker-1' : null,
+            conversationId: type === 'execution-resume' || type === 'revive' ? 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee' : null,
+            executionRunId: type.startsWith('execution') ? 'execution-run-1' : null,
+            loopMode: type.startsWith('execution') ? 'standard' : null
+          }
+        });
+      }
+      return response(404, {});
+    });
+    const worker = loadWorker({ local, session, fetch });
+
+    // An ordinary ChatGPT document is never moved merely because the extension can see it.
+    await worker.registerDocument({ id: 5, windowId: 9, url: 'https://chatgpt.com/c/user-chat' }, 'ordinary-user-page');
+    expect(worker.windowsCreate).not.toHaveBeenCalled();
+    expect(worker.tabsMove).not.toHaveBeenCalled();
+
+    const redeem = async (id: string, tabId: number, windowId: number) => {
+      const documentId = `document-${id}`;
+      return worker.sendFrom(
+        { type: 'redeem', id, client: documentId },
+        { id: tabId, windowId, url: `https://chatgpt.com/?clf=${id}` },
+        documentId
+      );
+    };
+
+    expect(await redeem('cmd-execution', 10, 9)).toMatchObject({ ok: true, command: { type: 'execution' } });
+    expect(worker.windowsCreate).toHaveBeenNthCalledWith(1, { tabId: 10, focused: false });
+    expect(session.data.managedWindows).toEqual({ execution: 70, agent: null });
+    expect(local.data.managedWindows).toBeUndefined();
+
+    expect(await redeem('cmd-execution-resume', 11, 9)).toMatchObject({
+      ok: true,
+      command: { type: 'execution-resume' }
+    });
+    expect(worker.tabsMove).toHaveBeenCalledWith(11, { windowId: 70, index: -1 });
+    expect(worker.windowsCreate).toHaveBeenCalledTimes(1);
+
+    expect(await redeem('cmd-worker', 20, 9)).toMatchObject({ ok: true, command: { type: 'worker' } });
+    expect(worker.windowsCreate).toHaveBeenNthCalledWith(2, { tabId: 20, focused: false });
+    expect(session.data.managedWindows).toEqual({ execution: 70, agent: 71 });
+
+    expect(await redeem('cmd-revive', 21, 9)).toMatchObject({ ok: true, command: { type: 'revive' } });
+    expect(worker.tabsMove).toHaveBeenCalledWith(21, { windowId: 71, index: -1 });
+
+    expect(await redeem('cmd-execution-rollover', 12, 9)).toMatchObject({
+      ok: true,
+      command: { type: 'execution-rollover' }
+    });
+    expect(worker.tabsMove).toHaveBeenCalledWith(12, { windowId: 70, index: -1 });
+
+    // Chrome window ids are browser-session identities. Once Chrome says the window is gone,
+    // the next owned execution tab creates a fresh managed window rather than moving to a stale id.
+    await worker.closeWindow(70);
+    expect(session.data.managedWindows).toEqual({ execution: null, agent: 71 });
+    expect(await redeem('cmd-execution-after-close', 13, 9)).toMatchObject({ ok: true });
+    expect(worker.windowsCreate).toHaveBeenNthCalledWith(3, { tabId: 13, focused: false });
+    expect(session.data.managedWindows).toEqual({ execution: 72, agent: 71 });
+  });
 
   it('redeems only the command id the page was opened for', async () => {
     const local = new FakeStorageArea(paired);
