@@ -4889,6 +4889,7 @@
       autoCompactReady = data.autoCompactReady === true;
       goalConfig = data.goal && typeof data.goal === 'object' ? data.goal : null;
       goalDraft = goalConfig ? goalConfig.draft || null : null;
+      reconcileManagedExecution(data.execution);
       bootstrap = data.bootstrap === 'resume' || data.bootstrap === 'worker' ? data.bootstrap : null;
       if (job && job.busy) pressedAt = 0;
       // The local phase describes this tab's part of a native compaction, which is over
@@ -5486,6 +5487,8 @@
   let autoLoopLastReason = '';
   let autoLoopRecentFingerprints = [];
   let currentExecutionRunId = null;
+  let currentExecutionStatus = null;
+  let executionContinuationPending = false;
   let autoLoopRecoveryGeneration = 0;
 
   function autoLoopSnapshot() {
@@ -5516,6 +5519,118 @@
       ? snapshot.recoveryGeneration + 1
       : 1;
     clearAutoLoopWatchdog();
+    return true;
+  }
+
+  function managedExecutionIdentity(runId, mode) {
+    const id = typeof runId === 'string' && runId ? runId : null;
+    const loopMode = mode === 'infinite' ? 'infinite' : mode === 'standard' ? 'standard' : null;
+    return id && loopMode ? { id, mode: loopMode } : null;
+  }
+
+  /** Disarms autonomous sends without forgetting which durable execution is paused. */
+  function suspendManagedExecution(reason = 'Execution paused') {
+    autoLoopActive = false;
+    autoLoopLastReason = reason;
+    if (autoLoopTimer) {
+      clearTimeout(autoLoopTimer);
+      autoLoopTimer = null;
+    }
+    clearAutoLoopWatchdog();
+    renderControl();
+  }
+
+  function managedExecutionSafeToContinue() {
+    if (!alive || generating || CLF_DOM.generating()) return false;
+    if (pendingTools > 0 || nativeBusy || compactCapture || (job && job.busy)) return false;
+    if (autonomousSendLease !== null) return false;
+    const composer = CLF_DOM.composer();
+    return Boolean(composer && composer.isConnected && !(composer.textContent || '').trim());
+  }
+
+  /**
+   * Reconciles Core's exact-conversation execution projection with this document's Loop state.
+   *
+   * `paused` is intentionally not `stopAutoLoop`: a phone pause retains run id, mode and turn
+   * count so a later resume is continuation of the same execution. Terminal state is different:
+   * it removes autonomous authority from this document entirely.
+   */
+  function reconcileManagedExecution(view) {
+    if (!view || typeof view !== 'object') return;
+    const identity = managedExecutionIdentity(view.id, view.mode);
+    const status = typeof view.status === 'string' ? view.status : '';
+    if (!identity || !['starting', 'running', 'paused', 'stopped', 'failed', 'completed'].includes(status)) return;
+
+    const sameRun = currentExecutionRunId === identity.id;
+    const previousStatus = sameRun ? currentExecutionStatus : null;
+    currentExecutionRunId = identity.id;
+    autoLoopMode = identity.mode;
+
+    if (status === 'paused') {
+      currentExecutionStatus = 'paused';
+      executionContinuationPending = true;
+      suspendManagedExecution('Execution paused remotely');
+      return;
+    }
+
+    if (status === 'stopped' || status === 'failed' || status === 'completed') {
+      currentExecutionStatus = status;
+      executionContinuationPending = false;
+      autoLoopActive = false;
+      if (autoLoopTimer) {
+        clearTimeout(autoLoopTimer);
+        autoLoopTimer = null;
+      }
+      clearAutoLoopWatchdog();
+      autoLoopMode = 'off';
+      currentExecutionRunId = null;
+      renderControl();
+      return;
+    }
+
+    if (status === 'starting') {
+      currentExecutionStatus = 'starting';
+      // A fresh execution bootstrap may already have sent the approved plan. Never turn the
+      // intermediate Core state into a second browser write.
+      if (!autoLoopActive) suspendManagedExecution('Execution is starting');
+      return;
+    }
+
+    const shouldContinue = executionContinuationPending || !sameRun || previousStatus === 'paused';
+    currentExecutionStatus = 'running';
+    autoLoopActive = true;
+    autoLoopLastReason = '';
+    if (shouldContinue) {
+      if (managedExecutionSafeToContinue()) {
+        executionContinuationPending = false;
+        clearAutoLoopWatchdog();
+        scheduleAutoLoopPrompt(
+          identity.mode === 'infinite' ? getInfiniteLoopEvolutionPrompt() : getContinuationPrompt(),
+          500
+        );
+      } else {
+        executionContinuationPending = true;
+      }
+    }
+    renderControl();
+  }
+
+  function bindExecutionCommandSemantic(boot, options = {}) {
+    const identity = managedExecutionIdentity(boot?.executionRunId, boot?.loopMode);
+    if (!identity) return false;
+    currentExecutionRunId = identity.id;
+    currentExecutionStatus = options.status || 'starting';
+    autoLoopMode = identity.mode;
+    executionContinuationPending = options.continuationPending === true;
+    if (options.active === true) {
+      autoLoopActive = true;
+      autoLoopLastReason = '';
+      if (options.promptAlreadySent === true) markAutoLoopPromptSent();
+      else clearAutoLoopWatchdog();
+    } else {
+      suspendManagedExecution('Execution is waiting to resume');
+    }
+    renderControl();
     return true;
   }
 
@@ -5770,6 +5885,7 @@
         await sleep(200);
         const sent = await CLF_DOM.send();
         if (sent) {
+          executionContinuationPending = false;
           autoLoopTurns++;
           markAutoLoopPromptSent();
           renderControl();
@@ -5847,6 +5963,7 @@
 
   async function handleAutoLoopTurnEnd(answer) {
     if (!autoLoopActive) return;
+    executionContinuationPending = false;
     const parsed = parseLoopStatusAndStep(answer);
     let prompt = '';
 
@@ -8008,6 +8125,24 @@
     };
     if (await failIfRetargeted()) return;
 
+    if (boot.type === 'execution-resume') {
+      if (!target || openedConversation !== target || !stillOnTarget()) {
+        return void (await fail('the execution resume no longer owns its exact conversation'));
+      }
+      if (!bindExecutionCommandSemantic(boot, { active: false, continuationPending: true, status: 'starting' })) {
+        return void (await fail('the execution resume did not carry valid durable execution identity'));
+      }
+      await ask({
+        type: 'ack',
+        id: boot.id,
+        status: 'sent',
+        conversationId: target,
+        agent: null,
+        client: RUN_ID
+      });
+      return;
+    }
+
     // Nothing half-written is ever overwritten. This is a normal failure rather than a
     // silent skip: the user may keep that draft indefinitely,
     // and the app has to be told so it can re-offer the work somewhere else.
@@ -8091,6 +8226,20 @@
       const found = CLF_DOM.conversationId();
       if (found) {
         const acknowledged = await ask({ type: 'ack', id: boot.id, status: 'sent', conversationId: found, agent, client: RUN_ID });
+        if (
+          (boot.type === 'execution' || boot.type === 'execution-rollover') &&
+          acknowledged &&
+          acknowledged.ok === true &&
+          acknowledged.data &&
+          acknowledged.data.committed === true
+        ) {
+          bindExecutionCommandSemantic(boot, {
+            active: true,
+            promptAlreadySent: true,
+            continuationPending: false,
+            status: 'running'
+          });
+        }
         if (boot.type === 'resume' && acknowledged && acknowledged.ok === true) {
           rememberResumeGoalPending(found, boot.id);
         }
@@ -8640,7 +8789,9 @@
       stopAutoLoop,
       handleAutoLoopTurnEnd,
       isAutoLoopActive: () => autoLoopActive,
-      getAutoLoopTurns: () => autoLoopTurns
+      getAutoLoopTurns: () => autoLoopTurns,
+      getAutoLoopMode: () => autoLoopMode,
+      getCurrentExecutionRunId: () => currentExecutionRunId
     });
   }
 })();

@@ -112,6 +112,7 @@ import { readDurable, writeDurableNow, writeDurableSoon } from './durable.js';
 import {
   bindExecutionConversation,
   executionBootstrapText,
+  executionForConversation,
   executionRun,
   setExecutionStatus
 } from './execution.js';
@@ -1223,6 +1224,10 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
     const since = Number(url.searchParams.get('since') ?? 0);
     const goalClient = (url.searchParams.get('goalClient') ?? '').slice(0, 100);
     if (!id) return json(res, 400, { error: 'bad_conversation_id' }, origin);
+    const execution = executionForConversation(id);
+    const executionView = execution
+      ? { id: execution.id, status: execution.status, mode: execution.mode }
+      : null;
     const retiredWorker = retiredWorkerForConversation(id);
     // Every open ChatGPT tab polls this for its own conversation every few seconds, so
     // this is the app's primary first-hand evidence of which chats exist right now.
@@ -1244,6 +1249,7 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
         userAnchors: [],
         nextSince: Number.isFinite(since) ? Math.max(0, since) : 0,
         job: null,
+        execution: executionView,
         ...(workerBlocked
           ? {
               // Worker conversations are never Compact & Resume sources. Keep the page's
@@ -1444,6 +1450,10 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
         // How this chat's own Compact & Resume is going, so the page can say what is
         // happening instead of spinning.
         job: resumeJobFor(live.sessionId),
+        // Core-owned autonomous execution state is projected only through its exact durable
+        // conversation binding. The page never infers a run from window/tab placement or a
+        // stale URL marker, and terminal state remains visible long enough to disarm Loop.
+        execution: executionView,
         // The goal loop: whether it is on, whether it *can* be on, and whatever draft this
         // chat currently has in flight. The draft's text grows on this feed, which is what
         // the panel above the composer streams — there is no second connection to hold open.

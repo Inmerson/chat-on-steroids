@@ -710,6 +710,41 @@ describe('observations', () => {
 // ---------------------------------------------------------------- activity
 
 describe('activity feed', () => {
+  it('projects the durable execution bound to this exact conversation, including paused and terminal state', async () => {
+    await pair();
+    const conversationId = '56565656-7878-4999-8aaa-bbbbbbbbbbbb';
+    const unrelatedConversation = '12121212-5656-4789-8abc-defabcdefabc';
+    const opened = await request('POST', '/events', {
+      body: {
+        conversationId,
+        events: [{ kind: 'turn_start', time: Date.now(), turnId: 'execution-activity-turn' }]
+      }
+    });
+    expect(opened.body.sessionId).toBeTruthy();
+    await request('POST', '/events', {
+      body: {
+        conversationId: unrelatedConversation,
+        events: [{ kind: 'turn_start', time: Date.now(), turnId: 'unrelated-turn' }]
+      }
+    });
+
+    const run = await createExecution({ plan: 'Keep executing the exact approved plan.', mode: 'infinite' });
+    await bindExecutionConversation(run.id, conversationId);
+    await setExecutionStatus(run.id, 'paused');
+
+    const paused = await request('GET', `/activity?conversationId=${conversationId}&since=0`);
+    expect(paused.status).toBe(200);
+    expect(paused.body.execution).toEqual({ id: run.id, status: 'paused', mode: 'infinite' });
+
+    const unrelated = await request('GET', `/activity?conversationId=${unrelatedConversation}&since=0`);
+    expect(unrelated.status).toBe(200);
+    expect(unrelated.body.execution).toBeNull();
+
+    await setExecutionStatus(run.id, 'stopped');
+    const stopped = await request('GET', `/activity?conversationId=${conversationId}&since=0`);
+    expect(stopped.body.execution).toEqual({ id: run.id, status: 'stopped', mode: 'infinite' });
+  });
+
   it('reopens a durable still-open chat after recorder memory is lost', async () => {
     await pair();
     const conversationId = '98989898-7777-6666-5555-444444444444';

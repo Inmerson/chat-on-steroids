@@ -141,6 +141,8 @@ interface Hook {
   handleAutoLoopTurnEnd(answer: string): Promise<void>;
   isAutoLoopActive(): boolean;
   getAutoLoopTurns(): number;
+  getAutoLoopMode(): string;
+  getCurrentExecutionRunId(): string | null;
   /** How long Overwrite leaves a user-driven scroll completely presentation-stable. */
   PRESENTATION_SCROLL_IDLE_MS: number;
 }
@@ -7218,6 +7220,41 @@ describe('folding away the chat’s opening instruction', () => {
 });
 
 describe('the fresh chat the app opened', () => {
+  it('arms the durable execution loop from the one approved-plan bootstrap without injecting a second kickoff', async () => {
+    let sends = 0;
+    live = await harness(
+      'https://chatgpt.com/?clf=cmd-execution-bootstrap',
+      {
+        redeem: () => ({
+          ok: true,
+          command: {
+            id: 'cmd-execution-bootstrap',
+            type: 'execution',
+            text: '@Chat On Steroids Core\n\nExecute the approved plan exactly once.',
+            agent: null,
+            conversationId: null,
+            executionRunId: 'execution-run-bootstrap',
+            loopMode: 'infinite'
+          }
+        }),
+        ack: () => ({ ok: true, data: { committed: true } })
+      },
+      (document, dom) => {
+        document.querySelector('[data-testid="send-button"]')!.addEventListener('click', () => {
+          sends += 1;
+          if (sends === 1) dom.reconfigure({ url: 'https://chatgpt.com/c/31313131-4242-4535-8646-575757575757' });
+        });
+      }
+    );
+
+    await settle(500);
+    expect(sends).toBe(1);
+    expect(live.hook.getCurrentExecutionRunId()).toBe('execution-run-bootstrap');
+    expect(live.hook.getAutoLoopMode()).toBe('infinite');
+    expect(live.hook.isAutoLoopActive()).toBe(true);
+    expect(live.sent.filter((message) => message.type === 'ack' && message.status === 'sent')).toHaveLength(1);
+  });
+
   it('delivers the bootstrap before unrelated status restoration can stall startup', async () => {
     let releaseStatus: () => void = () => undefined;
     const statusHeld = new Promise((resolve) => {
@@ -7253,6 +7290,120 @@ describe('the fresh chat the app opened', () => {
 
     releaseStatus();
     await settle();
+  });
+
+  it('rearms an exact execution chat without inserting or sending duplicate bootstrap text', async () => {
+    const conversationId = '41414141-5252-4636-8747-686868686868';
+    let sends = 0;
+    live = await harness(
+      `https://chatgpt.com/c/${conversationId}?clf=cmd-execution-resume`,
+      {
+        redeem: () => ({
+          ok: true,
+          command: {
+            id: 'cmd-execution-resume',
+            type: 'execution-resume',
+            text: '',
+            agent: null,
+            conversationId,
+            executionRunId: 'execution-run-resume',
+            loopMode: 'standard'
+          }
+        }),
+        ack: () => ({ ok: true, data: { committed: true } })
+      },
+      (document) => {
+        document.querySelector('[data-testid="send-button"]')!.addEventListener('click', () => {
+          sends += 1;
+        });
+      }
+    );
+
+    await settle(200);
+    expect(sends).toBe(0);
+    expect(live.document.querySelector('#prompt-textarea')!.textContent).toBe('');
+    expect(live.sent.filter((message) => message.type === 'ack')).toEqual([
+      expect.objectContaining({
+        id: 'cmd-execution-resume',
+        status: 'sent',
+        conversationId,
+        agent: null
+      })
+    ]);
+    expect(live.hook.getCurrentExecutionRunId()).toBe('execution-run-resume');
+    expect(live.hook.getAutoLoopMode()).toBe('standard');
+    expect(live.hook.isAutoLoopActive()).toBe(false);
+  });
+
+  it('suspends a managed execution on paused activity and rearms it only when the same run is running and idle', async () => {
+    const conversationId = '51515151-6262-4737-8848-797979797979';
+    let executionStatus = 'paused';
+    let sends = 0;
+    const activity = () => ({
+      ok: true,
+      data: {
+        sessionId: 'session-managed-execution',
+        entries: [],
+        stream: [],
+        userAnchors: [],
+        nextSince: 0,
+        job: null,
+        pendingTools: 0,
+        context: { auto: false, threshold: 0, warn: 0, limit: 0 },
+        goal: null,
+        execution: { id: 'execution-run-activity', status: executionStatus, mode: 'standard' }
+      }
+    });
+    live = await harness(
+      `https://chatgpt.com/c/${conversationId}?clf=cmd-execution-activity`,
+      {
+        redeem: () => ({
+          ok: true,
+          command: {
+            id: 'cmd-execution-activity',
+            type: 'execution-resume',
+            text: '',
+            agent: null,
+            conversationId,
+            executionRunId: 'execution-run-activity',
+            loopMode: 'standard'
+          }
+        }),
+        ack: () => ({ ok: true, data: { committed: true } }),
+        activity
+      },
+      (document) => {
+        document.querySelector('[data-testid="send-button"]')!.addEventListener('click', () => {
+          sends += 1;
+        });
+      }
+    );
+
+    await settle(150);
+    await live.hook.pullActivity();
+    await settle();
+    expect(live.hook.getCurrentExecutionRunId()).toBe('execution-run-activity');
+    expect(live.hook.getAutoLoopMode()).toBe('standard');
+    expect(live.hook.getAutoLoopTurns()).toBe(0);
+    expect(live.hook.isAutoLoopActive()).toBe(false);
+    expect(sends).toBe(0);
+
+    // From here model ChatGPT accepting the autonomous continuation. The default jsdom send
+    // button has no React state transition behind it, so CLF_DOM quite correctly cannot prove
+    // acceptance from a click alone.
+    const domApi = (live.window as any).CLF_DOM;
+    domApi.send = async () => {
+      sends += 1;
+      live!.document.querySelector('#prompt-textarea')!.replaceChildren();
+      return true;
+    };
+    executionStatus = 'running';
+    await live.hook.pullActivity();
+    await settle(200);
+    expect(live.hook.getCurrentExecutionRunId()).toBe('execution-run-activity');
+    expect(live.hook.getAutoLoopMode()).toBe('standard');
+    expect(live.hook.isAutoLoopActive()).toBe(true);
+    expect(sends).toBe(1);
   });
 
   it('does not journal replacement-chat observations until the resume ACK has committed the session move', async () => {
