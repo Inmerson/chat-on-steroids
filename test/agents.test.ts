@@ -1880,7 +1880,7 @@ describe('through the MCP endpoint', () => {
     const reply = await ordinaryWithRequestId(requestId, 'read', { paths: ['/anything'] });
     const text = textOfReply(reply);
     expect(text).not.toContain('WORKER_SLEEPING');
-    expect(text).toMatch(/unknown root/i);
+    expect(text).toMatch(/unknown root|not inside an approved folder/i);
     expect(identify({ conversationId: 'c-prime-b' }).id).toBe(PRIME_ID);
   });
 
@@ -1904,7 +1904,7 @@ describe('through the MCP endpoint', () => {
         calls: [{ messageId: 'm-dormant-late', tool: 'read', order: 0, answered: false, requestId }]
       }
     ]);
-    expect(textOfReply(await pending)).toMatch(/unknown root/i);
+    expect(textOfReply(await pending)).toMatch(/unknown root|not inside an approved folder/i);
   });
 
   it('delivers and acknowledges a parked prime inbox by exact conversation without adopting another history', async () => {

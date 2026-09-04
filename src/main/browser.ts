@@ -148,6 +148,7 @@ export async function openInPreferredBrowser(
   for (const browser of preferredBrowserCandidates(platform, env, options.home)) {
     if (!usable(browser)) continue;
     try {
+      const browserPath = platform === 'win32' ? path.win32 : path.posix;
       const args =
         platform === 'win32'
           ? [
@@ -156,7 +157,7 @@ export async function openInPreferredBrowser(
               url
             ]
           : [url];
-      await launch(browser, args, path.dirname(browser));
+      await launch(browser, args, browserPath.dirname(browser));
       return browser;
     } catch (error) {
       lastError = error;

@@ -11,34 +11,38 @@ the app refuses the extension and asks you to reload the matching copy.
 
 ## [Unreleased]
 
-The following changes are implemented on the autonomous execution branch. They have not
-been deployed to the installed app/extension or verified through authenticated live ChatGPT.
+No changes yet.
+
+## [2.1.0] — 2026-09-05
+
+2.1.0 integrates Agent System 3.0, Control Center, durable autonomous execution, Infinite Loop,
+desktop shortcut auto-healing, and safer background browser orchestration.
 
 ### Added
 - Durable desktop execution through the existing `session` tool: start, status, pause,
   resume, and stop. Execution control remains available when recording is disabled.
 - Separate managed Execution and Agent windows, with exact conversation binding and
   one-time delivery of the approved plan.
+- **Agent System 3.0 & Control Center:** DAG orchestration, worker allocation, recovery,
+  completion review, live status, and browser lease telemetry.
+- **Infinite Loop Mode:** Auto-rollover and decision delegation automation.
+- **Desktop Shortcut Auto-Healing:** Automatic shortcut creation and icon healing at app startup and packaging.
+- **Window Foreground Elevation:** Robust unminimize and foreground elevation sequence on Windows.
 
 ### Fixed
 - Exact-URL stalled-chat recovery with document-scoped state and bounded consecutive
   recovery attempts. The source tab stays open until replacement readiness is proved.
 - Worker tabs close only after durable sleeping/finished/failed lifecycle evidence;
   bootstrap delivery acknowledgement alone does not authorize closure.
+- Fresh worker tabs open in the background instead of stealing focus from the active ChatGPT tab.
+- Windows Chrome orchestration launches disable renderer backgrounding and background timer throttling.
 - Shared autonomous composer ownership across Loop, Goal, compaction, and revival.
 - Authenticated terminal continuation across chats, strict bridge protocol admission,
   and explicit All Computer state with confirmation and coherent manual root edits.
 - English-only first-party autonomous prompts, statuses, and decision/error heuristics.
-
-## [2.1.0] — 2026-09-04
-
-2.1.0 integrates Agent System 3.0, Control Center, Infinite Loop, and desktop shortcut auto-healing.
-
-### Added
-- **Desktop Shortcut Auto-Healing:** Automatic shortcut creation and icon healing at app startup and packaging.
-- **Window Foreground Elevation:** Robust unminimize and foreground elevation sequence on Windows.
-- **Agent System 3.0 & Control Center:** DAG orchestration, worker allocation, live status telemetry.
-- **Infinite Loop Mode:** Auto-rollover and decision delegation automation.
+- Fork clones now verify public-history privacy against the canonical upstream main line without
+  treating already-published upstream history as a new local privacy violation.
+- Cross-platform CI now uses platform-specific browser path semantics and platform-neutral root-denial assertions.
 
 ## [2.0.2] — 2026-08-26
 
