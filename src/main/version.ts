@@ -50,5 +50,8 @@ export function extensionDownloadUrl(version = APP_VERSION): string {
  * 9 — authenticated extension requests may carry the exact agent-tab lease/queue telemetry
  *     snapshot owned by the browser service worker, so Control Center can report the five-tab
  *     budget without inferring browser state from app-side command queues or ordinary user tabs.
+ * 10 — managed autonomous execution commands add durable execution-run identity and Loop mode
+ *      to the command wire, plus Core-owned execution rollover admission. Older peers cannot
+ *      safely infer those routing/ownership fields, so this generation must fail closed.
  */
-export const BRIDGE_PROTOCOL = 9;
+export const BRIDGE_PROTOCOL = 10;

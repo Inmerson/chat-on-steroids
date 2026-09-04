@@ -60,6 +60,11 @@ import { trayGuidArgsForPlatform, trayImageSpec } from './tray-image.js';
 import { browserWindowIconPath } from './window-icon.js';
 import { isBackgroundStartup, syncLoginStartup } from './background-startup.js';
 import { ensureDesktopShortcut } from './desktop-shortcut.js';
+import {
+  EXECUTION_STATE,
+  restoreExecutions,
+  type ExecutionSnapshot
+} from './execution.js';
 
 /** Durable state file holding the multi-agent run. Hashes only, never credentials. */
 const SWARM_STATE = 'swarm';
@@ -325,6 +330,12 @@ void app.whenReady().then(async () => {
   const savedGoalObjectives = await readDurable<GoalObjectivesSnapshot>(GOAL_OBJECTIVES_STATE);
   if (windowActivation.isDisabled()) return;
   restoreGoalObjectives(savedGoalObjectives);
+  // Execution command restore is validated against the durable run that owns each command.
+  // Load that authority before the bridge can bind a loopback port and call restoreCommands(),
+  // otherwise a valid pending execution bootstrap would look orphaned and be retired at startup.
+  const savedExecutions = await readDurable<ExecutionSnapshot>(EXECUTION_STATE);
+  if (windowActivation.isDisabled()) return;
+  restoreExecutions(savedExecutions);
   // Request ownership must exist before either side of the bridge can race in. A request id
   // that was proved yesterday remains the same workflow today even if its ChatGPT tab closed.
   await restoreRequestCorrelations();

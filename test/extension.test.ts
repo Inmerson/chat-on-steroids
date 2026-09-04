@@ -38,8 +38,8 @@ describe('extension release metadata', () => {
     expect(lock.version).toBe(APP_VERSION);
     expect(lock.packages?.['']?.version).toBe(APP_VERSION);
     expect(manifest.version).toBe(APP_VERSION);
-    expect(BRIDGE_PROTOCOL).toBe(9);
-    expect(backgroundSource).toContain('const BRIDGE_PROTOCOL = 9;');
+    expect(BRIDGE_PROTOCOL).toBe(10);
+    expect(backgroundSource).toContain('const BRIDGE_PROTOCOL = 10;');
   });
 
   /**

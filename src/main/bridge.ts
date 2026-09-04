@@ -109,6 +109,12 @@ import {
 } from './session/continuation.js';
 import { noteResumeOpening } from './session/resume-gate.js';
 import { readDurable, writeDurableNow, writeDurableSoon } from './durable.js';
+import {
+  bindExecutionConversation,
+  executionBootstrapText,
+  executionRun,
+  setExecutionStatus
+} from './execution.js';
 import { APP_VERSION, BRIDGE_PROTOCOL } from './version.js';
 import { requestCorrelation } from './session/correlation.js';
 import { bindAgentWorkspace } from './workspace.js';
@@ -280,7 +286,13 @@ type CommandSpec =
    * move happened. Keyed by session, because compacting the same chat twice is one job whose
    * brief got newer — not two fresh chats, which is what keying on the handoff produced.
    */
-  | { type: 'resume'; sessionId: string; token: string };
+  | { type: 'resume'; sessionId: string; token: string }
+  /** A fresh autonomous desktop execution backed by Core's durable execution-run state. */
+  | { type: 'execution'; executionRunId: string }
+  /** Re-arm one already-bound execution conversation without re-sending the approved plan. */
+  | { type: 'execution-resume'; executionRunId: string; conversationId: string }
+  /** Last-resort clean-chat continuation after exact-chat recovery can no longer proceed safely. */
+  | { type: 'execution-rollover'; executionRunId: string; fromConversationId: string; reason: string };
 
 interface Command {
   id: string;
@@ -370,6 +382,10 @@ export interface BridgeCommand {
    * the opposite precondition — a chat with no conversation of its own yet.
    */
   conversationId: string | null;
+  /** Durable Core execution identity when this command belongs to a managed autonomous run. */
+  executionRunId: string | null;
+  /** Loop mode is projected from the durable run rather than trusted from the browser. */
+  loopMode: 'standard' | 'infinite' | null;
 }
 
 let server: http.Server | null = null;
@@ -545,7 +561,11 @@ function extensionProtocol(req: http.IncomingMessage): number | null {
 
 function protocolCompatible(req: http.IncomingMessage): boolean {
   const p = extensionProtocol(req);
-  return p === BRIDGE_PROTOCOL || (p !== null && p >= 7 && p <= 12);
+  // Bridge generations are semantic contracts, not a numeric feature range. Protocol 10 adds
+  // execution ownership/routing fields whose absence changes which browser document may act;
+  // accepting an older generation here would turn an explicit fail-closed boundary into a
+  // best-effort downgrade. App and bundled extension ship together, so require exact equality.
+  return p === BRIDGE_PROTOCOL;
 }
 
 function noteExtensionVersion(req: http.IncomingMessage): void {
@@ -1922,6 +1942,46 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
     );
   }
 
+  /**
+   * Requests the last-resort clean-chat continuation of one managed execution.
+   *
+   * This route deliberately accepts no prompt/plan/progress field. Browser state is only a
+   * request to act; Core reconstructs all execution content from durable/session authority.
+   */
+  if (route === '/execution/rollover' && req.method === 'POST') {
+    let body: Record<string, unknown>;
+    try {
+      body = (await readBody(req)) as Record<string, unknown>;
+    } catch (err) {
+      if ((err as Error).message === 'body_too_large') return tooLarge(res, origin);
+      return json(res, 400, { error: 'bad_request' }, origin);
+    }
+    const executionRunId = typeof body['executionRunId'] === 'string' ? body['executionRunId'].slice(0, 256) : '';
+    const currentConversation = conversationId(body['conversationId']);
+    const reason = typeof body['reason'] === 'string'
+      ? body['reason'].slice(0, MAX_EXECUTION_ROLLOVER_REASON_CHARS)
+      : '';
+    if (!executionRunId) return json(res, 400, { error: 'bad_execution_run_id' }, origin);
+    if (!currentConversation) return json(res, 400, { error: 'bad_conversation_id' }, origin);
+    const execution = executionRun(executionRunId);
+    if (!execution) return json(res, 404, { error: 'no_such_execution' }, origin);
+    if (execution.status === 'stopped' || execution.status === 'failed' || execution.status === 'completed') {
+      return json(res, 409, { error: 'execution_terminal' }, origin);
+    }
+    if (execution.conversationId !== currentConversation) {
+      return json(res, 409, { error: 'execution_wrong_conversation' }, origin);
+    }
+    try {
+      const commandId = await queueExecutionRollover(executionRunId, currentConversation, reason);
+      return json(res, 200, { ok: true, commandId }, origin);
+    } catch (err) {
+      logWarn(
+        `bridge: could not queue rollover for execution ${executionRunId} — ${err instanceof Error ? err.message : String(err)}`
+      );
+      return json(res, 503, { error: 'execution_rollover_not_queued', retryable: true }, origin);
+    }
+  }
+
   // The targeted-open path: one page, opened by the app, redeeming the one command the
   // app opened it for. The id is not a credential — this route is behind the same bearer
   // token as everything else — it is a correlation marker, which is why a leaked URL or a
@@ -1954,8 +2014,36 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
       return json(res, 404, { error: 'no_such_command' }, origin);
     }
     if (
+      command.spec.type === 'execution' ||
+      command.spec.type === 'execution-resume' ||
+      command.spec.type === 'execution-rollover'
+    ) {
+      const run = executionRun(command.spec.executionRunId);
+      if (!run || run.status === 'stopped' || run.status === 'failed' || run.status === 'completed') {
+        retire(command, 'its durable execution run is no longer active');
+        return json(res, 404, { error: 'no_such_command' }, origin);
+      }
+      if (
+        command.spec.type === 'execution-resume' &&
+        run.conversationId !== command.spec.conversationId
+      ) {
+        retire(command, 'its durable execution conversation binding changed');
+        return json(res, 404, { error: 'no_such_command' }, origin);
+      }
+      if (
+        command.spec.type === 'execution-rollover' &&
+        run.conversationId !== command.spec.fromConversationId
+      ) {
+        retire(command, 'its durable execution rollover source changed');
+        return json(res, 404, { error: 'no_such_command' }, origin);
+      }
+    }
+    if (
       reportedConversation &&
-      (command.spec.type !== 'revive' || command.spec.conversationId !== reportedConversation)
+      !(
+        (command.spec.type === 'revive' && command.spec.conversationId === reportedConversation) ||
+        (command.spec.type === 'execution-resume' && command.spec.conversationId === reportedConversation)
+      )
     ) {
       // An existing ChatGPT page is allowed to claim exactly one kind of command: a revival
       // naming that exact chat. This check happens before the command acquires an owner, so a
@@ -2021,7 +2109,16 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
         return json(res, 503, { error: 'continuation_claim_not_durable', retryable: true }, origin);
       }
     }
-    return json(res, 200, { command: describe(command, client, claimedSummary) }, origin);
+    let rolloverText: string | undefined;
+    if (command.spec.type === 'execution-rollover') {
+      try {
+        rolloverText = await executionRolloverText(command.spec);
+      } catch (err) {
+        logWarn(`bridge: could not build ${specKey(command.spec)} payload — ${err instanceof Error ? err.message : String(err)}`);
+        return json(res, 409, { error: 'execution_rollover_stale' }, origin);
+      }
+    }
+    return json(res, 200, { command: describe(command, client, claimedSummary, rolloverText) }, origin);
   }
 
   if (route === '/commands/ack' && req.method === 'POST') {
@@ -2114,7 +2211,47 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
         // went into the worker's own conversation and not into some other tab.
         return json(res, 503, { error: 'conversation_required', retryable: true }, origin);
       }
-      if (command.spec.type === 'revive') {
+      if (
+        command.spec.type === 'execution' ||
+        command.spec.type === 'execution-resume' ||
+        command.spec.type === 'execution-rollover'
+      ) {
+        if (!conversation) return json(res, 503, { error: 'conversation_required', retryable: true }, origin);
+        const spec = command.spec;
+        const run = executionRun(spec.executionRunId);
+        const expectedConversation = spec.type === 'execution-resume' ? spec.conversationId : null;
+        if (
+          !run ||
+          run.status === 'stopped' ||
+          run.status === 'failed' ||
+          run.status === 'completed' ||
+          (expectedConversation !== null && conversation !== expectedConversation) ||
+          (expectedConversation !== null && run.conversationId !== expectedConversation) ||
+          (spec.type === 'execution-rollover' && run.conversationId !== spec.fromConversationId)
+        ) {
+          return json(res, 409, { error: 'execution_command_stale' }, origin);
+        }
+        try {
+          if (spec.type === 'execution' || spec.type === 'execution-rollover') {
+            await bindExecutionConversation(spec.executionRunId, conversation);
+          }
+          await setExecutionStatus(spec.executionRunId, 'running');
+        } catch (err) {
+          logWarn(
+            `bridge: could not durably commit ${specKey(spec)} ACK — ${err instanceof Error ? err.message : String(err)}`
+          );
+          return json(res, 503, { error: 'execution_commit_not_durable', retryable: true }, origin);
+        }
+        receipt = {
+          id,
+          client: client || command.owner,
+          conversationId: conversation,
+          outcome: 'committed',
+          committed: true,
+          error: null,
+          completedAt: Date.now()
+        };
+      } else if (command.spec.type === 'revive') {
         // Narrowed above.
         if (!conversation) return json(res, 503, { error: 'conversation_required', retryable: true }, origin);
         const revive = command.spec;
@@ -2278,6 +2415,32 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
         }
         }
       }
+    } else if (
+      command.spec.type === 'execution' ||
+      command.spec.type === 'execution-resume' ||
+      command.spec.type === 'execution-rollover'
+    ) {
+      const why = error ? `the browser could not start the execution chat — ${error}` : 'the browser could not start the execution chat';
+      const run = executionRun(command.spec.executionRunId);
+      if (run && run.status !== 'stopped' && run.status !== 'failed' && run.status !== 'completed') {
+        try {
+          await setExecutionStatus(command.spec.executionRunId, 'failed', why);
+        } catch (err) {
+          logWarn(
+            `bridge: could not durably fail ${specKey(command.spec)} — ${err instanceof Error ? err.message : String(err)}`
+          );
+          return json(res, 503, { error: 'execution_failure_not_durable', retryable: true }, origin);
+        }
+      }
+      receipt = {
+        id,
+        client: client || command.owner,
+        conversationId: conversation,
+        outcome: 'terminal-failure',
+        committed: false,
+        error: why,
+        completedAt: Date.now()
+      };
     } else if (command.spec.type === 'resume') {
       const state = continuationByToken(command.spec.token);
       if (state?.state === 'committed') {
@@ -2841,7 +3004,10 @@ export function shutdownBridge(): Promise<void> {
 function specKey(spec: CommandSpec): string {
   if (spec.type === 'worker') return `worker:${spec.agent}`;
   if (spec.type === 'revive') return `revive:${spec.agent}`;
-  return `resume:${spec.sessionId}`;
+  if (spec.type === 'resume') return `resume:${spec.sessionId}`;
+  if (spec.type === 'execution') return `execution:${spec.executionRunId}`;
+  if (spec.type === 'execution-resume') return `execution-resume:${spec.executionRunId}`;
+  return `execution-rollover:${spec.executionRunId}`;
 }
 
 /**
@@ -2852,7 +3018,8 @@ function specKey(spec: CommandSpec): string {
  * run A can be adopted by run B after a crash/restart and keep A's command id alive.
  */
 function commandKey(spec: CommandSpec): string {
-  return spec.type === 'resume' ? specKey(spec) : `${specKey(spec)}:${spec.runId}`;
+  if (spec.type === 'worker' || spec.type === 'revive') return `${specKey(spec)}:${spec.runId}`;
+  return specKey(spec);
 }
 
 const commandPhase = (command: Command): CommandPhase => (command.claimedAt === null ? 'queued' : 'leased');
@@ -3335,6 +3502,89 @@ export function queueWorkerRevival(agent: string, conversationId: string): Bridg
 }
 
 /**
+ * Publishes the first browser bootstrap for one durable autonomous execution.
+ *
+ * The run already owns the full approved plan. The command stores only that run id; the plan is
+ * resolved when the authenticated page redeems the marker, so no plan text is copied into URLs
+ * or the bridge command journal.
+ */
+export async function queueExecutionBootstrap(executionRunId: string): Promise<string> {
+  const execution = executionRun(executionRunId);
+  if (!execution) throw new Error(`Unknown execution run: ${executionRunId}`);
+  if (execution.status === 'stopped' || execution.status === 'failed' || execution.status === 'completed') {
+    throw new Error(`Execution run ${executionRunId} is already terminal`);
+  }
+  if (execution.conversationId) throw new Error(`Execution run ${executionRunId} is already bound to a conversation`);
+  const command = queue({ type: 'execution', executionRunId });
+  await deliver();
+  if (!commands.includes(command)) throw new Error(command.lastError || 'Desktop execution browser publication failed');
+  return command.id;
+}
+
+/** Reopens the exact conversation already bound to a durable execution without re-sending its plan. */
+export async function queueExecutionResume(executionRunId: string, conversationId: string): Promise<string> {
+  const execution = executionRun(executionRunId);
+  if (!execution) throw new Error(`Unknown execution run: ${executionRunId}`);
+  if (execution.status === 'stopped' || execution.status === 'failed' || execution.status === 'completed') {
+    throw new Error(`Execution run ${executionRunId} is already terminal`);
+  }
+  if (execution.conversationId !== conversationId) {
+    throw new Error(`Execution run ${executionRunId} is not bound to conversation ${conversationId}`);
+  }
+  const command = queue({ type: 'execution-resume', executionRunId, conversationId });
+  await deliver();
+  if (!commands.includes(command)) throw new Error(command.lastError || 'Desktop execution browser publication failed');
+  return command.id;
+}
+
+/** Queues a fresh-chat continuation after exact-chat recovery can no longer continue safely. */
+export async function queueExecutionRollover(
+  executionRunId: string,
+  fromConversationId: string,
+  reason: string
+): Promise<string> {
+  const execution = executionRun(executionRunId);
+  if (!execution) throw new Error(`Unknown execution run: ${executionRunId}`);
+  if (execution.status === 'stopped' || execution.status === 'failed' || execution.status === 'completed') {
+    throw new Error(`Execution run ${executionRunId} is already terminal`);
+  }
+  if (execution.conversationId !== fromConversationId) {
+    throw new Error(`Execution run ${executionRunId} is not bound to conversation ${fromConversationId}`);
+  }
+  const command = queue({
+    type: 'execution-rollover',
+    executionRunId,
+    fromConversationId,
+    reason: String(reason || '').slice(0, MAX_EXECUTION_ROLLOVER_REASON_CHARS)
+  });
+  await deliver();
+  if (!commands.includes(command)) throw new Error(command.lastError || 'Desktop execution rollover publication failed');
+  return command.id;
+}
+
+/** Durably withdraws every not-yet-final browser command belonging to one execution run. */
+export async function cancelExecutionCommands(executionRunId: string): Promise<void> {
+  const doomed = commands.filter(
+    (command) =>
+      (command.spec.type === 'execution' ||
+        command.spec.type === 'execution-resume' ||
+        command.spec.type === 'execution-rollover') &&
+      command.spec.executionRunId === executionRunId
+  );
+  if (doomed.length === 0) return;
+  const ids = new Set(doomed.map((command) => command.id));
+  const snapshot = commandSnapshot();
+  snapshot.commands = snapshot.commands.filter((record) => !ids.has(record.id));
+  await writeDurableNow(COMMANDS_STATE, snapshot);
+  for (const command of doomed) {
+    if (command.timer) clearTimeout(command.timer);
+    command.timer = null;
+  }
+  commands = commands.filter((command) => !ids.has(command.id));
+  changed();
+}
+
+/**
  * Queues the replacement chat for a continuation whose brief has been captured.
  *
  * Keyed by session, and carrying the transaction's token rather than any text: the token is
@@ -3420,7 +3670,8 @@ async function deliverOne(): Promise<void> {
     // Nothing can open a browser in this process, and nothing will come and ask. Ending it
     // here is what keeps the failure honest: the continuation stays in the chat it is in and
     // the worker slot fails, instead of a job sitting in a queue that has no reader.
-    drop(command, 'this app has no way to open a browser window');
+    command.lastError = 'this app has no way to open a browser window';
+    drop(command, command.lastError);
     return;
   }
   const claimedAt = Date.now();
@@ -3429,7 +3680,11 @@ async function deliverOne(): Promise<void> {
   changed();
   // A revival is the one command that must not open a fresh composer: it names the chat the
   // worker already has, so the page lands on it and the marker it redeems names it back.
-  const url = commandUrl(command.id, command.spec.type === 'revive' ? command.spec.conversationId : null);
+  const exactConversation =
+    command.spec.type === 'revive' || command.spec.type === 'execution-resume'
+      ? command.spec.conversationId
+      : null;
+  const url = commandUrl(command.id, exactConversation);
   // The recorder can see a brand-new ChatGPT conversation before that page's content script has
   // redeemed this command. Arm the session-transfer gate before the browser gets any chance to
   // create B, otherwise that early observation invents a shadow session for B and the real A→B
@@ -3524,6 +3779,30 @@ function rearmRetainedCommandDeadlines(): void {
 function expire(command: Command): void {
   if (!commands.includes(command)) return;
   const spec = command.spec;
+  if (spec.type === 'execution' || spec.type === 'execution-resume' || spec.type === 'execution-rollover') {
+    const run = executionRun(spec.executionRunId);
+    if (!run || run.status === 'stopped' || run.status === 'failed' || run.status === 'completed') {
+      retire(command, 'its durable execution run is no longer active');
+      void deliver();
+      return;
+    }
+    const why = command.lastError ?? 'the execution chat this app opened did not report back in time';
+    // The durable run state is the semantic authority. Do not retire the only transport first:
+    // a crash in that gap would restore a `starting`/`paused` run with no command capable of
+    // finishing or failing it. Persist `failed` first, then withdraw the transport.
+    void setExecutionStatus(spec.executionRunId, 'failed', why)
+      .then(() => {
+        if (commands.includes(command)) drop(command, why);
+        void deliver();
+      })
+      .catch((err) => {
+        logWarn(
+          `bridge: could not durably expire ${specKey(spec)} — ${err instanceof Error ? err.message : String(err)}`
+        );
+        if (commands.includes(command)) armDeadline(command, 5_000);
+      });
+    return;
+  }
   if (spec.type === 'resume') {
     const continuation = continuationByToken(spec.token);
     if (continuation?.state === 'committed' && continuation.to) {
@@ -3584,6 +3863,8 @@ function retire(command: Command, why: string): void {
  * anything at all.
  */
 function bootstrapText(spec: CommandSpec, summary: string): string {
+  if (spec.type === 'execution') return executionBootstrapText(spec.executionRunId);
+  if (spec.type === 'execution-resume' || spec.type === 'execution-rollover') return '';
   if (spec.type === 'revive') {
     // Written by the broker, out of that worker's own inbox, at the moment the page asks.
     // Empty means the broker no longer considers this worker to be waking, and an empty
@@ -3615,6 +3896,60 @@ function bootstrapText(spec: CommandSpec, summary: string): string {
   return resumeBootstrapText(summary);
 }
 
+const MAX_EXECUTION_ROLLOVER_PROGRESS_CHARS = 8_000;
+const MAX_EXECUTION_ROLLOVER_REASON_CHARS = 500;
+
+/**
+ * Builds the clean-chat continuation from Core-owned durable/session state only.
+ *
+ * The browser supplies the reason for requesting rollover, never plan/progress text. The approved
+ * plan is read from the durable execution run and the progress excerpt is read from the local
+ * session currently bound to that exact source conversation.
+ */
+async function executionRolloverText(spec: Extract<CommandSpec, { type: 'execution-rollover' }>): Promise<string> {
+  const execution = executionRun(spec.executionRunId);
+  if (!execution || execution.conversationId !== spec.fromConversationId) {
+    throw new Error('execution rollover no longer matches the durable conversation binding');
+  }
+  let progress = '';
+  try {
+    const session = await findSessionByConversation(spec.fromConversationId, { requireUnique: true });
+    if (session) {
+      const recent = await readRecentEvents(session.id, 96, { kinds: ['assistant_message', 'progress'] });
+      const final = [...recent]
+        .reverse()
+        .find((entry) => entry.kind === 'assistant_message' && entry.final === true && Boolean(entry.message.text));
+      const fallback = [...recent]
+        .reverse()
+        .find((entry) => (entry.kind === 'assistant_message' || entry.kind === 'progress') && Boolean(entry.message.text));
+      const source = final ?? fallback;
+      if (source && (source.kind === 'assistant_message' || source.kind === 'progress')) {
+        progress = source.message.text.slice(-MAX_EXECUTION_ROLLOVER_PROGRESS_CHARS).trim();
+      }
+    }
+  } catch (err) {
+    logWarn(
+      `bridge: could not read recorded progress for ${specKey(spec)} — ${err instanceof Error ? err.message : String(err)}`
+    );
+  }
+  const reason = spec.reason.slice(0, MAX_EXECUTION_ROLLOVER_REASON_CHARS).trim();
+  const lines = [
+    '@Chat On Steroids Core',
+    '',
+    'Continue the same durable autonomous execution in this fresh ChatGPT conversation.',
+    'Execute only the approved plan below. Preserve unrelated working-tree changes. Do not redo work that the recorded progress already proves complete. Verify before declaring completion.',
+    execution.mode === 'infinite'
+      ? 'Only after the current approved milestone is verified complete may you select the next highest-value improvement and continue.'
+      : 'Do not expand into unrelated feature work.',
+    reason ? `Rollover reason: ${reason}` : '',
+    '',
+    'APPROVED PLAN',
+    execution.plan
+  ];
+  if (progress) lines.push('', 'LATEST RECORDED PROGRESS', progress);
+  return lines.filter((line, index, all) => line !== '' || all[index - 1] !== '').join('\n');
+}
+
 /** The broker's current plan for waking one worker, or null once it is no longer waking. */
 function revivalFor(agent: string): WorkerRevival | null {
   return pendingWorkerRevivals().find((revival) => revival.id === agent) ?? null;
@@ -3629,24 +3964,40 @@ function revivalFor(agent: string): WorkerRevival | null {
  * gets here, and by the transaction itself if it somehow does. A continuation that can no
  * longer be claimed yields no text, and the command carries nothing to type.
  */
-function describe(command: Command, client: string | null, claimedSummary?: string): BridgeCommand {
+function describe(
+  command: Command,
+  client: string | null,
+  claimedSummary?: string,
+  rolloverText?: string
+): BridgeCommand {
   const spec = command.spec;
   // A resume's claim is persisted by /commands/redeem before this renderer is called. A
   // command shown to app/UI code without a browser document still carries no brief at all.
-  const text = spec.type === 'resume'
-    ? client && claimedSummary !== undefined
-      ? bootstrapText(spec, claimedSummary)
-      : ''
-    : bootstrapText(spec, '');
+  const text =
+    spec.type === 'resume'
+      ? client && claimedSummary !== undefined
+        ? bootstrapText(spec, claimedSummary)
+        : ''
+      : spec.type === 'execution-rollover'
+        ? rolloverText ?? ''
+        : bootstrapText(spec, '');
+  const executionRunId =
+    spec.type === 'execution' || spec.type === 'execution-resume' || spec.type === 'execution-rollover'
+      ? spec.executionRunId
+      : null;
+  const execution = executionRunId ? executionRun(executionRunId) : null;
   return {
     id: command.id,
     kind: 'open-chat',
     type: spec.type,
     text,
-    agent: spec.type === 'resume' ? null : spec.agent,
+    agent: spec.type === 'worker' || spec.type === 'revive' ? spec.agent : null,
     // The fence the page enforces before it types. Only a revival has one: the other two
     // kinds open a chat that does not exist yet, so there is nothing to compare against.
-    conversationId: spec.type === 'revive' ? spec.conversationId : null
+    conversationId:
+      spec.type === 'revive' || spec.type === 'execution-resume' ? spec.conversationId : null,
+    executionRunId,
+    loopMode: execution?.mode ?? null
   };
 }
 
@@ -3722,11 +4073,39 @@ function tidyCommands(): void {
   const wakingWorkers = new Set(pendingWorkerRevivals().map((revival) => revival.id));
   for (const command of [...commands]) {
     const workerAgent = command.spec.type === 'worker' ? command.spec.agent : null;
-    if (command.spec.type !== 'resume' && command.spec.runId !== runId) {
+    if (
+      (command.spec.type === 'worker' || command.spec.type === 'revive') &&
+      command.spec.runId !== runId
+    ) {
       // Run turnover is an identity boundary. A command from the retired incarnation is not
       // evidence that the same friendly worker id in the current run is already opening.
       retire(command, `its worker run ${command.spec.runId} is no longer current`);
       continue;
+    }
+    if (
+      command.spec.type === 'execution' ||
+      command.spec.type === 'execution-resume' ||
+      command.spec.type === 'execution-rollover'
+    ) {
+      const execution = executionRun(command.spec.executionRunId);
+      if (!execution || execution.status === 'stopped' || execution.status === 'failed' || execution.status === 'completed') {
+        retire(command, 'its durable execution run is no longer active');
+        continue;
+      }
+      if (
+        command.spec.type === 'execution-resume' &&
+        execution.conversationId !== command.spec.conversationId
+      ) {
+        retire(command, 'its durable execution conversation binding changed');
+        continue;
+      }
+      if (
+        command.spec.type === 'execution-rollover' &&
+        execution.conversationId !== command.spec.fromConversationId
+      ) {
+        retire(command, 'its durable execution rollover source changed');
+        continue;
+      }
     }
     if (command.spec.type === 'revive' && !wakingWorkers.has(command.spec.agent)) {
       // The slot stopped waking while this waited: the worker called in by itself, the prime's
@@ -3743,7 +4122,16 @@ function tidyCommands(): void {
       continue;
     }
     if (now - command.createdAt > COMMAND_TTL_MS && !waitingForRevivalReadiness(command)) {
-      drop(command, 'it has been waiting too long to still be what the user expects');
+      if (
+        command.spec.type === 'execution' ||
+        command.spec.type === 'execution-resume' ||
+        command.spec.type === 'execution-rollover'
+      ) {
+        command.lastError = 'it has been waiting too long to still be what the user expects';
+        expire(command);
+      } else {
+        drop(command, 'it has been waiting too long to still be what the user expects');
+      }
     }
   }
 }
@@ -3797,7 +4185,8 @@ function commandOrigin(id: string): SessionOrigin | null {
   // worker chat when it was first opened, and rewriting that origin now would only overwrite
   // the task this worker was actually created for with whatever it is being asked next.
   if (spec.type === 'revive') return null;
-  return { kind: 'resume', fromSessionId: spec.sessionId, agentId: null, task: '' };
+  if (spec.type === 'resume') return { kind: 'resume', fromSessionId: spec.sessionId, agentId: null, task: '' };
+  return null;
 }
 
 
@@ -3885,6 +4274,58 @@ function restoredReceipt(raw: Partial<CommandReceipt>, now: number): CommandRece
  * continuation WAL. Returning null is therefore a retirement decision, not a parse fallback.
  */
 function restoredCommandSpec(version: number, raw: Partial<CommandSpec>): CommandSpec | null {
+  if (
+    raw.type === 'execution' &&
+    typeof (raw as Partial<Extract<CommandSpec, { type: 'execution' }>>).executionRunId === 'string'
+  ) {
+    const spec = raw as Extract<CommandSpec, { type: 'execution' }>;
+    const execution = executionRun(spec.executionRunId);
+    if (!execution || execution.status === 'stopped' || execution.status === 'failed' || execution.status === 'completed') return null;
+    if (execution.conversationId) return null;
+    return { type: 'execution', executionRunId: spec.executionRunId };
+  }
+  if (
+    raw.type === 'execution-resume' &&
+    typeof (raw as Partial<Extract<CommandSpec, { type: 'execution-resume' }>>).executionRunId === 'string' &&
+    typeof (raw as Partial<Extract<CommandSpec, { type: 'execution-resume' }>>).conversationId === 'string'
+  ) {
+    const spec = raw as Extract<CommandSpec, { type: 'execution-resume' }>;
+    const execution = executionRun(spec.executionRunId);
+    if (
+      !execution ||
+      execution.status === 'stopped' ||
+      execution.status === 'failed' ||
+      execution.status === 'completed' ||
+      execution.conversationId !== spec.conversationId
+    ) return null;
+    return {
+      type: 'execution-resume',
+      executionRunId: spec.executionRunId,
+      conversationId: spec.conversationId
+    };
+  }
+  if (
+    raw.type === 'execution-rollover' &&
+    typeof (raw as Partial<Extract<CommandSpec, { type: 'execution-rollover' }>>).executionRunId === 'string' &&
+    typeof (raw as Partial<Extract<CommandSpec, { type: 'execution-rollover' }>>).fromConversationId === 'string' &&
+    typeof (raw as Partial<Extract<CommandSpec, { type: 'execution-rollover' }>>).reason === 'string'
+  ) {
+    const spec = raw as Extract<CommandSpec, { type: 'execution-rollover' }>;
+    const execution = executionRun(spec.executionRunId);
+    if (
+      !execution ||
+      execution.status === 'stopped' ||
+      execution.status === 'failed' ||
+      execution.status === 'completed' ||
+      execution.conversationId !== spec.fromConversationId
+    ) return null;
+    return {
+      type: 'execution-rollover',
+      executionRunId: spec.executionRunId,
+      fromConversationId: spec.fromConversationId,
+      reason: spec.reason.slice(0, MAX_EXECUTION_ROLLOVER_REASON_CHARS)
+    };
+  }
   if (
     version >= 3 &&
     raw.type === 'worker' &&

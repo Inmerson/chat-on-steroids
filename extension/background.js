@@ -24,7 +24,7 @@ const PORTS = [8765, 8766, 8767, 8768, 8769];
 const HELLO_TIMEOUT_MS = 1200;
 const REQUEST_TIMEOUT_MS = 10_000;
 /** Bumped only when the request/response shape changes; the app compares it. */
-const BRIDGE_PROTOCOL = 9;
+const BRIDGE_PROTOCOL = 10;
 const AGENT_TAB_BUDGET = 5;
 const MAX_AGENT_TAB_QUEUE = 400;
 

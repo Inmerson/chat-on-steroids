@@ -35,7 +35,10 @@ const {
   browserAgentTabTelemetry,
   cancelResume,
   commandUrl,
+  cancelExecutionCommands,
   pendingCommands,
+  queueExecutionBootstrap,
+  queueExecutionResume,
   queueResume,
   resetBridgeForTests,
   restoreCommands,
@@ -107,6 +110,14 @@ const {
 );
 const { makeTempDir, removeTempDir, SAMPLE_BRIEF } = await import('./helpers.js');
 const { resumeBootstrapText } = await import('../src/main/session/handoff.js');
+const {
+  EXECUTION_STATE,
+  bindExecutionConversation,
+  createExecution,
+  executionRun,
+  resetExecutionsForTests,
+  setExecutionStatus
+} = await import('../src/main/execution.js');
 
 const EXTENSION_ORIGIN = 'chrome-extension://abcdefghijklmnopabcdefghijklmnop';
 /** The chat that spawns the swarm in these tests: only a proven conversation can. */
@@ -298,6 +309,8 @@ beforeEach(async () => {
     opened.push(url);
   });
   resetRecorderForTests();
+  resetExecutionsForTests();
+  writeDurableSoon(EXECUTION_STATE, null);
   writeDurableSoon('bridge-commands', null);
   await flushDurable();
   await setSecret('bridgeToken', '');
@@ -3241,6 +3254,169 @@ describe('delivering a bootstrap', () => {
  * or no browser — the queue simply sat there and surfaced minutes later as tabs the user
  * had stopped expecting.
  */
+describe('durable execution browser commands', () => {
+  it('opens only a marker URL and resolves the full approved plan at authenticated redeem time', async () => {
+    await pair();
+    const plan = 'Implement the approved managed execution transport and verify it.';
+    const run = await createExecution({ plan, mode: 'standard' });
+
+    const commandId = await queueExecutionBootstrap(run.id);
+    await waitForOpened(1);
+
+    expect(opened).toEqual([commandUrl(commandId)]);
+    expect(opened[0]).not.toContain(encodeURIComponent(plan));
+    expect(opened[0]).not.toContain('APPROVED%20PLAN');
+
+    const redeemed = await redeem(commandId, 'execution-bootstrap-page');
+    expect(redeemed).toMatchObject({
+      id: commandId,
+      type: 'execution',
+      conversationId: null,
+      executionRunId: run.id,
+      loopMode: 'standard'
+    });
+    expect(redeemed.text).toContain(`APPROVED PLAN\n${plan}`);
+  });
+
+  it('binds and starts an execution only after the sent ACK names the real conversation', async () => {
+    await pair();
+    const run = await createExecution({ plan: 'Bind this run only after the browser send commits.', mode: 'infinite' });
+    const commandId = await queueExecutionBootstrap(run.id);
+    await waitForOpened(1);
+    await redeem(commandId, 'execution-ack-page');
+
+    expect(executionRun(run.id)).toMatchObject({ status: 'starting', conversationId: null });
+
+    const conversationId = 'eeeeeeee-1111-2222-3333-444444444444';
+    const ack = await request('POST', '/commands/ack', {
+      body: {
+        id: commandId,
+        status: 'sent',
+        conversationId,
+        client: 'execution-ack-page'
+      }
+    });
+
+    expect(ack.status).toBe(200);
+    expect(ack.body).toMatchObject({ committed: true, conversationId });
+    expect(executionRun(run.id)).toMatchObject({
+      status: 'running',
+      conversationId
+    });
+  });
+
+  it('rearms an existing execution through an exact-chat command with no duplicate plan text', async () => {
+    await pair();
+    const conversationId = 'ffffffff-1111-2222-3333-444444444444';
+    const run = await createExecution({ plan: 'Resume this exact execution chat.', mode: 'standard' });
+    await bindExecutionConversation(run.id, conversationId);
+    await setExecutionStatus(run.id, 'paused');
+
+    const commandId = await queueExecutionResume(run.id, conversationId);
+    await waitForOpened(1);
+
+    expect(opened).toEqual([commandUrl(commandId, conversationId)]);
+    const redeemed = await request('POST', '/commands/redeem', {
+      body: { id: commandId, client: 'execution-resume-page', conversationId }
+    });
+    expect(redeemed.status).toBe(200);
+    expect(redeemed.body.command).toMatchObject({
+      id: commandId,
+      type: 'execution-resume',
+      text: '',
+      conversationId,
+      executionRunId: run.id,
+      loopMode: 'standard'
+    });
+  });
+
+  it('retires execution commands idempotently so a stale page cannot rearm a stopped run', async () => {
+    await pair();
+    const run = await createExecution({ plan: 'Stop before the browser can send.', mode: 'standard' });
+    const commandId = await queueExecutionBootstrap(run.id);
+    await waitForOpened(1);
+    await redeem(commandId, 'execution-stop-page');
+
+    await setExecutionStatus(run.id, 'stopped');
+    await cancelExecutionCommands(run.id);
+    await cancelExecutionCommands(run.id);
+
+    expect((await request('POST', '/commands/ack', {
+      body: {
+        id: commandId,
+        status: 'sent',
+        conversationId: 'dddddddd-1111-2222-3333-444444444444',
+        client: 'execution-stop-page'
+      }
+    })).status).toBe(404);
+    expect(executionRun(run.id)?.status).toBe('stopped');
+  });
+
+  it('admits clean-chat rollover only for the exact bound run and builds its prompt from Core-owned state', async () => {
+    await pair();
+    const conversationId = 'cccccccc-1111-2222-3333-444444444444';
+    const progress = 'Verified the recovery transaction; managed window routing is the next step.';
+    const recorded = await request('POST', '/events', {
+      body: {
+        conversationId,
+        events: [
+          { kind: 'user_message', time: Date.now(), text: 'Execute the durable plan.', messageId: 'm-rollover-user' },
+          {
+            kind: 'assistant_message',
+            time: Date.now() + 1,
+            text: progress,
+            messageId: 'm-rollover-assistant',
+            final: true,
+            turnId: 'turn-rollover'
+          }
+        ]
+      }
+    });
+    expect(recorded.status).toBe(200);
+
+    const plan = 'Finish managed execution routing and verify the exact browser lifecycle.';
+    const run = await createExecution({ plan, mode: 'infinite' });
+    await bindExecutionConversation(run.id, conversationId);
+    await setExecutionStatus(run.id, 'running');
+
+    const mismatch = await request('POST', '/execution/rollover', {
+      body: {
+        executionRunId: run.id,
+        conversationId: 'bbbbbbbb-1111-2222-3333-444444444444',
+        reason: 'wrong conversation'
+      }
+    });
+    expect(mismatch.status).toBe(409);
+    expect(opened).toEqual([]);
+
+    const admitted = await request('POST', '/execution/rollover', {
+      body: {
+        executionRunId: run.id,
+        conversationId,
+        reason: 'same-chat recovery ceiling reached',
+        plan: 'BROWSER-SUPPLIED PLAN MUST NEVER BE USED'
+      }
+    });
+    expect(admitted.status).toBe(200);
+    expect(admitted.body).toMatchObject({ ok: true });
+    expect(typeof admitted.body.commandId).toBe('string');
+    await waitForOpened(1);
+    expect(opened).toEqual([commandUrl(admitted.body.commandId)]);
+
+    const redeemed = await redeem(admitted.body.commandId, 'execution-rollover-page');
+    expect(redeemed).toMatchObject({
+      type: 'execution-rollover',
+      conversationId: null,
+      executionRunId: run.id,
+      loopMode: 'infinite'
+    });
+    expect(redeemed.text).toContain(plan);
+    expect(redeemed.text).toContain(progress);
+    expect(redeemed.text).toContain('same-chat recovery ceiling reached');
+    expect(redeemed.text).not.toContain('BROWSER-SUPPLIED PLAN MUST NEVER BE USED');
+  });
+});
+
 describe('targeted open', () => {
   it('opens the fresh chat the instant a resume is queued, with no tab and no timer involved', async () => {
     setBrowserOpener(async (url) => {
