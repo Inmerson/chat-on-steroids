@@ -74,6 +74,7 @@ const {
   stageWorkerConversationFinish,
   stageMessages,
   stageSpawn,
+  snapshotRetiredWorkers,
   snapshotSwarm,
   spawn,
   swarmRunning,
@@ -1271,6 +1272,25 @@ describe('a worker that is sleeping', () => {
 });
 
 describe('restart', () => {
+  it('preserves terminal worker state in retired conversation fences so browser release evidence survives restart', () => {
+    const conversationId = 'c-retired-terminal-browser-view';
+    spawn({ workers: [{ task: 'finish and retire with browser release evidence' }], caller: { conversationId: PRIME_CHAT } });
+    expect(bindConversation('worker-1', conversationId)).toBe(true);
+    noteAgentContextTokens(conversationId, WORKER_CONTEXT_CEILING_TOKENS);
+    finishAgent({ conversationId }, 'terminal worker result');
+
+    resetSwarm();
+    const snapshot = snapshotRetiredWorkers();
+    expect(snapshot.workers.find((worker) => worker.conversationId === conversationId)).toMatchObject({
+      id: 'worker-1',
+      state: 'finished'
+    });
+
+    resetAgentsForTests();
+    restoreRetiredWorkers(snapshot);
+    expect(retiredWorkerForConversation(conversationId)).toMatchObject({ id: 'worker-1', state: 'finished' });
+  });
+
   it('restores every still-live retired worker fence after histories grow beyond the old 64-worker ceiling', () => {
     const now = Date.now();
     restoreRetiredWorkers({

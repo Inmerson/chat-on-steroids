@@ -526,6 +526,12 @@ export interface RetiredChat {
   conversationId: string;
   reason: string;
   retiredAt: number;
+  /**
+   * Terminal broker state retained so a still-open worker browser view can be released after
+   * the active/dormant run object itself has been retired. Older version-1 snapshots omit it;
+   * restore treats those conservatively as failed/ended workers.
+   */
+  state?: 'finished' | 'failed';
 }
 
 /** A worker whose chat still has to be opened. Carries no credential. */
@@ -971,7 +977,8 @@ function endRun(reason: string): void {
       id: agent.info.id,
       conversationId: agent.info.conversationId as string,
       reason,
-      retiredAt: Date.now()
+      retiredAt: Date.now(),
+      state: agent.info.state === 'finished' ? 'finished' : 'failed'
     }));
   for (const worker of retired) retiredWorkers.set(worker.conversationId, worker);
   retiredPersist?.();
@@ -3301,8 +3308,11 @@ export function agentForOwnedConversation(conversationId: string): string | null
 /** Read-only exact owner metadata for recorder/origin reconstruction across parked histories. */
 export function agentInfoForOwnedConversation(conversationId: string): AgentInfo | null {
   if (run) {
-    const active = agentForConversationId(conversationId);
-    if (active) return { ...active.info };
+    // Ownership outlives execution eligibility. `agentForConversationId()` deliberately hides
+    // finished/failed workers because they must not act again; this read-only projection must
+    // still see those exact terminal rows so recorder/browser lifecycle can retire their views.
+    const owned = [...run.agents.values()].find((agent) => agent.info.conversationId === conversationId) ?? null;
+    if (owned) return { ...owned.info };
   }
   const dormant = dormantAgentForConversation(conversationId)?.agent ?? null;
   return dormant ? { ...dormant.info } : null;
@@ -3413,7 +3423,8 @@ export function resetSwarm(): void {
         id: agent.info.id,
         conversationId: agent.info.conversationId,
         reason,
-        retiredAt
+        retiredAt,
+        state: agent.info.state === 'finished' ? 'finished' : 'failed'
       });
       retiredDormant = true;
     }
@@ -3547,7 +3558,10 @@ export function restoreRetiredWorkers(snapshot: RetiredWorkersSnapshot | null): 
     ) {
       continue;
     }
-    retiredWorkers.set(worker.conversationId, { ...worker });
+    retiredWorkers.set(worker.conversationId, {
+      ...worker,
+      state: worker.state === 'finished' ? 'finished' : 'failed'
+    });
   }
 }
 

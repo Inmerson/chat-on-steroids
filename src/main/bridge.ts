@@ -1229,6 +1229,22 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
       ? { id: execution.id, status: execution.status, mode: execution.mode }
       : null;
     const retiredWorker = retiredWorkerForConversation(id);
+    const workerInfo = agentInfoForOwnedConversation(id);
+    const workerLifecycle =
+      workerInfo?.role === 'worker'
+        ? {
+            agent: workerInfo.id,
+            state: workerInfo.state,
+            browserViewReleasable:
+              workerInfo.state === 'sleeping' || workerInfo.state === 'finished' || workerInfo.state === 'failed'
+          }
+        : retiredWorker
+          ? {
+              agent: retiredWorker.id,
+              state: retiredWorker.state === 'finished' ? 'finished' : 'failed',
+              browserViewReleasable: true
+            }
+        : null;
     // Every open ChatGPT tab polls this for its own conversation every few seconds, so
     // this is the app's primary first-hand evidence of which chats exist right now.
     let live = liveConversations().find((entry) => entry.conversationId === id);
@@ -1250,6 +1266,7 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
         nextSince: Number.isFinite(since) ? Math.max(0, since) : 0,
         job: null,
         execution: executionView,
+        workerLifecycle,
         ...(workerBlocked
           ? {
               // Worker conversations are never Compact & Resume sources. Keep the page's
@@ -1454,6 +1471,9 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
         // conversation binding. The page never infers a run from window/tab placement or a
         // stale URL marker, and terminal state remains visible long enough to disarm Loop.
         execution: executionView,
+        // The browser may destroy a worker view only after the broker has durably stopped it.
+        // Active/detached/waking workers keep their tab even when the bootstrap ACK is durable.
+        workerLifecycle,
         // The goal loop: whether it is on, whether it *can* be on, and whatever draft this
         // chat currently has in flight. The draft's text grows on this feed, which is what
         // the panel above the composer streams — there is no second connection to hold open.

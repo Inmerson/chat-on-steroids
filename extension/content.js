@@ -242,6 +242,7 @@
   let conversationId = null;
   let agent = null;
   let agentCommandId = null;
+  let agentTabReleaseSentFor = null;
   try {
     agent = sessionStorage.getItem('cos_agent_worker') || null;
   } catch {}
@@ -1602,13 +1603,6 @@
       }
     }
     if (endedTurnId) noteGoalTurn(ended, result.outcome, endedTurnId);
-    const workerAgent = agent || (() => {
-      try { return sessionStorage.getItem('cos_agent_worker'); } catch { return null; }
-    })();
-    if (endedTurnId && workerAgent && !autoLoopActive) {
-      try { sessionStorage.removeItem('cos_agent_worker'); } catch {}
-      void ask({ type: 'close_agent_tab' });
-    }
     turnStartedAt = 0;
     genNode = null;
   }
@@ -4890,6 +4884,7 @@
       goalConfig = data.goal && typeof data.goal === 'object' ? data.goal : null;
       goalDraft = goalConfig ? goalConfig.draft || null : null;
       reconcileManagedExecution(data.execution);
+      maybeReleaseAgentTab(data.workerLifecycle, forId);
       bootstrap = data.bootstrap === 'resume' || data.bootstrap === 'worker' ? data.bootstrap : null;
       if (job && job.busy) pressedAt = 0;
       // The local phase describes this tab's part of a native compaction, which is over
@@ -5613,6 +5608,34 @@
       }
     }
     renderControl();
+  }
+
+  /**
+   * Bootstrap durability is not permission to destroy a worker tab. The broker owns that
+   * decision and projects it through the exact worker conversation's activity feed.
+   */
+  function maybeReleaseAgentTab(view, expectedConversation) {
+    if (!view || typeof view !== 'object') return;
+    const worker = typeof view.agent === 'string' && view.agent ? view.agent : null;
+    if (!worker || !expectedConversation) return;
+
+    if (view.browserViewReleasable !== true) {
+      if (view.state === 'active' || view.state === 'waking' || view.state === 'detached') {
+        agentTabReleaseSentFor = null;
+      }
+      return;
+    }
+
+    const activation = agentCommandId || `${worker}:${expectedConversation}`;
+    if (agentTabReleaseSentFor === activation) return;
+    agentTabReleaseSentFor = activation;
+    try {
+      const sent = sendToWorker({ type: 'agent_tab_releasable' });
+      if (sent && typeof sent.catch === 'function') sent.catch(() => undefined);
+    } catch {
+      // Failing closed leaves the worker tab open. A later activity pull may retry.
+      agentTabReleaseSentFor = null;
+    }
   }
 
   function bindExecutionCommandSemantic(boot, options = {}) {
@@ -8243,18 +8266,12 @@
         if (boot.type === 'resume' && acknowledged && acknowledged.ok === true) {
           rememberResumeGoalPending(found, boot.id);
         }
-        if (agent) {
-          void ask({ type: 'close_agent_tab' });
-        }
         return;
       }
     }
     // Sent, but this tab never saw an id, so nothing can be bound to it. Reported honestly:
     // the app ends the slot or the continuation rather than waiting on a chat it cannot name.
     await ask({ type: 'ack', id: boot.id, status: 'sent', agent, client: RUN_ID });
-    if (agent) {
-      void ask({ type: 'close_agent_tab' });
-    }
   }
 
   // ----------------------------------------------------------------- start

@@ -117,6 +117,15 @@ function makeHarness(
       for (const listener of storageListeners) await listener(change, 'local');
       await settle();
     },
+    async release(tabId: number) {
+      const url = browserTabs.get(tabId);
+      if (!url) throw new Error(`No tab with id: ${tabId}`);
+      const sender = { tab: { id: tabId, url }, url };
+      for (const listener of runtimeListeners) {
+        await listener({ type: 'agent_tab_releasable' }, sender, () => undefined);
+      }
+      await settle();
+    },
     pauseNextCreate() {
       if (createGate) throw new Error('create gate already armed');
       let markStarted!: () => void;
@@ -179,6 +188,8 @@ describe('agent tab hard budget', () => {
     expect(h.created).toEqual([]);
 
     await h.ack('cmd-1', 'worker-1');
+    expect(h.created).toEqual([]);
+    await h.release(1);
 
     expect(h.created).toHaveLength(1);
     expect(h.created[0]?.url).toContain('clf=cmd-6');
@@ -202,10 +213,12 @@ describe('agent tab hard budget', () => {
     expect((h.sessionState.agentTabLeaseQueue ?? []).map((entry: any) => entry.commandId)).toEqual(['cmd-6', 'cmd-7']);
 
     await h.ack('cmd-1', 'worker-1');
+    await h.release(1);
     expect(h.created.map((tab) => tab.url)).toEqual([expect.stringContaining('clf=cmd-6')]);
     expect((h.sessionState.agentTabLeaseQueue ?? []).map((entry: any) => entry.commandId)).toEqual(['cmd-7']);
 
     await h.ack('cmd-2', 'worker-2');
+    await h.release(2);
     expect(h.created.map((tab) => tab.url)).toEqual([
       expect.stringContaining('clf=cmd-6'),
       expect.stringContaining('clf=cmd-7')
@@ -257,7 +270,8 @@ describe('agent tab hard budget', () => {
     for (let i = 1; i <= 6; i++) await h.register(i, `cmd-${i}`);
 
     const gate = h.pauseNextCreate();
-    const releaseFirstLease = h.ack('cmd-1', 'worker-1');
+    await h.ack('cmd-1', 'worker-1');
+    const releaseFirstLease = h.release(1);
     await gate.started;
 
     await h.register(8, 'cmd-8');
@@ -269,25 +283,38 @@ describe('agent tab hard budget', () => {
     expect((h.sessionState.agentTabLeaseQueue ?? []).map((entry: any) => entry.commandId)).toContain('cmd-8');
   });
 
-  it('does not lose the next queued command or self-await when the queue head is ACKed during tabs.create', async () => {
+  it('does not lose the next queued command when its bootstrap ACK arrives during tabs.create', async () => {
     const h = makeHarness();
     for (let i = 1; i <= 7; i++) await h.register(i, `cmd-${i}`);
 
     const firstCreate = h.pauseNextCreate();
-    const releaseFirstLease = h.ack('cmd-1', 'worker-1');
+    await h.ack('cmd-1', 'worker-1');
+    const releaseFirstLease = h.release(1);
     await firstCreate.started;
 
-    const secondCreate = h.pauseNextCreate();
+    // Chrome may let the newly created page ACK before tabs.create resolves back to this worker.
+    // That marks the future lease bootstrapSent but must not close it or free another slot yet.
     const ackCreatingCommand = h.ack('cmd-6', 'worker-6');
     await h.settle();
     firstCreate.resume();
+    await Promise.all([releaseFirstLease, ackCreatingCommand]);
     await h.settle(100);
 
-    expect(h.createRequests.map((url) => new URL(url).searchParams.get('clf'))).toEqual(['cmd-6', 'cmd-7']);
+    expect(h.createRequests.map((url) => new URL(url).searchParams.get('clf'))).toEqual(['cmd-6']);
+    expect((h.sessionState.agentTabLeaseQueue ?? []).map((entry: any) => entry.commandId)).toEqual(['cmd-7']);
+    expect(h.sessionState.agentTabLeases?.['100']).toMatchObject({
+      commandId: 'cmd-6',
+      bootstrapSent: true,
+      releasable: false
+    });
 
+    const secondCreate = h.pauseNextCreate();
+    const releaseCreatingCommand = h.release(100);
+    await secondCreate.started;
     secondCreate.resume();
-    await Promise.all([releaseFirstLease, ackCreatingCommand]);
+    await releaseCreatingCommand;
     await h.settle();
+    expect(h.createRequests.map((url) => new URL(url).searchParams.get('clf'))).toEqual(['cmd-6', 'cmd-7']);
     expect(h.sessionState.agentTabLeaseQueue ?? []).toEqual([]);
     expect(Object.keys(h.sessionState.agentTabLeases ?? {})).toHaveLength(5);
   });

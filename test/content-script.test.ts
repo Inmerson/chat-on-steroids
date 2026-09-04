@@ -7675,7 +7675,7 @@ describe('the fresh chat the app opened', () => {
     ]);
   });
 
-  it('sends a worker bootstrap whose task is shorter than the text it verifies', async () => {
+  it('keeps a worker tab open after bootstrap ACK and releases it only from exact broker lifecycle evidence', async () => {
     // The bootstrap is the task, a blank line, and the wrapper explaining how to report.
     // The composer turns that blank line into a paragraph break and gives the text back
     // with no newline in it at all, so verifying the insert by looking for the first 80
@@ -7721,6 +7721,39 @@ describe('the fresh chat the app opened', () => {
         navigationEpoch: expect.any(Number)
       }
     ]);
+    expect(live.sent.some((message) => message.type === 'close_agent_tab')).toBe(false);
+    expect(live.sent.some((message) => message.type === 'agent_tab_releasable')).toBe(false);
+
+    live.reply.set('activity', () => ({
+      ok: true,
+      data: {
+        entries: [],
+        stream: [],
+        userAnchors: [],
+        nextSince: 0,
+        pendingTools: 0,
+        workerLifecycle: { agent: 'worker-1', state: 'active', browserViewReleasable: false }
+      }
+    }));
+    live.hook.observe();
+    await settle();
+    await live.hook.pullActivity();
+    expect(live.sent.some((message) => message.type === 'agent_tab_releasable')).toBe(false);
+
+    live.reply.set('activity', () => ({
+      ok: true,
+      data: {
+        entries: [],
+        stream: [],
+        userAnchors: [],
+        nextSince: 0,
+        pendingTools: 0,
+        workerLifecycle: { agent: 'worker-1', state: 'sleeping', browserViewReleasable: true }
+      }
+    }));
+    await live.hook.pullActivity();
+    await live.hook.pullActivity();
+    expect(live.sent.filter((message) => message.type === 'agent_tab_releasable')).toHaveLength(1);
   });
 
   it('dismisses ChatGPT too-many-requests dialog once and retries the worker bootstrap', async () => {

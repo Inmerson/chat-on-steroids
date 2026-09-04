@@ -81,6 +81,7 @@ const {
   beginPrimeTransfer,
   bindConversation,
   cancelPrimeTransfer,
+  failAgent,
   finishAgent,
   currentRunId,
   DETACHED_SILENCE_MS,
@@ -710,6 +711,75 @@ describe('observations', () => {
 // ---------------------------------------------------------------- activity
 
 describe('activity feed', () => {
+  it('projects exact worker browser lifecycle and releases the browser view only after durable stopped states', async () => {
+    await pair();
+    const workerConversation = '67676767-8989-4aaa-8bbb-cccccccccccc';
+    spawn({ workers: [{ task: 'prove worker browser lifecycle' }], caller: { conversationId: PRIME_CHAT } });
+    expect(bindConversation('worker-1', workerConversation)).toBe(true);
+    await request('POST', '/events', {
+      body: {
+        conversationId: workerConversation,
+        agent: 'worker-1',
+        events: [{ kind: 'turn_start', time: Date.now(), turnId: 'worker-lifecycle-active' }]
+      }
+    });
+
+    const active = await request('GET', `/activity?conversationId=${workerConversation}&since=0`);
+    expect(active.status).toBe(200);
+    expect(active.body.workerLifecycle).toEqual({
+      agent: 'worker-1',
+      state: 'active',
+      browserViewReleasable: false
+    });
+
+    finishAgent({ conversationId: workerConversation }, 'worker is safely parked');
+    const sleeping = await request('GET', `/activity?conversationId=${workerConversation}&since=0`);
+    expect(sleeping.body.workerLifecycle).toEqual({
+      agent: 'worker-1',
+      state: 'sleeping',
+      browserViewReleasable: true
+    });
+  });
+
+  it('marks terminal worker browser views releasable for both finished and failed workers', async () => {
+    await pair();
+    const finishedConversation = '78787878-9090-4bbb-8ccc-dddddddddddd';
+    spawn({ workers: [{ task: 'finish terminally' }], caller: { conversationId: PRIME_CHAT } });
+    expect(bindConversation('worker-1', finishedConversation)).toBe(true);
+    await request('POST', '/events', {
+      body: {
+        conversationId: finishedConversation,
+        agent: 'worker-1',
+        events: [{ kind: 'turn_start', time: Date.now(), turnId: 'worker-lifecycle-finished' }]
+      }
+    });
+    noteAgentContextTokens(finishedConversation, WORKER_CONTEXT_CEILING_TOKENS);
+    finishAgent({ conversationId: finishedConversation }, 'worker is terminal');
+    expect((await request('GET', `/activity?conversationId=${finishedConversation}`)).body.workerLifecycle).toEqual({
+      agent: 'worker-1',
+      state: 'finished',
+      browserViewReleasable: true
+    });
+
+    resetSwarm();
+    const failedConversation = '89898989-a1a1-4ccc-8ddd-eeeeeeeeeeee';
+    spawn({ workers: [{ task: 'fail terminally' }], caller: { conversationId: PRIME_CHAT } });
+    expect(bindConversation('worker-1', failedConversation)).toBe(true);
+    await request('POST', '/events', {
+      body: {
+        conversationId: failedConversation,
+        agent: 'worker-1',
+        events: [{ kind: 'turn_start', time: Date.now(), turnId: 'worker-lifecycle-failed' }]
+      }
+    });
+    failAgent('worker-1', 'synthetic terminal failure');
+    expect((await request('GET', `/activity?conversationId=${failedConversation}`)).body.workerLifecycle).toEqual({
+      agent: 'worker-1',
+      state: 'failed',
+      browserViewReleasable: true
+    });
+  });
+
   it('projects the durable execution bound to this exact conversation, including paused and terminal state', async () => {
     await pair();
     const conversationId = '56565656-7878-4999-8aaa-bbbbbbbbbbbb';

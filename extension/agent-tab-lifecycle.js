@@ -19,14 +19,14 @@
   let openingLeaseReservations = 0;
   const closing = new Set();
   /**
-   * Worker command ids whose irreversible `sent` result became durable during this service-worker lifetime.
+   * Worker commands whose irreversible bootstrap `sent` result became durable during this
+   * service-worker lifetime. This is transport evidence only, never close eligibility.
    *
-   * `agent-tab-content.js` runs before the main recorder, but its registration request and the later ACK still
-   * cross asynchronous extension events. The storage change can therefore win by a few microtasks. Remembering
-   * the durable fact closes that race without inferring ownership: a late tab is still eligible only after its
-   * own marker has independently proved the exact same command id.
+   * The ACK can beat marker registration by a few microtasks, so keep the exact bound chat and
+   * agent with the command id. A later lease may inherit `bootstrapSent`; it still remains open
+   * until the broker-owned content document separately reports `agent_tab_releasable`.
    */
-  const durableCommands = new Set();
+  const bootstrapCommands = new Map();
 
   function load() {
     if (loaded) return Promise.resolve();
@@ -36,7 +36,29 @@
         .then((stored) => {
           const storedLeases = stored?.[LEASE_KEY];
           const storedQueue = stored?.[QUEUE_KEY];
-          leases = storedLeases && typeof storedLeases === 'object' && !Array.isArray(storedLeases) ? { ...storedLeases } : {};
+          leases = {};
+          if (storedLeases && typeof storedLeases === 'object' && !Array.isArray(storedLeases)) {
+            for (const [key, raw] of Object.entries(storedLeases)) {
+              if (
+                !raw ||
+                typeof raw !== 'object' ||
+                !Number.isInteger(raw.tabId) ||
+                raw.tabId < 0 ||
+                typeof raw.commandId !== 'string' ||
+                !raw.commandId
+              ) continue;
+              leases[key] = {
+                commandId: raw.commandId,
+                tabId: raw.tabId,
+                registeredAt: Number.isFinite(raw.registeredAt) ? raw.registeredAt : Date.now(),
+                bootstrapSent: raw.bootstrapSent === true || raw.handoffDurable === true,
+                releasable: raw.releasable === true,
+                agent: typeof raw.agent === 'string' && raw.agent ? raw.agent : null,
+                conversationId: cleanConversationId(raw.conversationId),
+                ...(raw.leaseManagerCreated === true ? { leaseManagerCreated: true } : {})
+              };
+            }
+          }
           queue = Array.isArray(storedQueue)
             ? storedQueue
                 .filter(
@@ -102,6 +124,23 @@
     }
   }
 
+  function cleanConversationId(value) {
+    const id = typeof value === 'string' ? value.trim() : '';
+    return /^[0-9a-f-]{8,64}$/i.test(id) ? id : null;
+  }
+
+  function conversationFrom(urlText) {
+    if (typeof urlText !== 'string' || !urlText) return null;
+    try {
+      const url = new URL(urlText);
+      if (!CHATGPT_HOSTS.has(url.hostname)) return null;
+      const match = /^\/c\/([0-9a-f-]{8,64})(?:\/|$)/i.exec(url.pathname);
+      return match ? match[1] : null;
+    } catch {
+      return null;
+    }
+  }
+
   function senderOwnsCommand(sender, commandId) {
     if (typeof commandId !== 'string' || !commandId) return false;
     const tabId = sender?.tab?.id;
@@ -154,15 +193,18 @@
 
         queue = queue.filter((queued) => queued.commandId !== entry.commandId);
         const tabId = created.id;
+        const bootstrap = bootstrapCommands.get(entry.commandId) ?? null;
         leases[leaseKey(tabId)] = {
           commandId: entry.commandId,
           tabId,
           registeredAt: Date.now(),
-          handoffDurable: durableCommands.has(entry.commandId),
+          bootstrapSent: bootstrap !== null,
+          releasable: false,
+          agent: bootstrap?.agent ?? null,
+          conversationId: bootstrap?.conversationId ?? null,
           leaseManagerCreated: true
         };
         await persist();
-        if (durableCommands.has(entry.commandId)) await closeDurableLease(tabId, false);
       }
     })();
     const tracked = work.finally(() => {
@@ -194,9 +236,8 @@
       if (!tab || typeof tab.url !== 'string') return false;
       const marker = markerFrom(tab.url);
       if (marker) return marker === lease.commandId;
-      if (lease?.handoffDurable) {
-        const url = new URL(tab.url);
-        return CHATGPT_HOSTS.has(url.hostname);
+      if (lease?.bootstrapSent && lease?.conversationId) {
+        return conversationFrom(tab.url) === lease.conversationId;
       }
       return false;
     } catch {
@@ -211,11 +252,11 @@
     if (drainAfter) await drainQueue();
   }
 
-  async function closeDurableLease(tabId, drainAfter = true) {
+  async function closeReleasableLease(tabId, drainAfter = true) {
     await load();
     const key = leaseKey(tabId);
     const lease = leases[key];
-    if (!lease?.handoffDurable || closing.has(tabId)) return false;
+    if (!lease?.bootstrapSent || !lease?.releasable || closing.has(tabId)) return false;
 
     closing.add(tabId);
     try {
@@ -271,7 +312,7 @@
       return { ok: false, error: 'agent_tab_command_mismatch' };
     }
 
-    if (!existing && !durableCommands.has(commandId) && leaseCapacityUsed() >= MAX_AGENT_TABS) {
+    if (!existing && !bootstrapCommands.has(commandId) && leaseCapacityUsed() >= MAX_AGENT_TABS) {
       const url = typeof sender?.url === 'string' && markerFrom(sender.url) === commandId ? sender.url : sender?.tab?.url;
       if (!queueCommand(commandId, url)) return { ok: false, error: 'agent_tab_queue_rejected' };
       await persist();
@@ -279,68 +320,106 @@
       return closed ? { ok: true, queued: true } : { ok: false, error: 'agent_tab_budget_close_failed' };
     }
 
+    const bootstrap = bootstrapCommands.get(commandId) ?? null;
     const lease = existing ?? {
       commandId,
       tabId,
       registeredAt: Date.now(),
-      handoffDurable: false
+      bootstrapSent: false,
+      releasable: false,
+      agent: null,
+      conversationId: null
     };
-    if (durableCommands.has(commandId)) lease.handoffDurable = true;
+    if (bootstrap) {
+      lease.bootstrapSent = true;
+      lease.agent = bootstrap.agent;
+      lease.conversationId = bootstrap.conversationId;
+    }
     leases[key] = lease;
     queue = queue.filter((entry) => entry.commandId !== commandId);
     await persist();
-    if (lease.handoffDurable) await closeDurableLease(tabId);
     return { ok: true };
   }
 
-  function durableWorkerCommandIds(value) {
-    const ids = new Set();
-    if (!Array.isArray(value)) return ids;
+  function durableWorkerCommands(value) {
+    const commands = new Map();
+    if (!Array.isArray(value)) return commands;
     for (const entry of value) {
       if (!entry || typeof entry !== 'object') continue;
       if (entry.status !== 'sent') continue;
       if (typeof entry.agent !== 'string' || !entry.agent) continue;
       if (typeof entry.id !== 'string' || !entry.id) continue;
-      ids.add(entry.id);
+      commands.set(entry.id, {
+        agent: entry.agent,
+        conversationId: cleanConversationId(entry.conversationId)
+      });
     }
-    return ids;
+    return commands;
   }
 
-  function rememberDurableCommands(commandIds) {
-    for (const commandId of commandIds) {
-      durableCommands.delete(commandId);
-      durableCommands.add(commandId);
+  function rememberBootstrapCommands(commands) {
+    for (const [commandId, bootstrap] of commands) {
+      bootstrapCommands.delete(commandId);
+      bootstrapCommands.set(commandId, bootstrap);
     }
-    while (durableCommands.size > MAX_DURABLE_COMMANDS) {
-      const oldest = durableCommands.values().next().value;
+    while (bootstrapCommands.size > MAX_DURABLE_COMMANDS) {
+      const oldest = bootstrapCommands.keys().next().value;
       if (typeof oldest !== 'string') break;
-      durableCommands.delete(oldest);
+      bootstrapCommands.delete(oldest);
     }
   }
 
   async function noteDurableAcks(value) {
-    const commandIds = durableWorkerCommandIds(value);
-    if (commandIds.size === 0) return;
-    rememberDurableCommands(commandIds);
+    const commands = durableWorkerCommands(value);
+    if (commands.size === 0) return;
+    rememberBootstrapCommands(commands);
     await load();
 
     const close = [];
     let changed = false;
     for (const lease of Object.values(leases)) {
       if (!lease || typeof lease !== 'object') continue;
-      if (!commandIds.has(lease.commandId)) continue;
-      if (!lease.handoffDurable) {
-        lease.handoffDurable = true;
+      const bootstrap = commands.get(lease.commandId);
+      if (!bootstrap) continue;
+      if (!lease.bootstrapSent) {
+        lease.bootstrapSent = true;
         changed = true;
       }
-      close.push(lease.tabId);
+      if (lease.agent !== bootstrap.agent) {
+        lease.agent = bootstrap.agent;
+        changed = true;
+      }
+      if (lease.conversationId !== bootstrap.conversationId) {
+        lease.conversationId = bootstrap.conversationId;
+        changed = true;
+      }
+      if (lease.releasable) close.push(lease.tabId);
     }
     const beforeQueue = queue.length;
-    queue = queue.filter((entry) => !commandIds.has(entry.commandId));
+    queue = queue.filter((entry) => !commands.has(entry.commandId));
     if (queue.length !== beforeQueue) changed = true;
     if (changed) await persist();
-    for (const tabId of close) await closeDurableLease(tabId);
+    for (const tabId of close) await closeReleasableLease(tabId);
     await drainQueue();
+  }
+
+  async function markReleasable(sender) {
+    await load();
+    const tabId = sender?.tab?.id;
+    if (!Number.isInteger(tabId) || tabId < 0) return { ok: false, error: 'unowned_agent_tab' };
+    const key = leaseKey(tabId);
+    const lease = leases[key];
+    if (!lease) return { ok: false, error: 'unowned_agent_tab' };
+    if (!(await stillOwnsLease(lease))) {
+      await releaseStaleLease(key, lease);
+      return { ok: false, error: 'stale_agent_tab' };
+    }
+    if (!lease.releasable) {
+      lease.releasable = true;
+      await persist();
+    }
+    if (lease.bootstrapSent) await closeReleasableLease(tabId);
+    return { ok: true, releasable: true };
   }
 
   async function recoverDurableLeases() {
@@ -364,17 +443,24 @@
     // nothing to repair. Without this, a cold browser session with zero agent tabs stays
     // indistinguishable from "telemetry unavailable" until the first worker opens.
     await persist();
-    const durable = Object.values(leases)
-      .filter((lease) => lease && typeof lease === 'object' && lease.handoffDurable === true)
+    const releasable = Object.values(leases)
+      .filter(
+        (lease) =>
+          lease &&
+          typeof lease === 'object' &&
+          lease.bootstrapSent === true &&
+          lease.releasable === true
+      )
       .map((lease) => lease.tabId)
       .filter((tabId) => Number.isInteger(tabId) && tabId >= 0);
-    for (const tabId of durable) await closeDurableLease(tabId);
+    for (const tabId of releasable) await closeReleasableLease(tabId);
     await drainQueue();
   }
 
   chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
-    if (message?.type !== 'agent_tab_register') return undefined;
-    void register(message, sender).then(sendResponse, (error) =>
+    if (message?.type !== 'agent_tab_register' && message?.type !== 'agent_tab_releasable') return undefined;
+    const operation = message.type === 'agent_tab_register' ? register(message, sender) : markReleasable(sender);
+    void operation.then(sendResponse, (error) =>
       sendResponse({ ok: false, error: error instanceof Error ? error.message : String(error) })
     );
     return true;

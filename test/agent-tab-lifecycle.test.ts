@@ -113,7 +113,7 @@ function makeHarness(
 const marked = (id: string) => ({ tab: { id: 17, url: `https://chatgpt.com/?clf=${encodeURIComponent(id)}#clf=${encodeURIComponent(id)}` } });
 
 describe('ephemeral agent tab lifecycle', () => {
-  it('closes a marker-owned worker tab only after its sent ACK is durable', async () => {
+  it('keeps a marker-owned worker tab open after bootstrap ACK and closes only after broker lifecycle says releasable', async () => {
     const h = makeHarness();
     await h.message({ type: 'agent_tab_register', id: 'cmd-worker-1' }, marked('cmd-worker-1'));
 
@@ -121,20 +121,53 @@ describe('ephemeral agent tab lifecycle', () => {
     expect(h.sessionState.agentTabLeases?.['17']).toMatchObject({
       commandId: 'cmd-worker-1',
       tabId: 17,
-      handoffDurable: false
+      bootstrapSent: false,
+      releasable: false
     });
 
-    await h.storageChange([{ id: 'cmd-worker-1', status: 'sent', agent: 'worker-1' }]);
+    await h.storageChange([
+      {
+        id: 'cmd-worker-1',
+        status: 'sent',
+        agent: 'worker-1',
+        conversationId: 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee'
+      }
+    ]);
+
+    expect(h.removed).toEqual([]);
+    expect(h.sessionState.agentTabLeases?.['17']).toMatchObject({
+      commandId: 'cmd-worker-1',
+      bootstrapSent: true,
+      releasable: false
+    });
+
+    h.navigate(17, 'https://chatgpt.com/c/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee');
+    await h.message(
+      { type: 'agent_tab_releasable' },
+      { tab: { id: 17, url: 'https://chatgpt.com/c/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee' } }
+    );
 
     expect(h.removed).toEqual([17]);
     expect(h.sessionState.agentTabLeases?.['17']).toBeUndefined();
   });
 
-  it('closes when the durable sent ACK wins the race just before marker registration', async () => {
+  it('remembers bootstrap ACK when it wins the registration race but still waits for releasable evidence', async () => {
     const h = makeHarness();
 
-    await h.storageChange([{ id: 'cmd-worker-1', status: 'sent', agent: 'worker-1' }]);
+    await h.storageChange([
+      {
+        id: 'cmd-worker-1',
+        status: 'sent',
+        agent: 'worker-1',
+        conversationId: 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee'
+      }
+    ]);
     await h.message({ type: 'agent_tab_register', id: 'cmd-worker-1' }, marked('cmd-worker-1'));
+
+    expect(h.removed).toEqual([]);
+    expect(h.sessionState.agentTabLeases?.['17']).toMatchObject({ bootstrapSent: true, releasable: false });
+
+    await h.message({ type: 'agent_tab_releasable' }, marked('cmd-worker-1'));
 
     expect(h.removed).toEqual([17]);
     expect(h.sessionState.agentTabLeases?.['17']).toBeUndefined();
@@ -147,18 +180,37 @@ describe('ephemeral agent tab lifecycle', () => {
       { tab: { id: 17, url: 'https://chatgpt.com/c/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee' } }
     );
     await h.message({ type: 'agent_tab_register', id: 'other' }, marked('cmd-worker-1'));
-    await h.storageChange([{ id: 'cmd-worker-1', status: 'sent', agent: 'worker-1' }]);
+    await h.storageChange([
+      {
+        id: 'cmd-worker-1',
+        status: 'sent',
+        agent: 'worker-1',
+        conversationId: 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee'
+      }
+    ]);
 
     expect(h.removed).toEqual([]);
     expect(h.sessionState.agentTabLeases ?? {}).toEqual({});
   });
 
-  it('closes a registered tab that navigated to a ChatGPT conversation URL, but releases ownership if navigated away from ChatGPT', async () => {
+  it('closes a releasable registered tab that stayed on ChatGPT, but releases ownership if it navigated away', async () => {
     const h = makeHarness();
     await h.message({ type: 'agent_tab_register', id: 'cmd-worker-1' }, marked('cmd-worker-1'));
     h.navigate(17, 'https://chatgpt.com/c/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee');
 
-    await h.storageChange([{ id: 'cmd-worker-1', status: 'sent', agent: 'worker-1' }]);
+    await h.storageChange([
+      {
+        id: 'cmd-worker-1',
+        status: 'sent',
+        agent: 'worker-1',
+        conversationId: 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee'
+      }
+    ]);
+    expect(h.removed).toEqual([]);
+    await h.message(
+      { type: 'agent_tab_releasable' },
+      { tab: { id: 17, url: 'https://chatgpt.com/c/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee' } }
+    );
 
     expect(h.removed).toEqual([17]);
     expect(h.sessionState.agentTabLeases?.['17']).toBeUndefined();
@@ -167,7 +219,15 @@ describe('ephemeral agent tab lifecycle', () => {
     await h2.message({ type: 'agent_tab_register', id: 'cmd-worker-2' }, { tab: { id: 18, url: 'https://chatgpt.com/?clf=cmd-worker-2' } });
     h2.navigate(18, 'https://example.com/other');
 
-    await h2.storageChange([{ id: 'cmd-worker-2', status: 'sent', agent: 'worker-2' }]);
+    await h2.storageChange([
+      {
+        id: 'cmd-worker-2',
+        status: 'sent',
+        agent: 'worker-2',
+        conversationId: 'bbbbbbbb-cccc-dddd-eeee-ffffffffffff'
+      }
+    ]);
+    await h2.message({ type: 'agent_tab_releasable' }, { tab: { id: 18, url: 'https://example.com/other' } });
 
     expect(h2.removed).toEqual([]);
     expect(h2.sessionState.agentTabLeases?.['18']).toBeUndefined();
@@ -181,20 +241,30 @@ describe('ephemeral agent tab lifecycle', () => {
     await h.storageChange([{ id: 'cmd-worker-1', status: 'sent', agent: null }]);
 
     expect(h.removed).toEqual([]);
-    expect(h.sessionState.agentTabLeases?.['17']?.handoffDurable).toBe(false);
+    expect(h.sessionState.agentTabLeases?.['17']?.bootstrapSent).toBe(false);
+    expect(h.sessionState.agentTabLeases?.['17']?.releasable).toBe(false);
   });
 
-  it('keeps a durable lease after bounded close failures and recovers it on service-worker restart', async () => {
+  it('keeps a releasable lease after bounded close failures and recovers it on service-worker restart', async () => {
     const sessionState: Record<string, any> = {};
     const browserTabs = new Map<number, string>();
     const first = makeHarness(sessionState, 3, browserTabs);
     await first.message({ type: 'agent_tab_register', id: 'cmd-worker-1' }, marked('cmd-worker-1'));
-    await first.storageChange([{ id: 'cmd-worker-1', status: 'sent', agent: 'worker-1' }]);
+    await first.storageChange([
+      {
+        id: 'cmd-worker-1',
+        status: 'sent',
+        agent: 'worker-1',
+        conversationId: 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee'
+      }
+    ]);
+    await first.message({ type: 'agent_tab_releasable' }, marked('cmd-worker-1'));
 
     expect(first.removed).toEqual([]);
     expect(sessionState.agentTabLeases?.['17']).toMatchObject({
       commandId: 'cmd-worker-1',
-      handoffDurable: true
+      bootstrapSent: true,
+      releasable: true
     });
 
     const restarted = makeHarness(sessionState, 0, browserTabs);
