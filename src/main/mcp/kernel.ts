@@ -41,22 +41,16 @@ import {
   AgentError,
   acknowledgeOffers,
   acknowledgeOffersForConversation,
-  dormantWorkerNotice,
-  endedWorkerNotice,
-  hasDormantWorkerLeases,
   sleepSilentDetachedWorkers,
   noteAgentAlive,
   agentForCaller,
   agentForFinishCaller,
-  hasRetiredWorkerLeases,
   offerMessages,
   offerMessagesForConversation,
   persistCriticalSwarmNow,
   requestWorkerRevivals,
   releaseQuiescentRun,
-  retiredWorkerForConversation,
-  stageQueuedWorkerRevivals,
-  swarmRunning
+  stageQueuedWorkerRevivals
 } from '../agents.js';
 import type { SurfaceId } from './surfaces.js';
 import {
@@ -70,7 +64,6 @@ import {
   type CallContext
 } from './call-context.js';
 import {
-  awaitFreshCallOrigin,
   evidenceWindow,
   freshCallOrigin,
   recordAgentMessage,
@@ -170,6 +163,12 @@ export function resetToolClock(): void {
   toolCallSeenAt = null;
   surfaceToolCallAt.clear();
   transportIdentity = { checked: false, present: false };
+}
+
+/** Transport bindings live for one local endpoint and are cleared when that endpoint starts. */
+export function resetTransportConversations(): void {
+  transportConversations.clear();
+  conflictedTransports.clear();
 }
 
 /**
@@ -288,6 +287,27 @@ function requestIdOf(mcpCtx: McpCallContext | undefined): string | null {
  * each run.
  */
 let transportIdentity: { checked: boolean; present: boolean } = { checked: false, present: false };
+const transportConversations = new Map<string, string>();
+const conflictedTransports = new Set<string>();
+
+export function transportConversation(transportKey: string | null): string | null {
+  if (!transportKey || conflictedTransports.has(transportKey)) return null;
+  return transportConversations.get(transportKey) ?? null;
+}
+
+export function bindTransportConversation(transportKey: string | null, conversationId: string | null): string | null {
+  if (!transportKey || !conversationId || conflictedTransports.has(transportKey)) return null;
+  const previous = transportConversations.get(transportKey);
+  if (!previous) {
+    transportConversations.set(transportKey, conversationId);
+    return conversationId;
+  }
+  if (previous === conversationId) return previous;
+  transportConversations.delete(transportKey);
+  conflictedTransports.add(transportKey);
+  logWarn('MCP transport identity conflicted between conversations; transport binding disabled until reconnect');
+  return null;
+}
 
 export function transportIdentityStatus(): { checked: boolean; present: boolean } {
   return { ...transportIdentity };
@@ -402,32 +422,17 @@ async function dispatchTracked(
   // request id, identity-sensitive handlers (workspace/session/agents) see it before they
   // touch state. If the page is one tick late this stays null; only handlers that actually
   // require identity wait for their own exact mate. Ordinary absolute reads/execs never wait.
-  context.caller.conversationId = callerConversation(name, startedAt, requestId);
-  // Only calls that need an *existing* per-chat workspace before the handler runs are
-  // identity-sensitive here. An absolute read or an exec with an explicit absolute workdir is
-  // self-contained and must stay fast; if its exact page mate is late, workspace.ts simply
-  // declines to learn a guessed workspace. Relative paths, omitted exec workdir and a patch with
-  // no explicit base really do consume caller state, so they wait for their exact request-id
-  // mate while a swarm is active. Use the full exact-id window, not the shorter prime window:
-  // the live worker failure that motivated IDENTITY_EVIDENCE_MS arrived ~8 seconds late.
-  const identitySensitive = needsWorkspaceIdentity(name, args);
-  if (!context.caller.conversationId && identitySensitive && swarmRunning() && requestId) {
-    context.caller.conversationId = await awaitFreshCallOrigin(name, startedAt, IDENTITY_EVIDENCE_MS, { requestId });
+  const transportOwner = transportConversation(transportKey);
+  const requestOwner = callerConversation(name, startedAt, requestId);
+  if (transportOwner && requestOwner && transportOwner !== requestOwner) {
+    bindTransportConversation(transportKey, requestOwner);
+    context.caller.conversationId = null;
+  } else {
+    context.caller.conversationId = requestOwner ?? transportOwner;
+    if (requestOwner) bindTransportConversation(transportKey, requestOwner);
   }
-  // A run that ended leaves an explicit short-lived lease tombstone for each open worker
-  // chat. Resolve exact request identity before ordinary tools too while such leases exist;
-  // otherwise an explicit-workdir exec could keep mutating after its worker was retired.
-  if (!context.caller.conversationId && hasRetiredWorkerLeases() && requestId) {
-    context.caller.conversationId = await awaitFreshCallOrigin(name, startedAt, IDENTITY_EVIDENCE_MS, { requestId });
-  }
-  // Dormant histories are long-lived identity fences, not active slot claims. An old worker tab
-  // may still issue a stale server-side call after its run parked, and without exact request-id
-  // attribution an absolute read/exec would otherwise look like an unrelated ordinary chat and
-  // run successfully. Resolve the exact mate for every call while such worker conversations
-  // exist, just as we do for short-lived retired worker leases.
-  if (!context.caller.conversationId && hasDormantWorkerLeases() && requestId) {
-    context.caller.conversationId = await awaitFreshCallOrigin(name, startedAt, IDENTITY_EVIDENCE_MS, { requestId });
-  }
+  // Ordinary Core authority is endpoint-scoped. Exact conversation evidence remains useful
+  // when it is already available, but browser attribution is never awaited before local work.
   // Two things about liveness, both before the agent is resolved so that the answer this
   // call gets is the state this call itself established.
   //
@@ -467,64 +472,19 @@ async function dispatchTracked(
     }
   }
   context.agent = isFinish ? agentForFinishCaller(context.caller) : agentForCaller(context.caller);
-  const retiredWorker = retiredWorkerForConversation(context.caller.conversationId);
-  // Parking a run releases its global execution claim without retiring its worker chats. Those
-  // exact conversations remain workers, though: a stale sleeping/terminal worker tab must not
-  // turn into an ordinary unidentified chat and keep running local tools merely because another
-  // prime currently owns the active run (or because no run is active at all). Only the owning
-  // prime's explicit agents message may wake a sleeping worker.
-  const dormantWorker = isFinish ? null : dormantWorkerNotice(context.caller.conversationId);
-  // A worker that really is over learns so on its own next call. Without this its calls
-  // resolved to nobody and ran anyway, so a chat the user had ended went on writing files
-  // in the name of no agent at all.
-  // A terminal worker may do exactly one thing: retry its own idempotent finish after a lost
-  // result. It still has a tombstone identity for that call so the dispatcher can re-offer the
-  // inbox that rode on the missing result. Every other tool call from the same chat is refused
-  // by endedWorkerNotice as before.
-  const endedWorker = isFinish ? null : endedWorkerNotice(context.caller.conversationId);
-  const retiredLeaseAmbiguous = hasRetiredWorkerLeases() && !context.caller.conversationId;
-  const dormantLeaseAmbiguous = hasDormantWorkerLeases() && !context.caller.conversationId;
-  // In a swarm, a relative/defaulted filesystem operation is not safe to execute after the
-  // exact caller lookup timed out: its workspace is part of the requested operation. Falling
-  // back to the first approved root turns an attribution outage into wrong-project mutation.
-  // Refuse and let the model retry once page evidence is healthy instead.
-  const result = await runInCallContext(context, () =>
-      dormantWorker
-        ? Promise.resolve(fail(dormantWorker))
-        : retiredWorker
-        ? Promise.resolve(
-            fail(
-              `WORKER_RETIRED: ${retiredWorker.id} was retired because ${retiredWorker.reason}. This chat can no longer use local tools. Stop working and return to the prime chat.`
-            )
-          )
-        : endedWorker
-        ? Promise.resolve(fail(endedWorker))
-        : retiredLeaseAmbiguous
-        ? Promise.resolve(
-            fail(
-              'CALLER_IDENTITY_REQUIRED: a recently retired worker tab may still be open, and the connector could not prove this call belongs to a different chat. No local tool was run. Reload the extension evidence path or wait for the retired lease to expire.'
-            )
-          )
-        : dormantLeaseAmbiguous
-        ? Promise.resolve(
-            fail(
-              'CALLER_IDENTITY_REQUIRED: a dormant worker chat still belongs to its prime history, and the connector could not prove this call belongs to a different conversation. No local tool was run. Restore the browser-extension identity path and retry.'
-            )
-          )
-        : swarmRunning() && identitySensitive && !context.caller.conversationId
-        ? Promise.resolve(
-            fail(
-              'CALLER_IDENTITY_REQUIRED: this operation needs this chat’s exact workspace, but the connector could not prove which ChatGPT conversation made the call. Retry after the extension reconnects; no file or command was changed.'
-            )
-          )
-        : run()
-  );
+  // Authentication happens at the secret MCP endpoint. Conversation identity is retained for
+  // attribution, workspaces and agent routing, but it is not an authorization gate for Core
+  // capabilities: every authenticated chat receives the permissions the user enabled in-app.
+  const result = await runInCallContext(context, run);
   // Identity, once, from this call's own evidence — see callerConversation. `agents` has
   // already established its own inside the call and adopted it, and re-reading here would
   // only be able to disagree with the stronger answer it waited for.
   if (!context.caller.conversationId) {
     const resolved = callerConversation(name, startedAt, requestId);
-    if (resolved) context.caller.conversationId = resolved;
+    if (resolved) {
+      const bound = bindTransportConversation(transportKey, resolved);
+      context.caller.conversationId = transportKey ? bound : resolved;
+    }
   }
   // Never erase an identity a handler proved more strongly (agents::callerNow). The old
   // post-handler pass could fail to rediscover evidence that callerNow had already reserved
@@ -601,29 +561,6 @@ async function dispatchTracked(
 }
 
 /** Whether this handler must know which chat it is before resolving its paths. */
-function needsWorkspaceIdentity(name: string, args: unknown): boolean {
-  const input = args && typeof args === 'object' ? (args as Record<string, unknown>) : {};
-  const relative = (value: unknown): boolean =>
-    typeof value === 'string' && !isAbsoluteVirtualPath(value) && !isNativeWindowsPath(value);
-  if (name === 'read') {
-    const paths = Array.isArray(input['paths']) ? input['paths'] : [];
-    return paths.some(relative);
-  }
-  if (name === 'find') return relative(input['path']);
-  if (name === 'apply_patch') {
-    // Codex's apply_patch surface has no cwd argument. Relative patch paths therefore always
-    // consume the turn/chat cwd analogue maintained by this connector.
-    return true;
-  }
-  if (name === 'exec_command') {
-    // Every exec in a swarm also needs caller identity so a long-running session can be
-    // owned by the right chat even when the cwd itself was explicit.
-    const workdir = input['workdir'];
-    return swarmRunning() || workdir === undefined || relative(workdir);
-  }
-  return false;
-}
-
 /**
  * Adopts an identity established *inside* a tool call.
  *
@@ -650,7 +587,8 @@ function isFinishCall(name: string, args: unknown): boolean {
 }
 
 /**
- * A path named by a tool call, resolved against the chat's workspace when it is relative.
+ * A path named by a tool call, resolved against the chat's workspace when known, otherwise
+ * against the first user-approved root.
  *
  * Every path argument in every tool goes through here rather than calling `resolvePath`
  * directly, for two reasons. Shorthand then means the same thing in `read` as in `exec` as in
@@ -675,7 +613,7 @@ export async function resolveIn(
   // away first. Doing that join here is how a relative patch path could climb out of the
   // workspace: `posix.normalize('/root/a/../../elsewhere')` is a perfectly clean-looking
   // `/elsewhere`, and nothing downstream can tell it apart from a path that was always that.
-  const base = options.base !== undefined ? options.base : (currentWorkspace()?.virtual ?? null);
+  const base = options.base !== undefined ? options.base : (currentWorkspace()?.virtual ?? (roots[0] ? `/${roots[0].name}` : null));
   const resolved = await resolvePath(roots, requested, {
     ...(options.allowMissing === undefined ? {} : { allowMissing: options.allowMissing }),
     base
@@ -708,11 +646,6 @@ export async function resolveCwd(ctx: ToolContext, virtualPath: string | undefin
   const workspace = currentWorkspace();
   // Codex treats an explicitly empty workdir exactly like an omitted one.
   const provided = virtualPath !== undefined && virtualPath !== '';
-  if (!provided && !workspace && swarmRunning()) {
-    throw new SandboxError(
-      'WORKSPACE_REQUIRED: this multi-agent chat has no proven workspace. Supply an explicit approved workdir before running a command.'
-    );
-  }
   const target = provided ? virtualPath : (workspace?.virtual ?? (ctx.roots[0] ? `/${ctx.roots[0].name}` : ''));
   if (!target) throw new SandboxError('No folder is approved, so there is nowhere to run');
   const resolved = await resolveIn(ctx.roots, target);

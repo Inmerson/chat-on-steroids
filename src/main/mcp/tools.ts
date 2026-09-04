@@ -50,4 +50,12 @@ export function buildServer(ctx: ToolContext, surface: SurfaceId): McpServer {
 
 export { toVirtualPath };
 export type { ToolContext };
-export { chunkText, lastToolCallAt, resetToolClock, transportIdentityStatus } from './kernel.js';
+export {
+  bindTransportConversation,
+  chunkText,
+  lastToolCallAt,
+  resetToolClock,
+  resetTransportConversations,
+  transportConversation,
+  transportIdentityStatus
+} from './kernel.js';

@@ -7575,6 +7575,113 @@ describe('the fresh chat the app opened', () => {
     ]);
   });
 
+  it('dismisses ChatGPT too-many-requests dialog once and retries the worker bootstrap', async () => {
+    let sends = 0;
+    let dismissals = 0;
+    live = await harness(
+      'https://chatgpt.com/?clf=cmd-rate-dialog',
+      {
+        redeem: () => ({
+          ok: true,
+          command: {
+            id: 'cmd-rate-dialog',
+            type: 'worker',
+            text: 'Continue after the temporary request dialog is dismissed.',
+            agent: 'worker-1'
+          }
+        }),
+        ack: () => ({ ok: true })
+      },
+      (document, dom) => {
+        document.querySelector('[data-testid="send-button"]')!.addEventListener('click', () => {
+          sends++;
+          if (sends === 1) {
+            const dialog = document.createElement('div');
+            dialog.setAttribute('role', 'dialog');
+            dialog.innerHTML = `
+              <h2>Çok fazla istek</h2>
+              <p>Çok hızlı istek gönderiyorsun. Verilerini korumak için konuşmalarına erişimi geçici olarak sınırladık.</p>
+              <p>Lütfen tekrar denemeden önce birkaç dakika bekleyin.</p>
+              <button type="button">Anladım</button>
+            `;
+            dialog.querySelector('button')!.addEventListener('click', () => {
+              dismissals++;
+              dialog.remove();
+            });
+            document.body.append(dialog);
+            return;
+          }
+          dom.reconfigure({ url: 'https://chatgpt.com/c/33333333-4444-5555-6666-777777777777' });
+        });
+      }
+    );
+
+    await settle(500);
+
+    expect(sends).toBe(2);
+    expect(dismissals).toBe(1);
+    expect(live.document.querySelector('[role="dialog"]')).toBeNull();
+    expect(live.sent.filter((message) => message.type === 'ack')).toContainEqual(
+      expect.objectContaining({
+        id: 'cmd-rate-dialog',
+        status: 'sent',
+        conversationId: '33333333-4444-5555-6666-777777777777',
+        agent: 'worker-1'
+      })
+    );
+  });
+
+  it('dismisses ChatGPT too-many-requests dialog even when it appears after the bootstrap was accepted', async () => {
+    let dismissals = 0;
+    live = await harness(
+      'https://chatgpt.com/?clf=cmd-post-send-rate-dialog',
+      {
+        redeem: () => ({
+          ok: true,
+          command: {
+            id: 'cmd-post-send-rate-dialog',
+            type: 'worker',
+            text: 'Accept this bootstrap before mounting the temporary request dialog.',
+            agent: 'worker-1'
+          }
+        }),
+        ack: () => ({ ok: true })
+      },
+      (document, dom) => {
+        document.querySelector('[data-testid="send-button"]')!.addEventListener('click', () => {
+          dom.reconfigure({ url: 'https://chatgpt.com/c/44444444-5555-6666-7777-888888888888' });
+          void Promise.resolve().then(() => {
+            const dialog = document.createElement('div');
+            dialog.setAttribute('role', 'dialog');
+            dialog.innerHTML = `
+              <h2>Çok fazla istek</h2>
+              <p>Çok hızlı istek gönderiyorsun. Verilerini korumak için konuşmalarına erişimi geçici olarak sınırladık.</p>
+              <button type="button">Anladım</button>
+            `;
+            dialog.querySelector('button')!.addEventListener('click', () => {
+              dismissals++;
+              dialog.remove();
+            });
+            document.body.append(dialog);
+          });
+        });
+      }
+    );
+
+    await settle(500);
+
+    expect(live.sent.filter((message) => message.type === 'ack')).toContainEqual(
+      expect.objectContaining({
+        id: 'cmd-post-send-rate-dialog',
+        status: 'sent',
+        conversationId: '44444444-5555-6666-7777-888888888888',
+        agent: 'worker-1'
+      })
+    );
+    expect(dismissals).toBe(1);
+    expect(live.document.querySelector('[role="dialog"]')).toBeNull();
+  });
+
   it('acks a same-chat revival immediately after ChatGPT accepts the send, before any timer can be throttled', async () => {
     const chat = '22222222-3333-4444-5555-777777777777';
     let freezeTimers = false;

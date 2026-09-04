@@ -10,13 +10,50 @@
  * startup, the tunnel, the servers — stay unattributed, because they genuinely are.
  */
 
+import { appendFileSync, renameSync, statSync } from 'node:fs';
 import type { LogEntry } from '../shared/types.js';
 import { currentAgent } from './mcp/call-context.js';
 
 const MAX_ENTRIES = 500;
+/** One rotation keeps the previous file, so the last two of these are always on disk. */
+const MAX_LOG_FILE_BYTES = 4 * 1024 * 1024;
 
 const entries: LogEntry[] = [];
 const listeners = new Set<(entry: LogEntry) => void>();
+
+let logFile: string | null = null;
+let logFileBytes = 0;
+
+/**
+ * Mirrors every line from here on to `file`, rotating it once to `file.1` when it fills.
+ *
+ * Synchronous and unconditional: the lines worth having are the ones written during a
+ * crash or teardown, when nothing asynchronous is guaranteed to run. A write failure is
+ * swallowed — the log is the reporting channel — and disables the mirror for this process.
+ */
+export function initLogFile(file: string): void {
+  logFile = file;
+  try {
+    logFileBytes = statSync(file).size;
+  } catch {
+    logFileBytes = 0;
+  }
+}
+
+function mirrorToFile(entry: LogEntry): void {
+  if (!logFile) return;
+  const line = `${new Date(entry.time).toISOString()}  ${entry.level.padEnd(5)}  ${entry.agent ? `[${entry.agent}] ` : ''}${entry.message}\n`;
+  try {
+    if (logFileBytes >= MAX_LOG_FILE_BYTES) {
+      renameSync(logFile, `${logFile}.1`);
+      logFileBytes = 0;
+    }
+    appendFileSync(logFile, line, 'utf8');
+    logFileBytes += Buffer.byteLength(line, 'utf8');
+  } catch {
+    logFile = null;
+  }
+}
 
 /** Masks anything shaped like a credential, wherever it appears in a message. */
 export function redact(message: string): string {
@@ -46,18 +83,13 @@ export function log(level: LogEntry['level'], message: string): void {
   };
   entries.push(entry);
   if (entries.length > MAX_ENTRIES) entries.shift();
+  mirrorToFile(entry);
   if (ECHO_TO_CONSOLE) process.stderr.write(`[${level}] ${entry.message}\n`);
   for (const listener of listeners) {
     try {
       listener(entry);
     } catch {
-      // Writing a log line must never be able to break the code that wrote it. Listeners run
-      // synchronously on the caller's stack, and the one that matters here reaches the
-      // renderer — which can already be gone while teardown is still logging its own progress.
-      // A throw from there used to propagate into the shutdown step doing the logging and kill
-      // it outright; that is how a force-close timer stopped forcing anything and left the app
-      // draining a half-closed socket forever. There is nowhere useful to report this: the log
-      // is the reporting channel.
+      // Writing a log line must never be able to break the code that wrote it.
     }
   }
 }

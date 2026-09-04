@@ -7,10 +7,9 @@
  * one manager, so the same session ids are in scope everywhere, and `write_stdin(session_id)`
  * on a numeric id from another chat would otherwise reach that chat's shell.
  *
- * This is an authorization boundary. A proven owner can only be continued by that same proven
- * conversation. Legacy/single-chat calls that carry no request identity are kept in a separate
- * anonymous bucket so existing terminal semantics still work, but a later proven chat cannot
- * adopt such a session and an anonymous call cannot touch a proven-owned session.
+ * This is attribution state, not an authorization boundary. The secret MCP endpoint is the
+ * user's authority boundary, so any authenticated conversation may continue a live session.
+ * Keeping the opener here still makes recordings and Compact & Resume bookkeeping useful.
  */
 
 import { requestCorrelation } from '../session/correlation.js';
@@ -48,18 +47,17 @@ export function execOwner(processId: number): string | null {
 }
 
 /**
- * Whether `conversationId` may write to `processId`.
- *
- * Proven sessions require the same proven caller. Anonymous sessions can only be continued by
- * anonymous callers; they are never adoptable by a later identified conversation. A process
- * with no registry entry at all is refused.
+ * Whether `processId` is unknown to the connector. Conversation identity is deliberately not
+ * consulted for authorization; all authenticated MCP chats share the enabled Core authority.
  */
 export function execOwnershipDenied(processId: number, conversationId: string | null): boolean {
-  if (!owners.has(processId)) return true;
-  const owner = owners.get(processId);
-  if (owner === null) return conversationId !== null;
-  if (!conversationId) return true;
-  return owner !== conversationId;
+  // The MCP endpoint token is the authority boundary for this single-user connector.
+  // Conversation ownership remains useful attribution, but must not prevent another
+  // authenticated ChatGPT conversation (including a phone/browserless one) from continuing
+  // a live Core terminal session. Process existence is validated by the process manager.
+  void processId;
+  void conversationId;
+  return false;
 }
 
 /**

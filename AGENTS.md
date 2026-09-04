@@ -64,8 +64,9 @@ threat models.** MCP is the model's capability endpoint. The bridge exists only 
 Chrome extension and deliberately has no route that reads a file, runs a command, or
 changes a permission. Never merge their lifecycles or their auth.
 
-The extension never executes a tool. It observes ChatGPT and reports evidence. **The app is
-the only authority on what a local tool actually did.** The renderer has no Node, no
+The extension never executes a tool. It observes ChatGPT and reports attribution/routing evidence;
+the authenticated MCP endpoint plus the user's live app permissions authorize ordinary local
+tools. **The app is the only authority on what a local tool actually did.** The renderer has no Node, no
 filesystem, no command, no network authority; it crosses preload through named IPC.
 
 ## 2. Where the bugs actually are
@@ -98,7 +99,7 @@ found the real boundary yet.
 | browser observation | conversation id + navigation epoch + message/turn identity |
 | agent | conversation id -> prime or worker slot |
 | workspace | conversation/agent key -> cwd |
-| terminal | proven owner -> exec session id |
+| terminal | authenticated MCP endpoint -> exec session id; conversation retained for attribution |
 | session | local session id + conversation lineage |
 | compaction | continuation token + from/to conversation |
 | renderer load | selected session id + load generation |
@@ -113,7 +114,7 @@ the symptom is displayed.
 Three policies apply everywhere and are not repeated per section:
 
 - **Fail closed** when a guess could cause cross-root access, cross-chat attribution,
-  cross-agent terminal control, wrong workspace mutation, wrong compaction target, unsafe
+  wrong compaction target, unsafe
   rendered HTML, or invalid image content reaching the model. For presentation-only
   degradation, keep the UI usable and label the uncertainty instead.
 - **Scope every async result to the epoch that requested it** — navigation epoch, load
@@ -341,10 +342,10 @@ tunnel request
  → server.ts    loopback Host/Origin, secret tokenized path, bounded body,
                 x-request-id read + normalized (split before '/')
  → tools.ts     build only the requested surface
- → kernel.ts    AsyncLocalStorage call context
-                resolve exact caller from correlation evidence
+  → kernel.ts    AsyncLocalStorage call context
+                resolve exact caller from correlation evidence for attribution/routing
                 resolve agent identity if a swarm is active
-                wait for identity when the operation genuinely needs it
+                wait for identity only inside features that genuinely need routing identity
                 enforce the live capability / read-only guard
  → tool handler sandbox any model path, execute, attach structured evidence
                 (changes, counts, exit code, session id, assets)
@@ -402,11 +403,10 @@ agent* is working in.
 Keyed by exact chat/agent identity, learned from proven absolute paths and project markers,
 inherited by spawned workers, moved by Compact & Resume.
 
-**Must hold.** A relative path or omitted `workdir` with no trustworthy workspace **fails**
-rather than mutating a guessed project. When caller identity is unresolved during a swarm,
-never silently fall back to the first approved root — that turns an attribution failure
-into a wrong-target mutation. Moving a workspace is state continuity, never a new
-permission; the target still has to be legal.
+**Must hold.** A learned per-chat workspace remains the preferred convenience base. When none
+is known, relative paths and omitted `workdir` use the first user-approved root, matching the
+single-user Core policy; sandbox containment remains the permission boundary. Moving a
+workspace is state continuity, never a new permission; the target still has to be legal.
 
 **Tests.** `workspace.test.ts`, `swarm.test.ts`.
 
@@ -460,13 +460,14 @@ HTTP x-request-id                       (inbound.ts, normalized before '/')
   → background.js journals it durably
   → bridge.ts     accepts it for that conversation
   → correlation.ts  proves requestId → conversationId
-  → consumed by: kernel · recorder · agents · workspace · terminal ownership
+  → consumed by: kernel · recorder · agents · workspace · terminal attribution
 ```
 
 **Never substitute** active tab, timing, tool name, most-recent chat, only-generating chat,
-worker payload, or arrival order. If proof is missing the safe state is **Unattributed**,
-no workspace, or refusal for identity-sensitive work. Guessing is worse than losing
-attribution: it routes commands, files, messages and history into the *wrong* chat.
+worker payload, or arrival order. If proof is missing the safe attribution state is
+**Unattributed**. The authenticated MCP endpoint still has the user's enabled Core authority;
+conversation proof is routing/recording metadata and must not become a second authorization
+gate for ordinary local tools.
 
 This one chain explains symptoms that look unrelated — worker `WORKER_IDENTITY_LOST`, calls
 piling into Unattributed, false worker stalls, wrong or absent project cwd, terminal
@@ -613,7 +614,8 @@ Experimental, enabled on fresh installs while existing configs preserve their st
 **one global active execution run at a time**, star topology:
 `worker ← prime → worker`. Workers never message each other.
 
-**Identity.** The prime is the conversation that successfully called `agents action=spawn`
+**Identity.** Agent routing still uses conversation identity even though ordinary Core authority
+does not. The prime is the conversation that successfully called `agents action=spawn`
 with proven caller identity. Worker slots are opened by the app through browser bootstrap;
 once the page has a real conversation id the extension reports it and the broker binds that
 exact conversation before normal worker work proceeds. **Conversation identity is the
@@ -790,7 +792,7 @@ Each has a different persistence boundary.
 | patch parse/match/write | `apply-patch/*`, `tools-core.ts` | both `codex-apply-patch-*` |
 | shell-intercepted patch behavior | `tools-core.ts`, `apply-patch/invocation.ts` | invocation parity, `mcp` |
 | exec / PTY / stdin / output / session | `unified-exec.ts`, `shell.ts`, `ownership.ts`, `exec-output.ts` | `codex-runtime-parity`, `mcp` |
-| one chat touches another's terminal | `ownership.ts`, `kernel.ts`, then §11 chain | `mcp`, `workspace` |
+| authenticated chat cannot continue a live terminal | `ownership.ts`, `kernel.ts`, then §11 attribution chain | `mcp`, `workspace` |
 | **calls land in Unattributed** | **§11 chain in order** — `inbound`→`fiber`→`content`→`background`→`bridge`→`correlation`→`recorder` | `correlation`, `mcp-inbound`, `fiber`, `content-script` |
 | worker identity / inbox / liveness | §11 chain **first**, then `agents.ts`, stale sweep in `bridge.ts` | `agents`, `swarm` |
 | wrong worker/project cwd | `workspace.ts`, `kernel.ts`, §11 chain | `workspace`, `swarm` |
@@ -851,7 +853,7 @@ start A → pause A before its durable/publish step → run B to completion
 
 Every security or identity fix needs its **negative case**: in-root native path works /
 escaping native path fails; exact correlation routes / conflicting correlation does not
-guess; owner polls the terminal / another worker cannot; current epoch accepts the Fiber
+guess; known live terminal ids work / unknown ids fail; current epoch accepts the Fiber
 answer / stale epoch discards it.
 
 **Both sides of a protocol.** A compiling one-sided edit is still broken. The multi-hop
@@ -980,13 +982,13 @@ provenance before it can be committed or pushed. `release.yml` on
 
 ## 21. Security-sensitive areas
 
-Some subsystems sit directly on trust boundaries and need extra review: browser/session identity,
+Some subsystems sit directly on trust boundaries and need extra review: MCP endpoint authentication, browser/session attribution,
 MCP request lifecycle, approved-path enforcement, process execution, desktop control, secrets,
 and resource limits. Keep public documentation focused on contracts and invariants rather than
 publishing exploit recipes or detailed reproductions for unresolved weaknesses.
 
 Before changing one of these areas, reproduce the behavior against the current tree, preserve
-fail-closed behavior, add a deterministic regression where practical, and verify neighboring
+the intended trust boundary, add a deterministic regression where practical, and verify neighboring
 negative/security cases. Suspected security issues and reproduction details belong through the
 private process in `SECURITY.md`, not in public issues, comments, or fixtures.
 

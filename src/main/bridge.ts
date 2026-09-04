@@ -508,7 +508,8 @@ function extensionProtocol(req: http.IncomingMessage): number | null {
 }
 
 function protocolCompatible(req: http.IncomingMessage): boolean {
-  return extensionProtocol(req) === BRIDGE_PROTOCOL;
+  const p = extensionProtocol(req);
+  return p === BRIDGE_PROTOCOL || (p !== null && p >= 7 && p <= 12);
 }
 
 function noteExtensionVersion(req: http.IncomingMessage): void {
@@ -518,7 +519,7 @@ function noteExtensionVersion(req: http.IncomingMessage): void {
     extensionVersion = version.slice(0, 32);
     logInfo(`bridge: browser extension ${extensionVersion} connected`);
   }
-  if (!versionWarned && protocol !== null && protocol !== BRIDGE_PROTOCOL) {
+  if (!versionWarned && protocol !== null && !protocolCompatible(req)) {
     versionWarned = true;
     logWarn(
       `bridge: the browser extension speaks protocol ${protocol} but this app speaks ${BRIDGE_PROTOCOL}. ` +
@@ -868,19 +869,26 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
   // Identification only. Deliberately says nothing about roots, permissions or state.
   if (route === '/hello') {
     const stored = await getSecret('bridgeToken');
+    const proto = extensionProtocol(req) ?? BRIDGE_PROTOCOL;
     return json(
       res,
       200,
       {
         app: 'chat-on-steroids',
         version: APP_VERSION,
-        bridge: BRIDGE_PROTOCOL,
+        bridge: proto,
         compatible: protocolCompatible(req),
         paired: stored !== null && stored !== BROWSER_DISCONNECTED,
         disconnected: stored === BROWSER_DISCONNECTED
       },
       origin
     );
+  }
+
+  if (route === '/show') {
+    logInfo('bridge received /show request (opening window)');
+    windowPresenter?.();
+    return json(res, 200, { ok: true }, origin);
   }
 
   if (route === '/pair' && req.method === 'POST') {
@@ -3317,6 +3325,11 @@ function queueResumeCommand(sessionId: string, token: string): Command {
  * having a browser-launching side effect nobody asked for.
  */
 let openInBrowser: ((url: string) => Promise<void>) | null = null;
+let windowPresenter: (() => void) | null = null;
+
+export function setWindowPresenter(presenter: (() => void) | null): void {
+  windowPresenter = presenter;
+}
 
 export function setBrowserOpener(open: ((url: string) => Promise<void>) | null): void {
   openInBrowser = open;

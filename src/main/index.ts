@@ -7,10 +7,10 @@ import { app, BrowserWindow, Menu, Tray, nativeImage, nativeTheme, screen, sessi
 import { getConfig, initConfigPath, loadConfig } from './config.js';
 import { connect, disconnect, getStatus, onStatusChange, shutdownConnection } from './connection.js';
 import { registerIpc } from './ipc.js';
-import { logError, logInfo, logWarn } from './logger.js';
+import { initLogFile, logError, logInfo, logWarn } from './logger.js';
 import { unifiedExecManager } from './codex/manager.js';
 import { initSecretsPath } from './secrets.js';
-import { setBrowserOpener, shutdownBridge, startBridge } from './bridge.js';
+import { setBrowserOpener, setWindowPresenter, shutdownBridge, startBridge } from './bridge.js';
 import { flushSessions, initSessionStore, pruneSessions } from './session/store.js';
 import {
   flushRecorder,
@@ -74,11 +74,23 @@ const backgroundStartup = isBackgroundStartup();
 // One instance only: two copies would fight over the tunnel and the config file.
 const hasSingleInstanceLock = app.requestSingleInstanceLock();
 if (!hasSingleInstanceLock) {
-  // `app.quit()` does not make the rest of this module stop executing. Mark this process as a
-  // terminal secondary instance immediately, so neither native activation nor the async bootstrap
-  // below can touch shared config/durable state while the primary instance is still running.
+  // Mark this process as terminal secondary instance immediately.
   quitting = true;
-  app.quit();
+  // If native ProcessSingleton IPC failed (e.g. error 32 on Windows), notify the primary instance
+  // directly via the local loopback bridge before terminating.
+  void import('node:http').then(({ request }) => {
+    const req = request({
+      hostname: '127.0.0.1',
+      port: 8765,
+      path: '/show',
+      method: 'POST',
+      timeout: 1000
+    });
+    req.on('error', () => app.quit());
+    req.on('response', () => app.quit());
+    req.end();
+    setTimeout(() => app.quit(), 1000);
+  }).catch(() => app.quit());
 }
 
 function createWindow(): void {
@@ -88,7 +100,7 @@ function createWindow(): void {
     ...layout,
     ...(icon ? { icon } : {}),
     fullscreenable: false,
-    show: false,
+    show: true,
     autoHideMenuBar: true,
     // Painted before the renderer loads, so a dark window never flashes white.
     backgroundColor: getConfig().ui.theme === 'dark' ? '#0e0e11' : '#ffffff',
@@ -104,11 +116,44 @@ function createWindow(): void {
     }
   });
 
+  window.center();
+  window.show();
+  app.focus({ steal: true });
+  window.focus();
+
   window.once('ready-to-show', () => {
     // A renderer can finish loading after Cmd+Q has already entered bounded teardown. Never let
     // that late native event make the app visible again while `will-quit` is draining.
-    if (!quitting) window?.show();
+    if (!quitting && window && !window.isDestroyed()) {
+      window.restore();
+      window.center();
+      window.show();
+      app.focus({ steal: true });
+      window.focus();
+      window.setAlwaysOnTop(true, 'screen-saver');
+      setTimeout(() => {
+        if (window && !window.isDestroyed()) {
+          window.setAlwaysOnTop(false);
+          window.focus();
+        }
+      }, 300);
+    }
   });
+
+  // Fallback: in case ready-to-show is delayed or missed on some Windows GPU setups
+  setTimeout(() => {
+    if (!quitting && window && !window.isDestroyed() && !window.isVisible()) {
+      window.show();
+      window.focus();
+      window.setAlwaysOnTop(true);
+      setTimeout(() => {
+        if (window && !window.isDestroyed()) {
+          window.setAlwaysOnTop(false);
+          window.focus();
+        }
+      }, 300);
+    }
+  }, 600);
 
   // A renderer that fails to load leaves a blank window with no other clue, so
   // record it where the diagnostics panel can show it.
@@ -151,17 +196,37 @@ function createWindow(): void {
 }
 
 function showWindow(): void {
-  // Defense in depth for every current or future native activation source. The explicit gate
-  // below additionally protects the long pre-window startup interval, while this invariant makes
-  // a direct caller harmless once `before-quit` has started.
+  logInfo(`showWindow called (quitting=${quitting}, hasWindow=${Boolean(window)})`);
   if (quitting) return;
-  if (!window) {
+  if (!window || window.isDestroyed()) {
+    logInfo('showWindow: creating new window');
     createWindow();
     return;
   }
-  if (window.isMinimized()) window.restore();
-  window.show();
-  window.focus();
+  try {
+    const wasVisible = window.isVisible();
+    const wasMinimized = window.isMinimized();
+    const currentBounds = window.getBounds();
+    logInfo(`showWindow: before -> visible=${wasVisible}, minimized=${wasMinimized}, bounds=${JSON.stringify(currentBounds)}`);
+
+    window.restore();
+    window.center();
+    window.show();
+    app.focus({ steal: true });
+    window.focus();
+    window.moveTop();
+    window.setAlwaysOnTop(true, 'screen-saver');
+    setTimeout(() => {
+      if (window && !window.isDestroyed()) {
+        window.setAlwaysOnTop(false);
+        window.focus();
+      }
+    }, 400);
+
+    logInfo(`showWindow: after -> visible=${window.isVisible()}, minimized=${window.isMinimized()}, bounds=${JSON.stringify(window.getBounds())}`);
+  } catch (err) {
+    logError(`showWindow error: ${(err as Error).message}`);
+  }
 }
 
 // Electron promises `second-instance` only after its own `ready`, not after our async startup.
@@ -198,7 +263,7 @@ function refreshTray(): void {
     Menu.buildFromTemplate([
       { label, enabled: false },
       { type: 'separator' },
-      { label: 'Open', click: windowActivation.request },
+      { label: 'Open', click: () => showWindow() },
       {
         label: running ? 'Disconnect' : 'Connect',
         click: () => void (running ? disconnect() : connect())
@@ -215,7 +280,10 @@ function refreshTray(): void {
   );
 }
 
-app.on('second-instance', windowActivation.request);
+app.on('second-instance', () => {
+  logInfo('second-instance event received (desktop shortcut or second launch)');
+  showWindow();
+});
 
 void app.whenReady().then(async () => {
   // This guard is intentionally before even app.getPath/init* calls. A secondary instance, or a
@@ -226,6 +294,7 @@ void app.whenReady().then(async () => {
   initSecretsPath(userData);
   initSessionStore(userData);
   initDurableStore(userData);
+  initLogFile(path.join(userData, 'app.log'));
   await loadConfig();
   if (windowActivation.isDisabled()) return;
   syncLoginStartup(app, getConfig().ui.autoConnect);
@@ -330,7 +399,7 @@ void app.whenReady().then(async () => {
   registerNativeWindowActivation(app, windowActivation.request);
 
   tray = new Tray(trayIcon(false), ...trayGuidArgsForPlatform());
-  tray.on('click', windowActivation.request);
+  tray.on('click', () => showWindow());
   refreshTray();
   onStatusChange(refreshTray);
 
@@ -344,6 +413,7 @@ void app.whenReady().then(async () => {
   // The bridge serves recording and multi-agent mode both: recording needs the
   // extension to observe the chat, and multi-agent mode needs it to open worker tabs.
   // Either switch being on starts it. ipc.ts applies the same rule on a settings save.
+  setWindowPresenter(showWindow);
   if (getConfig().sessions.record || getConfig().multiAgent.enabled) {
     void startBridge();
   }

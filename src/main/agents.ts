@@ -89,6 +89,11 @@ import { logInfo, logWarn } from './logger.js';
 import { inheritWorkspace, releasePrimeWorkspace } from './workspace.js';
 
 export const PRIME_ID = 'prime';
+/**
+ * Stable owner principal for authenticated MCP calls that carry no browser conversation.
+ * This is routing metadata, not a ChatGPT conversation id or an extra credential.
+ */
+export const MCP_OWNER_CONVERSATION_ID = 'mcp-owner';
 
 /**
  * Unacknowledged messages held per agent before the broker pushes back.
@@ -573,6 +578,24 @@ export interface Caller {
    * the model wrote, and never from "the chat that has been active lately".
    */
   conversationId?: string | null;
+}
+
+/**
+ * Route authenticated MCP control calls without making browser attribution an authority gate.
+ * Real worker conversations keep their worker identity; every other authenticated chat controls
+ * the active run as its owner-prime. A stateless caller starting a new run gets one stable owner
+ * principal so later stateless calls can address that same run.
+ */
+export function authorizeMcpOwnerCaller(caller: Caller): Caller {
+  if (!getConfig().multiAgent.enabled) return caller;
+  if (run) {
+    if (caller.conversationId) {
+      const member = boundAgent(caller.conversationId);
+      if (member?.info.role === 'worker') return caller;
+    }
+    return { ...caller, conversationId: run.primeConversationId };
+  }
+  return caller.conversationId ? caller : { ...caller, conversationId: MCP_OWNER_CONVERSATION_ID };
 }
 
 function requireEnabled(): void {

@@ -1931,11 +1931,12 @@ describe('through the MCP endpoint', () => {
     expect(identify({ conversationId: 'c-ahead' }).id).toBe(PRIME_ID);
   });
 
-  it('refuses a spawn whose conversation this app cannot prove, and creates nothing', async () => {
+  it('lets an authenticated MCP owner spawn without browser conversation evidence', async () => {
     const text = await agents('spawn', { workers: [{ task: 'anything' }] });
-    expect(text).toMatch(/UNIDENTIFIED_CALLER|could not/i);
-    expect(swarmRunning()).toBe(false);
-    expect(pendingWorkerSpawns()).toEqual([]);
+    expect(text).not.toMatch(/UNIDENTIFIED_CALLER|could not/i);
+    expect(text).toContain('prime agent');
+    expect(swarmRunning()).toBe(true);
+    expect(pendingWorkerSpawns()).toHaveLength(1);
   });
 
   it('rolls back a spawn whose durable acceptance barrier fails instead of resurrecting it from the debounce', async () => {
@@ -1974,16 +1975,15 @@ describe('through the MCP endpoint', () => {
     expect(JSON.stringify(agentsSchema)).not.toMatch(/join/i);
   });
 
-  it('tells an unrelated chat AGENTS_BUSY and nothing whatsoever about the run', async () => {
+  it('lets any authenticated non-worker chat control the active run as owner-prime', async () => {
     startSwarm(1);
     const text = await asChat('c-stranger', 'status');
-    expect(text).toContain('AGENTS_BUSY');
-    expect(text).not.toContain('worker-1');
-    expect(text).not.toContain('task 1');
-    expect(text).not.toContain(PRIME_CHAT);
+    expect(text).not.toContain('AGENTS_BUSY');
+    expect(text).toContain('You are prime.');
+    expect(text).toContain('worker-1');
   });
 
-  it('shows a parked prime only its own history while another prime owns the active run', async () => {
+  it('lets a parked prime chat control the currently active run as the authenticated owner', async () => {
     spawn({ workers: [{ label: 'A history worker', task: 'A private task' }], caller: prime });
     expect(bindConversation('worker-1', 'c-worker-a')).toBe(true);
     finishAgent({ conversationId: 'c-worker-a' }, 'A done for now');
@@ -1995,17 +1995,14 @@ describe('through the MCP endpoint', () => {
     });
     const structured = await structuredAsChat(PRIME_CHAT, 'status');
     expect(structured.self).toBe(PRIME_ID);
-    expect(structured.run_id).toBeNull();
-    // A owns history but cannot consume the one global execution claim while B is active.
-    expect(structured.free_worker_slots).toBe(0);
+    expect(structured.run_id).not.toBeNull();
     expect(structured.agents).toEqual(
-      expect.arrayContaining([expect.objectContaining({ id: 'worker-1', label: 'A history worker', state: 'sleeping' })])
+      expect.arrayContaining([expect.objectContaining({ id: 'worker-1', label: 'B live worker' })])
     );
-    expect(JSON.stringify(structured)).not.toContain('B live worker');
-    expect(JSON.stringify(structured)).not.toContain('B private task');
+    expect(JSON.stringify(structured)).not.toContain('A history worker');
   });
 
-  it('fences an exact dormant worker tool call while another prime owns the active run', async () => {
+  it('does not use dormant worker identity as an ordinary Core authorization fence', async () => {
     startSwarm(1);
     const worker = startWorker('worker-1');
     finishAgent(worker.caller, 'first prime work done');
@@ -2013,8 +2010,8 @@ describe('through the MCP endpoint', () => {
     expect(swarmRunning()).toBe(false);
 
     // Another prime is now entitled to the one active execution claim and may reuse the same
-    // friendly worker ids. The old exact worker conversation remains worker-owned history, not
-    // an ordinary chat that can keep using local tools.
+    // friendly worker ids. The old exact worker conversation remains worker-owned history for
+    // agent routing, but the authenticated MCP endpoint still has ordinary Core authority.
     spawn({ workers: [{ task: 'second prime work' }], caller: { conversationId: 'c-prime-b' } });
 
     const requestId = 'wfr_dormant_worker_exact';
@@ -2029,13 +2026,12 @@ describe('through the MCP endpoint', () => {
     ]);
     const reply = await ordinaryWithRequestId(requestId, 'read', { paths: ['/anything'] });
     const text = textOfReply(reply);
-    expect(text).toContain('WORKER_SLEEPING');
-    expect(text).toContain('Nothing was run');
-    expect(text).not.toMatch(/unknown root|not found/i);
+    expect(text).not.toContain('WORKER_SLEEPING');
+    expect(text).toMatch(/unknown root/i);
     expect(identify({ conversationId: 'c-prime-b' }).id).toBe(PRIME_ID);
   });
 
-  it('waits for late exact identity while dormant worker histories exist, then fences that worker', async () => {
+  it('does not wait on late browser identity before ordinary Core work', async () => {
     startSwarm(1);
     const worker = startWorker('worker-1');
     finishAgent(worker.caller, 'sleep before late evidence');
@@ -2043,8 +2039,8 @@ describe('through the MCP endpoint', () => {
 
     const requestId = 'wfr_dormant_worker_late';
     const pending = ordinaryWithRequestId(requestId, 'read', { paths: ['/anything'] });
-    // Initial cheap correlation has already had a chance to miss. Deliver the exact page mate
-    // while the kernel is in its dormant-worker evidence window.
+    // Delivering exact page evidence later may improve attribution, but must not be an
+    // authorization prerequisite for the already-authenticated Core call.
     await new Promise((resolve) => setTimeout(resolve, 20));
     await recordChatObservations('c-worker-1', [
       { kind: 'turn_start', time: Date.now(), turnId: 't-dormant-late' },
@@ -2055,7 +2051,7 @@ describe('through the MCP endpoint', () => {
         calls: [{ messageId: 'm-dormant-late', tool: 'read', order: 0, answered: false, requestId }]
       }
     ]);
-    expect(textOfReply(await pending)).toContain('WORKER_SLEEPING');
+    expect(textOfReply(await pending)).toMatch(/unknown root/i);
   });
 
   it('delivers and acknowledges a parked prime inbox by exact conversation without adopting another history', async () => {
@@ -2127,14 +2123,12 @@ describe('through the MCP endpoint', () => {
     });
   });
 
-  it('refuses a control call it cannot place at all, and says where to look', async () => {
+  it('treats an unattributed authenticated MCP control call as the owner-prime', async () => {
     startSwarm(1);
-    // No page evidence: this call could have come from anywhere, so it is not treated as a
-    // stranger and it is certainly not given a credential to carry instead.
     const text = await agents('status');
-    expect(text).toContain('WORKER_IDENTITY_LOST');
-    expect(text).toMatch(/extension/i);
-    expect(text).not.toContain('worker-1');
+    expect(text).not.toContain('WORKER_IDENTITY_LOST');
+    expect(text).toContain('You are prime.');
+    expect(text).toContain('worker-1');
   });
 
   it('uses the inbound HTTP request id instead of stealing a worker’s earlier agents evidence', async () => {
@@ -2467,10 +2461,10 @@ describe('through the MCP endpoint', () => {
     expect(retry).toContain('check the parser before you stop');
     expect(swarmStateForCaller(prime).agents.find((agent) => agent.id === 'worker-1')?.pending).toBe(1);
 
-    // The tombstone is not general membership. The same terminal chat still cannot use the
-    // ordinary agents surface after it has finished.
+    // The terminal chat has no live agent membership after finish. Ordinary Core authority is
+    // independent, while the agents surface simply reports that no history belongs to it.
     const status = await asChat('c-worker-1', 'status');
-    expect(status).toMatch(/WORKER_ENDED|AGENTS_BUSY/);
+    expect(status).toMatch(/No sub-agent history belongs to this conversation/i);
   });
 
   it('enforces worker-to-worker refusal over the wire', async () => {

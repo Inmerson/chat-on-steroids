@@ -24,7 +24,7 @@ import { createMcpHandler } from '@modelcontextprotocol/server';
 import { localhostHostValidation, localhostOriginValidation, toNodeHandler } from '@modelcontextprotocol/node';
 import { getConfig } from '../config.js';
 import { logError, logInfo, logWarn } from '../logger.js';
-import { buildServer, resetToolClock, type ToolContext } from './tools.js';
+import { buildServer, resetToolClock, resetTransportConversations, type ToolContext } from './tools.js';
 import { SURFACE_IDS, surfaceDefinition, type SurfaceId } from './surfaces.js';
 
 const MAX_BODY_BYTES = 8 * 1024 * 1024;
@@ -261,6 +261,7 @@ export async function startMcpServer(getContext: () => ToolContext): Promise<Mcp
   requestSeenAt = null;
   surfaceRequestAt.clear();
   resetToolClock();
+  resetTransportConversations();
   selfTestToken = randomBytes(16).toString('hex');
   tunnelProbeToken = randomBytes(16).toString('hex');
   // One path per surface, each with its own token. Distinct tokens rather than one shared

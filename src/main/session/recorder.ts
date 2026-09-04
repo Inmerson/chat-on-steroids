@@ -608,15 +608,6 @@ export function evidenceWindow(production: number): number {
 }
 
 /**
- * How long a completed MCP call may wait for its exact page-side request id observation.
- *
- * This wait is request-specific: only the identical normalized x-request-id can satisfy it.
- * Chrome-off, conflicting, or missing evidence ends in Unattributed activity rather than a
- * tool/time/generation guess.
- */
-const REQUEST_ID_GRACE_MS = evidenceWindow(15_000);
-
-/**
  * Late exact request-id evidence can arrive after a call already fell into Unattributed.
  *
  * Correlation is deliberately durable and request-specific, so once that evidence exists
@@ -1035,22 +1026,13 @@ let recordChain: Promise<unknown> = Promise.resolve();
  * Never throws into the caller: a broken recorder must not break the connector, so a
  * storage failure is logged and the tool result is returned to ChatGPT regardless.
  *
- * The work is queued rather than run inline. Attribution can have to wait a moment for
- * the page to report the exact request-id/message evidence that proves where the call came from, and nothing
- * ChatGPT is waiting on may wait on the browser: with sequential file and command tools
- * a second of that per call is the difference between a companion that feels immediate
- * and one that feels broken. The connector fires this and moves on; the returned promise
- * is for tests and for the flush at quit.
+ * The work is queued rather than run inline. Browser/page attribution is metadata and must
+ * never extend the MCP request lifecycle. Exact request-id evidence already present is used
+ * immediately; otherwise the call is filed under Unattributed activity and the deterministic
+ * repair pass moves it later if matching page evidence arrives.
  *
- * The two halves are queued differently on purpose. Every call's request-specific evidence
- * window opens the moment the call lands, all of them at once, so a burst of calls costs one
- * grace period rather than one per call. Only the write is serialised, in call order, so the
- * log stays in order. There is no shared pool of rows/evidence to claim.
- *
- * The cost of not blocking the connector is a crash window: a call whose evidence has not
- * resolved yet exists only in memory, so a power loss inside those couple of seconds
- * loses it, where the old inline write would not have. Quitting flushes. That is the
- * whole of the tradeoff, and it is bounded by REQUEST_ID_GRACE_MS.
+ * Writes remain serialised in call order so the log stays deterministic. There is no shared
+ * pool of rows/evidence to claim and no browser wait on this path.
  */
 export function recordToolCall(input: ToolCallInput): Promise<ToolCallRecord | null> {
   if (!recordingEnabled()) return Promise.resolve(null);
@@ -1077,32 +1059,20 @@ export function recordToolCall(input: ToolCallInput): Promise<ToolCallRecord | n
     return filed;
   }
 
-  // Late browser evidence is the only wait left in attribution. It can prove this exact
-  // request after the MCP handler already completed, but no different request/page state can
-  // ever satisfy it. Chrome-off or unmatched modern ids therefore end in Unattributed.
-  const attributing = input.requestId
-    ? awaitRequestCorrelation(input.requestId, REQUEST_ID_GRACE_MS).then((correlation) => {
-        const conversationId = correlation?.conversationId ?? null;
-        // Say which request id gave up, not just that something did. `unattributed` is the
-        // one outcome whose cause always lives in the browser half of the join, so the log
-        // has to carry the id that the page never confirmed — it is the only handle anyone
-        // has for matching this against what the extension believed it sent.
-        if (!conversationId) {
-          logWarn(
-            `request attribution: no page evidence for ${input.requestId} within ` +
-              `${REQUEST_ID_GRACE_MS}ms; filing ${input.tool} under Unattributed activity`
-          );
-        }
-        if (input.bind && conversationId) bindAgentConversation(input.bind, conversationId);
-        return {
-          conversationId,
-          sessionId: correlation?.sessionId ?? null,
-          attribution: conversationId ? ('request_id' as const) : ('unattributed' as const),
-          turnId: conversationId ? conversations.get(conversationId)?.turnId ?? null : null
-        };
-      })
-    : Promise.resolve<Target>({ conversationId: null, sessionId: null, attribution: 'unattributed', turnId: null });
-  const filed = recordChain.then(async () => fileToolCall(input, await attributing));
+  // Use exact evidence only when it already exists. Missing page evidence is expected for
+  // phone/browserless MCP clients, so it is never an authorization gate and never a 15s wait.
+  // If the browser reports the exact request later, noteCallEvidence() schedules deterministic
+  // repair of this Unattributed record.
+  const correlation = input.requestId ? requestCorrelation(input.requestId) : null;
+  const conversationId = correlation?.conversationId ?? null;
+  if (input.bind && conversationId) bindAgentConversation(input.bind, conversationId);
+  const target: Target = {
+    conversationId,
+    sessionId: correlation?.sessionId ?? null,
+    attribution: conversationId ? 'request_id' : 'unattributed',
+    turnId: conversationId ? conversations.get(conversationId)?.turnId ?? null : null
+  };
+  const filed = recordChain.then(() => fileToolCall(input, target));
   recordChain = filed.then(
     () => undefined,
     () => undefined

@@ -57,16 +57,6 @@ var CLF_DOM = (() => {
   const SPEECH =
     'button[data-testid="composer-speech-button"], button[data-testid="composer-dictate-button"], ' +
     'button[aria-label^="Dictate" i], button[aria-label^="Voice" i]';
-  /**
-   * A control ChatGPT mounts for a completed assistant message, scoped to that turn.
-   *
-   * `Copy message` is intentionally exact. Code blocks have their own Copy controls while a
-   * response is still streaming, so a generic copy button would turn ordinary interim prose
-   * into false terminal evidence. The current live renderer exposes the accessible label and
-   * recent renderers also used the explicit test id below.
-   */
-  const COMPLETION_ACTION =
-    'button[data-testid="copy-turn-action-button"], button[aria-label="Copy message" i]';
 
   const safe = (fn, fallback) => {
     try {
@@ -434,23 +424,6 @@ var CLF_DOM = (() => {
       }
       return out;
     }, []);
-  }
-
-  /**
-   * ChatGPT's completed-message action for exactly this logical assistant turn, if mounted.
-   *
-   * This is corroborating lifecycle evidence only. content.js still requires a quiet turn,
-   * authored assistant prose, a matching healthy Fiber descriptor and no unanswered connector
-   * call before it may use this node as a completion fallback.
-   */
-  function completionAction(turn) {
-    return safe(() => {
-      for (const section of turnNodes(turn)) {
-        const action = section && section.querySelector ? section.querySelector(COMPLETION_ACTION) : null;
-        if (action) return action;
-      }
-      return null;
-    }, null);
   }
 
   /** True while ChatGPT is producing a turn. The stop button is the honest signal. */
@@ -1092,27 +1065,6 @@ var CLF_DOM = (() => {
     return safe(() => document.querySelector('#prompt-textarea'), null);
   }
 
-  /**
-   * Whether ChatGPT's editing host is presently safe to receive a new user message.
-   *
-   * This deliberately says nothing about whether *our* recorder still considers the previous
-   * turn open; content.js owns that stronger lifecycle state. It is the page-native half of the
-   * same proof: a connected/editable composer, no Stop/generation control, and no user draft.
-   * Keeping the emptiness check here also makes it impossible for a revival waiter to "reserve"
-   * the composer by inserting its text before the page is actually ready.
-   */
-  function composerSubmitReady() {
-    return safe(() => {
-      const box = composer();
-      if (!box || !box.isConnected) return false;
-      if (generating() || stopButton()) return false;
-      if ((box.textContent || '').trim() !== '') return false;
-      if (box.getAttribute('aria-disabled') === 'true') return false;
-      if (box.getAttribute('contenteditable') === 'false') return false;
-      return true;
-    }, false);
-  }
-
   /** The composer as a whole, used as the root to watch for React replacing it. */
   function composerBox() {
     return safe(() => {
@@ -1293,13 +1245,10 @@ var CLF_DOM = (() => {
    * Makes one assistant turn an app-owned surface without deleting any React-owned DOM.
    *
    * The recorder still needs ChatGPT's native subtree to exist so it can observe final
-   * prose, progress and lifecycle changes. The visible stream deliberately lives *beside*
-   * ChatGPT's turn sections, not inside one of them. React transiently moves/reuses assistant
-   * sections while mounting the next user turn; keeping our stream inside such a section made
-   * the already-correct assistant answer jump across the new user message for one paint before
-   * reconciliation put it back. A connected sibling stream therefore never follows a native
-   * section that React moves. Turning Overwrite off only removes markers/the sibling; React
-   * never has to reconstruct anything we destroyed.
+   * prose, progress and lifecycle changes. Visually, however, Overwrite means exactly what
+   * it says: every native child is hidden and the Chat On Steroids stream is the only visible
+   * child of the first section. Turning Overwrite off only removes the marker; React never
+   * has to reconstruct anything we destroyed.
    */
   function replaceTurn(turn, root, replaced) {
     return safe(() => {
@@ -1309,26 +1258,31 @@ var CLF_DOM = (() => {
         if (replaced) section.setAttribute('data-clf-turn-replaced', '1');
         else section.removeAttribute('data-clf-turn-replaced');
       }
-      const embedded = Boolean(root && sections.some((section) => root.parentElement === section));
-      if (replaced && root && (!root.isConnected || embedded)) {
-        const last = sections[sections.length - 1];
-        if (last && last.parentElement) last.parentElement.insertBefore(root, last.nextSibling);
-      }
+      if (replaced && root && root.parentElement !== sections[0]) sections[0].append(root);
       return true;
     }, false);
   }
 
-  /** Types into the composer. Refuses if the user already has a draft there. */
-  function insertPrompt(value) {
+  /** Types into the composer. Refuses if the user already has a draft there, unless replace is true. */
+  function insertPrompt(value, replace = false) {
     return safe(() => {
       const box = composer();
       if (!box) return false;
-      if ((box.textContent || '').trim() !== '') return false;
+      if ((box.textContent || '').trim() !== '') {
+        if (!replace) return false;
+        box.focus();
+        box.replaceChildren();
+        box.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'deleteContentBackward', data: null }));
+      }
       box.focus();
       // execCommand still produces the native editing path ChatGPT listens for. Newer
       // composer builds occasionally ignore its return value, so verify the DOM and
       // also emit input so React cannot miss the mutation.
       document.execCommand('insertText', false, value);
+      box.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: value }));
+      if ((box.textContent || '').trim().length > 0) return true;
+      // Fallback for newer composer builds where execCommand is disabled on contenteditable
+      box.textContent = value;
       box.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: value }));
       return (box.textContent || '').trim().length > 0;
     }, false);
@@ -1424,7 +1378,6 @@ var CLF_DOM = (() => {
     presentationTurns,
     messages,
     messagesIn,
-    completionAction,
     sectionSignature,
     generating,
     stopButton,
@@ -1442,7 +1395,6 @@ var CLF_DOM = (() => {
     toolLabel,
     errors,
     composer,
-    composerSubmitReady,
     composerBox,
     pageTheme,
     composerActions,

@@ -1639,7 +1639,9 @@ describe('canonical recorder 1.8', () => {
         calls: [{ messageId: 'other-call', tool: 'read', order: 0, answered: false, requestId: 'wfr_other' }]
       }]);
       const pending = tool('wfr_missing', Date.now());
-      await vi.advanceTimersByTimeAsync(15_100);
+      // Browser/page attribution is metadata only. A missing page mate must not keep the
+      // recorder (and therefore the MCP request lifecycle) open for the 15s evidence window.
+      await vi.advanceTimersByTimeAsync(0);
       const call = await pending;
       expect(call?.attributionMethod).toBe('unattributed');
       expect(call?.conversationId).toBeNull();
