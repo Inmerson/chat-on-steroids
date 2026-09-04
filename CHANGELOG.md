@@ -9,6 +9,27 @@ The app and the `extension/` companion are versioned together. **Reload the
 extension after updating the app**. If their bridge protocols are incompatible,
 the app refuses the extension and asks you to reload the matching copy.
 
+## [Unreleased]
+
+The following changes are implemented on the autonomous execution branch. They have not
+been deployed to the installed app/extension or verified through authenticated live ChatGPT.
+
+### Added
+- Durable desktop execution through the existing `session` tool: start, status, pause,
+  resume, and stop. Execution control remains available when recording is disabled.
+- Separate managed Execution and Agent windows, with exact conversation binding and
+  one-time delivery of the approved plan.
+
+### Fixed
+- Exact-URL stalled-chat recovery with document-scoped state and bounded consecutive
+  recovery attempts. The source tab stays open until replacement readiness is proved.
+- Worker tabs close only after durable sleeping/finished/failed lifecycle evidence;
+  bootstrap delivery acknowledgement alone does not authorize closure.
+- Shared autonomous composer ownership across Loop, Goal, compaction, and revival.
+- Authenticated terminal continuation across chats, strict bridge protocol admission,
+  and explicit All Computer state with confirmation and coherent manual root edits.
+- English-only first-party autonomous prompts, statuses, and decision/error heuristics.
+
 ## [2.1.0] — 2026-09-04
 
 2.1.0 integrates Agent System 3.0, Control Center, Infinite Loop, and desktop shortcut auto-healing.

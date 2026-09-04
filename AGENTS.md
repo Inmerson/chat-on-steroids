@@ -167,9 +167,11 @@ Do not "restore" these from an older document:
 - Core declares **8** tool names but at most **7** are live: `find` and the exec pair are
   mutually exclusive. Desktop adds at most 2. Live ceiling is 9, and reporting must derive
   from the surface projection, never a hardcoded count.
-- `session` has exactly two actions, `search` and `read`. Search discovers recordings; read
-  requires an explicit local session id and returns lossless cursor pages. Compact & Resume is
-  app/browser orchestration — there is no model-visible `save_handoff`.
+- `session` keeps `search` and `read` for recordings, plus `execution_start`,
+  `execution_status`, `execution_pause`, `execution_resume`, and `execution_stop` for durable
+  desktop execution. Recording reads require an explicit local session id and return lossless
+  cursor pages. Execution controls remain discoverable with recording disabled. Compact &
+  Resume is app/browser orchestration — there is no model-visible `save_handoff`.
 - Extension pairing is silent loopback `/pair` bearer provisioning. The six-digit flow is gone.
 - Canonical messages live in `messages/*.json`, one replaceable shard per logical id; legacy
   `messages.json` is read during lazy migration. They are not appended forever to `events.jsonl`.
@@ -315,7 +317,7 @@ earn it today.
 | `find` | `search` **and not** `command` | `tools-core.ts` → `search.ts` |
 | `apply_patch` | any of `create`/`edit`/`move`/`deleteFile` | `codex/apply-patch/*` |
 | `exec_command`, `write_stdin` | `command` | `codex/unified-exec.ts` |
-| `session` | recording enabled | session subsystem |
+| `session` | always; search/read require recording enabled | session + durable execution |
 | `agents` | multi-agent enabled | `agents.ts` |
 
 **Desktop** (`chat-on-steroids-desktop`, optional, **Windows-only**): `observe` needs `screen`;
@@ -572,13 +574,14 @@ A second loopback HTTP service on the first free port of **8765–8769**. The ex
 it with `/hello`, silently provisions a bearer token with `/pair`, then uses authenticated
 routes: `/status`, `/events`, `/closed`, `/activity`, `/compact/claim-auto`, `/compact`,
 `/goal/draft`, `/goal/ack`, `/goal/objective`, `/goal/open`, `/settings` (GET and POST),
-`/commands/redeem`, `/commands/ack`. `/settings` is the only pair the page may write, and
+`/commands/redeem`, `/commands/ack`, `/execution/rollover`. `/settings` is the only settings pair the page may write, and
 its GET exists for the one composer with no conversation to read `/activity` for: a New Chat.
 
 **Must hold.** The token never enters the ChatGPT page — the service worker holds it in
 extension-owned state and the app keeps its counterpart out of config and log surfaces. The
 bridge exposes **no** filesystem, command, or config-mutation route. Protocol mismatch
-against `BRIDGE_PROTOCOL` warns once rather than spamming. Concurrent startup must not race
+against `BRIDGE_PROTOCOL` rejects protected requests with HTTP 426; admission requires exact
+protocol equality. Concurrent startup must not race
 on listener ownership.
 
 Because this is where browser-observed lifecycle meets recorder, agents, continuation and
