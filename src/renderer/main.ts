@@ -558,9 +558,7 @@ function isEntireDrivePath(folderPath: string): boolean {
 }
 
 function isAllComputerActive(config: AppState['config']): boolean {
-  if (config.allComputer) return true;
-  if (!config.roots || config.roots.length === 0) return false;
-  return config.roots.every((r) => isEntireDrivePath(r.path));
+  return config.allComputer === true;
 }
 
 function rootRow(root: AppState['config']['roots'][number]): HTMLElement {
@@ -1274,6 +1272,13 @@ async function addFolder(): Promise<void> {
 }
 
 async function toggleAllComputer(): Promise<void> {
+  if (!state) return;
+  if (!isAllComputerActive(state.config)) {
+    const approved = window.confirm(
+      'Share every detected computer drive with Chat On Steroids? This grants file access across those drives according to your enabled Core permissions.'
+    );
+    if (!approved) return;
+  }
   const next = await run(api.toggleAllComputer());
   if (next) {
     apply(next);

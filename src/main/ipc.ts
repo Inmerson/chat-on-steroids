@@ -360,10 +360,17 @@ export function registerIpc(getWindow: () => BrowserWindow | null): void {
 
     let addedName = '';
     await updateConfig(async (config) => {
-      const real = await validateNewRoot(result.filePaths[0]!, config.roots, { allowDrive: true });
+      // Whole-drive roots are the temporary representation of All Computer mode. A manual
+      // folder add explicitly exits that mode, so those drive roots must not make every folder
+      // on the machine fail the normal overlap check before the transition can occur.
+      const overlapRoots = config.allComputer === true ? [] : config.roots;
+      const real = await validateNewRoot(result.filePaths[0]!, overlapRoots, { allowDrive: true });
       const name = defaultRootNameForPath(real, config.roots);
       addedName = name;
-      return { ...config, roots: [...config.roots, { name, path: real }] };
+      const roots = [...config.roots, { name, path: real }];
+      return config.allComputer === true
+        ? { ...config, roots, allComputer: false, previousRoots: [] }
+        : { ...config, roots };
     });
     logInfo(`approved folder /${addedName}`);
     return buildState();
@@ -408,6 +415,7 @@ export function registerIpc(getWindow: () => BrowserWindow | null): void {
       return {
         ...config,
         allComputer: false,
+        ...(config.allComputer === true ? { previousRoots: [] } : {}),
         roots: config.roots.filter((r) => r.name !== name)
       };
     });
@@ -426,10 +434,10 @@ export function registerIpc(getWindow: () => BrowserWindow | null): void {
       if (config.roots.some((r) => r.name !== name && r.name === newName)) {
         throw new Error(`/${newName} is already used`);
       }
-      return {
-        ...config,
-        roots: config.roots.map((r) => (r.name === name ? { ...r, name: newName } : r))
-      };
+      const roots = config.roots.map((r) => (r.name === name ? { ...r, name: newName } : r));
+      return config.allComputer === true
+        ? { ...config, roots, allComputer: false, previousRoots: [] }
+        : { ...config, roots };
     });
     renameWorkspaceRoot(name, newName);
     return buildState();

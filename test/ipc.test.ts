@@ -6,6 +6,7 @@
  */
 
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
+import path from 'node:path';
 
 type Handler = (event: unknown, payload: unknown) => Promise<unknown>;
 const handlers = new Map<string, Handler>();
@@ -17,7 +18,7 @@ vi.mock('electron', () => ({
   },
   BrowserWindow: class {},
   clipboard: { readText: () => '', writeText: () => undefined },
-  dialog: { showOpenDialog: async () => ({ canceled: true, filePaths: [] }) },
+  dialog: { showOpenDialog: vi.fn(async () => ({ canceled: true, filePaths: [] })) },
   shell: { openExternal: vi.fn(async () => undefined), openPath: vi.fn(async () => '') },
   nativeTheme: { themeSource: 'system' },
   safeStorage: {
@@ -59,7 +60,7 @@ const {
   swarmStateForCaller
 } = await import('../src/main/agents.js');
 const { registerIpc } = await import('../src/main/ipc.js');
-const { app, nativeTheme, safeStorage, shell } = await import('electron');
+const { app, dialog, nativeTheme, safeStorage, shell } = await import('electron');
 const { extensionDownloadUrl } = await import('../src/main/version.js');
 const { resetWorkspaces, setWorkspaceFor, workspaceEntries } = await import('../src/main/workspace.js');
 const { makeTempDir, removeTempDir } = await import('./helpers.js');
@@ -73,6 +74,8 @@ let currentWindow: {
 
 const save = (patch: unknown, base: unknown = getConfig()): Promise<any> =>
   handlers.get('settings:save')!(null, { patch, base }) as Promise<any>;
+const addRoot = (): Promise<any> => handlers.get('roots:add')!(null, undefined) as Promise<any>;
+const toggleAllComputer = (): Promise<any> => handlers.get('roots:allComputer:toggle')!(null, undefined) as Promise<any>;
 const renameRoot = (payload: unknown): Promise<any> => handlers.get('roots:rename')!(null, payload) as Promise<any>;
 const removeRoot = (payload: unknown): Promise<any> => handlers.get('roots:remove')!(null, payload) as Promise<any>;
 const sessionEvents = (payload: unknown): Promise<any> => handlers.get('sessions:events')!(null, payload) as Promise<any>;
@@ -121,6 +124,7 @@ beforeEach(async () => {
   currentWindow = null;
   nativeTheme.themeSource = 'system';
   vi.mocked(safeStorage.isAsyncEncryptionAvailable).mockResolvedValue(true);
+  vi.mocked(dialog.showOpenDialog).mockReset().mockResolvedValue({ canceled: true, filePaths: [] });
   vi.mocked(shell.openPath).mockReset().mockResolvedValue('');
   vi.mocked(shell.openExternal).mockReset().mockResolvedValue(undefined);
   vi.mocked(app.getVersion).mockReset().mockReturnValue('0.0.0');
@@ -383,6 +387,90 @@ describe('settings writes from more than one UI', () => {
 });
 
 describe('root namespace invariants', () => {
+  it('uses allComputer as the sole mode authority and snapshots/restores the current explicit roots', async () => {
+    const base = defaultConfig();
+    const originalRoots = [{ name: 'project', path: dir }];
+    await saveConfig({
+      ...base,
+      roots: originalRoots,
+      allComputer: false,
+      previousRoots: []
+    });
+
+    const enabled = await toggleAllComputer();
+    expect(enabled.ok, enabled.error).toBe(true);
+    expect(getConfig().allComputer).toBe(true);
+    expect(getConfig().previousRoots).toEqual(originalRoots);
+    expect(getConfig().roots.length).toBeGreaterThan(0);
+
+    const disabled = await toggleAllComputer();
+    expect(disabled.ok, disabled.error).toBe(true);
+    expect(getConfig().allComputer).toBe(false);
+    expect(getConfig().previousRoots).toEqual([]);
+    expect(getConfig().roots).toEqual(originalRoots);
+
+    await toggleAllComputer();
+    const firstDrive = getConfig().roots[0]!;
+    const removed = await removeRoot({ name: firstDrive.name });
+    expect(removed.ok, removed.error).toBe(true);
+    const editedRoots = structuredClone(getConfig().roots);
+    expect(getConfig().allComputer).toBe(false);
+    expect(getConfig().previousRoots).toEqual([]);
+
+    const enabledAgain = await toggleAllComputer();
+    expect(enabledAgain.ok, enabledAgain.error).toBe(true);
+    expect(getConfig().allComputer).toBe(true);
+    expect(getConfig().previousRoots).toEqual(editedRoots);
+  });
+
+  it('exits All Computer and clears the restore snapshot on every manual root mutation', async () => {
+    const base = defaultConfig();
+    const priorRoots = [{ name: 'prior', path: dir }];
+
+    await saveConfig({
+      ...base,
+      roots: [{ name: 'drive', path: path.parse(dir).root }],
+      allComputer: true,
+      previousRoots: priorRoots
+    });
+    const renamed = await renameRoot({ name: 'drive', newName: 'renamed-drive' });
+    expect(renamed.ok, renamed.error).toBe(true);
+    expect(getConfig().allComputer).toBe(false);
+    expect(getConfig().previousRoots).toEqual([]);
+    expect(getConfig().roots[0]?.name).toBe('renamed-drive');
+
+    await saveConfig({
+      ...base,
+      roots: [{ name: 'drive', path: path.parse(dir).root }],
+      allComputer: true,
+      previousRoots: priorRoots
+    });
+    const removed = await removeRoot({ name: 'drive' });
+    expect(removed.ok, removed.error).toBe(true);
+    expect(getConfig().allComputer).toBe(false);
+    expect(getConfig().previousRoots).toEqual([]);
+    expect(getConfig().roots).toEqual([]);
+
+    await saveConfig({
+      ...base,
+      roots: [{ name: 'drive', path: path.parse(dir).root }],
+      allComputer: true,
+      previousRoots: priorRoots
+    });
+    currentWindow = {
+      setBackgroundColor: vi.fn(),
+      isDestroyed: () => false,
+      webContents: { send: vi.fn() }
+    };
+    vi.mocked(dialog.showOpenDialog).mockResolvedValue({ canceled: false, filePaths: [dir] });
+    const added = await addRoot();
+    expect(added.ok, added.error).toBe(true);
+    expect(getConfig().allComputer).toBe(false);
+    expect(getConfig().previousRoots).toEqual([]);
+    expect(getConfig().roots).toHaveLength(2);
+    expect(getConfig().roots.some((root) => root.path === dir)).toBe(true);
+  });
+
   it('refuses a live rename into the reserved /skills namespace', async () => {
     const base = defaultConfig();
     await saveConfig({

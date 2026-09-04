@@ -11,6 +11,98 @@ afterEach(() => {
   vi.resetModules();
 });
 
+it('uses config.allComputer exactly and confirms before granting full-drive access', async () => {
+  const html = await fs.readFile(path.join(process.cwd(), 'src', 'renderer', 'index.html'), 'utf8');
+  dom = new JSDOM(html, { url: 'https://local.test/', pretendToBeVisual: true });
+  const w = dom.window;
+  Object.assign(globalThis, {
+    window: w,
+    document: w.document,
+    HTMLElement: w.HTMLElement,
+    Element: w.Element,
+    Node: w.Node,
+    DocumentFragment: w.DocumentFragment,
+    HTMLInputElement: w.HTMLInputElement,
+    HTMLSelectElement: w.HTMLSelectElement,
+    HTMLTextAreaElement: w.HTMLTextAreaElement,
+    HTMLButtonElement: w.HTMLButtonElement
+  });
+  if (!(w.HTMLElement.prototype as any).scrollIntoView) (w.HTMLElement.prototype as any).scrollIntoView = () => {};
+
+  const baseConfig = {
+    roots: [{ name: 'c', path: 'C:\\' }],
+    allComputer: false,
+    previousRoots: [],
+    readOnly: false,
+    capabilities: {
+      browse: true, search: true, read: true, metadata: true,
+      create: true, edit: true, move: true, deleteFile: true, command: true,
+      screen: true, control: true, clipboardRead: true, clipboardWrite: true
+    },
+    tunnel: { kind: 'openai', tunnelId: '', desktopTunnelId: '', binaryPath: '' },
+    ui: { minimizeToTray: true, autoConnect: false, privacyScreenshots: false, theme: 'light' },
+    sessions: { record: true, retainDays: 30, advisoryTokens: 300000, limitTokens: 400000 },
+    compaction: { auto: true, autoTokens: 300000 },
+    multiAgent: { enabled: false, maxWorkers: 2 },
+    goal: {
+      enabled: false,
+      model: 'deepseek/deepseek-v4-flash',
+      reasoning: 'default' as const,
+      prompt: DEFAULT_GOAL_SYSTEM_PROMPT
+    }
+  };
+  const appState = (config: typeof baseConfig) => ({
+    config,
+    status: { state: 'disconnected', detail: '', publicUrl: null, localUrl: null, handshakeAt: null, lastRequestAt: null, lastToolCallAt: null, health: null, surfaces: [] },
+    hasApiKey: false,
+    hasGoalKey: false,
+    resolvedBinary: null,
+    bundledTunnelVersion: null,
+    bridge: { running: true, port: 8765, paired: false, present: false, lastSeenAt: null }
+  });
+  let current = appState(baseConfig);
+  const toggleAllComputer = vi.fn(async () => ({
+    ok: true as const,
+    data: (current = appState({ ...baseConfig, allComputer: !current.config.allComputer }))
+  }));
+  const confirm = vi.fn<() => boolean>().mockReturnValueOnce(false).mockReturnValueOnce(true);
+  Object.defineProperty(w, 'confirm', { value: confirm, configurable: true });
+  const ok = (data: any) => Promise.resolve({ ok: true as const, data });
+  const api: any = new Proxy({
+    getState: () => ok(current),
+    getLog: () => ok([]),
+    getSwarm: () => ok({ running: false, runId: null, agents: [], maxWorkers: 2, pendingReports: 0 }),
+    toggleAllComputer,
+    onStateChanged: () => () => undefined,
+    onLogEntry: () => () => undefined,
+    onSwarmChanged: () => () => undefined,
+    onSessionChanged: () => () => undefined,
+    listSessions: () => ok({ sessions: [], activeId: null, pressure: [] })
+  }, { get(target, prop) { if (prop in target) return (target as any)[prop]; return (..._args: any[]) => ok(null); } });
+  Object.defineProperty(w, 'api', { value: api, configurable: true });
+
+  await import('../src/renderer/main.js');
+  await new Promise((resolve) => setTimeout(resolve, 0));
+
+  const button = w.document.getElementById('allComputerBtn') as HTMLButtonElement;
+  expect(button.classList.contains('is-on')).toBe(false);
+  expect(button.title).toBe('Grant access to all computer drives');
+
+  button.click();
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  expect(confirm).toHaveBeenCalledTimes(1);
+  expect(toggleAllComputer).not.toHaveBeenCalled();
+
+  button.click();
+  await vi.waitFor(() => expect(toggleAllComputer).toHaveBeenCalledTimes(1));
+  expect(confirm).toHaveBeenCalledTimes(2);
+  await vi.waitFor(() => expect(button.classList.contains('is-on')).toBe(true));
+
+  button.click();
+  await vi.waitFor(() => expect(toggleAllComputer).toHaveBeenCalledTimes(2));
+  expect(confirm).toHaveBeenCalledTimes(2);
+});
+
 it('does not overwrite a focused dirty settings field on an unsolicited state push', async () => {
   const html = await fs.readFile(path.join(process.cwd(), 'src', 'renderer', 'index.html'), 'utf8');
   dom = new JSDOM(html, { url: 'https://local.test/', pretendToBeVisual: true });
