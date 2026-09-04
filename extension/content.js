@@ -578,6 +578,12 @@
   }
 
   let documentReady = null;
+  let startupLoopTransfer = null;
+  let recoveryProgressTracking = false;
+  let recoveryProgressArmed = false;
+  let recoveryProgressObserved = false;
+  let recoveryProgressSending = false;
+  let recoveryProgressSent = false;
 
   async function sendToWorker(message) {
     if (!alive) return null;
@@ -605,8 +611,42 @@
       observed.blocked = (registered && registered.error) || 'worker_unreachable';
       return registered;
     }
+    if (!startupLoopTransfer && registered.recovery && typeof registered.recovery === 'object') {
+      startupLoopTransfer = registered.recovery;
+    }
     observed.blocked = null;
     return sendToWorker({ ...message, navigationEpoch: epoch });
+  }
+
+  function noteRecoveryProgressEvidence(observation) {
+    if (!recoveryProgressTracking || recoveryProgressSent || !startupLoopTransfer) return;
+    const kind = observation && typeof observation.kind === 'string' ? observation.kind : '';
+    if (kind !== 'assistant_message' && kind !== 'page_tool' && kind !== 'turn_end') return;
+    recoveryProgressObserved = true;
+    void flushRecoveryProgressEvidence();
+  }
+
+  async function flushRecoveryProgressEvidence() {
+    if (
+      !recoveryProgressArmed ||
+      !recoveryProgressObserved ||
+      recoveryProgressSending ||
+      recoveryProgressSent ||
+      !startupLoopTransfer?.id
+    ) {
+      return false;
+    }
+    recoveryProgressSending = true;
+    try {
+      const reply = await ask({ type: 'recovery_progress', recoveryId: startupLoopTransfer.id });
+      if (reply && reply.ok === true) {
+        recoveryProgressSent = true;
+        return true;
+      }
+      return false;
+    } finally {
+      recoveryProgressSending = false;
+    }
   }
 
   // ------------------------------------------------------------- observing
@@ -674,6 +714,7 @@
     observed.lastKind = typeof queued.event.kind === 'string' ? queued.event.kind : null;
     observed.lastAt = queued.event.time;
     accountQueueEntry(queued);
+    noteRecoveryProgressEvidence(queued.event);
     // The service-worker journal already records an explicit gap when *its* durable queue has
     // to evict data. Do the same one layer earlier. Silently splicing the oldest observation
     // here made a long service-worker outage look like a complete transcript even though item
@@ -4652,6 +4693,7 @@
   let autoLoopTurns = 0;
   const MAX_AUTO_LOOP_TURNS = 20;
   let autoLoopTimer = null;
+  let autoLoopTransferPending = false;
 
   // Watchdog state: activity-aware tracking instead of blind timers
   let autoLoopPromptSentAt = 0;
@@ -4765,6 +4807,39 @@
 
   let autoLoopLastReason = '';
   let autoLoopRecentFingerprints = [];
+  let currentExecutionRunId = null;
+  let autoLoopRecoveryGeneration = 0;
+
+  function autoLoopSnapshot() {
+    return {
+      mode: autoLoopMode === 'infinite' ? 'infinite' : 'standard',
+      turns: autoLoopTurns,
+      lastReason: autoLoopLastReason || '',
+      recentFingerprints: autoLoopRecentFingerprints.slice(-8),
+      executionRunId: currentExecutionRunId || null,
+      recoveryGeneration: autoLoopRecoveryGeneration
+    };
+  }
+
+  function restoreAutoLoopSnapshot(snapshot) {
+    if (!snapshot || (snapshot.mode !== 'standard' && snapshot.mode !== 'infinite')) return false;
+    if (!Number.isInteger(snapshot.turns) || snapshot.turns < 0) return false;
+    autoLoopActive = true;
+    autoLoopMode = snapshot.mode;
+    autoLoopTurns = snapshot.turns;
+    autoLoopLastReason = typeof snapshot.lastReason === 'string' ? snapshot.lastReason : '';
+    autoLoopRecentFingerprints = Array.isArray(snapshot.recentFingerprints)
+      ? snapshot.recentFingerprints.filter((value) => typeof value === 'string').slice(-8)
+      : [];
+    currentExecutionRunId = typeof snapshot.executionRunId === 'string' && snapshot.executionRunId
+      ? snapshot.executionRunId
+      : null;
+    autoLoopRecoveryGeneration = Number.isInteger(snapshot.recoveryGeneration) && snapshot.recoveryGeneration >= 0
+      ? snapshot.recoveryGeneration + 1
+      : 1;
+    clearAutoLoopWatchdog();
+    return true;
+  }
 
   function normalizeForSimilarity(text) {
     if (!text || typeof text !== 'string') return '';
@@ -4928,117 +5003,73 @@
     }
   }
 
-  function recoverOrRolloverAutoLoop(reason) {
-    if (!autoLoopActive) return;
+  function safeRolloverExcerpt(value, limit) {
+    if (!value || typeof value !== 'string') return '';
+    return value
+      .replace(/\b(?:api[_ -]?key|password|secret|bearer|token|credential)\b\s*[:=]\s*\S+/gi, '[redacted]')
+      .replace(/\b(?:documentId|tabId|navigationEpoch)\b\s*[:=]\s*\S+/gi, '[browser identity omitted]')
+      .replace(/\b(?:ghp|github_pat|xox[baprs]|sk)-[A-Za-z0-9_-]{12,}\b/g, '[redacted]')
+      .replace(/\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}(?:\.[A-Za-z0-9_-]{10,})?\b/g, '[redacted]')
+      .slice(0, limit)
+      .trim();
+  }
+
+  function buildManualRolloverText(reason) {
+    const taskCtx = extractOngoingTaskContext();
+    const pieces = [
+      MCP_TRIGGER_PREFIX.trimEnd(),
+      '',
+      `Continue ONLY the interrupted task from the prior ChatGPT conversation${reason ? ` (${safeRolloverExcerpt(reason, 300)})` : ''}.`,
+      'Do not pick up unrelated repository work or unrelated uncommitted changes.'
+    ];
+    const title = safeRolloverExcerpt(taskCtx.title, 500);
+    const root = safeRolloverExcerpt(taskCtx.rootPrompt, 2_000);
+    const latest = safeRolloverExcerpt(taskCtx.latestUserPrompt, 1_500);
+    const progress = safeRolloverExcerpt(taskCtx.lastAssistantSummary, 2_500);
+    if (title) pieces.push('', `[TASK TITLE]\n${title}`);
+    if (root) pieces.push('', `[INTERRUPTED TASK]\n${root}`);
+    if (latest && latest !== root) pieces.push('', `[LATEST USER INSTRUCTION]\n${latest}`);
+    if (progress) pieces.push('', `[LAST ASSISTANT PROGRESS]\n${progress}`);
+    pieces.push('', 'Resume from this state, inspect only relevant files, and continue implementation and verification until the interrupted task is complete.');
+    return pieces.join('\n').slice(0, 8_000);
+  }
+
+  async function recoverOrRolloverAutoLoop(reason, options = {}) {
+    if (!autoLoopActive || autoLoopTransferPending) return false;
     const currentConvId = CLF_DOM.conversationId() || conversationId;
-
-    let recoverCount = 0;
+    if (!currentConvId) {
+      stopAutoLoop('Recovery could not be started');
+      return false;
+    }
+    autoLoopTransferPending = true;
     try {
-      if (currentConvId) {
-        recoverCount = Number(sessionStorage.getItem('cos_conv_recover_' + currentConvId)) || 0;
+      const reply = await ask({
+        type: 'recover_conversation_tab',
+        conversationId: currentConvId,
+        loop: autoLoopSnapshot(),
+        reason: reason || 'stall_recovery',
+        rolloverText: buildManualRolloverText(reason),
+        ...(options.forceRollover === true ? { forceRollover: true } : {})
+      });
+      if (!reply || reply.ok !== true) {
+        stopAutoLoop('Recovery could not be started');
+        return false;
       }
-    } catch {}
-
-    // If we have an existing conversation and haven't exceeded 3 recoveries,
-    // reopen the same conversation URL in a clean tab (and close the stalled tab).
-    // This preserves 100% of context, history, and files on ChatGPT natively!
-    if (currentConvId && recoverCount < 3) {
-      try {
-        sessionStorage.setItem('cos_conv_recover_' + currentConvId, String(recoverCount + 1));
-      } catch {}
-
       autoLoopActive = false;
       if (autoLoopTimer) {
         clearTimeout(autoLoopTimer);
         autoLoopTimer = null;
       }
       clearAutoLoopWatchdog();
-
-      const recoveryUrl = `https://chatgpt.com/c/${currentConvId}?cos_autoloop=1&cos_mode=${encodeURIComponent(autoLoopMode)}&cos_resume=1`;
-
-      try {
-        localStorage.setItem(
-          'cos_autoloop_pending',
-          JSON.stringify({
-            active: true,
-            mode: autoLoopMode,
-            conversationId: currentConvId,
-            resumeSameChat: true,
-            reason: reason || 'stall_recovery',
-            timestamp: Date.now()
-          })
-        );
-      } catch {}
-
-      void ask({ type: 'recover_conversation_tab', url: recoveryUrl })
-        .then((res) => {
-          if (!res || !res.ok) {
-            window.location.href = recoveryUrl;
-          }
-        })
-        .catch(() => {
-          window.location.href = recoveryUrl;
-        });
-      return;
+      renderControl();
+      return true;
+    } finally {
+      autoLoopTransferPending = false;
     }
-
-    // Fallback: If no conversation ID exists yet (root URL), or if repeated recoveries failed, rollover to a new chat
-    rolloverToNewChat(reason);
   }
 
   function rolloverToNewChat(reason) {
-    if (!autoLoopActive) return;
-    autoLoopActive = false;
-    if (autoLoopTimer) {
-      clearTimeout(autoLoopTimer);
-      autoLoopTimer = null;
-    }
-    clearAutoLoopWatchdog();
-
-    const taskCtx = extractOngoingTaskContext();
-    let rolloverPrompt = `${MCP_TRIGGER_PREFIX}`;
-    rolloverPrompt += `Transferred to this clean session to resume ongoing work${reason ? ` (${reason})` : ''}.\n\n`;
-
-    if (taskCtx.rootPrompt || taskCtx.title) {
-      rolloverPrompt += `CRITICAL INSTRUCTION: Continue ONLY the specific task that was interrupted in the previous session. Do NOT pick up unrelated uncommitted changes or work on other features that may be present in the workspace.\n\n`;
-      if (taskCtx.title) {
-        rolloverPrompt += `[TASK TITLE]: ${taskCtx.title}\n`;
-      }
-      if (taskCtx.rootPrompt) {
-        rolloverPrompt += `[INTERRUPTED TASK / ORIGINAL USER REQUEST]:\n${taskCtx.rootPrompt}\n\n`;
-      }
-      if (taskCtx.latestUserPrompt && taskCtx.latestUserPrompt !== taskCtx.rootPrompt) {
-        rolloverPrompt += `[LATEST INSTRUCTION BEFORE STALL]:\n${taskCtx.latestUserPrompt}\n\n`;
-      }
-      if (taskCtx.lastAssistantSummary) {
-        rolloverPrompt += `[LAST KNOWN PROGRESS]:\n${taskCtx.lastAssistantSummary}\n\n`;
-      }
-      rolloverPrompt += `NEXT STEPS:\n`;
-      rolloverPrompt += `1. Review the progress on THIS specific task only.\n`;
-      rolloverPrompt += `2. Inspect only the files and git status relevant to this task (ignore unrelated edits in the repository).\n`;
-      rolloverPrompt += `3. Continue implementing and verifying the solution until completion using your MCP tools.`;
-    } else {
-      rolloverPrompt +=
-        `TASK IN PROGRESS: Check the active task from the previous session. ` +
-        `Focus strictly on finishing the interrupted task, and continue execution immediately without stopping.`;
-    }
-
-    try {
-      localStorage.setItem(
-        'cos_autoloop_pending',
-        JSON.stringify({
-          active: true,
-          mode: autoLoopMode,
-          reason: reason || 'session_transfer',
-          prompt: rolloverPrompt,
-          timestamp: Date.now()
-        })
-      );
-    } catch {
-      // ignore storage error
-    }
-
-    window.location.href = 'https://chatgpt.com/?cos_autoloop=1&cos_mode=' + encodeURIComponent(autoLoopMode);
+    return recoverOrRolloverAutoLoop(reason, { forceRollover: true });
   }
 
   async function sendAutoLoopPrompt(promptText) {
@@ -5854,8 +5885,10 @@
    * returns whatever it would return anyway and advances nothing, and reads one number off
    * the answer. Null means the app could not be asked, which is not the same as zero.
    */
-  async function peekPendingTools() {
-    const reply = await ask({ type: 'activity', conversationId, since });
+  async function peekPendingTools(conversationOverride = null) {
+    const targetConversation = conversationOverride || conversationId;
+    if (!targetConversation) return null;
+    const reply = await ask({ type: 'activity', conversationId: targetConversation, since });
     if (!reply || reply.ok !== true || !reply.data) return null;
     const count = Number(reply.data.pendingTools);
     return Number.isFinite(count) ? count : 0;
@@ -6278,113 +6311,162 @@
     });
   }
 
-  async function checkAndResumeAutoLoopRollover() {
-    let pending = null;
+  function clearLegacyAutoLoopState() {
     try {
-      const raw = localStorage.getItem('cos_autoloop_pending');
-      if (raw) {
-        pending = JSON.parse(raw);
-        if (Date.now() - pending.timestamp > 300_000) {
-          pending = null;
-          localStorage.removeItem('cos_autoloop_pending');
+      localStorage.removeItem('cos_autoloop_pending');
+    } catch {}
+    try {
+      const legacyKeys = [];
+      for (let i = 0; i < sessionStorage.length; i++) {
+        const key = sessionStorage.key(i);
+        if (key && key.startsWith('cos_conv_recover_')) legacyKeys.push(key);
+      }
+      for (const key of legacyKeys) sessionStorage.removeItem(key);
+    } catch {}
+    try {
+      const current = new URL(window.location.href);
+      let changed = false;
+      for (const key of ['cos_autoloop', 'cos_mode', 'cos_resume']) {
+        if (current.searchParams.has(key)) {
+          current.searchParams.delete(key);
+          changed = true;
         }
       }
-    } catch {
-      pending = null;
+      if (changed) {
+        const query = current.searchParams.toString();
+        window.history.replaceState({}, '', `${current.pathname}${query ? `?${query}` : ''}${current.hash}`);
+      }
+    } catch {}
+  }
+
+  async function confirmStartupLoopReady(conversationIdValue = null) {
+    if (!startupLoopTransfer?.id) return false;
+    const reply = await ask({
+      type: 'recovery_ready',
+      recoveryId: startupLoopTransfer.id,
+      ...(conversationIdValue ? { conversationId: conversationIdValue } : {})
+    });
+    if (!reply || reply.ok !== true) {
+      stopAutoLoop('Recovery could not be confirmed');
+      return false;
     }
+    recoveryProgressArmed = true;
+    void flushRecoveryProgressEvidence();
+    return true;
+  }
 
-    const hasParam = typeof window !== 'undefined' && window.location && window.location.search.includes('cos_autoloop=1');
-    const hasInfiniteParam = typeof window !== 'undefined' && window.location && window.location.search.includes('cos_mode=infinite');
-    const isResumeSameChat = (pending && pending.resumeSameChat === true) || (typeof window !== 'undefined' && window.location && window.location.search.includes('cos_resume=1'));
-    if (!pending && !hasParam) return;
-
-    if (hasParam) {
-      try {
-        const cleanUrl = window.location.pathname;
-        window.history.replaceState({}, '', cleanUrl);
-      } catch {}
+  async function recoveryComposerSafe() {
+    const composer = CLF_DOM.composer();
+    if (!composer || !composer.isConnected) return false;
+    if ((composer.textContent || '').trim()) {
+      stopAutoLoop('User draft present in composer');
+      return false;
     }
-
-    if (pending) {
-      try {
-        localStorage.removeItem('cos_autoloop_pending');
-      } catch {}
+    const tools = await peekPendingTools();
+    if (tools !== 0) {
+      stopAutoLoop(tools === null ? 'Local tool state could not be verified' : 'Local tools are still running');
+      return false;
     }
+    return true;
+  }
 
-    autoLoopActive = true;
-    autoLoopMode = pending?.mode || (hasInfiniteParam ? 'infinite' : 'standard');
-    autoLoopTurns = 0;
-    autoLoopLastReason = isResumeSameChat
-      ? 'Resumed same conversation (' + (pending?.reason || 'stall recovery') + ')'
-      : 'Auto resumed (' + (pending?.reason || 'new session') + ')';
+  async function checkAndResumeAutoLoopRollover() {
+    clearLegacyAutoLoopState();
+    const transfer = startupLoopTransfer;
+    if (!transfer) return;
+    if (!restoreAutoLoopSnapshot(transfer.loop)) {
+      stopAutoLoop('Recovery state was invalid');
+      return;
+    }
     renderControl();
-    markAutoLoopPromptSent();
 
-    if (isResumeSameChat) {
+    if (transfer.kind === 'recovery') {
+      const expectedConversation = typeof transfer.conversationId === 'string' ? transfer.conversationId : '';
+      const currentConversation = CLF_DOM.conversationId() || conversationId || '';
+      if (!expectedConversation || currentConversation !== expectedConversation) {
+        stopAutoLoop('Recovery target changed');
+        return;
+      }
+      recoveryProgressTracking = true;
       const readyComposer = await waitForComposer();
-      if (!readyComposer) return;
-
-      // Allow 1.5s for ChatGPT to hydrate existing conversation turns
+      if (!readyComposer) {
+        stopAutoLoop('Recovery composer was unavailable');
+        return;
+      }
       await sleep(1500);
-
-      // If ChatGPT is already streaming/generating (e.g. reconnected on reload), don't inject anything
-      if (generating || CLF_DOM.generating()) {
-        markAutoLoopPromptSent();
-        renderControl();
+      if ((CLF_DOM.conversationId() || conversationId || '') !== expectedConversation) {
+        stopAutoLoop('Recovery target changed');
         return;
       }
 
-      // Check the latest assistant turn in the existing conversation
+      if (generating || CLF_DOM.generating()) {
+        markAutoLoopPromptSent();
+        renderControl();
+        await confirmStartupLoopReady(expectedConversation);
+        return;
+      }
+
+      if (!(await confirmStartupLoopReady(expectedConversation))) return;
+      if (!(await recoveryComposerSafe())) return;
+
       const allTurns = typeof CLF_DOM.turns === 'function' ? CLF_DOM.turns() : [];
-      const lastAssistantTurn = allTurns.filter((t) => t && t.role === 'assistant').pop();
+      const lastAssistantTurn = allTurns.filter((turn) => turn && turn.role === 'assistant').pop();
       const lastText = lastAssistantTurn
         ? (finalAnswerText(lastAssistantTurn) || answerText(lastAssistantTurn))
         : '';
       const parsed = parseLoopStatusAndStep(lastText);
-
-      // If the turn completed while tab was recovering and mode is infinite, evolve to next milestone
       if (parsed.status === 'COMPLETED') {
-        if (autoLoopMode === 'infinite') {
-          scheduleAutoLoopPrompt(getInfiniteLoopEvolutionPrompt(), 1000);
-        } else {
-          stopAutoLoop('Goal achieved!');
-        }
+        await handleAutoLoopTurnEnd(lastText);
         return;
       }
-
-      // Turn was stalled/interrupted: send a simple continuation nudge in the same chat
       const continuePrompt = parsed.nextStep
         ? getContinuationPrompt(parsed.nextStep)
-        : `${MCP_TRIGGER_PREFIX}Please continue where you left off without stopping.`;
-
+        : 'Please continue where you left off without stopping.';
       scheduleAutoLoopPrompt(continuePrompt, 1000);
       return;
     }
 
-    let promptToSend =
-      pending?.prompt ||
-      ('Transferred to this clean session. Task in progress: resume ongoing work and execute the next steps immediately without stopping.');
-    if (!promptToSend.startsWith('@Chat On Steroids')) {
-      promptToSend = `${MCP_TRIGGER_PREFIX}${promptToSend}`;
+    if (transfer.kind !== 'rollover' || typeof transfer.rolloverText !== 'string' || !transfer.rolloverText.trim()) {
+      stopAutoLoop('Recovery state was invalid');
+      return;
     }
-
-    for (let i = 0; i < 40; i++) {
-      await sleep(500);
-      const composer = CLF_DOM.composer();
-      if (composer) {
-        await sleep(300);
-        if (CLF_DOM.insertPrompt(promptToSend)) {
-          await sleep(250);
-          const sent = await CLF_DOM.send();
-          if (sent) {
-            autoLoopTurns = 1;
-            renderControl();
-            markAutoLoopPromptSent();
-            break;
-          }
-        }
-      }
+    if (CLF_DOM.conversationId() || conversationId) {
+      stopAutoLoop('Recovery target changed');
+      return;
     }
+    recoveryProgressTracking = true;
+    const composer = await waitForComposer();
+    if (!composer) {
+      stopAutoLoop('Recovery composer was unavailable');
+      return;
+    }
+    await sleep(300);
+    if ((composer.textContent || '').trim()) {
+      stopAutoLoop('User draft present in composer');
+      return;
+    }
+    const sourceConversation = typeof transfer.sourceConversationId === 'string' ? transfer.sourceConversationId : '';
+    const tools = await peekPendingTools(sourceConversation);
+    if (tools !== 0) {
+      stopAutoLoop(tools === null ? 'Local tool state could not be verified' : 'Local tools are still running');
+      return;
+    }
+    let promptToSend = transfer.rolloverText.trim();
+    if (!promptToSend.startsWith('@Chat On Steroids')) promptToSend = `${MCP_TRIGGER_PREFIX}${promptToSend}`;
+    if (!CLF_DOM.insertPrompt(promptToSend)) {
+      stopAutoLoop('Recovery continuation could not be inserted');
+      return;
+    }
+    await sleep(250);
+    const sent = await CLF_DOM.send();
+    if (!sent) {
+      stopAutoLoop('Recovery continuation could not be sent');
+      return;
+    }
+    autoLoopTurns++;
+    markAutoLoopPromptSent();
+    renderControl();
+    await confirmStartupLoopReady(CLF_DOM.conversationId() || conversationId || null);
   }
 
   // A marked page has exactly one job before ordinary page restoration: deliver the
@@ -6397,6 +6479,7 @@
   // On an ordinary existing chat there is no marker and this resolves immediately, after
   // which the established reload handshake remains unchanged: resumeOpenTurn() is still
   // awaited before the first observe() so a reloaded live turn cannot be duplicated.
+  clearLegacyAutoLoopState();
   const commandStartup = markerId() ? runCommand() : Promise.resolve();
   void commandStartup
     .catch(() => undefined)

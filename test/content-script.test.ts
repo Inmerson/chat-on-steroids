@@ -135,6 +135,11 @@ interface Hook {
   setRenderStream(on: boolean): void;
   renderStreamEnabled(): boolean;
   setShowTimes(on: boolean): void;
+  toggleAutoLoop(): void;
+  stopAutoLoop(reason?: string): void;
+  handleAutoLoopTurnEnd(answer: string): Promise<void>;
+  isAutoLoopActive(): boolean;
+  getAutoLoopTurns(): number;
   /** How long Overwrite leaves a user-driven scroll completely presentation-stable. */
   PRESENTATION_SCROLL_IDLE_MS: number;
 }
@@ -9211,7 +9216,10 @@ describe('Loop recovery transfer startup', () => {
 
     live = await harness(
       url,
-      { register_document: () => ({ ok: true, recovery }) },
+      {
+        register_document: () => ({ ok: true, recovery }),
+        recovery_ready: () => ({ ok: true })
+      },
       (document, dom) => {
         startGenerating(document);
         dom.window.localStorage.setItem(
@@ -9235,6 +9243,259 @@ describe('Loop recovery transfer startup', () => {
     const loopButton = live.document.querySelector('.clf-loop-btn');
     expect(loopButton).not.toBeNull();
     expect(loopButton?.textContent).toBe('♾️ Infinite (7)');
+    expect(live.sent.filter((message) => message.type === 'recovery_ready')).toEqual([
+      expect.objectContaining({ recoveryId: recovery.id, conversationId: recovery.conversationId })
+    ]);
+    expect(live.window.localStorage.getItem('cos_autoloop_pending')).toBeNull();
+  });
+
+  it('never treats legacy page storage as recovery authority without a scoped transfer', async () => {
+    const chat = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee';
+    live = await harness(`https://chatgpt.com/c/${chat}?model=gpt-5#section`, {}, (_document, dom) => {
+      dom.window.localStorage.setItem(
+        'cos_autoloop_pending',
+        JSON.stringify({
+          active: true,
+          mode: 'infinite',
+          conversationId: chat,
+          resumeSameChat: true,
+          reason: 'stale global state',
+          timestamp: 1_700_000_000_000
+        })
+      );
+      dom.window.sessionStorage.setItem(`cos_conv_recover_${chat}`, '2');
+    });
+    await settle(100);
+
+    expect(live.hook.isAutoLoopActive()).toBe(false);
+    expect(live.sent.filter((message) => message.type === 'recovery_ready')).toEqual([]);
+    expect(live.window.localStorage.getItem('cos_autoloop_pending')).toBeNull();
+    expect(live.window.sessionStorage.getItem(`cos_conv_recover_${chat}`)).toBeNull();
+  });
+
+  it('fails closed when a recovery payload names a different conversation', async () => {
+    const current = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee';
+    const recovery = {
+      id: 'loop-transfer-wrong-chat',
+      kind: 'recovery',
+      conversationId: '11111111-2222-3333-4444-555555555555',
+      loop: {
+        mode: 'standard',
+        turns: 3,
+        lastReason: 'stall',
+        recentFingerprints: [],
+        executionRunId: null,
+        recoveryGeneration: 1
+      },
+      reason: 'stall',
+      attempt: 1,
+      rolloverText: null
+    };
+    live = await harness(`https://chatgpt.com/c/${current}`, {
+      register_document: () => ({ ok: true, recovery }),
+      recovery_ready: () => ({ ok: true })
+    });
+    await settle(100);
+
+    expect(live.hook.isAutoLoopActive()).toBe(false);
+    expect(live.sent.filter((message) => message.type === 'recovery_ready')).toEqual([]);
+  });
+
+  it('reports genuine recovered progress once, not merely because the page loaded', async () => {
+    const chat = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee';
+    const recovery = {
+      id: 'loop-transfer-progress',
+      kind: 'recovery',
+      conversationId: chat,
+      loop: {
+        mode: 'standard',
+        turns: 4,
+        lastReason: 'stall',
+        recentFingerprints: [],
+        executionRunId: null,
+        recoveryGeneration: 1
+      },
+      reason: 'stall',
+      attempt: 1,
+      rolloverText: null
+    };
+    live = await harness(
+      `https://chatgpt.com/c/${chat}`,
+      {
+        register_document: () => ({ ok: true, recovery }),
+        recovery_ready: () => ({ ok: true }),
+        recovery_progress: () => ({ ok: true, reset: true })
+      },
+      (document) => startGenerating(document)
+    );
+    await settle(100);
+    expect(live.sent.filter((message) => message.type === 'recovery_progress')).toEqual([]);
+
+    live.hook.emit({ kind: 'assistant_message', messageId: 'new-progress', text: 'New recovered output.' });
+    await settle(100);
+    live.hook.emit({ kind: 'turn_end', turnId: 'recovered-turn', outcome: 'completed' });
+    await settle(100);
+
+    expect(live.sent.filter((message) => message.type === 'recovery_progress')).toEqual([
+      expect.objectContaining({ recoveryId: recovery.id })
+    ]);
+  });
+
+  it('starts recovery with semantic state and bounded manual rollover text, never a page URL', async () => {
+    const chat = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee';
+    live = await harness(
+      `https://chatgpt.com/c/${chat}?model=gpt-5#section`,
+      { recover_conversation_tab: () => ({ ok: true, transferId: 'loop-next', kind: 'recovery', attempt: 1 }) },
+      (document) => startGenerating(document)
+    );
+    userTurn(live.document, 'root-loop-user', 'Finish the exact parser migration and verify it.');
+    const assistant = assistantTurn(live.document, 'loop-assistant-progress', []);
+    const assistantMessage = live.document.createElement('div');
+    assistantMessage.setAttribute('data-message-id', 'loop-assistant-message');
+    assistantMessage.setAttribute('data-message-author-role', 'assistant');
+    const assistantBody = live.document.createElement('div');
+    assistantBody.className = 'markdown';
+    assistantBody.textContent = 'Parser migration is halfway complete.';
+    assistantMessage.append(assistantBody);
+    assistant.append(assistantMessage);
+
+    live.hook.toggleAutoLoop();
+    await live.hook.handleAutoLoopTurnEnd('Too many requests. Please try again later.');
+    await settle(100);
+
+    const request = live.sent.find((message) => message.type === 'recover_conversation_tab');
+    expect(request).toBeDefined();
+    if (!request) throw new Error('recovery request was not emitted');
+    expect(request).not.toHaveProperty('url');
+    expect(request).toMatchObject({
+      conversationId: chat,
+      loop: expect.objectContaining({ mode: 'standard', executionRunId: null }),
+      reason: 'ChatGPT rate limit or service error encountered'
+    });
+    expect(request.rolloverText).toContain('Continue ONLY the interrupted task');
+    expect(request.rolloverText).toContain('Finish the exact parser migration and verify it.');
+    expect(request.rolloverText.length).toBeLessThanOrEqual(8_000);
+    expect(request.rolloverText).not.toMatch(/cos_autoloop|documentId|tabId|token|credential/i);
+  });
+
+  it('keeps the source page open and stops Loop when the recovery transaction cannot start', async () => {
+    const chat = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee';
+    const url = `https://chatgpt.com/c/${chat}?model=gpt-5#section`;
+    live = await harness(
+      url,
+      { recover_conversation_tab: () => ({ ok: false, error: 'source_tab_missing' }) },
+      (document) => startGenerating(document)
+    );
+    live.hook.toggleAutoLoop();
+    await live.hook.handleAutoLoopTurnEnd('Too many requests. Please try again later.');
+    await settle(100);
+
+    expect(live.window.location.href).toBe(url);
+    expect(live.hook.isAutoLoopActive()).toBe(false);
+    expect(live.document.querySelector('.clf-loop-btn')?.textContent).toContain('Stopped');
+  });
+
+  it('requests an explicit clean-chat rollover when the restored Loop reaches its turn ceiling', async () => {
+    const chat = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee';
+    const recovery = {
+      id: 'loop-transfer-at-limit',
+      kind: 'recovery',
+      conversationId: chat,
+      loop: {
+        mode: 'standard',
+        turns: 20,
+        lastReason: '',
+        recentFingerprints: [],
+        executionRunId: null,
+        recoveryGeneration: 1
+      },
+      reason: 'stall',
+      attempt: 1,
+      rolloverText: null
+    };
+    live = await harness(
+      `https://chatgpt.com/c/${chat}`,
+      {
+        register_document: () => ({ ok: true, recovery }),
+        recovery_ready: () => ({ ok: true }),
+        recover_conversation_tab: () => ({ ok: true, transferId: 'forced-rollover', kind: 'rollover', attempt: 1 })
+      },
+      (document) => startGenerating(document)
+    );
+    await settle(100);
+
+    await live.hook.handleAutoLoopTurnEnd('Work remains in progress.');
+    await settle(100);
+
+    expect(live.sent.filter((message) => message.type === 'recover_conversation_tab').at(-1)).toMatchObject({
+      conversationId: chat,
+      forceRollover: true,
+      loop: expect.objectContaining({ turns: 20 })
+    });
+  });
+
+  it('coalesces repeated stall signals while one recovery transaction is still in flight', async () => {
+    const chat = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee';
+    let releaseRecovery!: () => void;
+    const heldRecovery = new Promise((resolve) => {
+      releaseRecovery = () => resolve({ ok: true, transferId: 'one-transfer', kind: 'recovery', attempt: 1 });
+    });
+    live = await harness(
+      `https://chatgpt.com/c/${chat}`,
+      { recover_conversation_tab: () => heldRecovery },
+      (document) => startGenerating(document)
+    );
+    live.hook.toggleAutoLoop();
+
+    await Promise.all([
+      live.hook.handleAutoLoopTurnEnd('Too many requests. Please try again later.'),
+      live.hook.handleAutoLoopTurnEnd('Too many requests. Please try again later.')
+    ]);
+    await settle(50);
+    expect(live.sent.filter((message) => message.type === 'recover_conversation_tab')).toHaveLength(1);
+
+    releaseRecovery();
+    await settle(50);
+  });
+
+  it('does not send a rollover continuation while local tool state is still busy', async () => {
+    const recovery = {
+      id: 'loop-rollover-busy-tools',
+      kind: 'rollover',
+      conversationId: null,
+      sourceConversationId: 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee',
+      loop: {
+        mode: 'standard',
+        turns: 20,
+        lastReason: 'turn ceiling',
+        recentFingerprints: [],
+        executionRunId: null,
+        recoveryGeneration: 2
+      },
+      reason: 'turn ceiling',
+      attempt: 1,
+      rolloverText: '@Chat On Steroids Core\n\nContinue ONLY the interrupted task.'
+    };
+    const sends = { count: 0 };
+    live = await harness(
+      'https://chatgpt.com/',
+      {
+        register_document: () => ({ ok: true, recovery }),
+        activity: () => ({ ok: true, data: { entries: [], pendingTools: 1, job: null } }),
+        recovery_ready: () => ({ ok: true })
+      },
+      (document) => {
+        document.querySelector('[data-testid="send-button"]')!.addEventListener('click', () => {
+          sends.count += 1;
+        });
+      }
+    );
+    await settle(150);
+
+    expect(sends.count).toBe(0);
+    expect(composerText(live.document)).toBe('');
+    expect(live.hook.isAutoLoopActive()).toBe(false);
+    expect(live.sent.filter((message) => message.type === 'recovery_ready')).toEqual([]);
   });
 });
 
