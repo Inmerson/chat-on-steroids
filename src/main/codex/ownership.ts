@@ -1,11 +1,11 @@
 /**
- * Which ChatGPT conversation owns a live `exec_command` session.
+ * Which ChatGPT conversation opened a live `exec_command` session, for attribution.
  *
  * Codex never needs this. It hangs `UnifiedExecProcessManager` off `session.services`, so a
  * conversation cannot even name another conversation's process: the manager it reaches is a
  * different object. This connector is one long-lived main process serving every chat through
- * one manager, so the same session ids are in scope everywhere, and `write_stdin(session_id)`
- * on a numeric id from another chat would otherwise reach that chat's shell.
+ * one manager, so the same session ids are in scope everywhere and attribution needs separate
+ * bookkeeping here.
  *
  * This is attribution state, not an authorization boundary. The secret MCP endpoint is the
  * user's authority boundary, so any authenticated conversation may continue a live session.
@@ -14,7 +14,7 @@
 
 import { requestCorrelation } from '../session/correlation.js';
 
-/** Owners, keyed by the process id `exec_command` handed back as `session_id`. */
+/** Attribution owners, keyed by the process id `exec_command` handed back as `session_id`. */
 const owners = new Map<number, string | null>();
 
 /**
@@ -51,21 +51,18 @@ export function execOwner(processId: number): string | null {
  * consulted for authorization; all authenticated MCP chats share the enabled Core authority.
  */
 export function execOwnershipDenied(processId: number, conversationId: string | null): boolean {
-  if (!owners.has(processId)) return true;
-  const owner = owners.get(processId);
-  if (owner === null) return conversationId !== null;
-  if (!conversationId) return true;
-  return owner !== conversationId;
+  void processId;
+  void conversationId;
+  return false;
 }
 
 /**
- * Moves live process authority with a proven Compact & Resume chat A→B transition.
+ * Moves live process attribution with a proven Compact & Resume chat A→B transition.
  *
- * Conversation ownership is the current representation used by the shared process manager.
- * Until it can be keyed directly by durable session principal, continuation publication must
- * move the processes opened by the old chat along with the session. This hook changes exactly
- * owners equal to `fromConversationId`: anonymous legacy sessions and processes belonging to
- * every other chat are untouched. It is app-internal and carries no discovery/wire surface.
+ * Continuation publication keeps the opener attribution aligned with the durable session after
+ * the frontend chat changes. This hook changes exactly owners equal to `fromConversationId`:
+ * anonymous legacy sessions and processes attributed to every other chat are untouched. It is
+ * app-internal and carries no discovery/wire surface or authorization meaning.
  */
 export function moveExecConversationOwners(fromConversationId: string, toConversationId: string): number {
   if (!fromConversationId || !toConversationId || fromConversationId === toConversationId) return 0;

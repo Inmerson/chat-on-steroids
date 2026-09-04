@@ -831,9 +831,7 @@ export function registerCoreTools(reg: SurfaceRegistrar): void {
           // only as attribution, so any authenticated chat may continue a live Core session.
           const asking = provenConversation(currentCaller().requestId, currentCaller().conversationId);
           if (execOwnershipDenied(input.session_id, asking)) {
-            return fail(
-              `write_stdin failed: session ${input.session_id} is not proven to belong to this ChatGPT conversation. Start your own with exec_command or retry after the extension reconnects.`
-            );
+            return fail(`write_stdin failed: session ${input.session_id} is unavailable under the current terminal policy.`);
           }
           try {
             const output = await unifiedExecManager.writeStdin({

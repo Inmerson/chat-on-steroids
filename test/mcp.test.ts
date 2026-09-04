@@ -3153,7 +3153,7 @@ describe('exec_command and write_stdin', () => {
   });
 });
 
-describe('exec sessions belong to the chat that opened them', () => {
+describe('exec session attribution and authenticated continuation', () => {
   beforeEach(() => {
     ctx.readOnly = false;
     ctx.caps = withCaps({ command: true });
@@ -3184,7 +3184,7 @@ describe('exec sessions belong to the chat that opened them', () => {
       requestId ? { 'x-request-id': `${requestId}/att1` } : {}
     );
 
-  it('refuses write_stdin from a chat that does not own the session, and keeps serving the one that does', async () => {
+  it('allows authenticated cross-chat and unattributed continuation of a live terminal session', async () => {
     expect(prove('wfr_execown_opener', 'conv-execown-opener')).toBe('stored');
     expect(prove('wfr_execown_stranger', 'conv-execown-stranger')).toBe('stored');
 
@@ -3204,33 +3204,28 @@ describe('exec sessions belong to the chat that opened them', () => {
     const sessionId = Number(textOf(started).match(/Process running with session ID (\d+)/)?.[1]);
     expect(Number.isInteger(sessionId)).toBe(true);
 
-    // The other chat can name that small integer just as easily as its owner can. Codex never
-    // has to think about this because its manager hangs off one conversation's services.
+    // Conversation identity is attribution, not authorization. A different authenticated MCP
+    // request may continue the same live process by session id.
     const stranger = await asChat('wfr_execown_stranger', 'write_stdin', {
       session_id: sessionId,
-      chars: 'stolen\r',
-      yield_time_ms: 250
+      chars: 'cross-chat\r',
+      yield_time_ms: 1_000
     });
-    expect(stranger.body.result?.isError).toBe(true);
-    expect(textOf(stranger)).toContain(
-      `write_stdin failed: session ${sessionId} is not proven to belong to this ChatGPT conversation.`
-    );
-    expect(textOf(stranger)).not.toContain('echo=stolen');
+    expect(stranger.body.result?.isError, textOf(stranger)).not.toBe(true);
+    expect(textOf(stranger)).toContain('echo=cross-chat');
 
-    // Caller identity is the authorization boundary. An unattributed call must not inherit
-    // the owner's authority merely because it can guess the small numeric session id.
+    // Browser evidence is optional for ordinary Core authority. A request that the extension
+    // could not attribute to a conversation must still be able to continue the live session.
     const unproven = await asChat(null, 'write_stdin', {
       session_id: sessionId,
       chars: 'anon\r',
       yield_time_ms: 1_000
     });
-    expect(unproven.body.result?.isError).toBe(true);
-    expect(textOf(unproven)).toContain('is not proven to belong to this ChatGPT conversation');
-    expect(textOf(unproven)).not.toContain('echo=anon');
+    expect(unproven.body.result?.isError, textOf(unproven)).not.toBe(true);
+    expect(textOf(unproven)).toContain('echo=anon');
 
-    // The replacement session contract exposes recordings only; the removed status action no
-    // longer gives either owner or stranger a side channel into the process manager. Terminal
-    // ownership remains entirely on write_stdin, where both refusals above exercised it.
+    // The replacement session contract exposes recordings only; the removed status action does
+    // not expose the process manager. Continuation still happens through write_stdin itself.
     const recordings = await asChat('wfr_execown_stranger', 'session', { action: 'search' });
     expect(recordings.body.result?.isError).not.toBe(true);
     expect(textOf(recordings)).not.toMatch(new RegExp(`^\\s*${sessionId}\\s+pid `, 'm'));
@@ -3245,7 +3240,7 @@ describe('exec sessions belong to the chat that opened them', () => {
     expect(textOf(owner)).toContain('Process exited with code 0');
   });
 
-  it('does not let a stale owner inherit a recycled process id during the new exec yield', async () => {
+  it('clears stale terminal attribution before publishing a recycled process id', async () => {
     // Model the real lifetime split directly: the manager has released an exited process id,
     // but the separate ownership registry still carries the chat that used to own it. Force
     // the next allocator pick to reuse that number so the race is deterministic instead of a
@@ -3260,15 +3255,15 @@ describe('exec sessions belong to the chat that opened them', () => {
     const random = vi.spyOn(Math, 'random').mockReturnValue(0);
     try {
       // Block in the shell process itself. Spawning a second cold `node` here made this
-      // ownership regression depend on hosted-runner process startup rather than on the
-      // authority window it is meant to test. The shell is already the exec process and can
+      // attribution regression depend on hosted-runner process startup rather than on the
+      // publication window it is meant to test. The shell is already the exec process and can
       // wait for one line of input without another child at all.
       const holdOpen = IS_WINDOWS
         ? "$line = [Console]::In.ReadLine(); Write-Output ('got=' + $line)"
         : "IFS= read -r line; printf 'got=%s\\n' \"$line\"";
 
       // Do not await. The process is registered while exec_command spends its initial yield
-      // collecting output, which is the exact old authority window.
+      // collecting output, which is the exact stale-attribution window.
       const starting = asChat('wfr_execown_new_recycled', 'exec_command', {
         cmd: holdOpen,
         workdir: '/workspace',
@@ -3282,17 +3277,10 @@ describe('exec sessions belong to the chat that opened them', () => {
         { timeout: 5_000, interval: 10 }
       );
 
-      // Allocation must have removed the stale principal before the new process became
-      // writable. The old chat knows this integer from its own previous session, but it no
-      // longer has authority over what now happens to occupy that slot.
+      // Allocation must remove stale attribution before the new process is published. The
+      // authenticated endpoint remains the authority boundary, so this registry is not a
+      // write_stdin authorization fence.
       expect(execOwner(recycledId)).toBeNull();
-      const stolen = await asChat('wfr_execown_old_recycled', 'write_stdin', {
-        session_id: recycledId,
-        chars: 'stolen\r',
-        yield_time_ms: 50
-      });
-      expect(stolen.body.result?.isError).toBe(true);
-      expect(textOf(stolen)).toContain('is not proven to belong to this ChatGPT conversation');
 
       const started = await starting;
       expect(started.body.result?.isError, textOf(started)).not.toBe(true);
@@ -3300,17 +3288,16 @@ describe('exec sessions belong to the chat that opened them', () => {
       expect(execOwner(recycledId)).toBe('conv-execown-new');
       expect(textOf(started)).not.toContain('got=');
 
-      // Let the real owner release the shell normally. Besides proving the new principal did
-      // receive authority, this keeps cleanup deterministic instead of spending the process
-      // manager's kill grace period on an intentionally blocked test process.
-      const owner = await asChat('wfr_execown_new_recycled', 'write_stdin', {
+      // A caller attributed to the prior chat may still continue the live process because
+      // authenticated Core access, not the attribution row above, grants terminal authority.
+      const continuation = await asChat('wfr_execown_old_recycled', 'write_stdin', {
         session_id: recycledId,
-        chars: 'owner\r',
+        chars: 'cross-chat\r',
         yield_time_ms: 5_000
       });
-      expect(owner.body.result?.isError, textOf(owner)).not.toBe(true);
-      expect(textOf(owner)).toContain('got=owner');
-      expect(textOf(owner)).toContain('Process exited with code 0');
+      expect(continuation.body.result?.isError, textOf(continuation)).not.toBe(true);
+      expect(textOf(continuation)).toContain('got=cross-chat');
+      expect(textOf(continuation)).toContain('Process exited with code 0');
     } finally {
       random.mockRestore();
       await unifiedExecManager.terminateAllProcesses();
