@@ -23,6 +23,7 @@
 const PORTS = [8765, 8766, 8767, 8768, 8769];
 const HELLO_TIMEOUT_MS = 1200;
 const REQUEST_TIMEOUT_MS = 10_000;
+/** Bumped only when the request/response shape changes; the app compares it. */
 const BRIDGE_PROTOCOL = 9;
 const AGENT_TAB_BUDGET = 5;
 const MAX_AGENT_TAB_QUEUE = 400;
@@ -65,6 +66,16 @@ let loading = null;
  * for one that was told to stop, and only this flag can tell those two apart.
  */
 let disconnected = false;
+/**
+ * Monotonic user connection intent for this worker lifetime.
+ *
+ * `/pair` is an async mint. A user can press Disconnect after that request has left but
+ * before its response arrives; without an intent fence the old response writes its token and
+ * clears `disconnected`, undoing the newer click. Worker restart needs no persisted generation
+ * because an in-flight fetch cannot survive it; the persisted `disconnected` flag is the
+ * cross-worker authority.
+ */
+let connectionEpoch = 0;
 
 /**
  * The `/pair` in flight, shared by everything that wants a token.
@@ -75,6 +86,10 @@ let disconnected = false;
  * means one credential no matter how many callers arrive together.
  */
 let pairing = null;
+let pairingEpoch = -1;
+let pairingReconnect = false;
+/** Most recent pairing failure, for the popup. Process-local and never a credential. */
+let pairingError = null;
 
 /**
  * When the app was last confirmed to be on `port`, and how long that is believed for.
@@ -99,7 +114,8 @@ const PORT_TRUST_MS = 30_000;
  * app is unreachable would otherwise file A's messages into B's history.
  */
 let journal = [];
-let flushing = false;
+/** The one journal flush currently talking to the app, if any. */
+let drainWork = null;
 
 /**
  * What the last /events delivery did, kept only so the popup can show it.
@@ -159,6 +175,24 @@ let terminalDocuments = {};
  * same bootstrap into a second conversation.
  */
 let settled = [];
+/**
+ * Existing-chat revivals that a content document saw while the target chat was not yet safe for
+ * another user message. Marker + conversation only: the prime's actual text stays exclusively in
+ * the app-side durable command/broker state until a submit-ready page redeems it.
+ *
+ * Unlike the observation journal this lives in storage.local. A browser restart clears
+ * storage.session, and "browser closed while the worker's final answer is still settling" is a
+ * normal wait, not permission to lose the wake request. Stale markers are harmless because the
+ * bridge redeem is still the authority fence and rejects commands that no longer exist.
+ */
+let deferredRevivals = [];
+/** One in-flight same-tab offer per deferred command in this MV3 worker lifetime. */
+const deferredRevivalOffers = new Map();
+/**
+ * While the app-opened marked fallback exists, prefer the worker tab that already owned the
+ * conversation. Browser-session only because numeric tab ids do not survive a browser restart.
+ */
+let revivalPreferences = {};
 
 function load() {
   if (loaded) return Promise.resolve();
@@ -174,12 +208,13 @@ function load() {
 }
 
 async function loadOnce() {
-  const stored = await chrome.storage.local.get(['port', 'token', 'disconnected']);
+  const stored = await chrome.storage.local.get(['port', 'token', 'disconnected', 'deferredRevivals', 'commandAckOutbox']);
   port = typeof stored.port === 'number' ? stored.port : null;
   token = typeof stored.token === 'string' ? stored.token : null;
   // Deliberately in `local` rather than `session`: a choice to disconnect that a browser
   // restart undoes is not a choice, it is a delay.
   disconnected = stored.disconnected === true;
+  deferredRevivals = Array.isArray(stored.deferredRevivals) ? stored.deferredRevivals.slice(-100) : [];
   const live = await chrome.storage.session.get([
     'settled',
     'journal',
@@ -207,7 +242,18 @@ async function loadOnce() {
   terminalDocuments =
     live.terminalDocuments && typeof live.terminalDocuments === 'object' ? { ...live.terminalDocuments } : {};
   closeOutbox = Array.isArray(live.closeOutbox) ? live.closeOutbox.slice(-200) : [];
-  commandAckOutbox = Array.isArray(live.commandAckOutbox) ? live.commandAckOutbox.slice(-200) : [];
+  // Browser-close durability: a send already accepted by ChatGPT is irreversible. Its final ACK
+  // therefore has to survive storage.session being cleared on browser restart. Prefer the local
+  // copy, while still accepting the old session copy as an upgrade migration path.
+  commandAckOutbox = Array.isArray(stored.commandAckOutbox)
+    ? stored.commandAckOutbox.slice(-200)
+    : Array.isArray(live.commandAckOutbox)
+      ? live.commandAckOutbox.slice(-200)
+      : [];
+  revivalPreferences =
+    live.revivalPreferences && typeof live.revivalPreferences === 'object' && !Array.isArray(live.revivalPreferences)
+      ? { ...live.revivalPreferences }
+      : {};
   if (live.delivery && typeof live.delivery === 'object' && !Array.isArray(live.delivery)) {
     delivery = { ...delivery, ...live.delivery };
   }
@@ -252,17 +298,26 @@ let liveWriteQueue = Promise.resolve();
 
 function persistLive() {
   const write = liveWriteQueue.then(() =>
-    chrome.storage.session.set({
-      settled: settled.slice(-40),
-      tabConversations,
-      tabDocuments,
-      tabEpochs,
-      retiredDocuments,
-      terminalDocuments,
-      closeOutbox: closeOutbox.slice(-200),
-      commandAckOutbox: commandAckOutbox.slice(-200),
-      delivery
-    })
+    Promise.all([
+      chrome.storage.session.set({
+        settled: settled.slice(-40),
+        tabConversations,
+        tabDocuments,
+        tabEpochs,
+        retiredDocuments,
+        terminalDocuments,
+        closeOutbox: closeOutbox.slice(-200),
+        commandAckOutbox: commandAckOutbox.slice(-200),
+        revivalPreferences,
+        delivery
+      }),
+      // Only small command-control metadata crosses browser restarts. No transcript and no
+      // revival text is duplicated into extension storage.
+      chrome.storage.local.set({
+        commandAckOutbox: commandAckOutbox.slice(-200),
+        deferredRevivals: deferredRevivals.slice(-100)
+      })
+    ])
   );
   liveWriteQueue = write.then(
     () => undefined,
@@ -298,7 +353,7 @@ async function persistJournalNow() {
         durabilityGap = true;
         journal.push(
           gapEntry(
-            journal.length > 0 ? journal[journal.length - 1].conversationId : null,
+            journal.length > 0 ? journal[journal.length - 1] : null,
             'chat_error',
             '⚠ The browser refused to store this extension’s pending observations. Until the app accepts them they exist only in memory, so closing the browser or reloading the extension would lose them.'
           )
@@ -367,12 +422,29 @@ function totalBytes() {
   return sum;
 }
 
-function overBudget(bytes) {
-  return journal.length > MAX_JOURNAL || bytes > MAX_JOURNAL_BYTES;
+/**
+ * Copies the identity that decides where one queued observation may be delivered.
+ *
+ * A fresh chat has no conversation id yet, so `provisional` is just as important as the
+ * eventual id. Worker provenance also has to stay on the exact row that carried it: combining
+ * an agent label from one row with another row's command id would manufacture authority.
+ */
+function routeOf(entry) {
+  return {
+    conversationId: entry && typeof entry.conversationId === 'string' ? entry.conversationId : null,
+    provisional: entry && typeof entry.provisional === 'string' ? entry.provisional : null,
+    agent: entry && typeof entry.agent === 'string' ? entry.agent : null,
+    agentCommandId: entry && typeof entry.agentCommandId === 'string' ? entry.agentCommandId : null
+  };
 }
 
-function gapEntry(conversationId, kind, text) {
-  return { conversationId, agent: null, gap: true, event: { kind, time: Date.now(), text } };
+function routeKey(entry) {
+  const route = routeOf(entry);
+  return JSON.stringify([route.conversationId, route.provisional, route.agent, route.agentCommandId]);
+}
+
+function gapEntry(source, kind, text) {
+  return { ...routeOf(source), gap: true, event: { kind, time: Date.now(), text } };
 }
 
 /**
@@ -423,8 +495,7 @@ function makeRoom(tighten = false) {
   // Pass one: progress and other non-essential lines, oldest first. The gap marker is
   // inserted on the first removal and counts against the limits while we keep trimming,
   // so pressure can never make the algorithm delete its own evidence of what was lost.
-  let dropped = 0;
-  let progressGap = null;
+  const progressGaps = new Map();
   let progressAt = 0;
   while (!fits()) {
     while (
@@ -437,15 +508,18 @@ function makeRoom(tighten = false) {
     const index = progressAt;
     const entry = removeAt(index);
     if (!entry) break;
-    dropped++;
-    if (!progressGap) {
-      progressGap = gapEntry(entry.conversationId, 'progress', '');
-      insertAt(index, progressGap);
+    const key = routeKey(entry);
+    let bucket = progressGaps.get(key);
+    if (!bucket) {
+      bucket = { gap: gapEntry(entry, 'progress', ''), dropped: 0 };
+      progressGaps.set(key, bucket);
+      insertAt(index, bucket.gap);
       progressAt = index + 1;
     }
+    bucket.dropped++;
     setGapText(
-      progressGap,
-      `⚠ ${dropped} progress line(s) observed here were dropped in the browser before the app accepted them. The app was unreachable and the local queue was full.`
+      bucket.gap,
+      `⚠ ${bucket.dropped} progress line(s) observed here were dropped in the browser before the app accepted them. The app was unreachable and the local queue was full.`
     );
   }
   if (fits()) return;
@@ -453,9 +527,7 @@ function makeRoom(tighten = false) {
   // Pass two: essentials themselves have to go. This is real loss, so keep one durable
   // marker naming exactly what kinds disappeared. As above, the marker is present while
   // trimming, which guarantees the final journal is genuinely inside both caps.
-  const counts = {};
-  let lost = 0;
-  let lossGap = null;
+  const lossGaps = new Map();
   let lossAt = 0;
   while (!fits()) {
     while (lossAt < journal.length && journal[lossAt].gap) lossAt++;
@@ -463,19 +535,22 @@ function makeRoom(tighten = false) {
     const index = lossAt;
     const entry = removeAt(index);
     if (!entry) break;
-    lost++;
-    counts[entry.event.kind] = (counts[entry.event.kind] || 0) + 1;
-    if (!lossGap) {
-      lossGap = gapEntry(entry.conversationId, 'chat_error', '');
-      insertAt(index, lossGap);
+    const key = routeKey(entry);
+    let bucket = lossGaps.get(key);
+    if (!bucket) {
+      bucket = { gap: gapEntry(entry, 'chat_error', ''), lost: 0, counts: {} };
+      lossGaps.set(key, bucket);
+      insertAt(index, bucket.gap);
       lossAt = index + 1;
     }
-    const detail = Object.entries(counts)
+    bucket.lost++;
+    bucket.counts[entry.event.kind] = (bucket.counts[entry.event.kind] || 0) + 1;
+    const detail = Object.entries(bucket.counts)
       .map(([kind, count]) => `${count} ${kind}`)
       .join(', ');
     setGapText(
-      lossGap,
-      `⚠ ${lost} observation(s) (${detail}) were lost in the browser before the app accepted them: the local journal hit its storage limit while the app was unreachable. This part of the history is incomplete.`
+      bucket.gap,
+      `⚠ ${bucket.lost} observation(s) (${detail}) were lost in the browser before the app accepted them: the local journal hit its storage limit while the app was unreachable. This part of the history is incomplete.`
     );
   }
 }
@@ -489,6 +564,7 @@ function enqueue(entries) {
       // the tab that saw them; bindProvisional() renames them once the id exists.
       provisional: typeof entry.provisional === 'string' ? entry.provisional : null,
       agent: typeof entry.agent === 'string' ? entry.agent : null,
+      agentCommandId: typeof entry.agentCommandId === 'string' ? entry.agentCommandId : null,
       event: entry.event
     });
   }
@@ -563,13 +639,18 @@ function noteDelivery(result, count, conversationId) {
 }
 
 /** Finds the next deliverable conversation and its first batch in one journal pass. */
-function nextJournalBatch() {
+function nextJournalBatch(preferredConversationId = null) {
   const blocked = new Set();
   for (const ack of commandAckOutbox) {
     if (ack && ack.conversationId) blocked.add(ack.conversationId);
   }
-  let conversationId = null;
+  const preferred = cleanConversationId(preferredConversationId);
+  let conversationId =
+    preferred && !blocked.has(preferred) && journal.some((entry) => entry.conversationId === preferred)
+      ? preferred
+      : null;
   let agent;
+  let agentCommandId;
   const mine = [];
   for (const entry of journal) {
     if (!conversationId) {
@@ -578,91 +659,136 @@ function nextJournalBatch() {
     }
     if (entry.conversationId !== conversationId || mine.length >= BATCH) continue;
     mine.push(entry);
-    if (!agent && entry.agent) agent = entry.agent;
+    // Recovery provenance must come from the same journal entry. Older entries can have an
+    // agent label but no command id; keep delivering them, but never upgrade that label into
+    // worker-binding authority by combining it with another row's command id.
+    if (!agent && entry.agent && entry.agentCommandId) {
+      agent = entry.agent;
+      agentCommandId = entry.agentCommandId;
+    }
     if (mine.length >= BATCH) break;
   }
-  return conversationId ? { conversationId, mine, agent } : null;
+  return conversationId ? { conversationId, mine, agent, agentCommandId } : null;
 }
 
-async function drain() {
+async function drainOnce(preferredConversationId = null) {
   await load();
-  if (flushing || journal.length === 0 || !token) return { ok: true, pending: journal.length };
-  flushing = true;
-  try {
-    let guard = 0;
-    while (journal.length > 0 && guard++ < 20) {
-      // A command page deliberately holds its page-local observations until its final ACK is
-      // handed to this worker. Preserve the same ordering after that hand-off: if transport
-      // leaves the ACK in the durable outbox, do not let observations from that command's
-      // concrete conversation overtake it. Other conversations remain independent.
-      const batch = nextJournalBatch();
-      if (!batch) break;
-      const { conversationId, mine, agent } = batch;
-      const result = await call('/events', {
+  if (journal.length === 0 || !token) return { ok: true, pending: journal.length };
+  let guard = 0;
+  while (journal.length > 0 && guard++ < 20) {
+    // A command page deliberately holds its page-local observations until its final ACK is
+    // handed to this worker. Preserve the same ordering after that hand-off: if transport
+    // leaves the ACK in the durable outbox, do not let observations from that command's
+    // concrete conversation overtake it. Other conversations remain independent.
+    const batch = nextJournalBatch(preferredConversationId);
+    if (!batch) break;
+    const { conversationId, mine, agent, agentCommandId } = batch;
+    const result = await call('/events', {
+      method: 'POST',
+      body: JSON.stringify({
+        conversationId,
+        agent,
+        agentCommandId,
+        events: mine.map((entry) => entry.event)
+      })
+    });
+    noteDelivery(result, mine.length, conversationId);
+    if (result.status === 413 && mine.length > 1) {
+      // Too big for the app to accept. Send half; the remainder stays queued.
+      const half = mine.slice(0, Math.floor(mine.length / 2));
+      const retry = await call('/events', {
         method: 'POST',
-        body: JSON.stringify({
-          conversationId,
-          agent,
-          events: mine.map((entry) => entry.event)
-        })
+        body: JSON.stringify({ conversationId, agent, agentCommandId, events: half.map((entry) => entry.event) })
       });
-      noteDelivery(result, mine.length, conversationId);
-      if (result.status === 413 && mine.length > 1) {
-        // Too big for the app to accept. Send half; the remainder stays queued.
-        const half = mine.slice(0, Math.floor(mine.length / 2));
-        const retry = await call('/events', {
-          method: 'POST',
-          body: JSON.stringify({ conversationId, agent, events: half.map((entry) => entry.event) })
-        });
-        noteDelivery(retry, half.length, conversationId);
-        if (!retry.ok) break;
-        const sent = new Set(half);
-        journal = journal.filter((entry) => !sent.has(entry));
-        continue;
-      }
-      if (result.status === 413 && mine.length === 1) {
+      noteDelivery(retry, half.length, conversationId);
+      if (!retry.ok) break;
+      const sent = new Set(half);
+      journal = journal.filter((entry) => !sent.has(entry));
+      continue;
+    }
+    if (result.status === 413 && mine.length === 1) {
+      const rejected = mine[0];
+      journal = journal.filter((entry) => entry !== rejected);
+      journal.unshift(
+        gapEntry(
+          rejected,
+          'chat_error',
+          '⚠ One browser observation was too large for the local bridge and was replaced by this explicit gap.'
+        )
+      );
+      continue;
+    }
+    if (!result.ok) {
+      // A permanently malformed/authenticated item must not hold every later
+      // conversation hostage. Replace it with an explicit gap and continue; transport,
+      // auth, throttling and server failures remain retryable.
+      if (result.status >= 400 && result.status < 500 && ![401, 408, 409, 426, 429].includes(result.status)) {
         const rejected = mine[0];
         journal = journal.filter((entry) => entry !== rejected);
-        journal.unshift(
-          gapEntry(
-            conversationId,
-            'chat_error',
-            '⚠ One browser observation was too large for the local bridge and was replaced by this explicit gap.'
-          )
-        );
+        if (!rejected.gap) {
+          journal.unshift(
+            gapEntry(
+              rejected,
+              'chat_error',
+              `⚠ One browser observation was rejected by the local bridge (HTTP ${result.status}) and was replaced by this explicit gap.`
+            )
+          );
+        }
         continue;
       }
-      if (!result.ok) {
-        // A permanently malformed/authenticated item must not hold every later
-        // conversation hostage. Replace it with an explicit gap and continue; transport,
-        // auth, throttling and server failures remain retryable.
-        if (result.status >= 400 && result.status < 500 && ![401, 408, 409, 426, 429].includes(result.status)) {
-          const rejected = mine[0];
-          journal = journal.filter((entry) => entry !== rejected);
-          if (!rejected.gap) {
-            journal.unshift(
-              gapEntry(
-                conversationId,
-                'chat_error',
-                `⚠ One browser observation was rejected by the local bridge (HTTP ${result.status}) and was replaced by this explicit gap.`
-              )
-            );
-          }
-          continue;
-        }
-        scheduleRetry();
-        break;
-      }
-      const sent = new Set(mine);
-      journal = journal.filter((entry) => !sent.has(entry));
+      scheduleRetry();
+      break;
     }
-    await persistJournal();
-    if (journal.length > 0) scheduleRetry();
-    else clearRetryIfIdle();
-    return { ok: true, pending: journal.length };
-  } finally {
-    flushing = false;
+    const sent = new Set(mine);
+    journal = journal.filter((entry) => !sent.has(entry));
   }
+  await persistJournal();
+  if (journal.length > 0) scheduleRetry();
+  else clearRetryIfIdle();
+  return { ok: true, pending: journal.length };
+}
+
+/**
+ * Starts a journal drain if one is not already running.
+ *
+ * Normal observation delivery deliberately keeps the old contention semantics: once an entry
+ * is durable in storage.session, a second tab should not have to wait for another chat's slow
+ * /events request merely because that request is already in flight. Goal joins explicitly in
+ * deliverConversationJournal(), because its correctness depends on the delivery boundary.
+ */
+function drain(preferredConversationId = null) {
+  if (drainWork) return Promise.resolve({ ok: true, pending: journal.length });
+  const work = drainOnce(preferredConversationId);
+  const tracked = work.finally(() => {
+    if (drainWork === tracked) drainWork = null;
+  });
+  drainWork = tracked;
+  return tracked;
+}
+
+function journalCountForConversation(conversationId) {
+  return journal.reduce((count, entry) => count + (entry.conversationId === conversationId ? 1 : 0), 0);
+}
+
+/** Proves this conversation has no accepted-but-undelivered transcript before Goal reads it. */
+async function deliverConversationJournal(conversationId) {
+  // One pass can carry 2,000 rows (20 × BATCH). Three attempts cover the full 4,000-row
+  // journal even if the first merely joins a flush that was already serving another chat.
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const before = journalCountForConversation(conversationId);
+    if (before === 0) return true;
+    // Unlike ordinary journal callers, Goal must join a flush already in flight. Only after
+    // it ends can a targeted pass prove whether this conversation reached the app.
+    if (drainWork) await drainWork;
+    if (journalCountForConversation(conversationId) === 0) return true;
+    await drain(conversationId);
+    const after = journalCountForConversation(conversationId);
+    if (after === 0) return true;
+    // The first pass may only have joined somebody else's in-flight drain. Once a targeted
+    // pass itself makes no progress, transport/ACK ordering prevents us proving the context.
+    if (attempt > 0 && after >= before) return false;
+  }
+  return journalCountForConversation(conversationId) === 0;
 }
 
 // -------------------------------------------------------------------- transport
@@ -744,8 +870,9 @@ async function discover(force = false) {
     if (Date.now() - portCheckedAt < PORT_TRUST_MS) return { port, paired: token !== null, compatible: portCompatible !== false, version: appVersion, bridge: appProtocol };
     const body = await hello(port);
     if (body) {
+      if (body.disconnected === true) await latchAppDisconnect();
       portCheckedAt = Date.now();
-      portCompatible = body.compatible !== false && (body.bridge === BRIDGE_PROTOCOL || (body.bridge >= 7 && body.bridge <= 12));
+      portCompatible = body.compatible !== false && body.bridge === BRIDGE_PROTOCOL;
       appVersion = typeof body.version === 'string' ? body.version : null;
       appProtocol = Number.isFinite(Number(body.bridge)) ? Number(body.bridge) : null;
       return { port, paired: body.paired === true, compatible: portCompatible, version: appVersion, bridge: appProtocol };
@@ -754,9 +881,10 @@ async function discover(force = false) {
   for (const candidate of PORTS) {
     const body = await hello(candidate);
     if (body) {
+      if (body.disconnected === true) await latchAppDisconnect();
       port = candidate;
       portCheckedAt = Date.now();
-      portCompatible = body.compatible !== false && (body.bridge === BRIDGE_PROTOCOL || (body.bridge >= 7 && body.bridge <= 12));
+      portCompatible = body.compatible !== false && body.bridge === BRIDGE_PROTOCOL;
       appVersion = typeof body.version === 'string' ? body.version : null;
       appProtocol = Number.isFinite(Number(body.bridge)) ? Number(body.bridge) : null;
       await persist();
@@ -776,6 +904,19 @@ async function discover(force = false) {
 function forgetPort() {
   portCheckedAt = 0;
   portCompatible = null;
+}
+
+/**
+ * Mirrors an explicit app-side Disconnect into this browser's own durable latch.
+ *
+ * `false` from the app is deliberately not authoritative here: this browser may itself have
+ * been disconnected from the popup, and merely observing an app that is willing to pair is
+ * not user intent to reconnect. Only an explicit successful pair clears the local latch.
+ */
+async function latchAppDisconnect() {
+  token = null;
+  disconnected = true;
+  await persist();
 }
 
 /** One authenticated request. Returns { ok, status, data } and never throws. */
@@ -804,7 +945,12 @@ async function call(path, init = {}, retried = false) {
         authorization: `Bearer ${token}`
       }
     });
+    const data = await response.json().catch(() => ({}));
     if (response.status === 401) {
+      if (data && data.error === 'browser_disconnected') {
+        await latchAppDisconnect();
+        return { ok: false, status: 401, error: 'disconnected', data };
+      }
       // Our token no longer matches the app's — it was reset, or the app's storage was
       // rebuilt. Drop ours and provision a new one once, rather than retrying forever
       // with a credential that will never work again or making the user do it by hand.
@@ -813,7 +959,6 @@ async function call(path, init = {}, retried = false) {
       if (retried) return { ok: false, status: 401, error: 'not_paired' };
       return call(path, init, true);
     }
-    const data = await response.json().catch(() => ({}));
     return { ok: response.ok, status: response.status, data };
   } catch (err) {
     // The request never reached anything, so the belief that the app is on this port is
@@ -835,18 +980,38 @@ async function call(path, init = {}, retried = false) {
  * The token itself stays: it is what keeps a second local program from driving the bridge
  * by accident, and it is why the marker in a chat URL is harmless on its own.
  */
-function provision() {
+function provision(reconnect = false) {
   // Singleflight. Everything that wants a token waits on the same request: `/pair` mints
   // a fresh credential and invalidates the one before it, so two concurrent callers do
   // not get two tokens, they get one working token and one that has already been revoked.
-  if (pairing) return pairing;
-  pairing = pairOnce().finally(() => {
-    pairing = null;
+  // A pairing from an *older* connection intent is deliberately not shared: Disconnect may
+  // have happened while it was in flight, and a later explicit Connect must be able to mint
+  // under the new intent without waiting for/accepting that stale result.
+  const intent = connectionEpoch;
+  if (pairing && pairingEpoch === intent && pairingReconnect === reconnect) return pairing;
+  const work = pairOnce(intent, reconnect).then((result) => {
+    pairingError = result && result.ok
+      ? null
+      : {
+          error: result && result.error ? String(result.error) : 'pair_failed',
+          message: result && result.message ? String(result.message) : ''
+        };
+    return result;
   });
-  return pairing;
+  const tracked = work.finally(() => {
+    if (pairing === tracked) {
+      pairing = null;
+      pairingEpoch = -1;
+      pairingReconnect = false;
+    }
+  });
+  pairing = tracked;
+  pairingEpoch = intent;
+  pairingReconnect = reconnect;
+  return tracked;
 }
 
-async function pairOnce() {
+async function pairOnce(intent = connectionEpoch, reconnect = false) {
   const found = await discover(true);
   if (!found) return { ok: false, error: 'app_not_found' };
   if (found.compatible === false) return { ok: false, error: 'incompatible_extension' };
@@ -855,12 +1020,19 @@ async function pairOnce() {
       method: 'POST',
       cache: 'no-store',
       headers: { 'content-type': 'application/json', ...versionHeaders() },
-      body: JSON.stringify({})
+      body: JSON.stringify(reconnect ? { reconnect: true } : {})
     });
     const data = await response.json().catch(() => ({}));
     if (!response.ok || typeof data.token !== 'string') {
+      if (data && data.error === 'browser_disconnected') {
+        await latchAppDisconnect();
+        return { ok: false, error: 'disconnected', message: data.message };
+      }
       return { ok: false, error: data.error || `HTTP ${response.status}`, message: data.message };
     }
+    // The response belongs to the connection state that launched it. A newer Disconnect is
+    // authoritative and must not be undone just because the network answered out of order.
+    if (intent !== connectionEpoch) return { ok: false, error: 'disconnected' };
     token = data.token;
     // Connecting is the counterpart of disconnecting, and the only thing that clears it.
     disconnected = false;
@@ -886,10 +1058,12 @@ async function pairOnce() {
  * The app answers 404 for a command that has been cancelled, superseded, or already
  * sent, so a stale marker types nothing.
  */
-async function redeemCommand(id, client) {
+async function redeemCommand(id, client, conversationId = null) {
   await load();
   if (!id || settled.includes(id)) return { ok: true, command: null };
-  const result = await call('/commands/redeem', { method: 'POST', body: JSON.stringify({ id, client }) });
+  const body = { id, client };
+  if (typeof conversationId === 'string' && conversationId) body.conversationId = conversationId;
+  const result = await call('/commands/redeem', { method: 'POST', body: JSON.stringify(body) });
   if (result.status === 404) return { ok: true, command: null, gone: true };
   // Another page already owns this command. Not an error to report: this page simply is not
   // the one the app is talking to, and it must type nothing.
@@ -992,7 +1166,125 @@ async function ackCommand(id, status, error, conversationId, agent, client, sour
   // handler rejects and the page is told truthfully that this worker did not take custody.
   await persistLive();
   scheduleRetry();
+  if (status === 'sent' && agent && source && Number.isInteger(source.tab)) {
+    try {
+      void chrome.tabs.remove(source.tab).catch(() => undefined);
+    } catch {
+      // Best effort; lifecycle module also removes durable worker lease
+    }
+  }
   return drainCommandAcks(id);
+}
+
+function deferredRevivalId(value) {
+  const id = typeof value === 'string' ? value.trim() : '';
+  return id && id.length <= 128 ? id : null;
+}
+
+async function rememberDeferredRevival(idValue, conversationValue) {
+  await load();
+  const id = deferredRevivalId(idValue);
+  const conversationId = cleanConversationId(conversationValue);
+  if (!id || !conversationId) return false;
+  // There can only be one not-yet-redeemed wake for one existing conversation. Seeing a newer
+  // marker for the same chat is app-side proof that an older extension-only recovery marker is
+  // obsolete. Keeping both is worse than redundant: recoverDeferredRevivals() can put the old
+  // marker into the exact document's pre-redeem wait and make the current wake bounce off `busy`.
+  const retiredIds = deferredRevivals
+    .filter((entry) => entry && entry.id !== id && cleanConversationId(entry.conversationId) === conversationId)
+    .map((entry) => deferredRevivalId(entry.id))
+    .filter(Boolean);
+  for (const retiredId of retiredIds) {
+    deferredRevivalOffers.delete(retiredId);
+    delete revivalPreferences[retiredId];
+  }
+  deferredRevivals = [
+    ...deferredRevivals.filter(
+      (entry) =>
+        entry &&
+        entry.id !== id &&
+        cleanConversationId(entry.conversationId) !== conversationId
+    ),
+    { id, conversationId, queuedAt: Date.now() }
+  ].slice(-100);
+  await persistLive();
+  return true;
+}
+
+function revivalPreference(idValue) {
+  const id = deferredRevivalId(idValue);
+  const raw = id ? revivalPreferences[id] : null;
+  if (
+    !id ||
+    !raw ||
+    typeof raw !== 'object' ||
+    cleanConversationId(raw.conversationId) === null ||
+    !Number.isInteger(raw.fallbackTabId) ||
+    !Number.isInteger(raw.preferredTabId)
+  ) {
+    return null;
+  }
+  return raw;
+}
+
+async function rememberPreferredRevival(idValue, conversationValue, fallbackTabId, preferredTabId) {
+  await load();
+  const id = deferredRevivalId(idValue);
+  const conversationId = cleanConversationId(conversationValue);
+  if (!id || !conversationId || !Number.isInteger(fallbackTabId) || !Number.isInteger(preferredTabId)) return false;
+  const retiredIds = deferredRevivals
+    .filter((entry) => entry && entry.id !== id && cleanConversationId(entry.conversationId) === conversationId)
+    .map((entry) => deferredRevivalId(entry.id))
+    .filter(Boolean);
+  for (const retiredId of retiredIds) {
+    deferredRevivalOffers.delete(retiredId);
+    delete revivalPreferences[retiredId];
+  }
+  deferredRevivals = [
+    ...deferredRevivals.filter(
+      (entry) =>
+        entry &&
+        entry.id !== id &&
+        cleanConversationId(entry.conversationId) !== conversationId
+    ),
+    { id, conversationId, queuedAt: Date.now() }
+  ].slice(-100);
+  revivalPreferences[id] = { conversationId, fallbackTabId, preferredTabId };
+  await persistLive();
+  return true;
+}
+
+async function clearRevivalPreference(idValue) {
+  const id = deferredRevivalId(idValue);
+  if (!id || !Object.prototype.hasOwnProperty.call(revivalPreferences, id)) return false;
+  delete revivalPreferences[id];
+  await persistLive();
+  return true;
+}
+
+function clearRevivalPreferencesForTab(tabId) {
+  if (!Number.isInteger(tabId)) return false;
+  let changed = false;
+  for (const [id, raw] of Object.entries(revivalPreferences)) {
+    if (!raw || typeof raw !== 'object') continue;
+    if (raw.fallbackTabId === tabId || raw.preferredTabId === tabId) {
+      delete revivalPreferences[id];
+      changed = true;
+    }
+  }
+  return changed;
+}
+
+async function forgetDeferredRevival(idValue) {
+  await load();
+  const id = deferredRevivalId(idValue);
+  if (!id) return false;
+  const before = deferredRevivals.length;
+  deferredRevivals = deferredRevivals.filter((entry) => entry && entry.id !== id);
+  deferredRevivalOffers.delete(id);
+  delete revivalPreferences[id];
+  if (deferredRevivals.length !== before) await persistLive();
+  return deferredRevivals.length !== before;
 }
 
 /**
@@ -1078,11 +1370,6 @@ function senderDocument(sender) {
   return typeof sender.documentId === 'string' && sender.documentId.length > 0 ? sender.documentId : null;
 }
 
-function terminalSender(sender) {
-  const id = tabId(sender);
-  return id !== null && Object.prototype.hasOwnProperty.call(terminalDocuments, String(id));
-}
-
 function messageEpoch(message) {
   const value = Number(message && message.navigationEpoch);
   return Number.isSafeInteger(value) && value >= 0 ? value : 0;
@@ -1119,7 +1406,15 @@ async function terminalPredictionWrong(id, key, documentId) {
   } catch {
     return false;
   }
-  return Boolean(tab) && isChatGptUrl(tab.url);
+  if (!tab || !isChatGptUrl(tab.url)) return false;
+  // A document can still send extension IPC during the overlap between navigation starting
+  // and Chrome replacing that document. In that window tabs.get() may already describe the
+  // destination ChatGPT URL, so the message proves only that the old document is *dying*, not
+  // that the loading event was a false terminal prediction. Reopen the lease only after
+  // Chrome itself says the tab is settled and has no destination still pending.
+  if (tab.status === 'loading') return false;
+  if (typeof tab.pendingUrl === 'string' && tab.pendingUrl !== '') return false;
+  return true;
 }
 
 /**
@@ -1347,7 +1642,7 @@ async function releaseTab(tab, expected = null, expectedDocument = null, expecte
 function conversationFromUrl(value) {
   try {
     const url = new URL(String(value || ''));
-    if (url.hostname !== 'chatgpt.com') return null;
+    if (url.protocol !== 'https:' || (url.hostname !== 'chatgpt.com' && url.hostname !== 'chat.openai.com')) return null;
     const match = /^\/c\/([0-9a-f-]{8,64})/i.exec(url.pathname);
     return match ? match[1] : null;
   } catch {
@@ -1380,7 +1675,9 @@ function serializeTab(tab, operation) {
 
 const HANDLERS = {
   async register_document(_message, sender) {
-    return registerDocument(sender, _message);
+    const result = await registerDocument(sender, _message);
+    if (result && result.ok === true) void recoverDeferredRevivals().catch(() => undefined);
+    return result;
   },
   async status() {
     await load();
@@ -1407,12 +1704,17 @@ const HANDLERS = {
       appVersion: found ? found.version : null,
       appProtocol: found ? found.bridge : null,
       extensionVersion: chrome.runtime.getManifest().version,
-      extensionProtocol: BRIDGE_PROTOCOL
+      extensionProtocol: BRIDGE_PROTOCOL,
+      ...(pairingError ? { pairError: pairingError } : {})
     };
   },
   async pair() {
     await load();
-    const result = await provision();
+    // This message exists only behind the popup's Connect/Retry control. Advance the intent
+    // generation so an older silent provision already on the wire cannot win after this
+    // explicit reconnect, then tell the app this /pair is allowed to clear its durable latch.
+    connectionEpoch++;
+    const result = await provision(true);
     if (result && result.ok) {
       void drainCommandAcks()
         .then(() => drain())
@@ -1423,10 +1725,13 @@ const HANDLERS = {
   },
   async unpair() {
     await load();
+    // Invalidate any `/pair` already on the wire before changing the visible/persisted state.
+    connectionEpoch++;
     token = null;
     // Remembered, not just cleared. Otherwise the next request — two seconds away in any
     // open tab — provisions a new token and the browser is connected again.
     disconnected = true;
+    pairingError = null;
     await persist();
     return { ok: true };
   },
@@ -1621,7 +1926,13 @@ const HANDLERS = {
     if (!ownsDocument(source)) return { ok: false, error: 'stale_document' };
     await noteTabConversation(source, message.conversationId);
     if (!ownsDocument(source)) return { ok: false, error: 'stale_document' };
-    const query = `?conversationId=${encodeURIComponent(message.conversationId)}&since=${Number(message.since) || 0}`;
+    // Goal drafts are conversation-scoped in the app but browser writes are tab-scoped. Tell
+    // the app which tab is polling so two tabs showing the same chat cannot both receive and
+    // submit one ready Goal draft.
+    const query =
+      `?conversationId=${encodeURIComponent(message.conversationId)}` +
+      `&since=${Number(message.since) || 0}` +
+      `&goalClient=${encodeURIComponent(String(source.tab))}`;
     const result = await call(`/activity${query}`);
     return ownsDocument(source) ? result : { ok: false, error: 'stale_document' };
   },
@@ -1679,12 +1990,230 @@ const HANDLERS = {
     });
     return ownsDocument(source) ? result : { ok: false, error: 'stale_document' };
   },
+  /**
+   * The goal loop: this page saw its turn genuinely finish and wants the next user message.
+   *
+   * The API key never comes near this worker. The app is handed the conversation id and the
+   * generation id and answers with a draft — which is also why `turnId` is forwarded
+   * verbatim: it is the app's idempotency key, and a retried send must not become a second
+   * message in somebody's chat.
+   */
+  async goal_draft(message, _sender, source) {
+    await load();
+    if (!ownsDocument(source)) return { ok: false, error: 'stale_document' };
+    const conversationId = cleanConversationId(message.conversationId);
+    if (!conversationId) return { ok: false, status: 400, error: 'bad_conversation_id' };
+    await noteTabConversation(source, conversationId);
+    if (!ownsDocument(source)) return { ok: false, error: 'stale_document' };
+    // Goal builds its prompt from the app's durable session transcript. The final assistant
+    // row that caused this request can still be only in this worker's storage.session journal
+    // when an earlier /events call was delayed or failed. Spend no OpenRouter request until
+    // that row has crossed the same /events boundary normal transcript delivery uses.
+    if (!(await deliverConversationJournal(conversationId))) {
+      return { ok: false, status: 503, error: 'transcript_not_delivered', retryable: true };
+    }
+    if (!ownsDocument(source)) return { ok: false, error: 'stale_document' };
+    const result = await call('/goal/draft', {
+      method: 'POST',
+      body: JSON.stringify({
+        conversationId,
+        turnId: String(message.turnId || ''),
+        clientId: String(source.tab)
+      })
+    });
+    return ownsDocument(source) ? result : { ok: false, error: 'stale_document' };
+  },
+  /**
+   * Raises the exact tab whose owned document has just triggered Goal.
+   *
+   * The sender is the locator. Never search by conversation and never open a fallback: focus is
+   * only presentation after the content script has independently decided a completed turn is
+   * Goal-worthy. That keeps background visibility out of completion/draft authority and makes a
+   * duplicate tab impossible on this path.
+   */
+  async goal_focus(message, sender, source) {
+    await load();
+    if (!ownsDocument(source)) return { ok: false, error: 'stale_document' };
+    const conversationId = cleanConversationId(message.conversationId);
+    if (!conversationId) return { ok: false, status: 400, error: 'bad_conversation_id' };
+    const key = String(source.tab);
+    const registeredConversation = cleanConversationId(tabConversations[key]);
+    if (registeredConversation && registeredConversation !== conversationId) {
+      return { ok: false, error: 'stale_conversation' };
+    }
+    if (!registeredConversation) {
+      await noteTabConversation(source, conversationId);
+      if (!ownsDocument(source)) return { ok: false, error: 'stale_document' };
+    }
+    try {
+      const activated = await chrome.tabs.update(source.tab, { active: true });
+      const senderWindow = sender && sender.tab && typeof sender.tab.windowId === 'number' ? sender.tab.windowId : null;
+      const windowId = senderWindow ?? (activated && typeof activated.windowId === 'number' ? activated.windowId : null);
+      if (windowId !== null) await chrome.windows.update(windowId, { focused: true });
+    } catch {
+      // Focus is a courtesy. The page owns Goal regardless, so browser/UI refusal must not turn
+      // a valid hidden completion into a failed continuation.
+      return ownsDocument(source) ? { ok: false, error: 'focus_failed' } : { ok: false, error: 'stale_document' };
+    }
+    return ownsDocument(source) ? { ok: true, focused: true } : { ok: false, error: 'stale_document' };
+  },
+  /** Typed, or given up on. Either way that draft is spent. */
+  async goal_ack(message, _sender, source) {
+    await load();
+    if (!ownsDocument(source)) return { ok: false, error: 'stale_document' };
+    const result = await call('/goal/ack', {
+      method: 'POST',
+      body: JSON.stringify({
+        conversationId: message.conversationId,
+        token: String(message.token || ''),
+        clientId: String(source.tab)
+      })
+    });
+    return ownsDocument(source) ? result : { ok: false, error: 'stale_document' };
+  },
+  /**
+   * This chat's specific goal, set or cleared from the settings sheet.
+   *
+   * The text is the user's own and goes straight through; the app bounds and trims it and
+   * answers with what it actually stored, which is what the sheet then draws.
+   */
+  async goal_objective(message, _sender, source) {
+    await load();
+    if (!ownsDocument(source)) return { ok: false, error: 'stale_document' };
+    const conversationId = cleanConversationId(message.conversationId);
+    if (!conversationId) return { ok: false, status: 400, error: 'bad_conversation_id' };
+    await noteTabConversation(source, conversationId);
+    if (!ownsDocument(source)) return { ok: false, error: 'stale_document' };
+    const result = await call('/goal/objective', {
+      method: 'POST',
+      body: JSON.stringify({ conversationId, text: String(message.text || '') })
+    });
+    return ownsDocument(source) ? result : { ok: false, error: 'stale_document' };
+  },
+  /**
+   * The opening message for a chat ChatGPT has not named yet.
+   *
+   * No conversation id, because there is none to send: this is the request whose answer
+   * becomes the message that causes ChatGPT to issue one. Everything else about it is an
+   * ordinary goal draft, and the key stays in the app exactly as it does for those.
+   */
+  async goal_open(message, _sender, source) {
+    await load();
+    if (!ownsDocument(source)) return { ok: false, error: 'stale_document' };
+    const result = await call('/goal/open', {
+      method: 'POST',
+      body: JSON.stringify({ text: String(message.text || '') })
+    });
+    return ownsDocument(source) ? result : { ok: false, error: 'stale_document' };
+  },
+  /**
+   * The same two settings, for a chat that has no feed to read them from.
+   *
+   * `/activity` carries them otherwise, and it needs a conversation id. A New Chat has none
+   * and is still somewhere a goal can be written, so the sheet above that composer asks for
+   * them directly. Read-only, and conversation-free by construction.
+   */
+  async settings_get(_message, _sender, source) {
+    await load();
+    if (!ownsDocument(source)) return { ok: false, error: 'stale_document' };
+    const result = await call('/settings', { method: 'GET' });
+    return ownsDocument(source) ? result : { ok: false, error: 'stale_document' };
+  },
+  /** The composer's settings menu, which owns exactly two switches. */
+  async settings_set(message, _sender, source) {
+    await load();
+    if (!ownsDocument(source)) return { ok: false, error: 'stale_document' };
+    const requestedConversation = cleanConversationId(message.conversationId);
+    const key = String(source.tab);
+    const registeredConversation = cleanConversationId(tabConversations[key]);
+    if (requestedConversation && registeredConversation && requestedConversation !== registeredConversation) {
+      return { ok: false, error: 'stale_conversation' };
+    }
+    if (requestedConversation && !registeredConversation) {
+      await noteTabConversation(source, requestedConversation);
+      if (!ownsDocument(source)) return { ok: false, error: 'stale_document' };
+    }
+    // A named chat's auto-compaction switch is not anonymous global authority. Pass the
+    // document's proven conversation to the app so worker-role policy is enforced there even
+    // if stale UI state somehow reaches this handler.
+    const conversationId = cleanConversationId(tabConversations[key]) ?? requestedConversation;
+    const body = {};
+    if (typeof message.autoCompact === 'boolean') body.autoCompact = message.autoCompact;
+    if (typeof message.goal === 'boolean') body.goal = message.goal;
+    if (typeof message.autoCompact === 'boolean' && conversationId) body.conversationId = conversationId;
+    const result = await call('/settings', { method: 'POST', body: JSON.stringify(body) });
+    return ownsDocument(source) ? result : { ok: false, error: 'stale_document' };
+  },
   /** The marked page asking for the one command it was opened for. */
   async redeem(message) {
-    return redeemCommand(String(message.id || ''), String(message.client || ''));
+    return redeemCommand(
+      String(message.id || ''),
+      String(message.client || ''),
+      typeof message.conversationId === 'string' ? message.conversationId : null
+    );
+  },
+  /**
+   * A revival page has positively identified the exact target chat but it is not submit-ready
+   * yet. Persist only its inert correlation marker so a service-worker/browser restart can put
+   * the same durable app command back in front of that conversation. No command text is copied.
+   */
+  async defer_revival(message, _sender, source) {
+    await load();
+    if (!ownsDocument(source)) return { ok: false, error: 'stale_document' };
+    const conversationId = cleanConversationId(message.conversationId);
+    if (!conversationId) return { ok: false, error: 'bad_conversation_id' };
+    await noteTabConversation(source, conversationId);
+    if (!ownsDocument(source)) return { ok: false, error: 'stale_document' };
+    const id = deferredRevivalId(message.id);
+    if (!id) return { ok: false, error: 'bad_command_id' };
+    const senderTabId = Number.isInteger(source?.tab) ? source.tab : null;
+    const senderUrl = typeof _sender?.tab?.url === 'string' ? _sender.tab.url : '';
+    const senderPendingUrl = typeof _sender?.tab?.pendingUrl === 'string' ? _sender.tab.pendingUrl : '';
+    const knownPreference = revivalPreference(id);
+    const isFallback =
+      senderTabId !== null &&
+      (
+        knownPreference?.fallbackTabId === senderTabId ||
+        revivalReuseAttempted.get(senderTabId) === id ||
+        markerFromUrl(senderUrl) === id ||
+        markerFromUrl(senderPendingUrl) === id
+      );
+    if (isFallback && senderTabId !== null) {
+      let tabs = [];
+      try {
+        tabs = await chrome.tabs.query({ url: CHATGPT_TAB_URLS });
+      } catch {
+        tabs = [];
+      }
+      const preferred = tabs.find(
+        (tab) =>
+          tab &&
+          typeof tab.id === 'number' &&
+          tab.id !== senderTabId &&
+          conversationForTab(tab) === conversationId
+      );
+      if (preferred) {
+        await rememberPreferredRevival(id, conversationId, senderTabId, preferred.id);
+        return { ok: true, deferred: true, preferredElsewhere: true };
+      }
+      if (knownPreference?.preferredTabId && knownPreference.preferredTabId !== senderTabId) {
+        // The preferred tab may be between query visibility and document registration. Keep the
+        // fallback fenced until a concrete lifecycle event proves that tab really left.
+        return { ok: true, deferred: true, preferredElsewhere: true };
+      }
+    }
+    const remembered = await rememberDeferredRevival(id, conversationId);
+    if (remembered && senderTabId !== null) deferredRevivalOffers.set(id, senderTabId);
+    return remembered ? { ok: true, deferred: true } : { ok: false, error: 'bad_command_id' };
+  },
+  async forget_revival(message, _sender, source) {
+    await load();
+    if (!ownsDocument(source)) return { ok: false, error: 'stale_document' };
+    await forgetDeferredRevival(message.id);
+    return { ok: true };
   },
   async ack(message, _sender, source) {
-    return ackCommand(
+    const result = await ackCommand(
       String(message.id || ''),
       message.status === 'failed' ? 'failed' : 'sent',
       message.error,
@@ -1693,6 +2222,43 @@ const HANDLERS = {
       message.client,
       source
     );
+    // ackCommand first made this irreversible page result durable in the browser-owned outbox.
+    // From that point recovery must never reopen the pre-send marker, even if the bridge HTTP
+    // response itself was lost; the outbox is now the sole retry path.
+    await forgetDeferredRevival(message.id);
+    return result;
+  },
+  async close_agent_tab(_message, sender, source) {
+    const id = (source && Number.isInteger(source.tab)) ? source.tab : tabId(sender);
+    if (id !== null && Number.isInteger(id)) {
+      try {
+        await chrome.tabs.remove(id);
+        return { ok: true };
+      } catch (err) {
+        return { ok: false, error: String(err && err.message ? err.message : err) };
+      }
+    }
+    return { ok: false, error: 'no_tab' };
+  },
+  async recover_conversation_tab(message, sender, source) {
+    const targetUrl = typeof message?.url === 'string' ? message.url : '';
+    if (!targetUrl || (!targetUrl.startsWith('https://chatgpt.com/') && !targetUrl.startsWith('https://chat.openai.com/'))) {
+      return { ok: false, error: 'invalid_url' };
+    }
+    const oldTabId = (source && Number.isInteger(source.tab)) ? source.tab : tabId(sender);
+    try {
+      await chrome.tabs.create({ url: targetUrl, active: true });
+      if (oldTabId !== null && Number.isInteger(oldTabId)) {
+        try {
+          await chrome.tabs.remove(oldTabId);
+        } catch {
+          // Tab may already be closing or closed
+        }
+      }
+      return { ok: true };
+    } catch (err) {
+      return { ok: false, error: String(err && err.message ? err.message : err) };
+    }
   }
 };
 
@@ -1710,9 +2276,20 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     'closed',
     'compact',
     'auto_compact_claim',
+    'goal_draft',
+    'goal_focus',
+    'goal_ack',
+    'goal_objective',
+    'goal_open',
+    'settings_set',
+    'settings_get',
     'repair_fiber',
     'redeem',
-    'ack'
+    'defer_revival',
+    'forget_revival',
+    'ack',
+    'close_agent_tab',
+    'recover_conversation_tab'
   ]);
   const run = async () => {
     let source = null;
@@ -1730,10 +2307,156 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   return true;
 });
 
+/** The command marker the app puts in a URL it opens, from either the query or the fragment. */
+function markerFromUrl(value) {
+  try {
+    const url = new URL(String(value || ''));
+    const fromQuery = url.searchParams.get('clf');
+    if (fromQuery) return fromQuery;
+    const hash = url.hash.startsWith('#') ? url.hash.slice(1) : url.hash;
+    return new URLSearchParams(hash).get('clf');
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Keeps a revival in the tab that chat is already open in.
+ *
+ * The app opens a URL; the browser makes a tab. That is the right answer for the two
+ * commands that open a chat which does not exist yet, and the wrong one for the command that
+ * names a chat the user may well be looking at right now: waking a worker would leave them
+ * with the same conversation open twice, once per revival, which is exactly the pile of
+ * ChatGPT tabs this whole design exists to avoid.
+ *
+ * So the marker is intercepted at the moment the tab is created — before it has navigated,
+ * loaded ChatGPT, or run a content script — and, if that conversation is already open
+ * somewhere, handed to the document that has it. Revival routing deliberately does not activate
+ * or focus that existing tab: hidden/background delivery is part of the transport contract, and
+ * visibility must not be required for the content document to redeem and submit the wake. The
+ * empty tab the browser just made is closed again only after the existing document claims.
+ *
+ * A ping proves only that an existing recorder is alive. It does not prove command ownership:
+ * while the service worker awaits that ping the newly opened `/c/<id>?clf=...` page can finish
+ * loading and durably redeem the same command. The existing document must therefore redeem the
+ * bridge lease itself and report `claimed:true` before the fallback is removed. Whichever page
+ * wins that durable lease stays alive; a mere health reply can never kill the winner.
+ */
+async function reuseOpenChatTab(openedTabId, conversation, commandId) {
+  await load();
+  let tabs = [];
+  try {
+    tabs = await chrome.tabs.query({ url: CHATGPT_TAB_URLS });
+  } catch {
+    return false;
+  }
+  const existing = tabs.filter(
+    (tab) => tab && typeof tab.id === 'number' && tab.id !== openedTabId && conversationForTab(tab) === conversation
+  );
+  if (existing.length === 0) return false;
+  // Presence is enough to establish preference, even if that document is still starting and
+  // cannot answer a ping yet. Persisting this browser-session fence before probing prevents the
+  // marked fallback from winning merely because the already-open worker tab needed another render.
+  try {
+    await rememberPreferredRevival(commandId, conversation, openedTabId, existing[0].id);
+  } catch {
+    // If browser metadata itself cannot be persisted, keep the fallback alive. The content-side
+    // defer custody gate will retry before either document is allowed to redeem/send.
+  }
+  for (const candidate of existing) {
+    try {
+      const alive = await chrome.tabs.sendMessage(candidate.id, { type: 'clf-recorder-ping' });
+      if (!alive || alive.ok !== true || alive.recorderVersion !== PAGE_RECORDER_VERSION) continue;
+    } catch {
+      // Two copies of one chat can survive an extension reload differently. A dead first match
+      // must not hide a healthy second one and force a third duplicate to remain open.
+      continue;
+    }
+    let reply = null;
+    try {
+      reply = await chrome.tabs.sendMessage(candidate.id, {
+        type: 'clf-run-command',
+        id: commandId,
+        conversationId: conversation
+      });
+    } catch {
+      // It died after the ping but before it could acquire the lease. Try another already-open
+      // copy; if none can claim, the app-opened fallback remains the ordinary delivery path.
+      continue;
+    }
+    if (!reply || reply.ok !== true || reply.claimed !== true) continue;
+
+    // This document now owns the command durably. The marked fallback can no longer redeem it,
+    // so removing that tab cannot destroy the only owner or cause duplicate user-message sends.
+    try {
+      await chrome.tabs.remove(openedTabId);
+    } catch {
+      // The fallback may already have been closed by the user. Ownership is still safely here.
+    }
+    await clearRevivalPreference(commandId).catch(() => undefined);
+    return true;
+  }
+  return false;
+}
+
+/**
+ * Best current conversation identity for one ChatGPT tab.
+ *
+ * A concrete `/c/<id>` URL wins. During full reload/startup Chrome can temporarily expose only
+ * the ChatGPT root, a pending URL, or no URL at all while our tab registry still durably knows
+ * which conversation this numeric tab represents. That transient shape must count as "the exact
+ * worker tab is present" for revival routing, otherwise recovery creates a duplicate tab ~at
+ * random depending on which lifecycle event won the race.
+ *
+ * The registry is deliberately ignored when a concrete *different* conversation is in the URL;
+ * that is a real A->B navigation and stale registry state must not keep A artificially present.
+ */
+function conversationForTab(tab) {
+  if (!tab || typeof tab.id !== 'number') return null;
+  const current = conversationFromUrl(tab.url);
+  if (current) return current;
+  const pending = conversationFromUrl(tab.pendingUrl);
+  if (pending) return pending;
+  const urls = [tab.url, tab.pendingUrl].filter((value) => typeof value === 'string' && value);
+  if (urls.some((value) => !isChatGptUrl(value))) return null;
+  return cleanConversationId(tabConversations[String(tab.id)]);
+}
+
+// Chrome may fire tabs.onCreated before either url or pendingUrl is populated, then publish
+// the real target on tabs.onUpdated. One marked revival gets exactly one reuse attempt per
+// tab+command: retrying on every loading/status update could hand the same command to the
+// existing document twice, while keying this only by tab id makes a long-lived worker tab's
+// *previous* revival look like fallback authority for every later wake.
+const revivalReuseAttempted = new Map();
+
+function maybeReuseRevivalTab(tabId, url) {
+  if (typeof tabId !== 'number') return false;
+  const conversation = conversationFromUrl(url);
+  const commandId = markerFromUrl(url);
+  // Only ever a marked URL naming a concrete conversation, which is only ever a revival.
+  if (!conversation || !commandId) return false;
+  if (revivalReuseAttempted.get(tabId) === commandId) return false;
+  revivalReuseAttempted.set(tabId, commandId);
+  void reuseOpenChatTab(tabId, conversation, commandId).catch(() => undefined);
+  return true;
+}
+
+// Guarded like every other listener registration here: an older Chrome, or a harness that
+// stubs only the tab APIs this extension used to need, must not fail to load the worker.
+if (chrome.tabs && chrome.tabs.onCreated && typeof chrome.tabs.onCreated.addListener === 'function') {
+  chrome.tabs.onCreated.addListener((tab) => {
+    const url = typeof tab?.pendingUrl === 'string' && tab.pendingUrl ? tab.pendingUrl : tab?.url;
+    maybeReuseRevivalTab(tab?.id, url);
+  });
+}
+
 // Document unload is not conversation lifetime. A real tab close is: reload keeps the
 // same tab id, while closing it wakes the service worker and retires only that tab's claim.
 chrome.tabs.onRemoved.addListener((id) => {
+  revivalReuseAttempted.delete(id);
+  clearDeferredRevivalOffersForTab(id);
   void serializeTab(id, async () => {
+    if (clearRevivalPreferencesForTab(id)) await persistLive();
     const documentId = await markTerminal(id);
     return releaseTab(id, null, documentId);
   }).catch(() => undefined);
@@ -1746,9 +2469,12 @@ chrome.tabs.onRemoved.addListener((id) => {
 // by the content script when another concrete conversation id appears.
 chrome.tabs.onUpdated.addListener((id, changeInfo) => {
   if (!changeInfo) return;
+  if (typeof changeInfo.url === 'string') maybeReuseRevivalTab(id, changeInfo.url);
   const fullNavigation = changeInfo.status === 'loading';
   const leftChatGpt = typeof changeInfo.url === 'string' && !isChatGptUrl(changeInfo.url);
   if (!fullNavigation && !leftChatGpt) return;
+  if (fullNavigation || leftChatGpt) clearDeferredRevivalOffersForTab(id);
+  if (leftChatGpt && clearRevivalPreferencesForTab(id)) void persistLive().catch(() => undefined);
   // A loading transition is a browser document boundary even when both URLs are ChatGPT.
   // SPA pushState does not emit it. The replacement document must register with its own
   // MessageSender.documentId before any identity-sensitive IPC is accepted.
@@ -1778,6 +2504,20 @@ chrome.tabs.onUpdated.addListener((id, changeInfo) => {
       }
       const documentId = typeof tabDocuments[key] === 'string' ? tabDocuments[key] : null;
       const targetConversation = conversationFromUrl(targetUrl);
+      if (targetConversation) {
+        let preferenceChanged = false;
+        for (const [commandId, raw] of Object.entries(revivalPreferences)) {
+          if (!raw || typeof raw !== 'object') continue;
+          if (
+            (raw.preferredTabId === id || raw.fallbackTabId === id) &&
+            cleanConversationId(raw.conversationId) !== targetConversation
+          ) {
+            delete revivalPreferences[commandId];
+            preferenceChanged = true;
+          }
+        }
+        if (preferenceChanged) await persistLive();
+      }
       if (knownConversation && targetConversation && targetConversation !== knownConversation && documentId) {
         // This is not an ambiguous reload: Chrome is replacing known chat A with concrete
         // chat B. Anything still provisional in A's dying document is too old/unbound to be
@@ -1814,7 +2554,158 @@ chrome.tabs.onUpdated.addListener((id, changeInfo) => {
  * receive both its static manifest injection and this recovery injection.
  */
 const CHATGPT_TAB_URLS = ['https://chatgpt.com/*', 'https://chat.openai.com/*'];
-const PAGE_RECORDER_VERSION = 9;
+const PAGE_RECORDER_VERSION = 10;
+
+let deferredRecoveryWork = null;
+
+function clearDeferredRevivalOffersForTab(tabId) {
+  if (!Number.isInteger(tabId)) return;
+  for (const [id, offeredTab] of [...deferredRevivalOffers.entries()]) {
+    if (offeredTab === tabId) deferredRevivalOffers.delete(id);
+  }
+}
+
+function offerDeferredRevivalToTab(entry, tab) {
+  if (!entry || !tab || typeof tab.id !== 'number') return false;
+  const id = deferredRevivalId(entry.id);
+  const conversationId = cleanConversationId(entry.conversationId);
+  if (!id || !conversationId) return false;
+  if (deferredRevivalOffers.get(id) === tab.id) return true;
+  deferredRevivalOffers.set(id, tab.id);
+  try {
+    const offered = chrome.tabs.sendMessage(tab.id, {
+      type: 'clf-run-command',
+      id,
+      conversationId,
+      // This is browser-restart recovery of a marker that may already have been superseded by a
+      // later app wake. content.js may abandon it only while it is still pre-redeem; a fresh
+      // reuse handoff is never allowed to preempt an already redeeming/owned command.
+      deferredRecovery: true
+    });
+    void Promise.resolve(offered).then(
+      (reply) => {
+        // A claimed response means this document crossed the durable bridge lease and remains
+        // the sole owner until ACK. Every other response means this offer did not take custody;
+        // allow a later document-registration/recovery signal to retry the same existing tab.
+        if (reply && reply.ok === true && reply.claimed === true) {
+          const preference = revivalPreference(id);
+          if (preference) {
+            if (tab.id === preference.preferredTabId) {
+              void chrome.tabs.remove(preference.fallbackTabId).catch(() => undefined);
+            }
+            void clearRevivalPreference(id).catch(() => undefined);
+          }
+        } else {
+          if (deferredRevivalOffers.get(id) === tab.id) deferredRevivalOffers.delete(id);
+        }
+      },
+      () => {
+        if (deferredRevivalOffers.get(id) === tab.id) deferredRevivalOffers.delete(id);
+      }
+    );
+    return true;
+  } catch {
+    if (deferredRevivalOffers.get(id) === tab.id) deferredRevivalOffers.delete(id);
+    return false;
+  }
+}
+
+function deferredRevivalUrl(entry) {
+  if (!entry || !deferredRevivalId(entry.id) || !cleanConversationId(entry.conversationId)) return null;
+  const url = new URL(`https://chatgpt.com/c/${entry.conversationId}`);
+  url.searchParams.set('clf', entry.id);
+  url.hash = `clf=${encodeURIComponent(entry.id)}`;
+  return url.toString();
+}
+
+/**
+ * Re-presents deferred revival markers after MV3/document/browser lifetime loss.
+ *
+ * There is deliberately no command text here and no local "sent" decision. An existing exact
+ * conversation gets first chance to install the content-side readiness waiter; if no such tab
+ * survived the browser restart, a marked exact-chat tab is recreated. Either path still has to
+ * win `/commands/redeem`, so several recovery triggers cannot duplicate or cross-deliver text.
+ */
+function recoverDeferredRevivals() {
+  if (deferredRecoveryWork) return deferredRecoveryWork;
+  const work = (async () => {
+    await load();
+    // A durable terminal page result supersedes its pre-send recovery marker. This matters on a
+    // browser restart between ChatGPT accepting the message and the app accepting the ACK.
+    const ackIds = new Set(commandAckOutbox.map((entry) => deferredRevivalId(entry?.id)).filter(Boolean));
+    const before = deferredRevivals.length;
+    deferredRevivals = deferredRevivals.filter(
+      (entry) => deferredRevivalId(entry?.id) && cleanConversationId(entry?.conversationId) && !ackIds.has(entry.id)
+    );
+    if (deferredRevivals.length !== before) await persistLive();
+    if (deferredRevivals.length === 0) return;
+
+    let tabs = [];
+    try {
+      tabs = await chrome.tabs.query({ url: CHATGPT_TAB_URLS });
+    } catch {
+      tabs = [];
+    }
+
+    for (const entry of [...deferredRevivals]) {
+      const preference = revivalPreference(entry.id);
+      let exact = null;
+      if (preference) {
+        exact =
+          tabs.find(
+            (tab) =>
+              tab &&
+              typeof tab.id === 'number' &&
+              tab.id === preference.preferredTabId &&
+              conversationForTab(tab) === entry.conversationId
+          ) ?? null;
+        if (!exact) {
+          // A browser-session preference is stronger than the fallback's temporary visibility.
+          // Do not let recovery pick the marked duplicate just because the original exact tab is
+          // between URL publication and document registration. onRemoved / concrete navigation
+          // clears the preference if that tab genuinely ceases to be the target.
+          continue;
+        }
+      } else {
+        exact =
+          tabs.find(
+            (tab) => tab && typeof tab.id === 'number' && conversationForTab(tab) === entry.conversationId
+          ) ?? null;
+      }
+      if (exact) {
+        // Presence and readiness are separate. Even a temporarily dead/stale recorder means the
+        // exact worker tab exists, so never create another tab merely because sendMessage cannot
+        // answer yet. Probe readiness first so a startup race does not spray repeated run-command
+        // messages at a document that cannot receive them; registration/reload recovery retries
+        // the same tab, and only a current recorder receives the actual command once.
+        try {
+          const live = await chrome.tabs.sendMessage(exact.id, { type: 'clf-recorder-ping' });
+          if (live && live.ok === true && live.recorderVersion === PAGE_RECORDER_VERSION) {
+            offerDeferredRevivalToTab(entry, exact);
+          }
+        } catch {
+          // Exact tab still exists. Temporary receiver absence is readiness=false, never absence.
+        }
+        continue;
+      }
+
+      const url = deferredRevivalUrl(entry);
+      if (!url) continue;
+      try {
+        const created = await chrome.tabs.create({ url });
+        if (created && typeof created.id === 'number') tabs.push({ ...created, url });
+      } catch {
+        // Browser policy/window teardown can reject create; the local marker remains for the next
+        // browser/service-worker lifetime instead of turning that transport failure into a wake failure.
+      }
+    }
+  })();
+  const tracked = work.finally(() => {
+    if (deferredRecoveryWork === tracked) deferredRecoveryWork = null;
+  });
+  deferredRecoveryWork = tracked;
+  return tracked;
+}
 
 async function restoreOpenChatgptTabs() {
   let tabs = [];
@@ -1860,7 +2751,7 @@ async function restoreOpenChatgptTabs() {
 }
 
 chrome.runtime.onInstalled.addListener(() => {
-  void restoreOpenChatgptTabs();
+  void restoreOpenChatgptTabs().then(() => recoverDeferredRevivals()).catch(() => undefined);
   void load().then(() => {
     if (journal.length > 0 || closeOutbox.length > 0 || commandAckOutbox.length > 0) scheduleRetry();
   });
@@ -1872,6 +2763,7 @@ if (chrome.runtime.onStartup && typeof chrome.runtime.onStartup.addListener === 
       .then(() => drainCommandAcks())
       .then(() => drain())
       .then(() => drainCloses())
+      .then(() => recoverDeferredRevivals())
       .catch(() => undefined);
   });
 }
@@ -1890,7 +2782,7 @@ if (chrome.alarms && chrome.alarms.onAlarm && typeof chrome.alarms.onAlarm.addLi
 // development/reload paths. The service worker itself *must* start, though. Ping first, so
 // ordinary worker wake-ups are one cheap message per ChatGPT tab and inject nothing; only a
 // dead or stale recorder pays the scripting cost.
-void restoreOpenChatgptTabs();
+void restoreOpenChatgptTabs().then(() => recoverDeferredRevivals()).catch(() => undefined);
 void load().then(() => {
   if (journal.length > 0 || closeOutbox.length > 0 || commandAckOutbox.length > 0) scheduleRetry();
 });

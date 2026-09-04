@@ -89,10 +89,19 @@ async function readText(file: string): Promise<string | null> {
   }
 }
 
-function parseJournal(raw: string): OrchestrationEvent[] {
+interface ParsedJournal {
+  events: OrchestrationEvent[];
+  /** UTF-8 byte length of the last fully terminated record; null when no torn tail exists. */
+  repairLength: number | null;
+}
+
+function parseJournal(raw: string): ParsedJournal {
   const events: OrchestrationEvent[] = [];
   let previousSeq = 0;
-  for (const line of raw.split(/\r?\n/)) {
+  const hasTornTail = raw.length > 0 && !raw.endsWith('\n');
+  const lastNewline = hasTornTail ? raw.lastIndexOf('\n') : raw.length - 1;
+  const committedPrefix = hasTornTail ? raw.slice(0, lastNewline + 1) : raw;
+  for (const line of committedPrefix.split(/\r?\n/)) {
     if (!line.trim()) continue;
     const event = JSON.parse(line) as OrchestrationEvent;
     if (!Number.isInteger(event.seq) || event.seq <= 0) {
@@ -104,12 +113,19 @@ function parseJournal(raw: string): OrchestrationEvent[] {
     previousSeq = event.seq;
     events.push(event);
   }
-  return events;
+  return {
+    events,
+    repairLength: hasTornTail ? Buffer.byteLength(committedPrefix, 'utf8') : null
+  };
+}
+
+async function readJournalFromDisk(): Promise<ParsedJournal> {
+  const raw = await readText(journalFile());
+  return raw === null ? { events: [], repairLength: null } : parseJournal(raw);
 }
 
 async function readEventsFromDisk(): Promise<OrchestrationEvent[]> {
-  const raw = await readText(journalFile());
-  return raw === null ? [] : parseJournal(raw);
+  return (await readJournalFromDisk()).events;
 }
 
 async function readSnapshotFromDisk<State = unknown>(): Promise<OrchestrationSnapshot<State> | null> {
@@ -119,8 +135,11 @@ async function readSnapshotFromDisk<State = unknown>(): Promise<OrchestrationSna
 
 async function currentSequence(): Promise<number> {
   if (nextSeq !== null) return nextSeq;
-  const [events, snapshot] = await Promise.all([readEventsFromDisk(), readSnapshotFromDisk()]);
-  const lastEvent = events.at(-1);
+  const [journal, snapshot] = await Promise.all([readJournalFromDisk(), readSnapshotFromDisk()]);
+  if (journal.repairLength !== null) {
+    await fs.truncate(journalFile(), journal.repairLength);
+  }
+  const lastEvent = journal.events.at(-1);
   const journalSeq = lastEvent?.seq ?? 0;
   nextSeq = Math.max(journalSeq, snapshot?.lastSeq ?? 0);
   return nextSeq;

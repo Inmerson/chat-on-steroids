@@ -68,6 +68,7 @@ const api = {
   addRoot: () => call<AppState>('roots:add'),
   removeRoot: (name: string) => call<AppState>('roots:remove', { name }),
   renameRoot: (name: string, newName: string) => call<AppState>('roots:rename', { name, newName }),
+  toggleAllComputer: () => call<AppState>('roots:allComputer:toggle'),
   setApiKey: (value: string) => call<AppState>('secret:set', { value }),
   // The goal loop's own credential. Same channel, named slot; the value only ever goes in.
   setGoalKey: (value: string) => call<AppState>('secret:set', { value, key: 'openRouterApiKey' }),

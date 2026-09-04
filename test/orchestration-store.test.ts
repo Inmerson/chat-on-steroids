@@ -70,4 +70,23 @@ describe('V3 orchestration durable store', () => {
 
     await expect(readOrchestrationSnapshot()).resolves.toEqual(snapshot);
   });
+
+  it('recovers the valid prefix of a torn final journal record and repairs it before the next append', async () => {
+    const dir = await tempStore();
+    const first = await appendOrchestrationEvent(event('RUN_CREATED', 'run-1'));
+    const journal = path.join(dir, 'state', 'orchestration', 'journal.jsonl');
+    await fs.appendFile(journal, '{"seq":2,"eventId":"torn', 'utf8');
+
+    resetOrchestrationStoreForTests();
+    initOrchestrationStore(dir);
+
+    await expect(readOrchestrationEvents()).resolves.toEqual([first]);
+    const second = await appendOrchestrationEvent(event('TASK_CREATED', 'T1'));
+    expect(second.seq).toBe(2);
+
+    resetOrchestrationStoreForTests();
+    initOrchestrationStore(dir);
+    await expect(readOrchestrationEvents()).resolves.toEqual([first, second]);
+    expect(await fs.readFile(journal, 'utf8')).not.toContain('"eventId":"torn');
+  });
 });

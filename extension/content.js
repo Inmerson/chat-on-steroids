@@ -207,6 +207,9 @@
 
   let conversationId = null;
   let agent = null;
+  try {
+    agent = sessionStorage.getItem('cos_agent_worker') || null;
+  } catch {}
 
   const queue = [];
   const queueSizes = new WeakMap();
@@ -1298,8 +1301,18 @@
     if (endedTurnId && compactCapture && compactCapture.generation === endedTurnId) {
       void deliverBrief(finalAnswerText(ended), result.outcome);
     }
-    if (endedTurnId && autoLoopActive && result.outcome === 'completed') {
-      void handleAutoLoopTurnEnd(finalAnswerText(ended));
+    if (endedTurnId && autoLoopActive) {
+      const ans = finalAnswerText(ended) || answerText(ended);
+      if (result.outcome === 'completed' || (result.outcome !== 'failed' && result.outcome !== 'stopped' && ans && ans.trim().length > 0)) {
+        void handleAutoLoopTurnEnd(ans);
+      }
+    }
+    const workerAgent = agent || (() => {
+      try { return sessionStorage.getItem('cos_agent_worker'); } catch { return null; }
+    })();
+    if (endedTurnId && workerAgent && !autoLoopActive) {
+      try { sessionStorage.removeItem('cos_agent_worker'); } catch {}
+      void ask({ type: 'close_agent_tab' });
     }
     turnStartedAt = 0;
     genNode = null;
@@ -4632,134 +4645,98 @@
   let nativeBusy = false;
 
   // ------------------------------------------------------------- auto-loop (API-free)
+  const MCP_TRIGGER_PREFIX = '@Chat On Steroids Core\n\n';
+
   let autoLoopActive = false;
   let autoLoopMode = 'off'; // 'off' | 'standard' | 'infinite'
   let autoLoopTurns = 0;
   const MAX_AUTO_LOOP_TURNS = 20;
   let autoLoopTimer = null;
+
+  // Watchdog state: activity-aware tracking instead of blind timers
+  let autoLoopPromptSentAt = 0;
+  let autoLoopLastProgressAt = 0;
+  let autoLoopGeneratingStarted = false;
+  const AUTO_LOOP_IDLE_TIMEOUT_MS = 180_000; // 3 minutes without generation starting
+  const AUTO_LOOP_GENERATION_FREEZE_MS = 300_000; // 5 minutes of absolute silence while generating
+
+  function markAutoLoopPromptSent() {
+    autoLoopPromptSentAt = Date.now();
+    autoLoopLastProgressAt = Date.now();
+    autoLoopGeneratingStarted = false;
+  }
+
+  function clearAutoLoopWatchdog() {
+    autoLoopPromptSentAt = 0;
+    autoLoopLastProgressAt = 0;
+    autoLoopGeneratingStarted = false;
+  }
+
+  function checkAutoLoopWatchdog() {
+    if (!autoLoopActive) return;
+
+    const isGen = generating || CLF_DOM.generating();
+    const now = Date.now();
+
+    if (isGen) {
+      autoLoopGeneratingStarted = true;
+      // While tokens stream or tool blocks update, lastChangeAt is refreshed.
+      // If activity happened within the last 3 minutes, treat generation as actively healthy.
+      if (lastChangeAt > 0 && (now - lastChangeAt) < 180_000) {
+        autoLoopLastProgressAt = now;
+      }
+      // Only diagnose a true freeze if generating has seen ZERO updates for 5 continuous minutes.
+      if (now - autoLoopLastProgressAt >= AUTO_LOOP_GENERATION_FREEZE_MS) {
+        recoverOrRolloverAutoLoop('Generation frozen for 5 minutes with no progress');
+      }
+      return;
+    }
+
+    // Not generating right now.
+    // Case 1: Prompt was dispatched, but ChatGPT hasn't started generating after 3 minutes.
+    if (autoLoopPromptSentAt > 0 && !autoLoopGeneratingStarted) {
+      if (now - autoLoopPromptSentAt >= AUTO_LOOP_IDLE_TIMEOUT_MS) {
+        recoverOrRolloverAutoLoop('No response initiated within 3 minutes');
+      }
+      return;
+    }
+
+    // Case 2: Auto-loop prompt is scheduled to send via timer.
+    if (autoLoopTimer !== null) return;
+
+    // Case 3: Idle recovery. If a turn finished but next prompt was not triggered for 2 minutes:
+    if (autoLoopGeneratingStarted && autoLoopPromptSentAt === 0) {
+      if (autoLoopLastProgressAt > 0 && (now - autoLoopLastProgressAt >= 120_000)) {
+        const composer = CLF_DOM.composer();
+        if (composer && (composer.textContent || '').trim()) {
+          stopAutoLoop('User draft present in composer');
+          return;
+        }
+        autoLoopGeneratingStarted = false;
+        autoLoopLastProgressAt = now;
+        const recoveryPrompt = autoLoopMode === 'infinite' ? getInfiniteLoopEvolutionPrompt() : getContinuationPrompt();
+        scheduleAutoLoopPrompt(recoveryPrompt, 500);
+      }
+    }
+  }
+
   const CONFIRMATION_PROMPTS = [
-    // Türkçe tekil aksiyon ve kısaltmalar
-    'devam',
-    'dvm',
-    'davm',
-    'ilerle',
-    'devam et',
-    'devamet',
-    'devamke',
-    'dvm et',
-    'devamm',
-    'dvmm',
-    'ilerle devam',
-    'sıradakine geç',
-    'siradakine gec',
-    'sıradaki adıma geçelim',
-    'siradaki adima gecelim',
-    'sıradaki adımı yap',
-    'siradaki adimi yap',
-    'sıradaki adımı uygula',
-    'siradaki adimi uygula',
-    'aynen devam',
-    'devam edelim',
-    'hadi devam',
-    'devam lütfen',
-    'devam lutfen',
-    'geç sıradakine',
-    'durma devam et',
-    'ilerle sıradaki',
-    'dvm devam',
-    'devam et durma',
-    'hadi ilerle',
-    'adımlara devam et',
-
-    // Türkçe doğal onay + aksiyon kombinasyonları (tamamdır + devam et vb.)
-    'tamamdır devam et',
-    'tamamdir devam et',
-    'tamamdır, devam et',
-    'tamamdir, devam et',
-    'tamam devam et',
-    'tamam devam',
-    'tamamdır devam',
-    'tamamdir devam',
-    'tmm devam',
-    'tmm devam et',
-    'tmm dvm',
-    'tamamdır ilerle',
-    'tamamdir ilerle',
-    'tamamdır sıradakine geç',
-    'tamamdir siradakine gec',
-    'tamamdır sıradaki adıma geçelim',
-    'tamamdir siradaki adima gecelim',
-    'güzel, devam et',
-    'guzel devam et',
-    'harika, devam et',
-    'harika devam',
-    'oldu devam et',
-    'olur devam et',
-    'tamamdır durma devam',
-    'tamamdır devamke',
-    'onaylıyorum, devam et',
-    'onayliyorum devam et',
-
-    // İngilizce tekil aksiyonlar
-    'continue',
-    'cntinue',
-    'contnue',
-    'proceed',
-    'proced',
-    'keep going',
-    'next step',
-    'next step please',
-    'nxt step',
-    'go ahead with next step',
-    'go on',
-    'move on to next step',
-    'move on',
-    'proceed to next step',
-    'carry on',
-    'continue next',
-    'keep moving forward',
-    'proceed with next step',
-    'continue, next step',
-    'lets continue',
-    "let's continue",
-    'continue please',
-
-    // İngilizce doğal onay + aksiyon kombinasyonları
-    'ok, continue',
-    'ok continue',
-    'okay, continue',
-    'okay, proceed',
-    'ok proceed',
-    'all good, keep going',
-    'all good, next step',
-    'sounds good, continue',
-    'looks good, proceed',
-    'looks good, next step',
-    'great, keep going',
-    'great, move on',
-    'got it, continue',
-    'understood, proceed',
-    'sure, go ahead',
-    'alright, continue'
+    'Proceed with the next step. Keep going autonomously using your tools.',
+    'Continue execution. Perform the next scheduled action without stopping.',
+    'Looks good, proceed to the next step and execute it.',
+    'Approved. Continue with the implementation.',
+    'Go ahead with the next step. Keep working towards completion.',
+    'Understood, keep going with the next action.',
+    'Continue with the plan. Execute the next step immediately.',
+    'All clear, proceed with the implementation.'
   ];
 
   const STEP_PREFIXES = [
-    'tamamdır, devam et: ',
-    'tamamdir devam et: ',
-    'devam et: ',
-    'ilerle, ',
-    'devam: ',
-    'dvm: ',
-    'tmm devam: ',
-    'sıradaki adım: ',
-    'siradaki adim: ',
-    'sıradaki adımı yap: ',
-    'siradaki adimi yap: ',
-    'ok, proceed with: ',
-    'continue with: ',
-    'next step: ',
-    'go ahead with: ',
-    'keep going with: '
+    'Approved, proceed with: ',
+    'Continue execution with: ',
+    'Keep going, next step is: ',
+    'Go ahead and execute: ',
+    'Proceed to implement: '
   ];
 
   function getContinuationPrompt(nextStep) {
@@ -4796,28 +4773,15 @@
       .replace(/`[^`]*`/g, '')
       .replace(/[^\p{L}\p{N}]/gu, '')
       .toLowerCase()
-      .slice(0, 250);
+      .slice(0, 500);
   }
 
   const DECISION_DELEGATION_PROMPTS = [
-    // Türkçe tam yetki ve karar devri mesajları
-    'Sen karar ver, en mantıklı seçenek hangisiyse onunla devam et.',
-    'Sana bırakıyorum, en uygun olanı seç ve ilerle.',
-    'En doğru seçeneği sen belirle ve durma devam et.',
-    'Sen karar ver devam et.',
-    'Sana bırakıyorum, en mantıklı adımı seçip ilerle.',
-    'En iyi seçenek hangisiyse onu uygula ve devam et.',
-    'Sen nasıl uygun görüyorsan öyle yap, devam et.',
-    'Karar senin, en uygun adımla devam et.',
-    'Sen seç ve ilerle, durma.',
-
-    // İngilizce karar devri mesajları
-    'You decide, proceed with the best option.',
-    'I leave the choice to you, pick the optimal option and continue.',
-    'Choose the most suitable option yourself and keep going.',
-    'You make the call and proceed.',
-    'Go with whichever option is best and keep moving forward.',
-    'Pick the best path yourself and continue.'
+    'You decide. Evaluate the trade-offs, choose the most optimal and robust approach, and proceed with execution immediately.',
+    'I delegate the decision to you. Select the best solution and continue without stopping.',
+    'Make the technical decision yourself based on best practices and proceed with the implementation.',
+    'You have full autonomy to choose the best option. Pick the right path and keep executing.',
+    'Choose whichever option delivers the highest quality and performance, and proceed right away.'
   ];
 
   function getDecisionDelegationPrompt() {
@@ -4826,16 +4790,19 @@
   }
 
   const INFINITE_LOOP_EVOLUTION_PROMPTS = [
-    // Türkçe ileri seviye otonom inovasyon ve geliştirme promptları
-    'Harika, bu aşama başarıyla tamamlandı! ŞİMDİ DURMAK YOK: Projedeki tüm kod tabanını, mevcut mimariyi, testleri ve performansı kapsamlıca analiz et. Projeyi bir üst seviyeye taşıyacak en kritik eksik özelliği, optimizasyonu veya yeni yeteneği belirle, adım adım planla ve hemen uygulamaya başla!',
-    'Tebrikler, hedef tamamlandı! Şimdi projeyi otonom geliştirmeye kesintisiz devam ediyoruz: Kod tabanında refactoring yapılabilecek alanları, güvenlik veya performans açıklarını ve kullanıcı deneyimini zenginleştirecek yeni kabiliyetleri tara. Sıradaki en değerli özelliği seç ve doğrudan kodlamaya başla.',
-    'Mükemmel, bu görev bitti! Durmaksızın devam: Projeye değer katacak bir sonraki mantıklı adımı, yeni özelliği veya mimari güçlendirmeyi belirle. Planını çıkar ve doğrudan uygulamaya geç.',
-    'Başarılı! Geliştirmeye tam gaz devam ediyoruz: Eksik testleri, eksik hata yakalamalarını veya projeyi zenginleştirecek yeni fonksiyonları tespit et ve hemen inşa etmeye başla.',
+    'Milestone completed successfully! CONTINUOUS AUTONOMOUS DEVELOPMENT MODE (INFINITE LOOP) ACTIVE.\n\n' +
+    'Do not stop: thoroughly inspect the project architecture, features, test coverage, and documentation. ' +
+    'Identify the next highest-impact feature, optimization, refactoring, or critical capability to build. ' +
+    'Note: If there are uncommitted working tree changes from other independent tasks, leave them untouched and focus on the chosen improvement. ' +
+    'Formulate a concrete execution plan and start implementing it immediately using your MCP tools.',
 
-    // İngilizce ileri seviye otonom inovasyon promptları
-    'Excellent, this milestone is fully completed! DO NOT STOP: inspect the entire codebase, current architecture, tests, and performance. Identify the next most impactful feature, optimization, or capability to build, outline the steps, and start implementing it right away!',
-    'Task completed successfully! Keep the autonomous momentum going: audit the repository for missing features, performance bottlenecks, or code quality enhancements. Select the highest-value improvement and proceed with coding immediately.',
-    'Great job, milestone achieved! Continuous evolution mode: determine the next logical feature or architectural enhancement for this project and start developing it now.'
+    'Goal achieved! Autonomous development continues without interruption.\n\n' +
+    'Audit the codebase for missing capabilities, performance improvements, test coverage gaps, or UI/UX enhancements. ' +
+    'Select the single most valuable improvement (ignoring unrelated external edits) and begin implementing it now.',
+
+    'Excellent work! Proceeding to the next evolutionary milestone in infinite autonomous mode.\n\n' +
+    'Analyze the current state of the repository, review the architecture, and determine the next logical feature or architectural enhancement. ' +
+    'Start coding and applying changes immediately using your MCP tools.'
   ];
 
   function getInfiniteLoopEvolutionPrompt() {
@@ -4855,6 +4822,9 @@
       /should\s+i\s+(?:proceed|continue)\s+with/i,
       /do\s+you\s+want\s+me\s+to/i,
       /please\s+(?:choose|select|pick)\s+(?:an\s+option|one)/i,
+      /(?:option\s+1|option\s+a)[\s\S]*?(?:option\s+2|option\s+b)/i,
+      /let\s+me\s+know\s+(?:what|how|which)/i,
+      /would\s+you\s+prefer/i,
       /hangisini\s+(?:tercih\s+edersiniz|seçersiniz|istersiniz)/i,
       /hangi\s+seçene(?:ği|k)/i,
       /nasıl\s+ilerlememizi\s+istersiniz/i,
@@ -4883,28 +4853,137 @@
 
     for (const pattern of errorPatterns) {
       if (pattern.test(lower)) {
-        return 'ChatGPT hata/limit uyarısı verdi.';
+        return 'ChatGPT rate limit or service error encountered';
       }
     }
 
     return null;
   }
 
-  let autoLoopWatchdogTimer = null;
-  const AUTO_LOOP_WATCHDOG_TIMEOUT_MS = 90_000;
+  function extractOngoingTaskContext() {
+    try {
+      const msgs = typeof CLF_DOM.messages === 'function' ? CLF_DOM.messages() : [];
+      const title = typeof CLF_DOM.conversationTitle === 'function' ? CLF_DOM.conversationTitle() : '';
 
-  function resetAutoLoopWatchdog() {
-    if (autoLoopWatchdogTimer) {
-      clearTimeout(autoLoopWatchdogTimer);
-      autoLoopWatchdogTimer = null;
-    }
-    if (autoLoopActive) {
-      autoLoopWatchdogTimer = setTimeout(() => {
-        if (autoLoopActive) {
-          rolloverToNewChat('90 saniye yanıt alınamadı / sohbet takıldı');
+      const cleanPrompt = (txt) => {
+        if (!txt || typeof txt !== 'string') return '';
+        return txt
+          .replace(/@chatonsteroid\b/gi, '')
+          .replace(/@Chat On Steroids[^\n]*\n*/gi, '')
+          .trim();
+      };
+
+      let userTexts = msgs
+        .filter((m) => m && m.role === 'user' && typeof m.text === 'string')
+        .map((m) => cleanPrompt(m.text))
+        .filter(Boolean);
+
+      if (userTexts.length === 0) {
+        const userNodes = document.querySelectorAll('[data-message-author-role="user"]');
+        for (const node of userNodes) {
+          const txt = cleanPrompt(node.textContent);
+          if (txt) userTexts.push(txt);
         }
-      }, AUTO_LOOP_WATCHDOG_TIMEOUT_MS);
+      }
+
+      const genuineUserPrompts = userTexts.filter((txt) =>
+        !txt.startsWith('Transferred to this clean session') &&
+        !txt.startsWith('Önceki sohbet') &&
+        !txt.startsWith('Milestone completed') &&
+        !txt.startsWith('Goal achieved')
+      );
+
+      const rootPrompt = genuineUserPrompts.length > 0
+        ? genuineUserPrompts[0]
+        : (userTexts.length > 0 ? userTexts[0] : '');
+
+      const latestUserPrompt = genuineUserPrompts.length > 1
+        ? genuineUserPrompts[genuineUserPrompts.length - 1]
+        : '';
+
+      let lastAssistantSummary = '';
+      const assistantMsgs = msgs
+        .filter((m) => m && m.role === 'assistant' && typeof m.text === 'string')
+        .map((m) => m.text.trim())
+        .filter(Boolean);
+
+      if (assistantMsgs.length === 0) {
+        const assistantNodes = document.querySelectorAll('[data-message-author-role="assistant"]');
+        if (assistantNodes.length > 0) {
+          const lastNode = assistantNodes[assistantNodes.length - 1];
+          lastAssistantSummary = (lastNode.textContent || '').trim();
+        }
+      } else {
+        lastAssistantSummary = assistantMsgs[assistantMsgs.length - 1];
+      }
+
+      return {
+        title,
+        rootPrompt: rootPrompt ? rootPrompt.slice(0, 1000) : '',
+        latestUserPrompt: latestUserPrompt ? latestUserPrompt.slice(0, 500) : '',
+        lastAssistantSummary: lastAssistantSummary ? lastAssistantSummary.slice(0, 800) : ''
+      };
+    } catch {
+      return { title: '', rootPrompt: '', latestUserPrompt: '', lastAssistantSummary: '' };
     }
+  }
+
+  function recoverOrRolloverAutoLoop(reason) {
+    if (!autoLoopActive) return;
+    const currentConvId = CLF_DOM.conversationId() || conversationId;
+
+    let recoverCount = 0;
+    try {
+      if (currentConvId) {
+        recoverCount = Number(sessionStorage.getItem('cos_conv_recover_' + currentConvId)) || 0;
+      }
+    } catch {}
+
+    // If we have an existing conversation and haven't exceeded 3 recoveries,
+    // reopen the same conversation URL in a clean tab (and close the stalled tab).
+    // This preserves 100% of context, history, and files on ChatGPT natively!
+    if (currentConvId && recoverCount < 3) {
+      try {
+        sessionStorage.setItem('cos_conv_recover_' + currentConvId, String(recoverCount + 1));
+      } catch {}
+
+      autoLoopActive = false;
+      if (autoLoopTimer) {
+        clearTimeout(autoLoopTimer);
+        autoLoopTimer = null;
+      }
+      clearAutoLoopWatchdog();
+
+      const recoveryUrl = `https://chatgpt.com/c/${currentConvId}?cos_autoloop=1&cos_mode=${encodeURIComponent(autoLoopMode)}&cos_resume=1`;
+
+      try {
+        localStorage.setItem(
+          'cos_autoloop_pending',
+          JSON.stringify({
+            active: true,
+            mode: autoLoopMode,
+            conversationId: currentConvId,
+            resumeSameChat: true,
+            reason: reason || 'stall_recovery',
+            timestamp: Date.now()
+          })
+        );
+      } catch {}
+
+      void ask({ type: 'recover_conversation_tab', url: recoveryUrl })
+        .then((res) => {
+          if (!res || !res.ok) {
+            window.location.href = recoveryUrl;
+          }
+        })
+        .catch(() => {
+          window.location.href = recoveryUrl;
+        });
+      return;
+    }
+
+    // Fallback: If no conversation ID exists yet (root URL), or if repeated recoveries failed, rollover to a new chat
+    rolloverToNewChat(reason);
   }
 
   function rolloverToNewChat(reason) {
@@ -4914,26 +4993,34 @@
       clearTimeout(autoLoopTimer);
       autoLoopTimer = null;
     }
-    if (autoLoopWatchdogTimer) {
-      clearTimeout(autoLoopWatchdogTimer);
-      autoLoopWatchdogTimer = null;
-    }
+    clearAutoLoopWatchdog();
 
-    let rolloverPrompt = '';
-    if (autoLoopMode === 'infinite') {
-      rolloverPrompt =
-        'Önceki sohbet ' +
-        (reason ? '(' + reason + ') ' : '') +
-        'sebebiyle takıldığı için bu temiz sohbete aktarıldık. ' +
-        'SONSUZ OTONOM GELİŞTİRME MODU AKTİF (INFINITE LOOP). Lütfen projenin ve yerel çalışma dizinindeki dosya ve git durumunu derinlemesine analiz et, ' +
-        'en son yapılanları kontrol et, projeye değer katacak sıradaki en kritik eksik özelliği veya optimizasyonu belirle ve durmadan kodlamaya başla!';
+    const taskCtx = extractOngoingTaskContext();
+    let rolloverPrompt = `${MCP_TRIGGER_PREFIX}`;
+    rolloverPrompt += `Transferred to this clean session to resume ongoing work${reason ? ` (${reason})` : ''}.\n\n`;
+
+    if (taskCtx.rootPrompt || taskCtx.title) {
+      rolloverPrompt += `CRITICAL INSTRUCTION: Continue ONLY the specific task that was interrupted in the previous session. Do NOT pick up unrelated uncommitted changes or work on other features that may be present in the workspace.\n\n`;
+      if (taskCtx.title) {
+        rolloverPrompt += `[TASK TITLE]: ${taskCtx.title}\n`;
+      }
+      if (taskCtx.rootPrompt) {
+        rolloverPrompt += `[INTERRUPTED TASK / ORIGINAL USER REQUEST]:\n${taskCtx.rootPrompt}\n\n`;
+      }
+      if (taskCtx.latestUserPrompt && taskCtx.latestUserPrompt !== taskCtx.rootPrompt) {
+        rolloverPrompt += `[LATEST INSTRUCTION BEFORE STALL]:\n${taskCtx.latestUserPrompt}\n\n`;
+      }
+      if (taskCtx.lastAssistantSummary) {
+        rolloverPrompt += `[LAST KNOWN PROGRESS]:\n${taskCtx.lastAssistantSummary}\n\n`;
+      }
+      rolloverPrompt += `NEXT STEPS:\n`;
+      rolloverPrompt += `1. Review the progress on THIS specific task only.\n`;
+      rolloverPrompt += `2. Inspect only the files and git status relevant to this task (ignore unrelated edits in the repository).\n`;
+      rolloverPrompt += `3. Continue implementing and verifying the solution until completion using your MCP tools.`;
     } else {
-      rolloverPrompt =
-        'Önceki sohbet ' +
-        (reason ? '(' + reason + ') ' : '') +
-        'sebebiyle takıldığı için bu temiz sohbete aktarıldık. ' +
-        'GÖREV BİTMEDİ, DEVAM EDİYOR. Lütfen projedeki ve yerel çalışma dizinindeki en son dosya ve git durumunu kontrol et, ' +
-        'kaldığımız adımı tespit et ve işi bitirene kadar durmadan sıradaki adımları uygulamaya devam et.';
+      rolloverPrompt +=
+        `TASK IN PROGRESS: Check the active task from the previous session. ` +
+        `Focus strictly on finishing the interrupted task, and continue execution immediately without stopping.`;
     }
 
     try {
@@ -4942,7 +5029,7 @@
         JSON.stringify({
           active: true,
           mode: autoLoopMode,
-          reason: reason || 'takilma_aktarimi',
+          reason: reason || 'session_transfer',
           prompt: rolloverPrompt,
           timestamp: Date.now()
         })
@@ -4954,33 +5041,84 @@
     window.location.href = 'https://chatgpt.com/?cos_autoloop=1&cos_mode=' + encodeURIComponent(autoLoopMode);
   }
 
+  async function sendAutoLoopPrompt(promptText) {
+    if (!autoLoopActive) return false;
+
+    let fullPrompt = (promptText || '').trim();
+    if (!fullPrompt.startsWith('@Chat On Steroids')) {
+      fullPrompt = `${MCP_TRIGGER_PREFIX}${fullPrompt}`;
+    }
+
+    const composer = CLF_DOM.composer();
+    if (composer && (composer.textContent || '').trim()) {
+      stopAutoLoop('User draft present in composer');
+      return false;
+    }
+
+    if (CLF_DOM.insertPrompt(fullPrompt)) {
+      await sleep(200);
+      const sent = await CLF_DOM.send();
+      if (sent) {
+        autoLoopTurns++;
+        markAutoLoopPromptSent();
+        renderControl();
+        return true;
+      } else {
+        recoverOrRolloverAutoLoop('ChatGPT failed to send message');
+        return false;
+      }
+    } else {
+      recoverOrRolloverAutoLoop('Unable to write to composer');
+      return false;
+    }
+  }
+
+  function scheduleAutoLoopPrompt(promptText, delayMs = 1500) {
+    if (autoLoopTimer) {
+      clearTimeout(autoLoopTimer);
+      autoLoopTimer = null;
+    }
+    autoLoopTimer = setTimeout(async () => {
+      autoLoopTimer = null;
+      if (!autoLoopActive) return;
+      await sendAutoLoopPrompt(promptText);
+    }, delayMs);
+  }
+
   function toggleAutoLoop() {
     if (!autoLoopActive) {
-      // 1. Tıklama: Standart Auto-Loop
+      // 1. Click: Standard Auto-Loop
       autoLoopActive = true;
       autoLoopMode = 'standard';
       autoLoopTurns = 0;
       autoLoopLastReason = '';
       autoLoopRecentFingerprints = [];
       renderControl();
-      resetAutoLoopWatchdog();
+      markAutoLoopPromptSent();
+
+      // If idle, immediately kick off the continuation prompt
+      if (!generating && !CLF_DOM.generating()) {
+        scheduleAutoLoopPrompt(getContinuationPrompt(), 500);
+      }
     } else if (autoLoopMode === 'standard') {
-      // 2. Tıklama: Sonsuz Otonom Döngü (Infinite Loop)
+      // 2. Click: Infinite Autonomous Loop
       autoLoopMode = 'infinite';
       renderControl();
+
+      // If idle, immediately trigger evolution prompt
+      if (!generating && !CLF_DOM.generating()) {
+        scheduleAutoLoopPrompt(getInfiniteLoopEvolutionPrompt(), 500);
+      }
     } else {
-      // 3. Tıklama: Kapat
-      stopAutoLoop('Kullanıcı durdurdu');
+      // 3. Click: Turn off
+      stopAutoLoop('User stopped');
     }
   }
 
   function stopAutoLoop(reason) {
     autoLoopMode = 'off';
     autoLoopLastReason = reason || '';
-    if (autoLoopWatchdogTimer) {
-      clearTimeout(autoLoopWatchdogTimer);
-      autoLoopWatchdogTimer = null;
-    }
+    clearAutoLoopWatchdog();
     if (!autoLoopActive && !autoLoopTimer) {
       renderControl();
       return;
@@ -5000,58 +5138,37 @@
 
     if (parsed.status === 'COMPLETED') {
       if (autoLoopMode === 'infinite') {
-        // Sonsuz döngü modunda başarıda durmak yok: sıradaki yeni özelliği bulup kodlamaya başla!
         prompt = getInfiniteLoopEvolutionPrompt();
       } else {
-        stopAutoLoop('Hedef tamamlandı!');
+        stopAutoLoop('Goal achieved!');
         return;
       }
     } else if (autoLoopTurns >= MAX_AUTO_LOOP_TURNS) {
-      rolloverToNewChat(`Maksimum ${MAX_AUTO_LOOP_TURNS} tur sınırına ulaşıldı`);
+      rolloverToNewChat(`Maximum turn limit of ${MAX_AUTO_LOOP_TURNS} reached`);
       return;
     } else {
       const blockReason = detectClarificationOrBlock(answer);
       if (blockReason) {
-        rolloverToNewChat(blockReason);
+        recoverOrRolloverAutoLoop(blockReason);
         return;
       }
 
       const fingerprint = normalizeForSimilarity(answer);
-      if (fingerprint && fingerprint.length > 25) {
-        if (autoLoopRecentFingerprints.includes(fingerprint)) {
-          rolloverToNewChat('Tekrarlayan yanıtta takıldı');
+      if (fingerprint && fingerprint.length > 50) {
+        const matches = autoLoopRecentFingerprints.filter((f) => f === fingerprint).length;
+        if (matches >= 2) {
+          recoverOrRolloverAutoLoop('Repetitive response detected');
           return;
         }
         autoLoopRecentFingerprints.push(fingerprint);
-        if (autoLoopRecentFingerprints.length > 4) autoLoopRecentFingerprints.shift();
+        if (autoLoopRecentFingerprints.length > 6) autoLoopRecentFingerprints.shift();
       }
 
       const isDecisionQuestion = detectDecisionOrOptionRequest(answer);
       prompt = isDecisionQuestion ? getDecisionDelegationPrompt() : getContinuationPrompt(parsed.nextStep);
     }
 
-    autoLoopTimer = setTimeout(async () => {
-      autoLoopTimer = null;
-      if (!autoLoopActive) return;
-      const composer = CLF_DOM.composer();
-      if (composer && (composer.textContent || '').trim()) {
-        stopAutoLoop('Mesaj kutusunda kullanıcı taslağı var.');
-        return;
-      }
-      if (CLF_DOM.insertPrompt(prompt)) {
-        await sleep(150);
-        const sent = await CLF_DOM.send();
-        if (sent) {
-          autoLoopTurns++;
-          renderControl();
-          resetAutoLoopWatchdog();
-        } else {
-          rolloverToNewChat('ChatGPT mesajı gönderemedi');
-        }
-      } else {
-        rolloverToNewChat('Mesaj kutusuna yazılamadı');
-      }
-    }, 1500);
+    scheduleAutoLoopPrompt(prompt, 1500);
   }
 
   function buildControl() {
@@ -5206,20 +5323,20 @@
         if (autoLoopMode === 'infinite') {
           control.loopBtn.className = 'clf-loop-btn clf-loop-active clf-loop-infinite';
           control.loopBtn.textContent = `♾️ Infinite (${autoLoopTurns})`;
-          control.loopBtn.title = `Sonsuz Otonom Döngü aktif (tur ${autoLoopTurns})!\nBaşarıda durmaz, sürekli yeni özellikler bulup kodlamaya devam eder.\nDurdurmak için tıklayın.`;
+          control.loopBtn.title = `Infinite Autonomous Loop active (turn ${autoLoopTurns})\nContinuously discovers and implements features without stopping.\nClick to stop.`;
         } else {
           control.loopBtn.className = 'clf-loop-btn clf-loop-active';
           control.loopBtn.textContent = `⚡ Loop (${autoLoopTurns})`;
-          control.loopBtn.title = `Standart Auto-Loop aktif (tur ${autoLoopTurns}/${MAX_AUTO_LOOP_TURNS}).\nGörev bittiğinde durur.\nTıklayarak ♾️ Infinite Loop moduna geçebilirsiniz.`;
+          control.loopBtn.title = `Standard Auto-Loop active (turn ${autoLoopTurns}/${MAX_AUTO_LOOP_TURNS})\nStops upon goal completion.\nClick to switch to Infinite Loop.`;
         }
       } else {
         control.loopBtn.className = 'clf-loop-btn';
         if (autoLoopLastReason) {
-          control.loopBtn.textContent = '⚡ Loop: Durdu';
-          control.loopBtn.title = `Auto-Loop durduruldu: ${autoLoopLastReason}\nTekrar başlatmak için tıklayın.`;
+          control.loopBtn.textContent = '⚡ Loop: Stopped';
+          control.loopBtn.title = `Auto-Loop stopped: ${autoLoopLastReason}\nClick to restart.`;
         } else {
           control.loopBtn.textContent = '⚡ Loop: Off';
-          control.loopBtn.title = 'Auto-Loop başlatmak için tıklayın.\n(1. Tık: Standart Loop, 2. Tık: ♾️ Infinite Loop)';
+          control.loopBtn.title = 'Click to start Auto-Loop.\n(1st click: Standard Loop, 2nd click: Infinite Loop)';
         }
       }
     }
@@ -5975,6 +6092,10 @@
     }
     if (!(await CLF_DOM.send())) return void (await fail('ChatGPT did not accept the bootstrap send'));
     agent = boot.agent || null;
+    try {
+      if (agent) sessionStorage.setItem('cos_agent_worker', agent);
+      else sessionStorage.removeItem('cos_agent_worker');
+    } catch {}
 
     // The conversation id only exists once ChatGPT has accepted the message, and it is the
     // whole point of the report: for a worker it is what binds the slot to this chat and
@@ -5985,12 +6106,18 @@
       const found = CLF_DOM.conversationId();
       if (found) {
         await ask({ type: 'ack', id: boot.id, status: 'sent', conversationId: found, agent, client: RUN_ID });
+        if (agent) {
+          void ask({ type: 'close_agent_tab' });
+        }
         return;
       }
     }
     // Sent, but this tab never saw an id, so nothing can be bound to it. Reported honestly:
     // the app ends the slot or the continuation rather than waiting on a chat it cannot name.
     await ask({ type: 'ack', id: boot.id, status: 'sent', agent, client: RUN_ID });
+    if (agent) {
+      void ask({ type: 'close_agent_tab' });
+    }
   }
 
   // ----------------------------------------------------------------- start
@@ -6168,6 +6295,7 @@
 
     const hasParam = typeof window !== 'undefined' && window.location && window.location.search.includes('cos_autoloop=1');
     const hasInfiniteParam = typeof window !== 'undefined' && window.location && window.location.search.includes('cos_mode=infinite');
+    const isResumeSameChat = (pending && pending.resumeSameChat === true) || (typeof window !== 'undefined' && window.location && window.location.search.includes('cos_resume=1'));
     if (!pending && !hasParam) return;
 
     if (hasParam) {
@@ -6186,13 +6314,59 @@
     autoLoopActive = true;
     autoLoopMode = pending?.mode || (hasInfiniteParam ? 'infinite' : 'standard');
     autoLoopTurns = 0;
-    autoLoopLastReason = 'Otomatik devralındı (' + (pending?.reason || 'yeni sohbet') + ')';
+    autoLoopLastReason = isResumeSameChat
+      ? 'Resumed same conversation (' + (pending?.reason || 'stall recovery') + ')'
+      : 'Auto resumed (' + (pending?.reason || 'new session') + ')';
     renderControl();
-    resetAutoLoopWatchdog();
+    markAutoLoopPromptSent();
 
-    const promptToSend =
+    if (isResumeSameChat) {
+      const readyComposer = await waitForComposer();
+      if (!readyComposer) return;
+
+      // Allow 1.5s for ChatGPT to hydrate existing conversation turns
+      await sleep(1500);
+
+      // If ChatGPT is already streaming/generating (e.g. reconnected on reload), don't inject anything
+      if (generating || CLF_DOM.generating()) {
+        markAutoLoopPromptSent();
+        renderControl();
+        return;
+      }
+
+      // Check the latest assistant turn in the existing conversation
+      const allTurns = typeof CLF_DOM.turns === 'function' ? CLF_DOM.turns() : [];
+      const lastAssistantTurn = allTurns.filter((t) => t && t.role === 'assistant').pop();
+      const lastText = lastAssistantTurn
+        ? (finalAnswerText(lastAssistantTurn) || answerText(lastAssistantTurn))
+        : '';
+      const parsed = parseLoopStatusAndStep(lastText);
+
+      // If the turn completed while tab was recovering and mode is infinite, evolve to next milestone
+      if (parsed.status === 'COMPLETED') {
+        if (autoLoopMode === 'infinite') {
+          scheduleAutoLoopPrompt(getInfiniteLoopEvolutionPrompt(), 1000);
+        } else {
+          stopAutoLoop('Goal achieved!');
+        }
+        return;
+      }
+
+      // Turn was stalled/interrupted: send a simple continuation nudge in the same chat
+      const continuePrompt = parsed.nextStep
+        ? getContinuationPrompt(parsed.nextStep)
+        : `${MCP_TRIGGER_PREFIX}Please continue where you left off without stopping.`;
+
+      scheduleAutoLoopPrompt(continuePrompt, 1000);
+      return;
+    }
+
+    let promptToSend =
       pending?.prompt ||
-      'Önceki sohbet takıldığı için bu temiz sohbete aktarıldık. GÖREV BİTMEDİ, DEVAM EDİYOR. Lütfen projenin yerel çalışma dizinindeki dosya ve git durumunu kontrol et ve sıradaki adımları durmadan uygulamaya devam et.';
+      ('Transferred to this clean session. Task in progress: resume ongoing work and execute the next steps immediately without stopping.');
+    if (!promptToSend.startsWith('@Chat On Steroids')) {
+      promptToSend = `${MCP_TRIGGER_PREFIX}${promptToSend}`;
+    }
 
     for (let i = 0; i < 40; i++) {
       await sleep(500);
@@ -6205,7 +6379,7 @@
           if (sent) {
             autoLoopTurns = 1;
             renderControl();
-            resetAutoLoopWatchdog();
+            markAutoLoopPromptSent();
             break;
           }
         }
@@ -6254,6 +6428,7 @@
     paint();
     renderStreams();
     foldBootstrap();
+    checkAutoLoopWatchdog();
   });
   scheduleActivityPull(ACTIVITY_MS);
   if (typeof document !== 'undefined' && document.addEventListener) {

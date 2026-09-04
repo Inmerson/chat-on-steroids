@@ -18,7 +18,13 @@ import { listGoalModels, MODEL_PAGE_SIZE, retireGoalDrafts } from './goal.js';
 import { forgetExposedSurface } from './mcp/server.js';
 import { runDiagnostics } from './diagnostics.js';
 import { formatLogAsJson, formatLogForClipboard, getLog, logInfo, onLog } from './logger.js';
-import { RESERVED_ROOT_NAMES, uniqueRootName, validateNewRoot, SandboxError } from './sandbox.js';
+import {
+  RESERVED_ROOT_NAMES,
+  defaultRootNameForPath,
+  detectSystemDrives,
+  validateNewRoot,
+  SandboxError
+} from './sandbox.js';
 import { hasSecret, isEncryptionAvailable, secureStorageStatus, setSecret } from './secrets.js';
 import { bundledVersion, locateBinary } from './tunnel/locate.js';
 import { TUNNEL_ID_PATTERN } from './tunnel/index.js';
@@ -354,12 +360,44 @@ export function registerIpc(getWindow: () => BrowserWindow | null): void {
 
     let addedName = '';
     await updateConfig(async (config) => {
-      const real = await validateNewRoot(result.filePaths[0]!, config.roots);
-      const name = uniqueRootName(real, config.roots);
+      const real = await validateNewRoot(result.filePaths[0]!, config.roots, { allowDrive: true });
+      const name = defaultRootNameForPath(real, config.roots);
       addedName = name;
       return { ...config, roots: [...config.roots, { name, path: real }] };
     });
     logInfo(`approved folder /${addedName}`);
+    return buildState();
+  });
+
+  handle('roots:allComputer:toggle', async () => {
+    let nowAllComputer = false;
+    await updateConfig(async (config) => {
+      const currentlyAll = Boolean(config.allComputer);
+      if (currentlyAll) {
+        const restoredRoots = config.previousRoots && config.previousRoots.length > 0 ? config.previousRoots : [];
+        nowAllComputer = false;
+        return {
+          ...config,
+          allComputer: false,
+          previousRoots: [],
+          roots: restoredRoots
+        };
+      } else {
+        const drives = await detectSystemDrives();
+        const driveRoots = drives.map((drive) => ({
+          name: defaultRootNameForPath(drive, []),
+          path: drive
+        }));
+        nowAllComputer = true;
+        return {
+          ...config,
+          allComputer: true,
+          previousRoots: config.roots,
+          roots: driveRoots
+        };
+      }
+    });
+    logInfo(nowAllComputer ? 'approved all computer drives' : 'revoked all computer drives');
     return buildState();
   });
 
@@ -369,6 +407,7 @@ export function registerIpc(getWindow: () => BrowserWindow | null): void {
       if (!config.roots.some((root) => root.name === name)) throw new Error(`/${name} is not an approved folder`);
       return {
         ...config,
+        allComputer: false,
         roots: config.roots.filter((r) => r.name !== name)
       };
     });

@@ -145,7 +145,7 @@ const rootSchema = z.object({
     .min(1)
     .max(32)
     .regex(/^[a-z0-9][a-z0-9._-]*$/, 'Root names are lowercase letters, digits, dot, dash, underscore'),
-  path: z.string().min(2).max(4096)
+  path: z.string().min(1).max(4096)
 });
 
 /**
@@ -214,6 +214,8 @@ const configSchema = z.object({
     .transform(uniqueStoredRoots),
   capabilities: capabilitiesSchema,
   readOnly: z.boolean(),
+  allComputer: z.boolean().optional().default(false),
+  previousRoots: z.array(rootSchema).optional().default([]),
   tunnel: z.object({
     kind: z.enum(['openai', 'cloudflared', 'manual']),
     tunnelId: z.string().max(128),
@@ -328,6 +330,8 @@ export function defaultConfig(platform: NodeJS.Platform = process.platform): Con
     // stored schema remains cross-platform so one config can still be moved between machines.
     capabilities: capabilitiesForPlatform({ ...ALL_FIRST_LAUNCH_CAPABILITIES }, platform),
     readOnly: false,
+    allComputer: false,
+    previousRoots: [],
     tunnel: { kind: 'openai', tunnelId: '', desktopTunnelId: '', binaryPath: '' },
     ui: { minimizeToTray: true, autoConnect: false, privacyScreenshots: false, theme: 'dark' },
     sessions: { ...DEFAULT_SESSIONS },

@@ -15,6 +15,10 @@ export interface AssignmentEvidence {
   source: AssignmentEvidenceSource;
 }
 
+export interface MessageEvidence {
+  workerId: string;
+}
+
 interface SnapshotMessage {
   text: string;
 }
@@ -86,6 +90,38 @@ export function assignmentEvidenceForPrime(
     ownerPrimeConversationId,
     assignmentMarker(operationId)
   );
+}
+
+export function messageEvidenceInSnapshot(
+  snapshotInput: unknown,
+  ownerPrimeConversationId: string,
+  marker: string
+): MessageEvidence | null {
+  if (!snapshotInput || typeof snapshotInput !== 'object') return null;
+  const snapshot = snapshotInput as BrokerSnapshot;
+  const agents = ownerAgents(snapshot, ownerPrimeConversationId);
+  if (!agents) return null;
+
+  const matches = new Set<string>();
+  for (const agent of agents) {
+    if (!agent?.info || agent.info.role !== 'worker' || typeof agent.info.id !== 'string') continue;
+    for (const message of Array.isArray(agent.queue) ? agent.queue : []) {
+      if (!message || typeof message.text !== 'string' || !hasMarkerLine(message.text, marker)) continue;
+      matches.add(agent.info.id);
+    }
+  }
+  if (matches.size === 0) return null;
+  if (matches.size > 1) {
+    throw new Error(`MESSAGE_EVIDENCE_AMBIGUOUS: marker matched ${matches.size} workers`);
+  }
+  return { workerId: [...matches][0] as string };
+}
+
+export function messageEvidenceForPrime(
+  ownerPrimeConversationId: string,
+  marker: string
+): MessageEvidence | null {
+  return messageEvidenceInSnapshot(snapshotSwarm() as unknown, ownerPrimeConversationId, marker);
 }
 
 export function brokerWorkersForPrime(ownerPrimeConversationId: string) {

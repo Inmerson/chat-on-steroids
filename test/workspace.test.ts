@@ -103,12 +103,12 @@ describe('live process ownership across chat replacement', () => {
 
     expect(moveExecConversationOwners('chat-a', 'chat-b')).toBe(1);
     expect(execOwner(101)).toBe('chat-b');
-    expect(execOwnershipDenied(101, 'chat-a')).toBe(false);
+    expect(execOwnershipDenied(101, 'chat-a')).toBe(true);
     expect(execOwnershipDenied(101, 'chat-b')).toBe(false);
 
     expect(execOwner(102)).toBeNull();
     expect(execOwnershipDenied(102, null)).toBe(false);
-    expect(execOwnershipDenied(102, 'chat-b')).toBe(false);
+    expect(execOwnershipDenied(102, 'chat-b')).toBe(true);
     expect(execOwner(103)).toBe('chat-other');
     expect(execOwnershipDenied(103, 'chat-other')).toBe(false);
   });

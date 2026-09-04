@@ -223,6 +223,8 @@ export interface Config {
   compaction: CompactionSettings;
   multiAgent: MultiAgentSettings;
   goal: GoalSettings;
+  allComputer?: boolean;
+  previousRoots?: Root[];
 }
 
 export type ConnectionState =

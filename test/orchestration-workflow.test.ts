@@ -5,12 +5,13 @@ import path from 'node:path';
 import { promisify } from 'node:util';
 import { afterEach, describe, expect, it } from 'vitest';
 
-import { initDurableStore, resetDurableForTests } from '../src/main/durable.js';
+import { initDurableStore, resetDurableForTests, writeDurableNow } from '../src/main/durable.js';
 import { acceptInitialManagerPlan } from '../src/main/orchestration/manager-plan.js';
 import { recoverOrchestrationState } from '../src/main/orchestration/recovery.js';
 import { appendOrchestrationEvents, resetOrchestrationStoreForTests } from '../src/main/orchestration/store.js';
 import * as workflowModule from '../src/main/orchestration/workflow.js';
 import {
+  advanceWorkflowForRuntime,
   resetWorkflowStateForTests,
   submitTaskCompletionForRuntime,
   submitRunReviewForRuntime,
@@ -121,6 +122,14 @@ async function fixture(taskCount: 1 | 2 = 1) {
       calls.push(`message:${workerId}:${text}`);
       return true;
     },
+    messageEvidence: (_runtime, marker) => {
+      const workerMatch = calls.find((call) => call.startsWith('message:') && call.includes(marker));
+      const workerId = workerMatch?.match(/^message:([^:]+):/)?.[1];
+      if (workerId) return { workerId };
+      return calls.some((call) => call.startsWith('manager:') && call.includes(marker))
+        ? { workerId: runtime.managerAgentId }
+        : null;
+    },
     notifyManager: async (_runtime, text) => { calls.push(`manager:${text}`); },
     integrateTask: async (_runtime, task) => {
       const integrationRevision = task.taskId === 'T1' ? 'integration-1' : 'integration-2';
@@ -182,6 +191,437 @@ describe('Agent System 3.0 completion/review workflow', () => {
     expect((await recoverOrchestrationState()).state.tasks.T1?.state).toBe('VERIFIED');
     expect(f.calls).toContain('schedule');
     expect((await workflowStateForRun('run-1'))?.verifications.T1?.[0]?.revision).toBe('integration-1');
+  });
+
+  it('repairs an approved review after a crash persisted the verdict before the journal transition', async () => {
+    const f = await fixture();
+    await submitTaskCompletionForRuntime(
+      f.runtime, 'worker-2',
+      { taskId: 'T1', revision: f.revision, changedFiles: ['src/feature.ts'], verification: [], risks: [], notes: [] },
+      [], true, f.deps
+    );
+
+    const beforeCrash = await workflowStateForRun(f.runtime.runId);
+    const review = beforeCrash?.reviews.T1;
+    expect(review?.reviewerId).toBe('reviewer-1');
+    expect(review?.verdict).toBeNull();
+    await writeDurableNow('as3-workflow', {
+      version: 1,
+      runs: {
+        [f.runtime.runId]: {
+          ...beforeCrash!,
+          reviews: {
+            ...beforeCrash!.reviews,
+            T1: { ...review!, verdict: 'APPROVED', findings: ['looks good'] }
+          }
+        }
+      }
+    });
+
+    // Model process death after the workflow file landed but before TASK_APPROVED was appended.
+    resetDurableForTests();
+    initDurableStore(f.dir);
+    expect((await recoverOrchestrationState()).state.tasks.T1?.state).toBe('REVIEWING');
+
+    await submitTaskReviewForRuntime(
+      f.runtime, 'reviewer-1', { taskId: 'T1', verdict: 'APPROVED', findings: ['looks good'] }, [], true, f.deps
+    );
+
+    expect((await recoverOrchestrationState()).state.tasks.T1?.state).toBe('VERIFIED');
+    expect(f.calls).toContain('verify:T1:integration-1');
+  });
+
+  it('repairs requested changes after a crash persisted the verdict before the journal transition', async () => {
+    const f = await fixture();
+    await submitTaskCompletionForRuntime(
+      f.runtime, 'worker-2',
+      { taskId: 'T1', revision: f.revision, changedFiles: ['src/feature.ts'], verification: [], risks: [], notes: [] },
+      [], true, f.deps
+    );
+
+    const beforeCrash = await workflowStateForRun(f.runtime.runId);
+    const review = beforeCrash?.reviews.T1;
+    await writeDurableNow('as3-workflow', {
+      version: 1,
+      runs: {
+        [f.runtime.runId]: {
+          ...beforeCrash!,
+          reviews: {
+            ...beforeCrash!.reviews,
+            T1: { ...review!, verdict: 'CHANGES_REQUESTED', findings: ['fix the edge case'] }
+          }
+        }
+      }
+    });
+
+    resetDurableForTests();
+    initDurableStore(f.dir);
+    expect((await recoverOrchestrationState()).state.tasks.T1?.state).toBe('REVIEWING');
+
+    await submitTaskReviewForRuntime(
+      f.runtime,
+      'reviewer-1',
+      { taskId: 'T1', verdict: 'CHANGES_REQUESTED', findings: ['fix the edge case'] },
+      [],
+      true,
+      f.deps
+    );
+
+    expect((await recoverOrchestrationState()).state.tasks.T1?.state).toBe('ACTIVE');
+    const recoveredWorkflow = await workflowStateForRun(f.runtime.runId);
+    expect(recoveredWorkflow?.reviewHistory.T1).toHaveLength(1);
+    expect(recoveredWorkflow?.reviews.T1).toBeUndefined();
+    expect(recoveredWorkflow?.completions.T1).toBeUndefined();
+    expect(f.calls.filter((call) => call.startsWith('message:worker-2:'))).toHaveLength(1);
+  });
+
+  it('repairs a blocked review after a crash persisted the verdict before the journal transition', async () => {
+    const f = await fixture();
+    await submitTaskCompletionForRuntime(
+      f.runtime, 'worker-2',
+      { taskId: 'T1', revision: f.revision, changedFiles: ['src/feature.ts'], verification: [], risks: [], notes: [] },
+      [], true, f.deps
+    );
+
+    const beforeCrash = await workflowStateForRun(f.runtime.runId);
+    const review = beforeCrash?.reviews.T1;
+    await writeDurableNow('as3-workflow', {
+      version: 1,
+      runs: {
+        [f.runtime.runId]: {
+          ...beforeCrash!,
+          reviews: {
+            ...beforeCrash!.reviews,
+            T1: { ...review!, verdict: 'BLOCKED', findings: ['dependency missing'] }
+          }
+        }
+      }
+    });
+
+    resetDurableForTests();
+    initDurableStore(f.dir);
+    expect((await recoverOrchestrationState()).state.tasks.T1?.state).toBe('REVIEWING');
+
+    await submitTaskReviewForRuntime(
+      f.runtime,
+      'reviewer-1',
+      { taskId: 'T1', verdict: 'BLOCKED', findings: ['dependency missing'] },
+      [],
+      true,
+      f.deps
+    );
+
+    expect((await recoverOrchestrationState()).state.tasks.T1?.state).toBe('BLOCKED');
+    const recoveredWorkflow = await workflowStateForRun(f.runtime.runId);
+    expect(recoveredWorkflow?.status).toBe('blocked');
+    expect(recoveredWorkflow?.reviewHistory.T1).toHaveLength(1);
+    expect(recoveredWorkflow?.reviews.T1).toBeUndefined();
+    expect(recoveredWorkflow?.completions.T1).toBeUndefined();
+    const managerCall = f.calls.find((call) => call.startsWith('manager:[T1 blocked] dependency missing'));
+    expect(managerCall).toContain(`AS3-Review-Outcome: ${review?.operationId}`);
+    expect(recoveredWorkflow?.reviewHistory.T1?.[0]?.outcomeDelivered).toBe(true);
+  });
+
+  it('preserves the review-round ceiling when recovering persisted requested changes', async () => {
+    const f = await fixture();
+    await submitTaskCompletionForRuntime(
+      f.runtime, 'worker-2',
+      { taskId: 'T1', revision: f.revision, changedFiles: ['src/feature.ts'], verification: [], risks: [], notes: [] },
+      [], true, f.deps
+    );
+
+    const beforeCrash = await workflowStateForRun(f.runtime.runId);
+    const review = beforeCrash?.reviews.T1;
+    await writeDurableNow('as3-workflow', {
+      version: 1,
+      runs: {
+        [f.runtime.runId]: {
+          ...beforeCrash!,
+          reviews: {
+            ...beforeCrash!.reviews,
+            T1: { ...review!, round: 3, verdict: 'CHANGES_REQUESTED', findings: ['still broken'] }
+          }
+        }
+      }
+    });
+
+    resetDurableForTests();
+    initDurableStore(f.dir);
+    expect((await recoverOrchestrationState()).state.tasks.T1?.state).toBe('REVIEWING');
+
+    await submitTaskReviewForRuntime(
+      f.runtime,
+      'reviewer-1',
+      { taskId: 'T1', verdict: 'CHANGES_REQUESTED', findings: ['still broken'] },
+      [],
+      true,
+      f.deps
+    );
+
+    expect((await recoverOrchestrationState()).state.tasks.T1?.state).toBe('BLOCKED');
+    const recoveredWorkflow = await workflowStateForRun(f.runtime.runId);
+    expect(recoveredWorkflow?.status).toBe('blocked');
+    expect(recoveredWorkflow?.reviewHistory.T1).toHaveLength(1);
+    expect(recoveredWorkflow?.reviews.T1).toBeUndefined();
+    expect(recoveredWorkflow?.completions.T1).toBeUndefined();
+  });
+
+  it('reconciles requested-change bookkeeping after the journal advanced before workflow cleanup', async () => {
+    const f = await fixture();
+    await submitTaskCompletionForRuntime(
+      f.runtime, 'worker-2',
+      { taskId: 'T1', revision: f.revision, changedFiles: ['src/feature.ts'], verification: [], risks: [], notes: [] },
+      [], true, f.deps
+    );
+
+    const beforeCrash = await workflowStateForRun(f.runtime.runId);
+    const review = beforeCrash?.reviews.T1;
+    await writeDurableNow('as3-workflow', {
+      version: 1,
+      runs: {
+        [f.runtime.runId]: {
+          ...beforeCrash!,
+          reviews: {
+            ...beforeCrash!.reviews,
+            T1: { ...review!, verdict: 'CHANGES_REQUESTED', findings: ['fix after review'] }
+          }
+        }
+      }
+    });
+    await appendOrchestrationEvents([
+      { eventId: 'crash-review-changes', runId: f.runtime.runId, time: 20, type: 'TASK_CHANGES_REQUESTED', actor: 'reviewer-1', entityId: 'T1', payload: { round: 1 } },
+      { eventId: 'crash-review-reactivate', runId: f.runtime.runId, time: 21, type: 'TASK_ACTIVATED', actor: 'kernel', entityId: 'T1', payload: {} }
+    ]);
+
+    resetDurableForTests();
+    initDurableStore(f.dir);
+    expect((await recoverOrchestrationState()).state.tasks.T1?.state).toBe('ACTIVE');
+
+    await advanceWorkflowForRuntime(f.runtime, [], true, f.deps);
+
+    const reconciled = await workflowStateForRun(f.runtime.runId);
+    expect(reconciled?.reviewHistory.T1).toHaveLength(1);
+    expect(reconciled?.reviews.T1).toBeUndefined();
+    expect(reconciled?.completions.T1).toBeUndefined();
+    expect(f.calls.filter((call) => call.startsWith('message:worker-2:'))).toHaveLength(1);
+
+    await fs.writeFile(path.join(f.repo, 'src', 'feature.ts'), 'export const value = 3;\n');
+    await git(f.repo, ['add', '.']);
+    await git(f.repo, ['commit', '-m', 'fix after recovered review']);
+    const fixedRevision = await git(f.repo, ['rev-parse', 'HEAD']);
+    await submitTaskCompletionForRuntime(
+      f.runtime, 'worker-2',
+      { taskId: 'T1', revision: fixedRevision, changedFiles: ['src/feature.ts'], verification: [], risks: [], notes: [] },
+      [], true, f.deps
+    );
+    expect((await workflowStateForRun(f.runtime.runId))?.reviews.T1?.round).toBe(2);
+  });
+
+  it('reconciles requested-change bookkeeping before accepting the next worker completion', async () => {
+    const f = await fixture();
+    await submitTaskCompletionForRuntime(
+      f.runtime, 'worker-2',
+      { taskId: 'T1', revision: f.revision, changedFiles: ['src/feature.ts'], verification: [], risks: [], notes: [] },
+      [], true, f.deps
+    );
+
+    const beforeCrash = await workflowStateForRun(f.runtime.runId);
+    const review = beforeCrash?.reviews.T1;
+    await writeDurableNow('as3-workflow', {
+      version: 1,
+      runs: {
+        [f.runtime.runId]: {
+          ...beforeCrash!,
+          reviews: {
+            ...beforeCrash!.reviews,
+            T1: { ...review!, verdict: 'CHANGES_REQUESTED', findings: ['fix before resubmission'] }
+          }
+        }
+      }
+    });
+    await appendOrchestrationEvents([
+      { eventId: 'crash-before-next-completion-changes', runId: f.runtime.runId, time: 20, type: 'TASK_CHANGES_REQUESTED', actor: 'reviewer-1', entityId: 'T1', payload: { round: 1 } },
+      { eventId: 'crash-before-next-completion-active', runId: f.runtime.runId, time: 21, type: 'TASK_ACTIVATED', actor: 'kernel', entityId: 'T1', payload: {} }
+    ]);
+
+    resetDurableForTests();
+    initDurableStore(f.dir);
+    await fs.writeFile(path.join(f.repo, 'src', 'feature.ts'), 'export const value = 3;\n');
+    await git(f.repo, ['add', '.']);
+    await git(f.repo, ['commit', '-m', 'fix without manual advance']);
+    const fixedRevision = await git(f.repo, ['rev-parse', 'HEAD']);
+
+    await submitTaskCompletionForRuntime(
+      f.runtime, 'worker-2',
+      { taskId: 'T1', revision: fixedRevision, changedFiles: ['src/feature.ts'], verification: [], risks: [], notes: [] },
+      [], true, f.deps
+    );
+
+    const reconciled = await workflowStateForRun(f.runtime.runId);
+    expect(reconciled?.reviewHistory.T1).toHaveLength(1);
+    expect(reconciled?.reviews.T1?.round).toBe(2);
+  });
+
+  it('delivers requested-change feedback after workflow cleanup persisted before the send', async () => {
+    const f = await fixture();
+    await submitTaskCompletionForRuntime(
+      f.runtime, 'worker-2',
+      { taskId: 'T1', revision: f.revision, changedFiles: ['src/feature.ts'], verification: [], risks: [], notes: [] },
+      [], true, f.deps
+    );
+
+    const beforeCrash = await workflowStateForRun(f.runtime.runId);
+    const review = beforeCrash?.reviews.T1;
+    const settled = { ...review!, verdict: 'CHANGES_REQUESTED' as const, findings: ['send this after restart'] };
+    await appendOrchestrationEvents([
+      { eventId: 'cleanup-before-send-changes', runId: f.runtime.runId, time: 20, type: 'TASK_CHANGES_REQUESTED', actor: 'reviewer-1', entityId: 'T1', payload: { round: 1 } },
+      { eventId: 'cleanup-before-send-active', runId: f.runtime.runId, time: 21, type: 'TASK_ACTIVATED', actor: 'kernel', entityId: 'T1', payload: {} }
+    ]);
+    await writeDurableNow('as3-workflow', {
+      version: 1,
+      runs: {
+        [f.runtime.runId]: {
+          ...beforeCrash!,
+          status: 'running',
+          reviewHistory: { ...beforeCrash!.reviewHistory, T1: [settled] },
+          reviews: {},
+          completions: {}
+        }
+      }
+    });
+
+    resetDurableForTests();
+    initDurableStore(f.dir);
+    await advanceWorkflowForRuntime(f.runtime, [], true, f.deps);
+
+    const feedbackCalls = f.calls.filter((call) => call.startsWith('message:worker-2:'));
+    expect(feedbackCalls).toHaveLength(1);
+    expect(feedbackCalls[0]).toContain(`AS3-Review-Outcome: ${settled.operationId}`);
+    expect((await workflowStateForRun(f.runtime.runId))?.reviewHistory.T1?.[0]?.outcomeDelivered).toBe(true);
+
+    await advanceWorkflowForRuntime(f.runtime, [], true, f.deps);
+    expect(f.calls.filter((call) => call.startsWith('message:worker-2:'))).toHaveLength(1);
+  });
+
+  it('uses durable broker evidence after a crash between feedback acceptance and workflow acknowledgement', async () => {
+    const f = await fixture();
+    await submitTaskCompletionForRuntime(
+      f.runtime, 'worker-2',
+      { taskId: 'T1', revision: f.revision, changedFiles: ['src/feature.ts'], verification: [], risks: [], notes: [] },
+      [], true, f.deps
+    );
+
+    const beforeCrash = await workflowStateForRun(f.runtime.runId);
+    const review = beforeCrash?.reviews.T1;
+    const settled = { ...review!, verdict: 'CHANGES_REQUESTED' as const, findings: ['already durable in broker'] };
+    const marker = `AS3-Review-Outcome: ${settled.operationId}`;
+    await appendOrchestrationEvents([
+      { eventId: 'feedback-accepted-changes', runId: f.runtime.runId, time: 20, type: 'TASK_CHANGES_REQUESTED', actor: 'reviewer-1', entityId: 'T1', payload: { round: 1 } },
+      { eventId: 'feedback-accepted-active', runId: f.runtime.runId, time: 21, type: 'TASK_ACTIVATED', actor: 'kernel', entityId: 'T1', payload: {} }
+    ]);
+    await writeDurableNow('as3-workflow', {
+      version: 1,
+      runs: {
+        [f.runtime.runId]: {
+          ...beforeCrash!,
+          status: 'running',
+          reviewHistory: { ...beforeCrash!.reviewHistory, T1: [settled] },
+          reviews: {},
+          completions: {}
+        }
+      }
+    });
+    f.calls.push(`message:worker-2:${marker}\n[T1 changes requested] already durable in broker`);
+
+    resetDurableForTests();
+    initDurableStore(f.dir);
+    await advanceWorkflowForRuntime(f.runtime, [], true, f.deps);
+
+    expect(f.calls.filter((call) => call.startsWith('message:worker-2:'))).toHaveLength(1);
+    expect((await workflowStateForRun(f.runtime.runId))?.reviewHistory.T1?.[0]?.outcomeDelivered).toBe(true);
+  });
+
+  it('reconciles blocked-review bookkeeping after the journal advanced before workflow cleanup', async () => {
+    const f = await fixture();
+    await submitTaskCompletionForRuntime(
+      f.runtime, 'worker-2',
+      { taskId: 'T1', revision: f.revision, changedFiles: ['src/feature.ts'], verification: [], risks: [], notes: [] },
+      [], true, f.deps
+    );
+
+    const beforeCrash = await workflowStateForRun(f.runtime.runId);
+    const review = beforeCrash?.reviews.T1;
+    await writeDurableNow('as3-workflow', {
+      version: 1,
+      runs: {
+        [f.runtime.runId]: {
+          ...beforeCrash!,
+          reviews: {
+            ...beforeCrash!.reviews,
+            T1: { ...review!, verdict: 'BLOCKED', findings: ['blocked after review'] }
+          }
+        }
+      }
+    });
+    await appendOrchestrationEvents([
+      { eventId: 'crash-review-blocked', runId: f.runtime.runId, time: 20, type: 'TASK_BLOCKED', actor: 'reviewer-1', entityId: 'T1', payload: { reviewerId: 'reviewer-1', round: 1, reason: 'blocked after review' } }
+    ]);
+
+    resetDurableForTests();
+    initDurableStore(f.dir);
+    expect((await recoverOrchestrationState()).state.tasks.T1?.state).toBe('BLOCKED');
+
+    await advanceWorkflowForRuntime(f.runtime, [], true, f.deps);
+
+    const reconciled = await workflowStateForRun(f.runtime.runId);
+    expect(reconciled?.status).toBe('blocked');
+    expect(reconciled?.reviewHistory.T1).toHaveLength(1);
+    expect(reconciled?.reviews.T1).toBeUndefined();
+    expect(reconciled?.completions.T1).toBeUndefined();
+    const managerCalls = f.calls.filter((call) => call.startsWith('manager:[T1 blocked] blocked after review'));
+    expect(managerCalls).toHaveLength(1);
+    expect(managerCalls[0]).toContain(`AS3-Review-Outcome: ${review?.operationId}`);
+    expect(reconciled?.reviewHistory.T1?.[0]?.outcomeDelivered).toBe(true);
+
+    await advanceWorkflowForRuntime(f.runtime, [], true, f.deps);
+    expect(f.calls.filter((call) => call.startsWith('manager:[T1 blocked] blocked after review'))).toHaveLength(1);
+  });
+
+  it('delivers blocked-review control to Manager after cleanup persisted before the notification', async () => {
+    const f = await fixture();
+    await submitTaskCompletionForRuntime(
+      f.runtime, 'worker-2',
+      { taskId: 'T1', revision: f.revision, changedFiles: ['src/feature.ts'], verification: [], risks: [], notes: [] },
+      [], true, f.deps
+    );
+
+    const beforeCrash = await workflowStateForRun(f.runtime.runId);
+    const review = beforeCrash?.reviews.T1;
+    const settled = { ...review!, verdict: 'BLOCKED' as const, findings: ['manager must see this'] };
+    await appendOrchestrationEvents([
+      { eventId: 'blocked-cleanup-before-notify', runId: f.runtime.runId, time: 20, type: 'TASK_BLOCKED', actor: 'reviewer-1', entityId: 'T1', payload: { reviewerId: 'reviewer-1', round: 1, reason: 'manager must see this' } }
+    ]);
+    await writeDurableNow('as3-workflow', {
+      version: 1,
+      runs: {
+        [f.runtime.runId]: {
+          ...beforeCrash!,
+          status: 'blocked',
+          reviewHistory: { ...beforeCrash!.reviewHistory, T1: [settled] },
+          reviews: {},
+          completions: {}
+        }
+      }
+    });
+
+    resetDurableForTests();
+    initDurableStore(f.dir);
+    await advanceWorkflowForRuntime(f.runtime, [], true, f.deps);
+
+    const managerCalls = f.calls.filter((call) => call.startsWith('manager:[T1 blocked] manager must see this'));
+    expect(managerCalls).toHaveLength(1);
+    expect(managerCalls[0]).toContain(`AS3-Review-Outcome: ${settled.operationId}`);
+    expect((await workflowStateForRun(f.runtime.runId))?.reviewHistory.T1?.[0]?.outcomeDelivered).toBe(true);
   });
 
   it('bounds review correction loops at three rounds instead of cycling forever', async () => {

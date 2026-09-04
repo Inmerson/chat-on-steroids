@@ -153,15 +153,24 @@ describe('ephemeral agent tab lifecycle', () => {
     expect(h.sessionState.agentTabLeases ?? {}).toEqual({});
   });
 
-  it('releases ownership instead of closing when a registered tab loses its command marker', async () => {
+  it('closes a registered tab that navigated to a ChatGPT conversation URL, but releases ownership if navigated away from ChatGPT', async () => {
     const h = makeHarness();
     await h.message({ type: 'agent_tab_register', id: 'cmd-worker-1' }, marked('cmd-worker-1'));
     h.navigate(17, 'https://chatgpt.com/c/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee');
 
     await h.storageChange([{ id: 'cmd-worker-1', status: 'sent', agent: 'worker-1' }]);
 
-    expect(h.removed).toEqual([]);
+    expect(h.removed).toEqual([17]);
     expect(h.sessionState.agentTabLeases?.['17']).toBeUndefined();
+
+    const h2 = makeHarness();
+    await h2.message({ type: 'agent_tab_register', id: 'cmd-worker-2' }, { tab: { id: 18, url: 'https://chatgpt.com/?clf=cmd-worker-2' } });
+    h2.navigate(18, 'https://example.com/other');
+
+    await h2.storageChange([{ id: 'cmd-worker-2', status: 'sent', agent: 'worker-2' }]);
+
+    expect(h2.removed).toEqual([]);
+    expect(h2.sessionState.agentTabLeases?.['18']).toBeUndefined();
   });
 
   it('does not close on a failed ACK or on a Prime/resume ACK with no agent id', async () => {

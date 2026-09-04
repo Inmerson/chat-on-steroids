@@ -553,10 +553,21 @@ async function commitRootRename(input: HTMLInputElement, rename: RootRenameState
   paintRoots(state?.config.roots ?? []);
 }
 
+function isEntireDrivePath(folderPath: string): boolean {
+  return /^[A-Za-z]:[\\/]*$/.test(folderPath) || folderPath === '/';
+}
+
+function isAllComputerActive(config: AppState['config']): boolean {
+  if (config.allComputer) return true;
+  if (!config.roots || config.roots.length === 0) return false;
+  return config.roots.every((r) => isEntireDrivePath(r.path));
+}
+
 function rootRow(root: AppState['config']['roots'][number]): HTMLElement {
   const row = el('div', 'root');
   const renameState =
     rootRename?.targetName === root.name && rootRename.targetPath === root.path ? rootRename : null;
+  const isDrive = isEntireDrivePath(root.path);
   const name = el('b', '', `/${root.name}`);
   let label: HTMLElement = name;
 
@@ -616,9 +627,9 @@ function rootRow(root: AppState['config']['roots'][number]): HTMLElement {
     const result = await run(api.removeRoot(root.name));
     if (result) apply(result);
   });
-  const path = el('span', '', root.path);
+  const path = el('span', '', isDrive ? `${root.path} (Entire Drive)` : root.path);
   path.title = root.path;
-  row.append(icon('i-folder'), label, path, rename, remove);
+  row.append(icon(isDrive ? 'i-monitor' : 'i-folder'), label, path, rename, remove);
   return row;
 }
 
@@ -721,6 +732,19 @@ function apply(next: AppState): void {
   paintGroups();
 
   // ---- folders
+  const allComp = isAllComputerActive(config);
+  const allCompBtn = $<HTMLButtonElement>('allComputerBtn');
+  allCompBtn.classList.toggle('is-on', allComp);
+  allCompBtn.title = allComp
+    ? 'All computer drives are shared with ChatGPT (click to revoke)'
+    : 'Grant access to all computer drives';
+
+  const wizAllComp = document.getElementById('wizAllComputer');
+  if (wizAllComp) {
+    wizAllComp.classList.toggle('is-on', allComp);
+    wizAllComp.title = allCompBtn.title;
+  }
+
   paintRoots(config.roots);
   $('rootsEmpty').hidden = config.roots.length > 0;
 
@@ -1249,6 +1273,14 @@ async function addFolder(): Promise<void> {
   if (next) apply(next);
 }
 
+async function toggleAllComputer(): Promise<void> {
+  const next = await run(api.toggleAllComputer());
+  if (next) {
+    apply(next);
+    toast(next.config.allComputer ? 'All computer drives approved' : 'Restored previous folder access');
+  }
+}
+
 async function toggleConnection(): Promise<void> {
   if (!state) return;
   // Mirrors the button label exactly, so a click always does what it says.
@@ -1319,6 +1351,11 @@ $('readOnlyBtn').addEventListener('click', () => {
 
 $('addFolder').addEventListener('click', () => void addFolder());
 $('wizAddFolder').addEventListener('click', () => void addFolder());
+$('allComputerBtn').addEventListener('click', () => void toggleAllComputer());
+const wizAllComputer = document.getElementById('wizAllComputer');
+if (wizAllComputer) {
+  wizAllComputer.addEventListener('click', () => void toggleAllComputer());
+}
 
 $('wizExpand').addEventListener('click', () => {
   showAllSteps = !showAllSteps;

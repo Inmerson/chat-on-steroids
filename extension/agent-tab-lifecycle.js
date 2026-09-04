@@ -191,7 +191,14 @@
   async function stillOwnsLease(lease) {
     try {
       const tab = await chrome.tabs.get(lease.tabId);
-      return markerFrom(tab?.url) === lease.commandId;
+      if (!tab || typeof tab.url !== 'string') return false;
+      const marker = markerFrom(tab.url);
+      if (marker) return marker === lease.commandId;
+      if (lease?.handoffDurable) {
+        const url = new URL(tab.url);
+        return CHATGPT_HOSTS.has(url.hostname);
+      }
+      return false;
     } catch {
       return false;
     }
@@ -374,7 +381,7 @@
   });
 
   chrome.storage.onChanged.addListener((changes, areaName) => {
-    if (areaName !== 'local' || !changes?.commandAckOutbox) return;
+    if ((areaName !== 'local' && areaName !== 'session') || !changes?.commandAckOutbox) return;
     void noteDurableAcks(changes.commandAckOutbox.newValue);
   });
 

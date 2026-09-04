@@ -2,7 +2,8 @@ import { describe, expect, it } from 'vitest';
 
 import {
   assignmentEvidenceInSnapshot,
-  assignmentMarker
+  assignmentMarker,
+  messageEvidenceInSnapshot
 } from '../src/main/orchestration/broker-assignment.js';
 
 function worker(id: string, task: string, queue: Array<{ text: string }> = []) {
@@ -103,5 +104,18 @@ describe('V3 broker assignment evidence', () => {
     const marker = assignmentMarker('55555555-5555-4555-8555-555555555555');
     const snapshot = { ...base, agents: [worker('worker-2', `prefix ${marker} suffix`)] };
     expect(assignmentEvidenceInSnapshot(snapshot, 'prime-A', marker)).toBeNull();
+  });
+
+  it('finds an exact durable message marker without treating bootstrap task text as message evidence', () => {
+    const marker = 'AS3-Review-Outcome: review-op-1';
+    const snapshot = {
+      ...base,
+      agents: [
+        worker('worker-2', marker),
+        worker('worker-3', 'other task', [{ text: `${marker}\n[T1 changes requested] fix it` }])
+      ]
+    };
+
+    expect(messageEvidenceInSnapshot(snapshot, 'prime-A', marker)).toEqual({ workerId: 'worker-3' });
   });
 });

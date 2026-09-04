@@ -10,6 +10,8 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import type { Root } from '../src/shared/types.js';
 import {
   SandboxError,
+  defaultRootNameForPath,
+  detectSystemDrives,
   isContained,
   normaliseRootName,
   resolvePath,
@@ -52,7 +54,6 @@ describe('virtual paths embedded in shell text', () => {
     expect(strayVirtualPath('/not-approved/file.txt', roots)).toBeNull();
   });
 });
-
 /** Asserts the call is refused, and that it is refused by the sandbox itself. */
 async function expectRefused(virtualPath: string, allowMissing = false): Promise<SandboxError> {
   try {
@@ -499,5 +500,53 @@ describe.runIf(IS_WINDOWS)('a native Windows path', () => {
     // "project" is a root name, not a drive letter: the guard must not catch it.
     const resolved = await resolvePath(roots, '/project/sub/nested.txt');
     expect(resolved.virtual).toBe('/project/sub/nested.txt');
+  });
+});
+
+describe('all computer and drive roots', () => {
+  it('detects system drives', async () => {
+    const drives = await detectSystemDrives();
+    expect(drives.length).toBeGreaterThan(0);
+    if (IS_WINDOWS) {
+      expect(drives.some((d) => /^[A-Za-z]:\\$/.test(d))).toBe(true);
+    } else {
+      expect(drives).toContain('/');
+    }
+  });
+
+  it('generates appropriate default root names for drives and folders', () => {
+    if (IS_WINDOWS) {
+      expect(defaultRootNameForPath('C:\\')).toBe('drive-c');
+      expect(defaultRootNameForPath('D:\\')).toBe('drive-d');
+      expect(defaultRootNameForPath('c:/')).toBe('drive-c');
+      expect(defaultRootNameForPath('C:\\', [{ name: 'drive-c', path: 'C:\\' }])).toBe('drive-c-2');
+    } else {
+      expect(defaultRootNameForPath('/')).toBe('computer');
+    }
+  });
+
+  it('allows drive root only when allowDrive is enabled', async () => {
+    if (IS_WINDOWS) {
+      await expect(validateNewRoot('C:\\', [])).rejects.toThrow(/entire drive/i);
+      const approvedDrive = await validateNewRoot('C:\\', [], { allowDrive: true });
+      expect(approvedDrive).toMatch(/^[A-Za-z]:[\\/]*$/);
+    } else {
+      await expect(validateNewRoot('/', [])).rejects.toThrow(/entire filesystem/i);
+      const approvedRoot = await validateNewRoot('/', [], { allowDrive: true });
+      expect(approvedRoot).toBe('/');
+    }
+  });
+
+  it('resolves virtual and native paths inside a drive root', async () => {
+    if (IS_WINDOWS) {
+      const driveRoot: Root = { name: 'drive-c', path: 'C:\\' };
+      const resolved = await resolvePath([driveRoot], '/drive-c/Windows');
+      expect(resolved.real.toLowerCase()).toBe('c:\\windows');
+      expect(resolved.virtual.toLowerCase()).toBe('/drive-c/windows');
+
+      const nativeResolved = await resolvePath([driveRoot], 'C:\\Windows');
+      expect(nativeResolved.real.toLowerCase()).toBe('c:\\windows');
+      expect(nativeResolved.virtual.toLowerCase()).toBe('/drive-c/windows');
+    }
   });
 });

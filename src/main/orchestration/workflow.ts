@@ -23,7 +23,8 @@ import {
   assignmentEvidenceForPrime,
   bindTaskWorktree,
   brokerFreeSlotsForPrime,
-  brokerWorkersForPrime
+  brokerWorkersForPrime,
+  messageEvidenceForPrime
 } from './broker-assignment.js';
 import { recoverOrchestrationState } from './recovery.js';
 import { runSchedulerCycleForRuntime } from './scheduler.js';
@@ -107,6 +108,7 @@ export interface ReviewRecord {
   round: number;
   verdict: ReviewVerdict | null;
   findings: string[];
+  outcomeDelivered?: boolean;
 }
 
 export interface SystemReviewRecord {
@@ -153,6 +155,7 @@ export interface WorkflowDependencies {
     operationId: string
   ): Promise<string | null>;
   sendWorkerMessage(runtime: WorkflowRuntime, workerId: string, text: string): Promise<boolean>;
+  messageEvidence(runtime: WorkflowRuntime, marker: string): { workerId: string } | null;
   notifyManager(runtime: WorkflowRuntime, text: string): Promise<void>;
   integrateTask(
     runtime: WorkflowRuntime,
@@ -720,6 +723,7 @@ async function defaultAssignSystemReviewer(
 const DEFAULT_DEPS: WorkflowDependencies = {
   assignReviewer: defaultAssignReviewer,
   sendWorkerMessage: defaultSendWorkerMessage,
+  messageEvidence: (runtime, marker) => messageEvidenceForPrime(runtime.ownerPrimeConversationId, marker),
   notifyManager: defaultNotifyManager,
   integrateTask: defaultIntegrateTask,
   verifyTask: defaultVerifyTask,
@@ -736,6 +740,150 @@ async function appendTaskEvent(runtime: WorkflowRuntime, taskId: string, type: P
     actor: 'kernel',
     entityId: taskId,
     payload
+  });
+}
+
+async function archiveSettledReview(
+  runtime: WorkflowRuntime,
+  taskId: string,
+  review: ReviewRecord,
+  status: RunWorkflowState['status']
+): Promise<void> {
+  await updateRun(runtime.runId, (current) => {
+    const history = current.reviewHistory[taskId] ?? [];
+    const archived = history.some((entry) => entry.operationId === review.operationId) ? history : [...history, review];
+    return {
+      ...current,
+      status,
+      reviewHistory: { ...current.reviewHistory, [taskId]: archived },
+      reviews: Object.fromEntries(Object.entries(current.reviews).filter(([id]) => id !== taskId)),
+      completions: Object.fromEntries(Object.entries(current.completions).filter(([id]) => id !== taskId))
+    };
+  });
+}
+
+function reviewOutcomeMarker(operationId: string): string {
+  return `AS3-Review-Outcome: ${operationId}`;
+}
+
+async function markReviewOutcomeDelivered(runId: string, taskId: string, operationId: string): Promise<void> {
+  await updateRun(runId, (current) => {
+    const history = current.reviewHistory[taskId] ?? [];
+    const index = history.findIndex((entry) => entry.operationId === operationId);
+    if (index < 0 || history[index]?.outcomeDelivered === true) return current;
+    const nextHistory = [...history];
+    nextHistory[index] = { ...(nextHistory[index] as ReviewRecord), outcomeDelivered: true };
+    return {
+      ...current,
+      reviewHistory: { ...current.reviewHistory, [taskId]: nextHistory }
+    };
+  });
+}
+
+async function ensureReviewOutcomeDeliveries(runtime: WorkflowRuntime, deps: WorkflowDependencies): Promise<void> {
+  const orchestration = await recoverOrchestrationState();
+  const run = await workflowStateForRun(runtime.runId);
+  if (!run) return;
+
+  for (const task of Object.values(orchestration.state.tasks)) {
+    const history = run.reviewHistory[task.taskId] ?? [];
+    const review = history.at(-1);
+    if (!review || review.outcomeDelivered === true) continue;
+
+    const marker = reviewOutcomeMarker(review.operationId);
+    const evidence = deps.messageEvidence(runtime, marker);
+
+    const terminalBlocked = task.state === 'BLOCKED' && (
+      review.verdict === 'BLOCKED'
+      || (review.verdict === 'CHANGES_REQUESTED' && review.round >= MAX_REVIEW_ROUNDS)
+    );
+    if (terminalBlocked) {
+      if (evidence) {
+        if (evidence.workerId !== runtime.managerAgentId) {
+          throw new Error(`REVIEW_OUTCOME_EVIDENCE_MISMATCH: ${review.operationId} belongs to ${evidence.workerId}`);
+        }
+        await markReviewOutcomeDelivered(runtime.runId, task.taskId, review.operationId);
+        continue;
+      }
+
+      const feedback = `[${task.taskId} blocked] ${review.findings.join(' | ') || 'Review round limit exhausted.'}\n${marker}`;
+      await deps.notifyManager(runtime, feedback);
+      const deliveredEvidence = deps.messageEvidence(runtime, marker);
+      if (deliveredEvidence) {
+        if (deliveredEvidence.workerId !== runtime.managerAgentId) {
+          throw new Error(`REVIEW_OUTCOME_EVIDENCE_MISMATCH: ${review.operationId} belongs to ${deliveredEvidence.workerId}`);
+        }
+        await markReviewOutcomeDelivered(runtime.runId, task.taskId, review.operationId);
+      }
+      continue;
+    }
+
+    if (
+      task.state !== 'ACTIVE'
+      || !task.assignedWorkerId
+      || review.verdict !== 'CHANGES_REQUESTED'
+      || review.round >= MAX_REVIEW_ROUNDS
+    ) continue;
+
+    if (evidence) {
+      if (evidence.workerId !== task.assignedWorkerId) {
+        throw new Error(`REVIEW_OUTCOME_EVIDENCE_MISMATCH: ${review.operationId} belongs to ${evidence.workerId}`);
+      }
+      await markReviewOutcomeDelivered(runtime.runId, task.taskId, review.operationId);
+      continue;
+    }
+
+    const feedback = `${marker}\n[${task.taskId} changes requested — review round ${review.round}/${MAX_REVIEW_ROUNDS}] ${review.findings.join(' | ')}`;
+    const delivered = await deps.sendWorkerMessage(runtime, task.assignedWorkerId, feedback);
+    if (delivered) {
+      await markReviewOutcomeDelivered(runtime.runId, task.taskId, review.operationId);
+    } else {
+      await deps.notifyManager(runtime, `${feedback} Worker wake is waiting for execution capacity.`);
+    }
+  }
+}
+
+async function reconcileSettledReviewBookkeeping(runtime: WorkflowRuntime): Promise<void> {
+  const orchestration = await recoverOrchestrationState();
+  const existing = await workflowStateForRun(runtime.runId);
+  if (!existing) return;
+
+  const candidates = Object.values(orchestration.state.tasks).filter((task) => {
+    const review = existing.reviews[task.taskId];
+    if (!review?.verdict) return false;
+    const terminalReview = review.verdict === 'BLOCKED' || (review.verdict === 'CHANGES_REQUESTED' && review.round >= MAX_REVIEW_ROUNDS);
+    if (terminalReview) return task.state === 'BLOCKED';
+    return review.verdict === 'CHANGES_REQUESTED' && task.state === 'ACTIVE';
+  });
+  if (candidates.length === 0) return;
+
+  await updateRun(runtime.runId, (current) => {
+    const reviews = { ...current.reviews };
+    const completions = { ...current.completions };
+    const reviewHistory = { ...current.reviewHistory };
+    let status = current.status;
+    let changed = false;
+
+    for (const task of candidates) {
+      const review = reviews[task.taskId];
+      if (!review?.verdict) continue;
+      const terminalReview = review.verdict === 'BLOCKED' || (review.verdict === 'CHANGES_REQUESTED' && review.round >= MAX_REVIEW_ROUNDS);
+      const journalApplied = terminalReview
+        ? task.state === 'BLOCKED'
+        : review.verdict === 'CHANGES_REQUESTED' && task.state === 'ACTIVE';
+      if (!journalApplied) continue;
+
+      const history = reviewHistory[task.taskId] ?? [];
+      if (!history.some((entry) => entry.operationId === review.operationId)) {
+        reviewHistory[task.taskId] = [...history, review];
+      }
+      delete reviews[task.taskId];
+      delete completions[task.taskId];
+      if (terminalReview) status = 'blocked';
+      changed = true;
+    }
+
+    return changed ? { ...current, status, reviews, completions, reviewHistory } : current;
   });
 }
 
@@ -991,6 +1139,8 @@ export async function advanceWorkflowForRuntime(
   if (orchestration.state.runId !== runtime.runId || orchestration.state.managerAgentId !== runtime.managerAgentId) {
     throw new Error('WORKFLOW_AUTHORITY_MISMATCH');
   }
+  await reconcileSettledReviewBookkeeping(runtime);
+  await ensureReviewOutcomeDeliveries(runtime, deps);
   await routePendingReviews(runtime, deps);
   await integrateAndVerify(runtime, roots, allowCommands, deps);
   await routeSystemReview(runtime, deps);
@@ -1004,6 +1154,7 @@ export async function submitTaskCompletionForRuntime(
   allowCommands: boolean,
   deps: WorkflowDependencies = DEFAULT_DEPS
 ): Promise<{ taskId: string; reviewerId: string | null }> {
+  await reconcileSettledReviewBookkeeping(runtime);
   const orchestration = await recoverOrchestrationState();
   const task = orchestration.state.tasks[input.taskId];
   if (!task) throw new Error(`Unknown orchestration task: ${input.taskId}`);
@@ -1057,6 +1208,33 @@ export async function submitTaskReviewForRuntime(
   if (!review?.reviewerId || review.reviewerId !== actorAgentId) throw new Error(`${actorAgentId} is not the assigned reviewer for ${task.taskId}`);
   if (review.verdict !== null) {
     if (review.verdict !== normalized.verdict) throw new Error('Review was already settled with a different verdict');
+    if (review.verdict === 'APPROVED') {
+      await appendTaskEvent(runtime, task.taskId, 'TASK_APPROVED', { reviewerId: actorAgentId, round: review.round });
+      await advanceWorkflowForRuntime(runtime, roots, allowCommands, deps);
+    } else if (review.verdict === 'CHANGES_REQUESTED' && review.round >= MAX_REVIEW_ROUNDS) {
+      await appendTaskEvent(runtime, task.taskId, 'TASK_BLOCKED', {
+        reviewerId: actorAgentId,
+        round: review.round,
+        reason: 'MAX_REVIEW_ROUNDS exhausted'
+      });
+      await archiveSettledReview(runtime, task.taskId, review, 'blocked');
+      await ensureReviewOutcomeDeliveries(runtime, deps);
+    } else if (review.verdict === 'CHANGES_REQUESTED') {
+      await appendOrchestrationEvents([
+        { eventId: `review-changes:${task.taskId}:${randomUUID()}`, runId: runtime.runId, time: Date.now(), type: 'TASK_CHANGES_REQUESTED', actor: actorAgentId, entityId: task.taskId, payload: { round: review.round } },
+        { eventId: `review-reactivate:${task.taskId}:${randomUUID()}`, runId: runtime.runId, time: Date.now(), type: 'TASK_ACTIVATED', actor: 'kernel', entityId: task.taskId, payload: {} }
+      ]);
+      await archiveSettledReview(runtime, task.taskId, review, 'running');
+      await ensureReviewOutcomeDeliveries(runtime, deps);
+    } else if (review.verdict === 'BLOCKED') {
+      await appendTaskEvent(runtime, task.taskId, 'TASK_BLOCKED', {
+        reviewerId: actorAgentId,
+        round: review.round,
+        reason: review.findings.join(' | ')
+      });
+      await archiveSettledReview(runtime, task.taskId, review, 'blocked');
+      await ensureReviewOutcomeDeliveries(runtime, deps);
+    }
     return { taskId: task.taskId, verdict: normalized.verdict };
   }
   const settled: ReviewRecord = { ...review, verdict: normalized.verdict, findings: normalized.findings };
@@ -1068,22 +1246,14 @@ export async function submitTaskReviewForRuntime(
     return { taskId: task.taskId, verdict: normalized.verdict };
   }
 
-  const historyUpdate = async (status: RunWorkflowState['status']) => updateRun(runtime.runId, (current) => ({
-    ...current,
-    status,
-    reviewHistory: { ...current.reviewHistory, [task.taskId]: [...(current.reviewHistory[task.taskId] ?? []), settled] },
-    reviews: Object.fromEntries(Object.entries(current.reviews).filter(([taskId]) => taskId !== task.taskId)),
-    completions: Object.fromEntries(Object.entries(current.completions).filter(([taskId]) => taskId !== task.taskId))
-  }));
-
   if (normalized.verdict === 'BLOCKED' || review.round >= MAX_REVIEW_ROUNDS) {
     await appendTaskEvent(runtime, task.taskId, 'TASK_BLOCKED', {
       reviewerId: actorAgentId,
       round: review.round,
       reason: normalized.verdict === 'BLOCKED' ? normalized.findings.join(' | ') : 'MAX_REVIEW_ROUNDS exhausted'
     });
-    await historyUpdate('blocked');
-    await deps.notifyManager(runtime, `[${task.taskId} blocked] ${normalized.findings.join(' | ') || 'Review round limit exhausted.'}`);
+    await archiveSettledReview(runtime, task.taskId, settled, 'blocked');
+    await ensureReviewOutcomeDeliveries(runtime, deps);
     return { taskId: task.taskId, verdict: normalized.verdict };
   }
 
@@ -1091,10 +1261,8 @@ export async function submitTaskReviewForRuntime(
     { eventId: `review-changes:${task.taskId}:${randomUUID()}`, runId: runtime.runId, time: Date.now(), type: 'TASK_CHANGES_REQUESTED', actor: actorAgentId, entityId: task.taskId, payload: { round: review.round } },
     { eventId: `review-reactivate:${task.taskId}:${randomUUID()}`, runId: runtime.runId, time: Date.now(), type: 'TASK_ACTIVATED', actor: 'kernel', entityId: task.taskId, payload: {} }
   ]);
-  await historyUpdate('running');
-  const feedback = `[${task.taskId} changes requested — review round ${review.round}/${MAX_REVIEW_ROUNDS}] ${normalized.findings.join(' | ')}`;
-  const delivered = task.assignedWorkerId ? await deps.sendWorkerMessage(runtime, task.assignedWorkerId, feedback) : false;
-  if (!delivered) await deps.notifyManager(runtime, `${feedback} Worker wake is waiting for execution capacity.`);
+  await archiveSettledReview(runtime, task.taskId, settled, 'running');
+  await ensureReviewOutcomeDeliveries(runtime, deps);
   return { taskId: task.taskId, verdict: normalized.verdict };
 }
 

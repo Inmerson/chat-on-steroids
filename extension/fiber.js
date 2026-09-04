@@ -65,7 +65,7 @@
   /** Connector requests reported for one turn. Far above any real turn's call count. */
   const MAX_CALLS = 200;
   /** ChatGPT's own assistant turn sections, which is where a turn's message model hangs. */
-  const TURN_SECTION = 'section[data-testid^="conversation-turn"][data-turn-id]';
+  const TURN_SECTION = 'section[data-testid^="conversation-turn"]';
   /** ChatGPT-rendered authored prose. Tool rows and this extension's own surfaces are excluded. */
   const MARKDOWN = '.markdown';
   const TOOL = 'span[class*="tool-message"], div.pointer-events-none.contents';
@@ -472,6 +472,13 @@
           }
         }
       }
+      // The parent fallback can itself collide when the page publishes two authored blocks
+      // with the same relation and no creation stamp. Raw ids are weaker across reloads but
+      // still strictly better than swallowing one of two distinct messages in this scan.
+      if (logicalIds.has(logicalId)) {
+        logicalId = id;
+        stable = false;
+      }
       // Keep the position from ChatGPT's own turn model. `messages` and native activity are
       // transported as separate arrays below for validation, so without this ordinal the
       // isolated-world recorder has no way to put them back together. That was visible on
@@ -583,6 +590,7 @@
     if (assistantCandidates.length === 0 && userCandidates.length === 0) return [];
 
     const blocks = [];
+    const blockSections = [];
     for (let sectionAt = 0; sectionAt < sections.length; sectionAt++) {
       const section = sections[sectionAt];
       let found;
@@ -597,6 +605,7 @@
         const parent = block.parentElement && block.parentElement.closest ? block.parentElement.closest(MARKDOWN) : null;
         if (parent && section.contains(parent)) continue;
         blocks.push(block);
+        blockSections.push(sectionAt);
       }
     }
 
@@ -716,7 +725,10 @@
       } catch {
         renderedHtml = '';
       }
-      if (renderedHtml) out[target].renderedHtml = renderedHtml;
+      if (renderedHtml) {
+        out[target].renderedHtml = renderedHtml;
+        out[target].sectionIndex = blockSections[at];
+      }
     }
     out.sort((left, right) => left.order - right.order);
     return out;

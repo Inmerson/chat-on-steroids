@@ -62,16 +62,57 @@ export function normaliseRootName(input: string): string {
   return slug || 'folder';
 }
 
-/** Picks a root name derived from a folder that does not collide with existing ones. */
-export function uniqueRootName(folderPath: string, existing: readonly Root[]): string {
-  const base = normaliseRootName(path.basename(folderPath) || 'folder');
+/**
+ * Generates an appropriate default virtual root name for a path.
+ * Whole drives receive names like `drive-c` or `computer` so they are distinct
+ * from regular folders and avoid CLI flag collisions in `strayVirtualPath`.
+ */
+export function defaultRootNameForPath(folderPath: string, existing: readonly Root[] = []): string {
+  let base: string;
+  if (IS_WINDOWS) {
+    const driveMatch = folderPath.trim().match(/^([A-Za-z]):[\\/]*$/);
+    if (driveMatch) {
+      base = `drive-${driveMatch[1]!.toLowerCase()}`;
+    } else {
+      base = normaliseRootName(path.basename(folderPath) || 'folder');
+    }
+  } else if (folderPath.trim() === '/' || folderPath.trim() === '') {
+    base = 'computer';
+  } else {
+    base = normaliseRootName(path.basename(folderPath) || 'folder');
+  }
+
   const taken = new Set([...RESERVED_ROOT_NAMES, ...existing.map((r) => r.name)]);
   if (!taken.has(base)) return base;
   for (let i = 2; i < 1000; i++) {
     const candidate = `${base}-${i}`;
     if (!taken.has(candidate)) return candidate;
   }
-  throw new SandboxError('Could not find a free root name');
+  return base;
+}
+
+/** Picks a root name derived from a folder that does not collide with existing ones. */
+export function uniqueRootName(folderPath: string, existing: readonly Root[]): string {
+  return defaultRootNameForPath(folderPath, existing);
+}
+
+/** Detects active drive roots on Windows (e.g. C:\, D:\) or / on POSIX. */
+export async function detectSystemDrives(): Promise<string[]> {
+  if (IS_WINDOWS) {
+    const drives: string[] = [];
+    for (let i = 65; i <= 90; i++) {
+      const letter = String.fromCharCode(i);
+      const drive = `${letter}:\\`;
+      try {
+        const stat = await fs.stat(drive).catch(() => null);
+        if (stat?.isDirectory()) {
+          drives.push(drive);
+        }
+      } catch {}
+    }
+    return drives.length > 0 ? drives : ['C:\\'];
+  }
+  return ['/'];
 }
 
 /**
@@ -391,11 +432,19 @@ export async function resolveRoot(roots: readonly Root[], name: string): Promise
   return { root, real: await realRoot(root) };
 }
 
+export interface ValidateRootOptions {
+  allowDrive?: boolean;
+}
+
 /**
  * Validates a folder the user picked in the UI before it becomes a root.
  * Rejects network paths and roots that would nest inside an existing one.
  */
-export async function validateNewRoot(folderPath: string, existing: readonly Root[]): Promise<string> {
+export async function validateNewRoot(
+  folderPath: string,
+  existing: readonly Root[],
+  options: ValidateRootOptions = {}
+): Promise<string> {
   if (!path.isAbsolute(folderPath)) {
     throw new SandboxError('Folder path must be absolute');
   }
@@ -411,7 +460,7 @@ export async function validateNewRoot(folderPath: string, existing: readonly Roo
   }
   const parsed = path.parse(real);
   const sameRoot = IS_WINDOWS ? parsed.root.toLowerCase() === real.toLowerCase() : parsed.root === real;
-  if (sameRoot) {
+  if (sameRoot && !options.allowDrive) {
     throw new SandboxError(
       IS_WINDOWS
         ? 'Approving an entire drive is not allowed. Pick a folder inside it.'

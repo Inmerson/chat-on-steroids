@@ -51,13 +51,11 @@ export function execOwner(processId: number): string | null {
  * consulted for authorization; all authenticated MCP chats share the enabled Core authority.
  */
 export function execOwnershipDenied(processId: number, conversationId: string | null): boolean {
-  // The MCP endpoint token is the authority boundary for this single-user connector.
-  // Conversation ownership remains useful attribution, but must not prevent another
-  // authenticated ChatGPT conversation (including a phone/browserless one) from continuing
-  // a live Core terminal session. Process existence is validated by the process manager.
-  void processId;
-  void conversationId;
-  return false;
+  if (!owners.has(processId)) return true;
+  const owner = owners.get(processId);
+  if (owner === null) return conversationId !== null;
+  if (!conversationId) return true;
+  return owner !== conversationId;
 }
 
 /**
