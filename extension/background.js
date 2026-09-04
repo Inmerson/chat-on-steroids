@@ -1861,6 +1861,7 @@ function publicLoopTransfer(record) {
     id: record.id,
     kind: record.kind,
     conversationId: record.kind === 'recovery' ? record.expectedConversationId : null,
+    sourceConversationId: record.sourceConversationId,
     loop: structuredCloneSafe(record.loop),
     reason: record.reason,
     attempt: record.attempt,
@@ -2586,7 +2587,8 @@ const HANDLERS = {
     const previous = loopRecoveryCounters[counterKey];
     const previousCount = previous && Number.isInteger(previous.count) && previous.count >= 0 ? previous.count : 0;
     const attempt = previousCount + 1;
-    const kind = previousCount >= 3 ? 'rollover' : 'recovery';
+    const forceRollover = message?.forceRollover === true;
+    const kind = forceRollover || previousCount >= 3 ? 'rollover' : 'recovery';
     if (kind === 'rollover' && loop.executionRunId) {
       return { ok: false, error: 'core_rollover_required' };
     }
@@ -2596,10 +2598,13 @@ const HANDLERS = {
         : null;
     if (kind === 'rollover' && !rolloverText) return { ok: false, error: 'rollover_text_required' };
 
-    // The attempt itself is durable before the browser is asked to create or navigate anything.
-    // A create/navigation failure therefore remains part of the consecutive-stall history.
-    loopRecoveryCounters[counterKey] = { count: attempt, updatedAt: Date.now() };
-    await persistLoopRecoveryCounters();
+    // Only same-chat recovery attempts contribute to the consecutive-stall counter. An explicit
+    // clean-chat rollover is a policy decision, not another failed recovery, so it must not make
+    // a later healthy run appear closer to the three-strike threshold.
+    if (!forceRollover) {
+      loopRecoveryCounters[counterKey] = { count: attempt, updatedAt: Date.now() };
+      await persistLoopRecoveryCounters();
+    }
 
     const createOptions = {
       active: false,

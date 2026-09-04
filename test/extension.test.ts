@@ -979,6 +979,7 @@ describe('Loop recovery transfer contract', () => {
         id: expect.any(String),
         kind: attempt <= 3 ? 'recovery' : 'rollover',
         conversationId: attempt <= 3 ? CHAT : null,
+        sourceConversationId: CHAT,
         loop: LOOP,
         reason: REASON,
         attempt,
@@ -1000,6 +1001,73 @@ describe('Loop recovery transfer contract', () => {
         sourceDocument = targetDocument;
       }
     }
+  });
+
+  it('allows an explicit manual rollover immediately without waiting for three failed recoveries', async () => {
+    const local = new FakeStorageArea();
+    const session = new FakeStorageArea();
+    const tabs = new Map<number, { id: number; url: string; status: string; windowId: number }>([
+      [91, { id: 91, url: SOURCE_URL, status: 'complete', windowId: 7 }]
+    ]);
+    const worker = loadWorker({
+      local,
+      session,
+      tabsGet: async (tabId) => {
+        const tab = tabs.get(tabId);
+        if (!tab) throw new Error('tab not found');
+        return { ...tab };
+      }
+    });
+    const sourceTab = { id: 91, status: 'complete', windowId: 7 };
+    const sourceDocument = 'document-force-rollover';
+    await worker.registerDocument(sourceTab, sourceDocument);
+    await worker.sendFrom({ type: 'bind', conversationId: CHAT }, sourceTab, sourceDocument);
+    worker.tabsCreate.mockResolvedValue({ id: 92, status: 'complete', windowId: 7 });
+
+    const started = await worker.sendFrom(
+      { ...recoveryMessage(), forceRollover: true },
+      sourceTab,
+      sourceDocument
+    );
+
+    expect(started).toMatchObject({ ok: true, kind: 'rollover', attempt: 1 });
+    expect(worker.tabsUpdate).toHaveBeenCalledWith(92, { url: 'https://chatgpt.com/', active: true });
+    expect(local.data.loopRecoveryCounters).toBeUndefined();
+  });
+
+  it('requires Core-owned rollover when a managed execution run asks for an explicit manual rollover', async () => {
+    const local = new FakeStorageArea();
+    const session = new FakeStorageArea();
+    const tabs = new Map<number, { id: number; url: string; status: string; windowId: number }>([
+      [93, { id: 93, url: SOURCE_URL, status: 'complete', windowId: 7 }]
+    ]);
+    const worker = loadWorker({
+      local,
+      session,
+      tabsGet: async (tabId) => {
+        const tab = tabs.get(tabId);
+        if (!tab) throw new Error('tab not found');
+        return { ...tab };
+      }
+    });
+    const sourceTab = { id: 93, status: 'complete', windowId: 7 };
+    const sourceDocument = 'document-force-managed-rollover';
+    await worker.registerDocument(sourceTab, sourceDocument);
+    await worker.sendFrom({ type: 'bind', conversationId: CHAT }, sourceTab, sourceDocument);
+
+    const started = await worker.sendFrom(
+      {
+        ...recoveryMessage(),
+        forceRollover: true,
+        loop: { ...LOOP, executionRunId: 'execution-run-1' }
+      },
+      sourceTab,
+      sourceDocument
+    );
+
+    expect(started).toEqual({ ok: false, error: 'core_rollover_required' });
+    expect(worker.tabsCreate).not.toHaveBeenCalled();
+    expect(local.data.loopRecoveryCounters).toBeUndefined();
   });
 });
 
