@@ -9,6 +9,16 @@ The app and the `extension/` companion are versioned together. **Reload the
 extension after updating the app**. If their bridge protocols are incompatible,
 the app refuses the extension and asks you to reload the matching copy.
 
+## [2.1.0] — 2026-09-04
+
+2.1.0 integrates Agent System 3.0, Control Center, Infinite Loop, and desktop shortcut auto-healing.
+
+### Added
+- **Desktop Shortcut Auto-Healing:** Automatic shortcut creation and icon healing at app startup and packaging.
+- **Window Foreground Elevation:** Robust unminimize and foreground elevation sequence on Windows.
+- **Agent System 3.0 & Control Center:** DAG orchestration, worker allocation, live status telemetry.
+- **Infinite Loop Mode:** Auto-rollover and decision delegation automation.
+
 ## [2.0.2] — 2026-08-26
 
 2.0.2 is the native cross-platform release port. The already-published 2.0.1 release remains the

@@ -59,6 +59,7 @@ import {
 import { trayGuidArgsForPlatform, trayImageSpec } from './tray-image.js';
 import { browserWindowIconPath } from './window-icon.js';
 import { isBackgroundStartup, syncLoginStartup } from './background-startup.js';
+import { ensureDesktopShortcut } from './desktop-shortcut.js';
 
 /** Durable state file holding the multi-agent run. Hashes only, never credentials. */
 const SWARM_STATE = 'swarm';
@@ -140,13 +141,13 @@ function createWindow(): void {
       window.show();
       app.focus({ steal: true });
       window.focus();
-      window.setAlwaysOnTop(true, 'screen-saver');
+      window.setAlwaysOnTop(true);
       setTimeout(() => {
         if (window && !window.isDestroyed()) {
           window.setAlwaysOnTop(false);
           window.focus();
         }
-      }, 300);
+      }, 250);
     }
   });
 
@@ -219,19 +220,27 @@ function showWindow(): void {
     const currentBounds = window.getBounds();
     logInfo(`showWindow: before -> visible=${wasVisible}, minimized=${wasMinimized}, bounds=${JSON.stringify(currentBounds)}`);
 
-    window.restore();
-    window.center();
+    if (window.isMinimized()) {
+      window.restore();
+    }
     window.show();
-    app.focus({ steal: true });
-    window.focus();
+    window.center();
+
+    // Windows OS foreground elevation:
+    // Toggling setAlwaysOnTop(true) -> moveTop() -> focus() forces DWM to bring
+    // the window in front of other full-screen windows (like Chrome).
+    window.setAlwaysOnTop(true);
     window.moveTop();
-    window.setAlwaysOnTop(true, 'screen-saver');
+    window.focus();
+    app.focus({ steal: true });
+
     setTimeout(() => {
       if (window && !window.isDestroyed()) {
         window.setAlwaysOnTop(false);
+        window.moveTop();
         window.focus();
       }
-    }, 400);
+    }, 250);
 
     logInfo(`showWindow: after -> visible=${window.isVisible()}, minimized=${window.isMinimized()}, bounds=${JSON.stringify(window.getBounds())}`);
   } catch (err) {
@@ -308,6 +317,7 @@ void app.whenReady().then(async () => {
   await loadConfig();
   if (windowActivation.isDisabled()) return;
   syncLoginStartup(app, getConfig().ui.autoConnect);
+  ensureDesktopShortcut(app.isPackaged, process.execPath);
   // The renderer has its own explicit light/dark palette, so native chrome must follow the same
   // user choice instead of Electron's default `system` theme. On macOS this controls the window
   // frame, application menus and OS dialogs; on Linux/Windows it covers Electron-native UI.

@@ -43,3 +43,7 @@ for (const arch of arches) {
   if (dirOnly) builderArgs.push('--dir');
   run(node, builderArgs, { ...process.env, COS_PACKAGE_ARCH: arch });
 }
+
+if (platform === 'win32') {
+  run(node, ['scripts/update-desktop-shortcut.mjs']);
+}

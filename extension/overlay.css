@@ -308,6 +308,20 @@
 }
 
 /*
+ * The soft appear ChatGPT gives its own popovers — the one the reasoning slider has.
+ * CSS `animation` naming keyframes that do not exist is not an error, it is simply nothing,
+ * so the tooltip and the settings menu had been snapping in at full opacity since 1.9.4,
+ * next to a page whose own popovers fade. Opacity does the work; the scale is small enough
+ * to read as the surface settling rather than as a zoom.
+ */
+@keyframes clf-pop-in {
+  from {
+    opacity: 0;
+    transform: scale(0.98);
+  }
+}
+
+/*
  * The hover bubble, replacing the `title` attribute this used everywhere.
  *
  * `title` is drawn by the operating system: a pale rectangle in the platform's font that
