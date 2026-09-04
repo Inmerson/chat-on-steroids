@@ -164,6 +164,15 @@ let tabEpochs = {};
 let retiredDocuments = {};
 /** Durable terminal lease; cleared only when a different browser document speaks. */
 let terminalDocuments = {};
+/** Target-tab-scoped Auto-Loop transfer transactions for same-chat recovery and manual rollover. */
+let loopTransfers = {};
+/** Short-lived receipts kept after ready so later genuine progress can reset the counter. */
+let completedLoopTransfers = {};
+/** Consecutive recovery attempts survive service-worker and tab replacement lifetimes. */
+let loopRecoveryCounters = {};
+const LOOP_TRANSFER_TTL_MS = 5 * 60_000;
+let loopTransferWriteQueue = Promise.resolve();
+let loopCounterWriteQueue = Promise.resolve();
 
 /**
  * Command ids this browser has already delivered.
@@ -208,13 +217,21 @@ function load() {
 }
 
 async function loadOnce() {
-  const stored = await chrome.storage.local.get(['port', 'token', 'disconnected', 'deferredRevivals', 'commandAckOutbox']);
+  const stored = await chrome.storage.local.get([
+    'port',
+    'token',
+    'disconnected',
+    'deferredRevivals',
+    'commandAckOutbox',
+    'loopRecoveryCounters'
+  ]);
   port = typeof stored.port === 'number' ? stored.port : null;
   token = typeof stored.token === 'string' ? stored.token : null;
   // Deliberately in `local` rather than `session`: a choice to disconnect that a browser
   // restart undoes is not a choice, it is a delay.
   disconnected = stored.disconnected === true;
   deferredRevivals = Array.isArray(stored.deferredRevivals) ? stored.deferredRevivals.slice(-100) : [];
+  loopRecoveryCounters = parseLoopRecoveryCounters(stored.loopRecoveryCounters);
   const live = await chrome.storage.session.get([
     'settled',
     'journal',
@@ -227,7 +244,9 @@ async function loadOnce() {
     'commandAckOutbox',
     'revivalPreferences',
     'delivery',
-    'agentTabLeaseTelemetry'
+    'agentTabLeaseTelemetry',
+    'loopTransfers',
+    'completedLoopTransfers'
   ]);
   settled = Array.isArray(live.settled) ? live.settled : [];
   journal = Array.isArray(live.journal) ? live.journal : [];
@@ -257,7 +276,10 @@ async function loadOnce() {
   if (live.delivery && typeof live.delivery === 'object' && !Array.isArray(live.delivery)) {
     delivery = { ...delivery, ...live.delivery };
   }
+  loopTransfers = parseLoopTransfers(live.loopTransfers);
+  completedLoopTransfers = parseCompletedLoopTransfers(live.completedLoopTransfers);
   agentTabLeaseTelemetry = parseAgentTabLeaseTelemetry(live.agentTabLeaseTelemetry);
+  await cleanupLoopTransferState({ checkTabs: true });
   loaded = true;
 }
 
@@ -324,6 +346,38 @@ function persistLive() {
     () => undefined
   );
   return write;
+}
+
+function persistLoopTransfers() {
+  const snapshot = {
+    loopTransfers: structuredCloneSafe(loopTransfers),
+    completedLoopTransfers: structuredCloneSafe(completedLoopTransfers)
+  };
+  const write = loopTransferWriteQueue.then(() => chrome.storage.session.set(snapshot));
+  loopTransferWriteQueue = write.then(
+    () => undefined,
+    () => undefined
+  );
+  return write;
+}
+
+function persistLoopRecoveryCounters() {
+  trimLoopRecoveryCounters();
+  const snapshot = structuredCloneSafe(loopRecoveryCounters);
+  const write = loopCounterWriteQueue.then(() => chrome.storage.local.set({ loopRecoveryCounters: snapshot }));
+  loopCounterWriteQueue = write.then(
+    () => undefined,
+    () => undefined
+  );
+  return write;
+}
+
+function structuredCloneSafe(value) {
+  try {
+    return JSON.parse(JSON.stringify(value));
+  } catch {
+    return {};
+  }
 }
 
 /**
@@ -1659,6 +1713,266 @@ function isChatGptUrl(value) {
   }
 }
 
+function parseLoopSnapshot(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  if (value.mode !== 'standard' && value.mode !== 'infinite') return null;
+  const turns = Number.isInteger(value.turns) && value.turns >= 0 ? Math.min(value.turns, 10_000) : null;
+  if (turns === null) return null;
+  return {
+    mode: value.mode,
+    turns,
+    lastReason: typeof value.lastReason === 'string' ? value.lastReason.slice(0, 500) : '',
+    recentFingerprints: Array.isArray(value.recentFingerprints)
+      ? value.recentFingerprints.filter((item) => typeof item === 'string').slice(-8).map((item) => item.slice(0, 500))
+      : [],
+    executionRunId:
+      typeof value.executionRunId === 'string' && value.executionRunId
+        ? value.executionRunId.slice(0, 80)
+        : null,
+    recoveryGeneration:
+      Number.isInteger(value.recoveryGeneration) && value.recoveryGeneration >= 0
+        ? Math.min(value.recoveryGeneration, 10_000)
+        : 0
+  };
+}
+
+function loopCounterKey(loop, conversationId) {
+  const runId = loop && typeof loop.executionRunId === 'string' && loop.executionRunId ? loop.executionRunId : null;
+  return runId ? `run:${runId}` : `conversation:${conversationId}`;
+}
+
+function parseLoopRecoveryCounters(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return {};
+  const rows = [];
+  for (const [key, raw] of Object.entries(value)) {
+    if (!/^(?:run|conversation):[0-9a-z-]{1,100}$/i.test(key)) continue;
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) continue;
+    const count = Number.isInteger(raw.count) && raw.count >= 0 ? Math.min(raw.count, 10_000) : null;
+    const updatedAt = Number.isFinite(raw.updatedAt) && raw.updatedAt > 0 ? raw.updatedAt : null;
+    if (count === null || updatedAt === null) continue;
+    rows.push([key, { count, updatedAt }]);
+  }
+  rows.sort((a, b) => b[1].updatedAt - a[1].updatedAt);
+  return Object.fromEntries(rows.slice(0, 128));
+}
+
+function trimLoopRecoveryCounters() {
+  loopRecoveryCounters = parseLoopRecoveryCounters(loopRecoveryCounters);
+}
+
+function parseLoopTransferRecord(value, targetKey) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  if (value.kind !== 'recovery' && value.kind !== 'rollover') return null;
+  const id = typeof value.id === 'string' && value.id.length > 0 ? value.id.slice(0, 120) : null;
+  const sourceTabId = Number.isInteger(value.sourceTabId) ? value.sourceTabId : null;
+  const targetTabId = Number.isInteger(value.targetTabId) ? value.targetTabId : null;
+  const sourceDocumentId =
+    typeof value.sourceDocumentId === 'string' && value.sourceDocumentId ? value.sourceDocumentId.slice(0, 200) : null;
+  const targetDocumentId =
+    typeof value.targetDocumentId === 'string' && value.targetDocumentId
+      ? value.targetDocumentId.slice(0, 200)
+      : null;
+  const sourceConversationId = cleanConversationId(value.sourceConversationId);
+  const expectedConversationId = cleanConversationId(value.expectedConversationId);
+  const loop = parseLoopSnapshot(value.loop);
+  const sourceUrl = typeof value.sourceUrl === 'string' && isChatGptUrl(value.sourceUrl) ? value.sourceUrl : null;
+  const expectedUrl = typeof value.expectedUrl === 'string' && isChatGptUrl(value.expectedUrl) ? value.expectedUrl : null;
+  const reason = typeof value.reason === 'string' ? value.reason.slice(0, 500) : '';
+  const attempt = Number.isInteger(value.attempt) && value.attempt > 0 ? Math.min(value.attempt, 10_000) : null;
+  const createdAt = Number.isFinite(value.createdAt) && value.createdAt > 0 ? value.createdAt : null;
+  const sourceNavigationEpoch =
+    Number.isInteger(value.sourceNavigationEpoch) && value.sourceNavigationEpoch >= 0 ? value.sourceNavigationEpoch : 0;
+  if (
+    !id ||
+    sourceTabId === null ||
+    targetTabId === null ||
+    String(targetTabId) !== String(targetKey) ||
+    !sourceDocumentId ||
+    !sourceConversationId ||
+    !loop ||
+    !sourceUrl ||
+    !expectedUrl ||
+    attempt === null ||
+    createdAt === null
+  ) {
+    return null;
+  }
+  if (value.kind === 'recovery' && (!expectedConversationId || conversationFromUrl(expectedUrl) !== expectedConversationId)) {
+    return null;
+  }
+  if (value.kind === 'rollover' && expectedConversationId !== null) return null;
+  return {
+    id,
+    kind: value.kind,
+    sourceTabId,
+    sourceDocumentId,
+    sourceNavigationEpoch,
+    sourceConversationId,
+    targetTabId,
+    targetDocumentId,
+    sourceUrl,
+    expectedUrl,
+    expectedConversationId,
+    loop,
+    reason,
+    attempt,
+    rolloverText:
+      value.kind === 'rollover' && typeof value.rolloverText === 'string' ? value.rolloverText.slice(0, 8_000) : null,
+    createdAt,
+    counterKey: loopCounterKey(loop, sourceConversationId)
+  };
+}
+
+function parseLoopTransfers(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return {};
+  const out = {};
+  for (const [key, raw] of Object.entries(value).slice(-64)) {
+    const parsed = parseLoopTransferRecord(raw, key);
+    if (parsed) out[key] = parsed;
+  }
+  return out;
+}
+
+function parseCompletedLoopTransfers(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return {};
+  const rows = [];
+  for (const [id, raw] of Object.entries(value)) {
+    if (!id || !raw || typeof raw !== 'object' || Array.isArray(raw)) continue;
+    if (!Number.isInteger(raw.targetTabId)) continue;
+    if (typeof raw.targetDocumentId !== 'string' || !raw.targetDocumentId) continue;
+    if (typeof raw.counterKey !== 'string' || !/^(?:run|conversation):/i.test(raw.counterKey)) continue;
+    if (!Number.isFinite(raw.completedAt) || raw.completedAt <= 0) continue;
+    rows.push([
+      id.slice(0, 120),
+      {
+        targetTabId: raw.targetTabId,
+        targetDocumentId: raw.targetDocumentId.slice(0, 200),
+        counterKey: raw.counterKey.slice(0, 140),
+        completedAt: raw.completedAt
+      }
+    ]);
+  }
+  rows.sort((a, b) => b[1].completedAt - a[1].completedAt);
+  return Object.fromEntries(rows.slice(0, 64));
+}
+
+function publicLoopTransfer(record) {
+  return {
+    id: record.id,
+    kind: record.kind,
+    conversationId: record.kind === 'recovery' ? record.expectedConversationId : null,
+    loop: structuredCloneSafe(record.loop),
+    reason: record.reason,
+    attempt: record.attempt,
+    rolloverText: record.kind === 'rollover' ? record.rolloverText : null
+  };
+}
+
+function newLoopTransferId() {
+  return `loop-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+}
+
+function isNewChatUrl(value) {
+  try {
+    const url = new URL(String(value || ''));
+    return isChatGptUrl(value) && !conversationFromUrl(value) && (url.pathname === '/' || url.pathname === '');
+  } catch {
+    return false;
+  }
+}
+
+async function tabExists(id) {
+  try {
+    const tab = await chrome.tabs.get(id);
+    return Boolean(tab && tab.id === id);
+  } catch {
+    return false;
+  }
+}
+
+async function cleanupLoopTransferState({ removedTabId = null, checkTabs = false } = {}) {
+  const now = Date.now();
+  let changed = false;
+  for (const [key, record] of Object.entries(loopTransfers)) {
+    let stale = !record || now - record.createdAt > LOOP_TRANSFER_TTL_MS;
+    if (!stale && Number.isInteger(removedTabId)) {
+      stale = record.sourceTabId === removedTabId || record.targetTabId === removedTabId;
+    }
+    if (!stale && checkTabs) {
+      stale = !(await tabExists(record.sourceTabId)) || !(await tabExists(record.targetTabId));
+    }
+    if (stale) {
+      delete loopTransfers[key];
+      changed = true;
+    }
+  }
+  for (const [id, receipt] of Object.entries(completedLoopTransfers)) {
+    let stale = !receipt || now - receipt.completedAt > LOOP_TRANSFER_TTL_MS;
+    if (!stale && Number.isInteger(removedTabId)) stale = receipt.targetTabId === removedTabId;
+    if (!stale && checkTabs) stale = !(await tabExists(receipt.targetTabId));
+    if (stale) {
+      delete completedLoopTransfers[id];
+      changed = true;
+    }
+  }
+  if (changed) await persistLoopTransfers();
+  return changed;
+}
+
+async function transferForRegisteredDocument(result) {
+  if (!result || result.ok !== true || !Number.isInteger(result.tab) || !result.documentId) return null;
+  await cleanupLoopTransferState();
+  const record = loopTransfers[String(result.tab)];
+  if (!record || record.targetTabId !== result.tab) return null;
+  if (record.targetDocumentId && record.targetDocumentId !== result.documentId) return null;
+  if (!ownsDocument({ tab: result.tab, documentId: result.documentId, navigationEpoch: result.navigationEpoch })) return null;
+  let tab = null;
+  try {
+    tab = await chrome.tabs.get(result.tab);
+  } catch {
+    return null;
+  }
+  const currentUrl = typeof tab?.url === 'string' ? tab.url : '';
+  if (record.kind === 'recovery') {
+    if (currentUrl !== record.expectedUrl) return null;
+    if (conversationFromUrl(currentUrl) !== record.expectedConversationId) return null;
+  } else if (!isNewChatUrl(currentUrl)) {
+    return null;
+  }
+  record.targetDocumentId = result.documentId;
+  if (record.kind === 'recovery') {
+    // Install the replacement's exact browser-derived conversation ownership before the old
+    // tab can be closed. Otherwise tabs.onRemoved can momentarily see no surviving owner and
+    // publish a false /closed for a conversation that is already open in the target tab.
+    tabConversations[String(result.tab)] = record.expectedConversationId;
+    await persistLive();
+  }
+  await persistLoopTransfers();
+  return publicLoopTransfer(record);
+}
+
+async function activeLoopTransferForSource(source, recoveryId, rolloverConversationId = null) {
+  if (!source || !Number.isInteger(source.tab) || !source.documentId) return null;
+  const record = loopTransfers[String(source.tab)];
+  if (!record || record.id !== recoveryId) return null;
+  if (record.targetTabId !== source.tab || record.targetDocumentId !== source.documentId) return null;
+  if (!ownsDocument(source)) return null;
+  let tab = null;
+  try {
+    tab = await chrome.tabs.get(source.tab);
+  } catch {
+    return null;
+  }
+  const currentUrl = typeof tab?.url === 'string' ? tab.url : '';
+  if (record.kind === 'recovery') {
+    if (currentUrl !== record.expectedUrl || conversationFromUrl(currentUrl) !== record.expectedConversationId) return null;
+  } else if (!isNewChatUrl(currentUrl)) {
+    const concrete = conversationFromUrl(currentUrl);
+    if (!concrete || cleanConversationId(rolloverConversationId) !== concrete) return null;
+  }
+  return record;
+}
+
 /** Serializes every ownership transition and owned side effect for one browser tab. */
 const tabOperationQueues = new Map();
 
@@ -1676,7 +1990,11 @@ function serializeTab(tab, operation) {
 const HANDLERS = {
   async register_document(_message, sender) {
     const result = await registerDocument(sender, _message);
-    if (result && result.ok === true) void recoverDeferredRevivals().catch(() => undefined);
+    if (result && result.ok === true) {
+      const recovery = await transferForRegisteredDocument(result);
+      void recoverDeferredRevivals().catch(() => undefined);
+      return recovery ? { ...result, recovery } : result;
+    }
     return result;
   },
   async status() {
@@ -2240,25 +2558,183 @@ const HANDLERS = {
     }
     return { ok: false, error: 'no_tab' };
   },
-  async recover_conversation_tab(message, sender, source) {
-    const targetUrl = typeof message?.url === 'string' ? message.url : '';
-    if (!targetUrl || (!targetUrl.startsWith('https://chatgpt.com/') && !targetUrl.startsWith('https://chat.openai.com/'))) {
-      return { ok: false, error: 'invalid_url' };
+  async recover_conversation_tab(message, _sender, source) {
+    await load();
+    if (!ownsDocument(source)) return { ok: false, error: 'stale_document' };
+    const loop = parseLoopSnapshot(message?.loop);
+    if (!loop) return { ok: false, error: 'invalid_loop_state' };
+    const requestedConversation = cleanConversationId(message?.conversationId);
+    const sourceKey = String(source.tab);
+    const provenConversation = cleanConversationId(tabConversations[sourceKey]);
+    if (!requestedConversation || requestedConversation !== provenConversation) {
+      return { ok: false, error: 'stale_conversation' };
     }
-    const oldTabId = (source && Number.isInteger(source.tab)) ? source.tab : tabId(sender);
+
+    let sourceTab = null;
     try {
-      await chrome.tabs.create({ url: targetUrl, active: true });
-      if (oldTabId !== null && Number.isInteger(oldTabId)) {
-        try {
-          await chrome.tabs.remove(oldTabId);
-        } catch {
-          // Tab may already be closing or closed
-        }
-      }
-      return { ok: true };
+      sourceTab = await chrome.tabs.get(source.tab);
+    } catch {
+      return { ok: false, error: 'source_tab_missing' };
+    }
+    const exactSourceUrl = typeof sourceTab?.url === 'string' ? sourceTab.url : '';
+    if (!isChatGptUrl(exactSourceUrl) || conversationFromUrl(exactSourceUrl) !== provenConversation) {
+      return { ok: false, error: 'source_conversation_mismatch' };
+    }
+    if (!ownsDocument(source)) return { ok: false, error: 'stale_document' };
+
+    const counterKey = loopCounterKey(loop, provenConversation);
+    const previous = loopRecoveryCounters[counterKey];
+    const previousCount = previous && Number.isInteger(previous.count) && previous.count >= 0 ? previous.count : 0;
+    const attempt = previousCount + 1;
+    const kind = previousCount >= 3 ? 'rollover' : 'recovery';
+    if (kind === 'rollover' && loop.executionRunId) {
+      return { ok: false, error: 'core_rollover_required' };
+    }
+    const rolloverText =
+      kind === 'rollover' && typeof message?.rolloverText === 'string'
+        ? message.rolloverText.trim().slice(0, 8_000)
+        : null;
+    if (kind === 'rollover' && !rolloverText) return { ok: false, error: 'rollover_text_required' };
+
+    // The attempt itself is durable before the browser is asked to create or navigate anything.
+    // A create/navigation failure therefore remains part of the consecutive-stall history.
+    loopRecoveryCounters[counterKey] = { count: attempt, updatedAt: Date.now() };
+    await persistLoopRecoveryCounters();
+
+    const createOptions = {
+      active: false,
+      ...(Number.isInteger(sourceTab?.windowId) ? { windowId: sourceTab.windowId } : {})
+    };
+    let target = null;
+    try {
+      target = await chrome.tabs.create(createOptions);
     } catch (err) {
       return { ok: false, error: String(err && err.message ? err.message : err) };
     }
+    const targetTabId = target && Number.isInteger(target.id) ? target.id : null;
+    if (targetTabId === null) return { ok: false, error: 'target_tab_missing' };
+
+    const expectedUrl = kind === 'recovery' ? exactSourceUrl : 'https://chatgpt.com/';
+    const transferId = newLoopTransferId();
+    loopTransfers[String(targetTabId)] = {
+      id: transferId,
+      kind,
+      sourceTabId: source.tab,
+      sourceDocumentId: source.documentId,
+      sourceNavigationEpoch: Number.isSafeInteger(source.navigationEpoch) ? source.navigationEpoch : 0,
+      sourceConversationId: provenConversation,
+      targetTabId,
+      targetDocumentId: null,
+      sourceUrl: exactSourceUrl,
+      expectedUrl,
+      expectedConversationId: kind === 'recovery' ? provenConversation : null,
+      loop,
+      reason: typeof message?.reason === 'string' ? message.reason.slice(0, 500) : '',
+      attempt,
+      rolloverText,
+      createdAt: Date.now(),
+      counterKey
+    };
+    try {
+      await persistLoopTransfers();
+    } catch (err) {
+      delete loopTransfers[String(targetTabId)];
+      try {
+        await chrome.tabs.remove(targetTabId);
+      } catch {}
+      return { ok: false, error: String(err && err.message ? err.message : err) };
+    }
+
+    try {
+      await chrome.tabs.update(targetTabId, { url: expectedUrl, active: true });
+    } catch (err) {
+      delete loopTransfers[String(targetTabId)];
+      await persistLoopTransfers().catch(() => undefined);
+      try {
+        await chrome.tabs.remove(targetTabId);
+      } catch {}
+      return { ok: false, error: String(err && err.message ? err.message : err) };
+    }
+    return { ok: true, transferId, kind, attempt };
+  },
+  async recovery_ready(message, _sender, source) {
+    await load();
+    const recoveryId = typeof message?.recoveryId === 'string' ? message.recoveryId : '';
+    const record = await activeLoopTransferForSource(source, recoveryId, message?.conversationId);
+    if (!record) return { ok: false, error: 'stale_recovery' };
+
+    if (record.kind === 'rollover') {
+      let target = null;
+      try {
+        target = await chrome.tabs.get(record.targetTabId);
+      } catch {
+        target = null;
+      }
+      const targetConversation = conversationFromUrl(target?.url);
+      if (targetConversation) {
+        tabConversations[String(record.targetTabId)] = targetConversation;
+        await persistLive();
+      }
+    }
+
+    const sourceKey = String(record.sourceTabId);
+    if (
+      tabDocuments[sourceKey] !== record.sourceDocumentId ||
+      (Number.isSafeInteger(record.sourceNavigationEpoch) && tabEpochs[sourceKey] !== record.sourceNavigationEpoch)
+    ) {
+      return { ok: false, error: 'source_document_changed' };
+    }
+    let original = null;
+    try {
+      original = await chrome.tabs.get(record.sourceTabId);
+    } catch {
+      original = null;
+    }
+    const originalUrl = typeof original?.url === 'string' ? original.url : '';
+    if (originalUrl !== record.sourceUrl || conversationFromUrl(originalUrl) !== record.sourceConversationId) {
+      return { ok: false, error: 'source_tab_changed' };
+    }
+
+    // Persist the receipt before closing the old presentation. A later progress signal remains
+    // attributable even if the service worker is stopped between tab removal and transfer cleanup.
+    completedLoopTransfers[record.id] = {
+      targetTabId: record.targetTabId,
+      targetDocumentId: record.targetDocumentId,
+      counterKey: record.counterKey,
+      completedAt: Date.now()
+    };
+    await persistLoopTransfers();
+    try {
+      await chrome.tabs.remove(record.sourceTabId);
+    } catch {
+      // The user may have closed the old tab in the small window after the re-proof above.
+    }
+    delete loopTransfers[String(record.targetTabId)];
+    await persistLoopTransfers();
+    return { ok: true, closedSource: true };
+  },
+  async recovery_progress(message, _sender, source) {
+    await load();
+    const recoveryId = typeof message?.recoveryId === 'string' ? message.recoveryId : '';
+    let counterKey = null;
+    const active = await activeLoopTransferForSource(source, recoveryId);
+    if (active) {
+      counterKey = active.counterKey;
+    } else {
+      const receipt = completedLoopTransfers[recoveryId];
+      if (
+        receipt &&
+        receipt.targetTabId === source?.tab &&
+        receipt.targetDocumentId === source?.documentId &&
+        ownsDocument(source)
+      ) {
+        counterKey = receipt.counterKey;
+      }
+    }
+    if (!counterKey) return { ok: false, error: 'stale_recovery' };
+    loopRecoveryCounters[counterKey] = { count: 0, updatedAt: Date.now() };
+    await persistLoopRecoveryCounters();
+    return { ok: true, reset: true };
   }
 };
 
@@ -2289,7 +2765,9 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     'forget_revival',
     'ack',
     'close_agent_tab',
-    'recover_conversation_tab'
+    'recover_conversation_tab',
+    'recovery_ready',
+    'recovery_progress'
   ]);
   const run = async () => {
     let source = null;
@@ -2456,6 +2934,7 @@ chrome.tabs.onRemoved.addListener((id) => {
   revivalReuseAttempted.delete(id);
   clearDeferredRevivalOffersForTab(id);
   void serializeTab(id, async () => {
+    await cleanupLoopTransferState({ removedTabId: id });
     if (clearRevivalPreferencesForTab(id)) await persistLive();
     const documentId = await markTerminal(id);
     return releaseTab(id, null, documentId);

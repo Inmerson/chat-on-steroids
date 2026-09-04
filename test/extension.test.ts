@@ -837,6 +837,7 @@ describe('Loop recovery transfer contract', () => {
       reason: REASON,
       attempt: 1
     });
+    expect((session.data.tabConversations as Record<string, string>)['52']).toBe(CHAT);
     const recoveryId = targetRegistration.recovery.id as string;
     expect(worker.tabsRemove).not.toHaveBeenCalledWith(sourceTab.id);
 
@@ -853,6 +854,84 @@ describe('Loop recovery transfer contract', () => {
       targetDocument
     );
     expect(worker.tabsRemove).toHaveBeenCalledWith(sourceTab.id);
+  });
+
+  it('resets the consecutive counter on genuine target progress even after ready retired the transfer', async () => {
+    const local = new FakeStorageArea();
+    const session = new FakeStorageArea();
+    const tabs = new Map<number, { id: number; url: string; status: string; windowId: number }>([
+      [71, { id: 71, url: SOURCE_URL, status: 'complete', windowId: 7 }]
+    ]);
+    const makeWorker = () =>
+      loadWorker({
+        local,
+        session,
+        tabsGet: async (tabId) => {
+          const tab = tabs.get(tabId);
+          if (!tab) throw new Error('tab not found');
+          return { ...tab };
+        }
+      });
+
+    const first = makeWorker();
+    const sourceTab = { id: 71, status: 'complete', windowId: 7 };
+    const sourceDocument = 'document-progress-source';
+    await first.registerDocument(sourceTab, sourceDocument);
+    await first.sendFrom({ type: 'bind', conversationId: CHAT }, sourceTab, sourceDocument);
+    first.tabsCreate.mockResolvedValue({ id: 72, status: 'complete', windowId: 7 });
+    expect(await first.sendFrom(recoveryMessage(), sourceTab, sourceDocument)).toMatchObject({ ok: true, attempt: 1 });
+
+    tabs.set(72, { id: 72, url: SOURCE_URL, status: 'complete', windowId: 7 });
+    const targetTab = { id: 72, status: 'complete', windowId: 7 };
+    const targetDocument = 'document-progress-target';
+    const registered = await first.registerDocument(targetTab, targetDocument);
+    const recoveryId = registered.recovery.id as string;
+    await first.sendFrom({ type: 'recovery_ready', recoveryId }, targetTab, targetDocument);
+    expect(first.tabsRemove).toHaveBeenCalledWith(71);
+
+    expect(await first.sendFrom({ type: 'recovery_progress', recoveryId }, targetTab, targetDocument)).toMatchObject({
+      ok: true,
+      reset: true
+    });
+    await first.sendFrom({ type: 'bind', conversationId: CHAT }, targetTab, targetDocument);
+
+    const second = makeWorker();
+    await second.registerDocument(targetTab, targetDocument);
+    second.tabsCreate.mockResolvedValue({ id: 73, status: 'complete', windowId: 7 });
+    expect(await second.sendFrom(recoveryMessage(), targetTab, targetDocument)).toMatchObject({
+      ok: true,
+      kind: 'recovery',
+      attempt: 1
+    });
+  });
+
+  it('garbage-collects a transfer when its target tab disappears without closing another tab', async () => {
+    const local = new FakeStorageArea();
+    const session = new FakeStorageArea();
+    const tabs = new Map<number, { id: number; url: string; status: string; windowId: number }>([
+      [81, { id: 81, url: SOURCE_URL, status: 'complete', windowId: 7 }]
+    ]);
+    const worker = loadWorker({
+      local,
+      session,
+      tabsGet: async (tabId) => {
+        const tab = tabs.get(tabId);
+        if (!tab) throw new Error('tab not found');
+        return { ...tab };
+      }
+    });
+    const sourceTab = { id: 81, status: 'complete', windowId: 7 };
+    const sourceDocument = 'document-gc-source';
+    await worker.registerDocument(sourceTab, sourceDocument);
+    await worker.sendFrom({ type: 'bind', conversationId: CHAT }, sourceTab, sourceDocument);
+    worker.tabsCreate.mockResolvedValue({ id: 82, status: 'complete', windowId: 7 });
+    expect(await worker.sendFrom(recoveryMessage(), sourceTab, sourceDocument)).toMatchObject({ ok: true });
+    expect((session.data.loopTransfers as Record<string, unknown>)['82']).toBeTruthy();
+
+    tabs.delete(82);
+    await worker.closeTab(82);
+    expect((session.data.loopTransfers as Record<string, unknown>)['82']).toBeUndefined();
+    expect(worker.tabsRemove).not.toHaveBeenCalledWith(81);
   });
 
   it('keeps failed recovery attempts across worker restarts and rolls over after three', async () => {
