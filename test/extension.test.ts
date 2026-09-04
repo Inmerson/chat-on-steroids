@@ -407,6 +407,11 @@ class FakeStorageArea {
 
 interface WorkerHarness {
   send(message: Record<string, unknown>, tabId?: number, documentId?: string): Promise<any>;
+  sendFrom(
+    message: Record<string, unknown>,
+    tab: { id: number; url?: string; pendingUrl?: string; status?: string; windowId?: number },
+    documentId?: string
+  ): Promise<any>;
   /** Fires Chrome's real tab-close lifecycle event. */
   closeTab(tabId: number): Promise<void>;
   /** Fires only Chrome's navigation-start signal, without inventing a replacement document. */
@@ -419,6 +424,12 @@ interface WorkerHarness {
   storageChange(areaName: 'local' | 'session', changes: Record<string, { oldValue?: unknown; newValue?: unknown }>): Promise<void>;
   /** Registers the browser document that owns subsequent tab-scoped messages. */
   registerTab(tabId: number, documentId?: string): Promise<any>;
+  /** Registers a document with Chrome-owned tab metadata such as its exact URL. */
+  registerDocument(
+    tab: { id: number; url?: string; pendingUrl?: string; status?: string; windowId?: number },
+    documentId?: string,
+    navigationEpoch?: number
+  ): Promise<any>;
   /** Fires Chrome's tab-created lifecycle event, the way opening a link in a new tab does. */
   createTab(tab: { id: number; url?: string; pendingUrl?: string }): Promise<void>;
   tabsCreate: ReturnType<typeof vi.fn>;
@@ -596,12 +607,12 @@ function loadWorker(options: {
       await new Promise((resolve) => setTimeout(resolve, 0));
       await new Promise((resolve) => setTimeout(resolve, 0));
     },
-    registerTab(tabId, documentId = documentFor(tabId)) {
+    registerDocument(tab, documentId = documentFor(tab.id), navigationEpoch = 0) {
       return new Promise((resolve, reject) => {
         try {
           const keep = listener!(
-            { type: 'register_document' },
-            { tab: { id: tabId }, documentId, frameId: 0 },
+            { type: 'register_document', navigationEpoch },
+            { tab, documentId, frameId: 0 },
             resolve
           );
           if (keep !== true) reject(new Error('listener did not keep the response channel open'));
@@ -609,6 +620,9 @@ function loadWorker(options: {
           reject(err);
         }
       });
+    },
+    registerTab(tabId, documentId = documentFor(tabId)) {
+      return this.registerDocument({ id: tabId }, documentId);
     },
     async navigateTab(tabId: number, url: string) {
       const chatGpt = /^https:\/\/(?:chatgpt\.com|chat\.openai\.com)(?:\/|$)/i.test(url);
@@ -644,6 +658,16 @@ function loadWorker(options: {
       return new Promise((resolve, reject) => {
         try {
           const keep = listener!(message, { tab: { id: tabId }, documentId, frameId: 0 }, resolve);
+          if (keep !== true) reject(new Error('listener did not keep the response channel open'));
+        } catch (err) {
+          reject(err);
+        }
+      });
+    },
+    sendFrom(message, tab, documentId = documentFor(tab.id)) {
+      return new Promise((resolve, reject) => {
+        try {
+          const keep = listener!(message, { tab, documentId, frameId: 0 }, resolve);
           if (keep !== true) reject(new Error('listener did not keep the response channel open'));
         } catch (err) {
           reject(err);
@@ -698,6 +722,205 @@ describe('worker settings authority', () => {
       error: 'stale_conversation'
     });
     expect(fetch.mock.calls.some(([input]) => new URL(String(input)).pathname === '/settings')).toBe(false);
+  });
+});
+
+describe('Loop recovery transfer contract', () => {
+  const CHAT = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee';
+  const SOURCE_URL = 'https://chatgpt.com/c/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee?model=gpt-5#section';
+  const REASON = 'Generation frozen for 5 minutes with no progress';
+  const ROLLOVER_TEXT = '@Chat On Steroids Core\n\nContinue the interrupted task.';
+  const LOOP = {
+    mode: 'infinite',
+    turns: 7,
+    lastReason: REASON,
+    recentFingerprints: ['fingerprint-one', 'fingerprint-two'],
+    executionRunId: null,
+    recoveryGeneration: 2
+  } as const;
+
+  const recoveryMessage = () => ({
+    type: 'recover_conversation_tab',
+    conversationId: CHAT,
+    loop: { ...LOOP, recentFingerprints: [...LOOP.recentFingerprints] },
+    reason: REASON,
+    rolloverText: ROLLOVER_TEXT
+  });
+
+  it('reopens the exact Chrome-owned conversation URL without Chat On Steroids parameters', async () => {
+    const local = new FakeStorageArea();
+    const session = new FakeStorageArea();
+    const tabs = new Map<number, { id: number; url: string; status: string; windowId: number }>([
+      [41, { id: 41, url: SOURCE_URL, status: 'complete', windowId: 7 }]
+    ]);
+    const worker = loadWorker({
+      local,
+      session,
+      tabsGet: async (tabId) => {
+        const tab = tabs.get(tabId);
+        if (!tab) throw new Error('tab not found');
+        return { ...tab };
+      }
+    });
+    // Deliberately omit the URL from MessageSender metadata. Recovery must re-read Chrome's tab
+    // state at the irreversible handoff boundary instead of trusting a page-supplied URL field.
+    const sourceTab = { id: 41, status: 'complete', windowId: 7 };
+    const sourceDocument = 'document-source-exact-url';
+    await worker.registerDocument(sourceTab, sourceDocument);
+    await worker.sendFrom({ type: 'bind', conversationId: CHAT, navigationEpoch: 0 }, sourceTab, sourceDocument);
+    worker.tabsCreate.mockResolvedValue({ id: 42, windowId: 7 });
+
+    const message = recoveryMessage();
+    expect(message).not.toHaveProperty('url');
+    await worker.sendFrom(message, sourceTab, sourceDocument);
+
+    // The approved transaction ordering is blank target -> durable transfer -> exact navigation.
+    expect(worker.tabsCreate).toHaveBeenCalledWith(expect.not.objectContaining({ url: expect.anything() }));
+    expect(worker.tabsUpdate).toHaveBeenCalledWith(42, { url: SOURCE_URL, active: true });
+    const navigatedUrl = worker.tabsUpdate.mock.calls.at(-1)?.[1]?.url as string | undefined;
+    expect(navigatedUrl).toBe(SOURCE_URL);
+    expect(navigatedUrl).not.toMatch(/cos_|clf=/);
+  });
+
+  it('offers recovery only to the exact target and closes the source only after that target is ready', async () => {
+    const local = new FakeStorageArea();
+    const session = new FakeStorageArea();
+    const tabs = new Map<number, { id: number; url: string; status: string; windowId: number }>([
+      [51, { id: 51, url: SOURCE_URL, status: 'complete', windowId: 7 }]
+    ]);
+    const worker = loadWorker({
+      local,
+      session,
+      tabsGet: async (tabId) => {
+        const tab = tabs.get(tabId);
+        if (!tab) throw new Error('tab not found');
+        return { ...tab };
+      }
+    });
+    const sourceTab = { id: 51, status: 'complete', windowId: 7 };
+    const sourceDocument = 'document-source-isolation';
+    const targetTab = { id: 52, status: 'complete', windowId: 7 };
+    await worker.registerDocument(sourceTab, sourceDocument);
+    await worker.sendFrom({ type: 'bind', conversationId: CHAT, navigationEpoch: 0 }, sourceTab, sourceDocument);
+    worker.tabsCreate.mockResolvedValue(targetTab);
+
+    const started = await worker.sendFrom(recoveryMessage(), sourceTab, sourceDocument);
+    expect(started).toMatchObject({ ok: true, transferId: expect.any(String), kind: 'recovery', attempt: 1 });
+    expect(worker.tabsRemove).not.toHaveBeenCalledWith(sourceTab.id);
+    tabs.set(52, { id: 52, url: SOURCE_URL, status: 'complete', windowId: 7 });
+    tabs.set(53, { id: 53, url: SOURCE_URL, status: 'complete', windowId: 7 });
+
+    const unrelated = await worker.registerDocument(
+      { id: 53, status: 'complete', windowId: 7 },
+      'document-unrelated'
+    );
+    expect(unrelated).not.toHaveProperty('recovery');
+
+    tabs.set(52, {
+      id: 52,
+      url: 'https://chatgpt.com/c/11111111-2222-3333-4444-555555555555?model=gpt-5#section',
+      status: 'complete',
+      windowId: 7
+    });
+    const wrongConversation = await worker.registerDocument(targetTab, 'document-target-wrong-conversation');
+    expect(wrongConversation).not.toHaveProperty('recovery');
+
+    tabs.set(52, { id: 52, url: SOURCE_URL, status: 'complete', windowId: 7 });
+    const targetDocument = 'document-target-correct-conversation';
+    const targetRegistration = await worker.registerDocument(targetTab, targetDocument, 3);
+    expect(targetRegistration).toHaveProperty('recovery');
+    expect(targetRegistration.recovery).toMatchObject({
+      id: expect.any(String),
+      kind: 'recovery',
+      conversationId: CHAT,
+      loop: LOOP,
+      reason: REASON,
+      attempt: 1
+    });
+    const recoveryId = targetRegistration.recovery.id as string;
+    expect(worker.tabsRemove).not.toHaveBeenCalledWith(sourceTab.id);
+
+    await worker.sendFrom(
+      { type: 'recovery_ready', recoveryId, navigationEpoch: 2 },
+      targetTab,
+      targetDocument
+    );
+    expect(worker.tabsRemove).not.toHaveBeenCalledWith(sourceTab.id);
+
+    await worker.sendFrom(
+      { type: 'recovery_ready', recoveryId, navigationEpoch: 3 },
+      targetTab,
+      targetDocument
+    );
+    expect(worker.tabsRemove).toHaveBeenCalledWith(sourceTab.id);
+  });
+
+  it('keeps failed recovery attempts across worker restarts and rolls over after three', async () => {
+    const local = new FakeStorageArea();
+    const session = new FakeStorageArea();
+    const tabs = new Map<number, { id: number; url: string; status: string; windowId: number }>();
+    let sourceTab = { id: 61, status: 'complete', windowId: 7 };
+    let sourceDocument = 'document-recovery-attempt-0';
+    tabs.set(61, { id: 61, url: SOURCE_URL, status: 'complete', windowId: 7 });
+
+    for (let attempt = 1; attempt <= 4; attempt += 1) {
+      const worker = loadWorker({
+        local,
+        session,
+        tabsGet: async (tabId) => {
+          const tab = tabs.get(tabId);
+          if (!tab) throw new Error('tab not found');
+          return { ...tab };
+        }
+      });
+      await worker.registerDocument(sourceTab, sourceDocument);
+      await worker.sendFrom(
+        { type: 'bind', conversationId: CHAT, navigationEpoch: 0 },
+        sourceTab,
+        sourceDocument
+      );
+
+      const targetId = 61 + attempt;
+      const targetUrl = attempt <= 3 ? SOURCE_URL : 'https://chatgpt.com/';
+      const targetTab = { id: targetId, status: 'complete', windowId: 7 };
+      worker.tabsCreate.mockResolvedValue(targetTab);
+      const started = await worker.sendFrom(recoveryMessage(), sourceTab, sourceDocument);
+      expect(started).toMatchObject({
+        ok: true,
+        transferId: expect.any(String),
+        kind: attempt <= 3 ? 'recovery' : 'rollover',
+        attempt
+      });
+      tabs.set(targetId, { id: targetId, url: targetUrl, status: 'complete', windowId: 7 });
+
+      const targetDocument = `document-recovery-attempt-${attempt}`;
+      const registered = await worker.registerDocument(targetTab, targetDocument);
+      expect(registered).toHaveProperty('recovery');
+      expect(registered.recovery).toMatchObject({
+        id: expect.any(String),
+        kind: attempt <= 3 ? 'recovery' : 'rollover',
+        conversationId: attempt <= 3 ? CHAT : null,
+        loop: LOOP,
+        reason: REASON,
+        attempt,
+        ...(attempt === 4 ? { rolloverText: ROLLOVER_TEXT } : {})
+      });
+
+      if (attempt <= 3) {
+        await worker.sendFrom(
+          { type: 'recovery_ready', recoveryId: registered.recovery.id, navigationEpoch: 0 },
+          targetTab,
+          targetDocument
+        );
+        await worker.sendFrom(
+          { type: 'bind', conversationId: CHAT, navigationEpoch: 0 },
+          targetTab,
+          targetDocument
+        );
+        sourceTab = targetTab;
+        sourceDocument = targetDocument;
+      }
+    }
   });
 });
 

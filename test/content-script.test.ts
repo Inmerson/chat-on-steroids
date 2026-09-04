@@ -9189,6 +9189,55 @@ describe('a request id ChatGPT reused across retries', () => {
   });
 });
 
+describe('Loop recovery transfer startup', () => {
+  it('restores Loop mode and turn count from register_document instead of legacy localStorage', async () => {
+    const url = 'https://chatgpt.com/c/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee?model=gpt-5#section';
+    const recovery = {
+      id: 'loop-transfer-recovery-1',
+      kind: 'recovery',
+      conversationId: 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee',
+      loop: {
+        mode: 'infinite',
+        turns: 7,
+        lastReason: 'Generation frozen for 5 minutes with no progress',
+        recentFingerprints: ['fingerprint-one', 'fingerprint-two'],
+        executionRunId: null,
+        recoveryGeneration: 2
+      },
+      reason: 'Generation frozen for 5 minutes with no progress',
+      attempt: 2,
+      rolloverText: null
+    };
+
+    live = await harness(
+      url,
+      { register_document: () => ({ ok: true, recovery }) },
+      (document, dom) => {
+        startGenerating(document);
+        dom.window.localStorage.setItem(
+          'cos_autoloop_pending',
+          JSON.stringify({
+            active: true,
+            mode: 'standard',
+            conversationId: recovery.conversationId,
+            resumeSameChat: true,
+            reason: 'legacy state must not win',
+            timestamp: 1_700_000_000_000
+          })
+        );
+      }
+    );
+    await settle(200);
+
+    expect(live.sent[0]?.type).toBe('register_document');
+    expect(live.window.location.search).toBe('?model=gpt-5');
+    expect(live.window.location.hash).toBe('#section');
+    const loopButton = live.document.querySelector('.clf-loop-btn');
+    expect(loopButton).not.toBeNull();
+    expect(loopButton?.textContent).toBe('♾️ Infinite (7)');
+  });
+});
+
 /**
  * The goal loop, from the page's side.
  *
