@@ -864,3 +864,297 @@
 .clf-row.clf-bad .clf-label {
   color: color-mix(in srgb, currentColor 40%, #dc2626);
 }
+
+/* --- settings / per-chat goal sheet -------------------------------------- */
+
+.clf-menu {
+  --clf-menu-bg: #2f2f2f;
+  --clf-menu-ink: #ececec;
+  --clf-menu-line: rgb(255 255 255 / 11%);
+  --clf-menu-hover: rgb(255 255 255 / 7%);
+}
+
+[data-clf-theme='light'] .clf-menu {
+  --clf-menu-bg: #fff;
+  --clf-menu-ink: #0d0d0d;
+  --clf-menu-line: rgb(0 0 0 / 10%);
+  --clf-menu-hover: rgb(0 0 0 / 5%);
+}
+
+.clf-menu {
+  position: fixed;
+  z-index: 2147483000;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  box-sizing: border-box;
+  min-width: 17.5rem;
+  max-width: 22rem;
+  padding: 6px;
+  border: 1px solid var(--clf-menu-line);
+  border-radius: 16px;
+  background: var(--clf-menu-bg);
+  box-shadow: 0 10px 32px rgb(0 0 0 / 22%), 0 2px 6px rgb(0 0 0 / 12%);
+  color: var(--clf-menu-ink);
+  font-size: 14px;
+  line-height: 1.35;
+  animation: clf-pop-in 0.15s cubic-bezier(0.23, 1, 0.32, 1);
+}
+
+.clf-menu[hidden] {
+  display: none;
+}
+
+.clf-menu[data-clf-busy='1'] {
+  /* The write is in flight. Still legible, visibly not accepting a second one. */
+  opacity: 0.72;
+}
+
+.clf-menu-row {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  width: 100%;
+  padding: 8px 10px;
+  border: 0;
+  border-radius: 11px;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.clf-menu-row:hover:not(:disabled) {
+  background: var(--clf-menu-hover);
+}
+
+.clf-menu-row:focus-visible {
+  outline: 2px solid color-mix(in srgb, currentColor 45%, transparent);
+  outline-offset: -2px;
+}
+
+.clf-menu-row:disabled {
+  cursor: default;
+}
+
+.clf-menu-label {
+  display: flex;
+  flex: 1 1 auto;
+  flex-direction: column;
+  gap: 1px;
+  min-width: 0;
+}
+
+.clf-menu-name {
+  font-weight: 550;
+}
+
+/* The line under each name is the answer to "on until what?" and "with what?", so it is
+   allowed to wrap — the missing-key notice is a sentence and must not be ellipsed away. */
+.clf-menu-note {
+  font-size: 12px;
+  line-height: 1.35;
+  opacity: 0.62;
+  overflow-wrap: anywhere;
+}
+
+.clf-menu-note[data-clf-warn='1'] {
+  color: color-mix(in srgb, currentColor 45%, #f59e0b);
+  opacity: 1;
+}
+
+/* The switch. Green for on and a plain neutral track for off — red is what this app uses for
+   a failure, and a setting somebody deliberately turned off is not one. */
+.clf-switch {
+  position: relative;
+  flex: none;
+  width: 34px;
+  height: 20px;
+  border-radius: 9999px;
+  background: color-mix(in srgb, currentColor 26%, transparent);
+  transition: background-color 0.15s ease;
+}
+
+.clf-switch[data-clf-on='1'] {
+  background: #10a37f;
+}
+
+.clf-switch-knob {
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 16px;
+  height: 16px;
+  border-radius: 9999px;
+  background: #fff;
+  box-shadow: 0 1px 2px rgb(0 0 0 / 25%);
+  transition: transform 0.15s cubic-bezier(0.23, 1, 0.32, 1);
+}
+
+.clf-switch[data-clf-on='1'] .clf-switch-knob {
+  transform: translateX(14px);
+}
+
+/* The specific goal, sitting under the Goal switch it belongs to.
+   Indented to the switch's own text column and set in the note's size, so it reads as part
+   of that row rather than as a second setting. The accent is this app's amber — the same
+   colour the sheet already uses to say "this needs you" — because until a goal is written
+   there is nothing here to be on or off. */
+.clf-menu-goal {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 0 10px 8px 10px;
+  margin-top: -4px;
+}
+
+.clf-menu-goal-text {
+  font-size: 12px;
+  line-height: 1.4;
+  opacity: 0.75;
+  overflow-wrap: anywhere;
+}
+
+.clf-menu-goal-link {
+  display: flex;
+  align-items: center;
+  align-self: flex-end;
+  gap: 6px;
+  padding: 2px 4px;
+  border: 0;
+  border-radius: 7px;
+  background: transparent;
+  color: color-mix(in srgb, currentColor 30%, #f59e0b);
+  font: inherit;
+  font-size: 12px;
+  font-weight: 550;
+  cursor: pointer;
+}
+
+.clf-menu-goal-link:hover:not(:disabled) {
+  background: var(--clf-menu-hover);
+}
+
+.clf-menu-goal-link:focus-visible {
+  outline: 2px solid color-mix(in srgb, currentColor 45%, transparent);
+  outline-offset: -2px;
+}
+
+.clf-menu-goal-link:disabled {
+  cursor: default;
+  opacity: 0.5;
+}
+
+.clf-menu-goal-plus {
+  font-size: 15px;
+  line-height: 1;
+}
+
+.clf-menu-goal-input {
+  box-sizing: border-box;
+  width: 100%;
+  padding: 7px 9px;
+  border: 1px solid var(--clf-menu-line);
+  border-radius: 10px;
+  background: color-mix(in srgb, currentColor 6%, transparent);
+  color: inherit;
+  font: inherit;
+  font-size: 13px;
+  line-height: 1.4;
+  /* Grows with the goal, up to the point where the sheet itself would stop fitting. */
+  min-height: 66px;
+  max-height: 40vh;
+  resize: vertical;
+}
+
+.clf-menu-goal-input:focus-visible {
+  outline: 2px solid color-mix(in srgb, currentColor 35%, #f59e0b);
+  outline-offset: -1px;
+}
+
+.clf-menu-goal-buttons {
+  display: flex;
+  gap: 6px;
+}
+
+.clf-menu-goal-buttons button {
+  padding: 5px 12px;
+  border: 1px solid var(--clf-menu-line);
+  border-radius: 9px;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  font-size: 12px;
+  font-weight: 550;
+  cursor: pointer;
+}
+
+.clf-menu-goal-buttons button:hover:not(:disabled) {
+  background: var(--clf-menu-hover);
+}
+
+.clf-menu-goal-buttons button:disabled {
+  cursor: default;
+  opacity: 0.45;
+}
+
+.clf-menu-goal-save {
+  border-color: transparent !important;
+  background: #10a37f !important;
+  color: #fff;
+}
+
+.clf-menu-goal-save:hover:not(:disabled) {
+  background: #0e8f6f !important;
+}
+
+/* Clearing a goal ends a loop somebody set up deliberately, so it is set apart from Cancel
+   rather than sitting beside it as a third equal button. */
+.clf-menu-goal-clear {
+  margin-left: auto;
+  color: color-mix(in srgb, currentColor 45%, #dc2626);
+}
+
+.clf-menu-goal-note {
+  font-size: 12px;
+  line-height: 1.35;
+  opacity: 0.62;
+  overflow-wrap: anywhere;
+}
+
+.clf-menu-goal-note[data-clf-warn='1'],
+.clf-menu-goal-link [data-clf-warn='1'] {
+  color: color-mix(in srgb, currentColor 45%, #f59e0b);
+  opacity: 1;
+}
+
+/* The button's old job, kept: one action row under a hairline, so it reads as an action
+   among settings rather than as a third switch. */
+.clf-menu-action {
+  margin-top: 4px;
+  padding: 9px 10px;
+  border: 0;
+  border-top: 1px solid var(--clf-menu-line);
+  border-radius: 0 0 11px 11px;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  font-weight: 550;
+  text-align: left;
+  cursor: pointer;
+}
+
+.clf-menu-action:hover:not(:disabled) {
+  background: var(--clf-menu-hover);
+}
+
+.clf-menu-action:focus-visible {
+  outline: 2px solid color-mix(in srgb, currentColor 45%, transparent);
+  outline-offset: -2px;
+}
+
+.clf-menu-action:disabled {
+  cursor: default;
+  opacity: 0.4;
+}

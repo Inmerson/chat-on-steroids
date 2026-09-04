@@ -100,6 +100,8 @@
   const HIDDEN_ACTIVITY_MS = 30_000;
   /** Keep a previously proven full replacement through brief Fiber/feed disagreement. */
   const REPLACEMENT_GRACE_MS = 8000;
+  /** Freeze Overwrite while user-driven scrolling/virtualization is still in flight. */
+  const PRESENTATION_SCROLL_IDLE_MS = 240;
   const STATUS_MS = 15_000;
   /** Longer than any honest tool call: past this a silent turn is called stalled. */
   const STALL_MS = 10 * 60 * 1000;
@@ -120,6 +122,30 @@
   let SHOW_TIMES = false;
   let renderPreferenceReady = TEST_MODE;
   const renderStreamAllowed = () => RENDER_STREAM && renderPreferenceReady;
+  let lastPresentationScrollInputAt = -Infinity;
+
+  function editableScrollTarget(target) {
+    if (!target || target.nodeType !== 1) return false;
+    const element = target;
+    return Boolean(
+      element.isContentEditable ||
+      (element.closest && element.closest('input, textarea, select, [contenteditable="true"], [role="textbox"]'))
+    );
+  }
+
+  function notePresentationScrollInput(event) {
+    if (!alive || !event) return;
+    if (event.type === 'keydown') {
+      if (editableScrollTarget(event.target)) return;
+      if (event.altKey || event.ctrlKey || event.metaKey) return;
+      if (!['ArrowUp', 'ArrowDown', 'PageUp', 'PageDown', 'Home', 'End', ' ', 'Spacebar'].includes(event.key)) return;
+    }
+    lastPresentationScrollInputAt = Date.now();
+  }
+
+  function presentationScrollActive() {
+    return Date.now() - lastPresentationScrollInputAt < PRESENTATION_SCROLL_IDLE_MS;
+  }
 
   async function loadRenderPreference() {
     if (TEST_MODE || !globalThis.chrome || !chrome.storage || !chrome.storage.local) {
@@ -140,6 +166,14 @@
   let painted = false;
 
   let alive = true;
+  const stopCleanups = [];
+  function rememberCleanup(cleanup) {
+    stopCleanups.push(cleanup);
+  }
+  function listen(target, type, listener, options) {
+    target.addEventListener(type, listener, options);
+    rememberCleanup(() => target.removeEventListener(type, listener, options));
+  }
   let status = { connected: false, paired: false, disconnected: false };
 
   /**
@@ -207,6 +241,7 @@
 
   let conversationId = null;
   let agent = null;
+  let agentCommandId = null;
   try {
     agent = sessionStorage.getItem('cos_agent_worker') || null;
   } catch {}
@@ -220,6 +255,7 @@
   const queueGaps = new Map();
   const queueGapKeys = new WeakMap();
   let flushing = false;
+  let flushWork = null;
 
   /**
    * Which conversation this tab is on, counted rather than named.
@@ -453,6 +489,15 @@
   let baselineSections = [];
   /** What the newest of those said then, so a reused section can prove it has moved. */
   let baselineMarks = [];
+  /** Assistant sections that already exposed a completed-message action last observation. */
+  let baselineCompletionSections = [];
+  /**
+   * Completed-message actions that pre-date this generation.
+   *
+   * A Copy action is only corroborating terminal evidence when it appeared for this response;
+   * an old action on a reused section must never certify a new turn during a Stop dropout.
+   */
+  let completionActionBaselineSections = new WeakSet();
   /**
    * Assistant section node → the local generation that finished writing into it.
    *
@@ -494,6 +539,8 @@
   const bySeq = new Map();
   /** App-owned render events, including calls ChatGPT never gave a native row. */
   const streamBySeq = new Map();
+  /** Stable render key → visible sibling stream outside React-owned assistant sections. */
+  const streamRootsByKey = new Map();
   /** Latest delivery seq for each canonical ChatGPT assistant message. */
   const streamMessageSeq = new Map();
   /** Stable user-message id → durable event position, used only to anchor page responses. */
@@ -539,6 +586,112 @@
    * it goes false again on its own the moment the answer lands.
    */
   let autoCompactReady = false;
+
+  // ------------------------------------------------------------- goal loop
+  let goalConfig = null;
+  let goalDraft = null;
+  let goalTurnId = null;
+  let goalPhase = '';
+  let goalError = '';
+  let goalBusy = false;
+  let goalTypingSince = 0;
+  let dismissedGoalStage = null;
+  /** A specific goal waiting for a New Chat to acquire its first concrete conversation id. */
+  let pendingObjective = '';
+  let pendingObjectiveSent = false;
+  let objectiveBusy = false;
+  let objectiveError = '';
+
+  const GOAL_SPENT_STORAGE = 'clf-goal-spent-v1';
+  const goalSpent = new Set();
+  try {
+    const restored = JSON.parse(sessionStorage.getItem(GOAL_SPENT_STORAGE) || '[]');
+    if (Array.isArray(restored)) {
+      for (const item of restored.slice(-64)) {
+        if (typeof item === 'string' && item.length > 0 && item.length <= 500) goalSpent.add(item);
+      }
+    }
+  } catch {}
+
+  function goalSpentKey(conversation, token) {
+    return `${conversation}\u0000${token}`;
+  }
+
+  function goalWasSpent(conversation, token) {
+    return goalSpent.has(goalSpentKey(conversation, token));
+  }
+
+  function rememberGoalSpent(conversation, token) {
+    const key = goalSpentKey(conversation, token);
+    goalSpent.delete(key);
+    goalSpent.add(key);
+    while (goalSpent.size > 64) goalSpent.delete(goalSpent.values().next().value);
+    try {
+      sessionStorage.setItem(GOAL_SPENT_STORAGE, JSON.stringify([...goalSpent]));
+    } catch {}
+  }
+
+  const RESUME_GOAL_STORAGE = 'clf-resume-goal-v1';
+  let resumeGoalPending = null;
+  try {
+    const restored = JSON.parse(sessionStorage.getItem(RESUME_GOAL_STORAGE) || 'null');
+    if (
+      restored &&
+      typeof restored === 'object' &&
+      typeof restored.conversationId === 'string' &&
+      restored.conversationId &&
+      typeof restored.commandId === 'string' &&
+      restored.commandId
+    ) {
+      resumeGoalPending = {
+        conversationId: restored.conversationId.slice(0, 256),
+        commandId: restored.commandId.slice(0, 200),
+        turnId: typeof restored.turnId === 'string' && restored.turnId ? restored.turnId.slice(0, 200) : null
+      };
+    }
+  } catch {}
+
+  function persistResumeGoalPending() {
+    try {
+      if (resumeGoalPending) sessionStorage.setItem(RESUME_GOAL_STORAGE, JSON.stringify(resumeGoalPending));
+      else sessionStorage.removeItem(RESUME_GOAL_STORAGE);
+    } catch {}
+  }
+
+  function clearResumeGoalPending() {
+    resumeGoalPending = null;
+    persistResumeGoalPending();
+  }
+
+  function rememberResumeGoalPending(conversation, commandId) {
+    resumeGoalPending = { conversationId: conversation, commandId, turnId: null };
+    persistResumeGoalPending();
+  }
+
+  function bindResumeGoalTurn(localTurnId) {
+    if (!resumeGoalPending || resumeGoalPending.conversationId !== conversationId || !localTurnId) return;
+    if (resumeGoalPending.turnId && resumeGoalPending.turnId !== localTurnId) {
+      clearResumeGoalPending();
+      return;
+    }
+    if (!resumeGoalPending.turnId) {
+      resumeGoalPending.turnId = localTurnId;
+      persistResumeGoalPending();
+    }
+  }
+
+  const AUTONOMOUS_SEND_OWNERS = new Set(['goal', 'loop', 'compact', 'bootstrap', 'revival']);
+  let autonomousSendLease = null;
+
+  function acquireAutonomousSend(owner) {
+    if (!AUTONOMOUS_SEND_OWNERS.has(owner) || autonomousSendLease !== null) return false;
+    autonomousSendLease = owner;
+    return true;
+  }
+
+  function releaseAutonomousSend(owner) {
+    if (autonomousSendLease === owner) autonomousSendLease = null;
+  }
 
 
   const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -690,6 +843,7 @@
     const queued = {
       conversationId,
       agent,
+      agentCommandId,
       event: { time: Date.now(), ...bounded }
     };
     // Streaming canonical messages replace their older unsent snapshot. Keeping every
@@ -723,13 +877,14 @@
       const index = queue.findIndex((entry) => !queueGapKeys.has(entry));
       if (index < 0) break;
       const dropped = removeQueueEntry(index);
-      const key = `${dropped.conversationId || ''}\u0000${dropped.agent || ''}`;
+      const key = `${dropped.conversationId || ''}\u0000${dropped.agent || ''}\u0000${dropped.agentCommandId || ''}`;
       let held = queueGaps.get(key);
       if (!held) {
         held = {
           entry: {
             conversationId: dropped.conversationId,
             agent: dropped.agent,
+            agentCommandId: dropped.agentCommandId,
             event: {
               time: dropped.event.time,
               kind: 'chat_error',
@@ -771,9 +926,11 @@
    * renames them when bindConversation() reports the real id.
    */
   async function flush() {
-    if (commandJournalGate || flushing || queue.length === 0) return;
+    if (commandJournalGate) return false;
+    if (queue.length === 0) return true;
+    if (flushWork) return flushWork;
     flushing = true;
-    try {
+    const work = (async () => {
       const batch = queue.slice(0, 200);
       // Freeze overflow markers that enter this delivery attempt. New observations can
       // arrive while the service worker is answering. If they overflow too, they need a
@@ -804,10 +961,17 @@
         for (let index = queue.length - 1; index >= 0; index--) {
           if (sent.has(queue[index])) removeQueueEntry(index);
         }
+        return true;
       }
-    } finally {
+      return false;
+    })();
+    const tracked = work.finally(() => {
       flushing = false;
-    }
+      if (flushWork === tracked) flushWork = null;
+      notifyCommandReadiness();
+    });
+    flushWork = tracked;
+    return tracked;
   }
 
   /**
@@ -857,6 +1021,7 @@
     generating = true;
     resumedFirstObservation = true;
     turnId = open;
+    bindResumeGoalTurn(turnId);
     genNode = null;
     priorSections = new WeakSet(baselineSections);
     priorMarks = baselineMarks;
@@ -962,6 +1127,10 @@
     bootstrap = null;
     bySeq.clear();
     streamBySeq.clear();
+    for (const root of streamRootsByKey.values()) {
+      if (root && root.remove) root.remove();
+    }
+    streamRootsByKey.clear();
     streamMessageSeq.clear();
     userAnchorByMessage.clear();
     entries = [];
@@ -979,6 +1148,18 @@
     pressedAt = 0;
     localError = '';
     retirementHandledFor = null;
+    goalTurnId = null;
+    goalConfig = null;
+    goalPhase = '';
+    goalDraft = null;
+    goalError = '';
+    goalTypingSince = 0;
+    dismissedGoalStage = null;
+    pendingObjective = '';
+    pendingObjectiveSent = false;
+    objectiveBusy = false;
+    objectiveError = '';
+    removeStagePanel();
     generating = false;
     quietSince = 0;
     quietTurn = null;
@@ -990,6 +1171,8 @@
     priorMarks = [];
     baselineSections = [];
     baselineMarks = [];
+    baselineCompletionSections = [];
+    completionActionBaselineSections = new WeakSet();
     userStopped = false;
     stallReported = false;
     fiberTerminalMessageId = null;
@@ -1187,10 +1370,66 @@
     // A browser where Fiber genuinely is unavailable still needs a usable lifecycle, so the
     // old DOM rule remains there behind this capability check.
     if (!fiberPresent && answerText(turn).length > 0) return { outcome: 'completed' };
+    // Fiber normally supplies the exact `end_turn:true` message and refreshFiber() closes from
+    // that immediately. A visibly final response can occasionally lose that bit while ChatGPT
+    // still mounts its completed-message action row. Use that only as corroboration: exact
+    // Fiber ownership, public prose, no unanswered connector call, a fresh completion action,
+    // and the existing Stop-gone settle window must all agree.
+    if (fiberPresent && answerText(turn).length > 0 && fiberQuietTerminal(turn)) {
+      return { outcome: 'completed' };
+    }
     if (turnStartedAt > 0 && Date.now() - lastChangeAt > STALL_MS) {
       return { outcome: 'stalled', detail: 'no visible output and no progress for ten minutes' };
     }
     return { outcome: 'unknown' };
+  }
+
+  /** The exact public assistant message corroborated as terminal by the quiet page, or null. */
+  function fiberQuietTerminal(turn) {
+    if (!turn || !CLF_DOM.completionAction) return null;
+    const nodes = turn.nodes || (turn.node ? [turn.node] : []);
+    const ownedNode = genNode && nodes.includes(genNode) ? genNode : null;
+    const fiber = ownedNode ? fiberTurnForNode(ownedNode) : fiberTurnFor(turn);
+    if (!fiber) return null;
+    if ((fiber.calls || []).some((call) => !call || call.answered !== true)) return null;
+
+    // One response can grow across sibling sections. Refresh membership from the current Fiber
+    // stamps rather than freezing quietTurn/genNode to the first section that existed.
+    const exactNodes = [];
+    for (const current of CLF_DOM.turns()) {
+      if (current?.role !== 'assistant') continue;
+      for (const node of current.nodes || (current.node ? [current.node] : [])) {
+        if (fiberTurnForNode(node) === fiber) exactNodes.push(node);
+      }
+    }
+    if (exactNodes.length === 0) return null;
+
+    const messages = (fiber.messages || []).filter((message) => message && message.role !== 'user' && message.rawText);
+    const terminal = messages.length > 0 ? messages[messages.length - 1] : null;
+    const terminalId = terminal?.rawMessageId || terminal?.messageId || null;
+    if (!terminalId) return null;
+
+    // An earlier sibling may already have its Copy action while newer prose is still live.
+    // Require the action on the exact sibling that owns the chosen terminal Fiber message.
+    let terminalNode = null;
+    if (
+      Number.isInteger(terminal.sectionIndex) &&
+      terminal.sectionIndex >= 0 &&
+      terminal.sectionIndex < exactNodes.length
+    ) {
+      terminalNode = exactNodes[terminal.sectionIndex] || null;
+    } else if (CLF_DOM.messagesIn) {
+      const owners = [];
+      for (const node of exactNodes) {
+        const rendered = CLF_DOM.messagesIn({ role: 'assistant', id: turn.id || null, node, nodes: [node] });
+        if (rendered.some((message) => message && message.role === 'assistant' && message.id === terminalId)) owners.push(node);
+      }
+      if (owners.length === 1) terminalNode = owners[0];
+    }
+    if (!terminalNode) return null;
+    if (completionActionBaselineSections.has(terminalNode)) return null;
+    if (!CLF_DOM.completionAction({ nodes: [terminalNode] })) return null;
+    return terminalId;
   }
 
   /** The turn section a node is rendered in, or null. */
@@ -1307,10 +1546,13 @@
     // other named turn by accident. Modern generations always mint/adopt an id; this is the
     // fail-closed guard for stale/legacy/reinjected state.
     const endedTurnId = turnId;
+    const corroboratedTerminalMessageId =
+      result.outcome === 'completed' && ended ? fiberQuietTerminal(ended) : null;
     generating = false;
     quietSince = 0;
     quietTurn = null;
     quietOutcome = null;
+    completionActionBaselineSections = new WeakSet();
     if (ended && endedTurnId) {
       for (const node of ended.nodes || [ended.node]) {
         if (node) settledGenerations.set(node, { turnId: endedTurnId, mark: sectionMark(node) });
@@ -1329,18 +1571,29 @@
       // omit `data-turn-id` entirely, and the post-turn settle window still has to be able
       // to find this generation's Fiber descriptor; the node carries fiber.js's own
       // `data-clf-fiber-turn` stamp, which is present whether or not the page id is.
-      fiberSettled = { pageTurnId: ended?.id || null, localTurnId: endedTurnId, pageTurn: ended || null };
+      fiberSettled = {
+        pageTurnId: ended?.id || null,
+        localTurnId: endedTurnId,
+        pageTurn: ended || null,
+        terminalMessageId: corroboratedTerminalMessageId || null
+      };
       fiberSettleUntil = Date.now() + FIBER_SETTLE_MS;
     }
     if (endedTurnId && publishFinal && result.outcome === 'completed') {
-      void refreshFiber({ pageTurnId: ended?.id || null, localTurnId: endedTurnId, pageTurn: ended || null });
+      void refreshFiber({
+        pageTurnId: ended?.id || null,
+        localTurnId: endedTurnId,
+        pageTurn: ended || null,
+        terminalMessageId: corroboratedTerminalMessageId || null
+      });
     }
     if (endedTurnId) emit({ kind: 'turn_end', turnId: endedTurnId, ...result });
     // The compaction turn settling is the moment the brief exists. Read here, from this
     // generation's own section, while `ended` still names it — a tick later the page is just
     // a transcript again and this answer is indistinguishable from any other.
-    if (endedTurnId && compactCapture && compactCapture.generation === endedTurnId) {
-      void deliverBrief(finalAnswerText(ended), result.outcome);
+    if (endedTurnId && compactCapture && compactCapture.generation === endedTurnId && !compactCapture.settling) {
+      compactCapture.settling = true;
+      void settleBrief(ended, result.outcome);
     }
     if (endedTurnId && autoLoopActive) {
       const ans = finalAnswerText(ended) || answerText(ended);
@@ -1348,6 +1601,7 @@
         void handleAutoLoopTurnEnd(ans);
       }
     }
+    if (endedTurnId) noteGoalTurn(ended, result.outcome, endedTurnId);
     const workerAgent = agent || (() => {
       try { return sessionStorage.getItem('cos_agent_worker'); } catch { return null; }
     })();
@@ -1378,6 +1632,8 @@
     // lifetime is owned by chrome.tabs.onRemoved in background.js; an SPA move is proven
     // here only when another concrete conversation id replaces the old one.
     if (id && id !== conversationId) {
+      const abandonedOpening = Boolean(pendingObjective) && !pendingObjectiveSent;
+      const carriedObjective = pendingObjectiveSent ? pendingObjective : '';
       if (conversationId) {
         // A genuine move to another *identified* chat: close the old one out and start
         // clean. The order matters — what the old chat left on screen is retired before
@@ -1394,6 +1650,34 @@
         // and the worker renames the observations it already journalled under this tab.
         conversationId = id;
         void bindConversation(id);
+        if (abandonedOpening) {
+          pendingObjective = '';
+          pendingObjectiveSent = false;
+          goalConfig = null;
+          goalDraft = null;
+          goalPhase = '';
+          goalError = '';
+          objectiveError = '';
+          removeStagePanel();
+        }
+      }
+      if (carriedObjective) {
+        pendingObjective = '';
+        pendingObjectiveSent = false;
+        void ask({ type: 'goal_objective', conversationId: id, text: carriedObjective }).then((reply) => {
+          if (!alive || conversationId !== id || CLF_DOM.conversationId() !== id) return;
+          if (reply && reply.ok === true) {
+            const stored = reply.data && typeof reply.data.objective === 'string'
+              ? reply.data.objective
+              : carriedObjective;
+            goalConfig = { ...(goalConfig || {}), objective: stored };
+          } else {
+            objectiveError = replyError(reply) || 'the goal could not be saved to this chat';
+          }
+          injectStage();
+          renderControl();
+          renderMenu();
+        });
       }
     }
 
@@ -1404,6 +1688,7 @@
     // resumes unchanged; if it is B, the branch above retires A and resets before anything
     // visible in B is recorded. No timeout and no DOM-position guess participates.
     if (!id && conversationId) {
+      if (!pendingObjective) removeStagePanel();
       void flush();
       return;
     }
@@ -1434,7 +1719,10 @@
     // conversation's earlier history at 4 and 5. A log whose first assistant turn precedes
     // the question that caused it cannot be read back as a session, however complete it is.
     const newUserMessage = reportMessages(nowGenerating);
-    if (newUserMessage) fiberTerminalMessageId = null;
+    if (newUserMessage) {
+      fiberTerminalMessageId = null;
+      dismissTerminalGoalStage();
+    }
     if (!nowGenerating) fiberTerminalMessageId = null;
 
     // A new user message after the stop control went quiet is definitive evidence that the
@@ -1459,8 +1747,10 @@
       quietOutcome = null;
       userStopped = false;
       stallReported = false;
+      completionActionBaselineSections = new WeakSet(baselineCompletionSections);
       genCount++;
       turnId = `g-${RUN_ID}-${epoch}-${genCount}`;
+      bindResumeGoalTurn(turnId);
       genNode = null;
       // What was already there is what this generation must not adopt — as it stood at the
       // *previous* observation. Reading the DOM here instead is what the first version of
@@ -1625,7 +1915,11 @@
       // never a terminal boundary on its own. User stop is already explicit; a new user
       // message is handled above, and Fiber end_turn closes independently in refreshFiber().
       const markerOnlyInterrupted = result.outcome === 'interrupted' && !userStopped;
-      if (userStopped || (!markerOnlyInterrupted && result.outcome !== 'unknown' && quietFor >= TURN_SETTLE_MS)) {
+      const corroboratedTerminalBoundary = markerOnlyInterrupted && Boolean(fiberQuietTerminal(quietTurn || turn));
+      if (
+        userStopped ||
+        ((result.outcome !== 'unknown' && (!markerOnlyInterrupted || corroboratedTerminalBoundary)) && quietFor >= TURN_SETTLE_MS)
+      ) {
         // The turn the end is about is the one that was on screen when it went quiet.
         // Re-reading it here would pick up whatever ChatGPT has rendered since, which during
         // a settle window can be a different section entirely.
@@ -1665,7 +1959,11 @@
     // generation ever binds to a section further back than that.
     baselineSections = assistantSections(observedTurns);
     baselineMarks = baselineSections.slice(-3).map((node) => ({ node, mark: sectionMark(node) }));
+    baselineCompletionSections = CLF_DOM.completionAction
+      ? baselineSections.filter((node) => Boolean(CLF_DOM.completionAction({ nodes: [node] })))
+      : [];
     resumedFirstObservation = false;
+    notifyCommandReadiness();
     void flush();
   }
 
@@ -1699,7 +1997,7 @@
     } catch {
       seededPath = null;
     }
-    new MutationObserver((records) => {
+    const observer = new MutationObserver((records) => {
       if (!sameChat()) {
         return;
       }
@@ -1718,7 +2016,9 @@
         if (!alive || !sameChat()) return;
         void flush();
       });
-    }).observe(document.body, { childList: true, subtree: true });
+    });
+    observer.observe(document.body, { childList: true, subtree: true });
+    rememberCleanup(() => observer.disconnect());
   }
 
   /**
@@ -1730,8 +2030,27 @@
   function watchTranscript() {
     if (typeof MutationObserver !== 'function' || !document.body) return;
     let timer = null;
-    new MutationObserver((records) => {
-      if (!alive || timer !== null || !sameChat()) return;
+    let urgentQueued = false;
+    const observer = new MutationObserver((records) => {
+      if (!alive || !sameChat()) return;
+      // Stop lives under the composer, outside TURN_SECTION. In a hidden tab the final prose can
+      // schedule a throttled debounce, then Stop removal can be the only terminal mutation. Wake
+      // lifecycle observation in a microtask before filtering to transcript-local mutations.
+      if (generating && !CLF_DOM.generating()) {
+        if (timer !== null) {
+          clearTimeout(timer);
+          timer = null;
+        }
+        if (!urgentQueued) {
+          urgentQueued = true;
+          void Promise.resolve().then(() => {
+            urgentQueued = false;
+            if (!alive || !sameChat()) return;
+            observe();
+          });
+        }
+        return;
+      }
       const relevant = records.some((record) => {
         const target = record.target && record.target.nodeType === 1 ? record.target : record.target.parentElement;
         if (!target || (target.closest && target.closest('.clf-stream'))) return false;
@@ -1743,6 +2062,7 @@
         return false;
       });
       if (!relevant) return;
+      if (timer !== null) return;
       // Streaming Markdown can mutate once per token and a virtualized history mount can
       // deliver hundreds of DOM records in one navigation. Running the full conversation
       // scan synchronously for every MutationObserver turn is what made clicking a large
@@ -1754,7 +2074,13 @@
         if (!alive) return;
         observe();
       }, TRANSCRIPT_OBSERVE_MS);
-    }).observe(document.body, { childList: true, subtree: true, characterData: true });
+    });
+    observer.observe(document.body, { childList: true, subtree: true, characterData: true });
+    rememberCleanup(() => {
+      observer.disconnect();
+      if (timer !== null) clearTimeout(timer);
+      timer = null;
+    });
   }
 
   const TURN_SECTION = 'section[data-testid^="conversation-turn"]';
@@ -2066,7 +2392,11 @@
             ? entry.createTime
             : null,
         rawText,
-        renderedHtml
+        renderedHtml,
+        sectionIndex:
+          Number.isInteger(entry.sectionIndex) && entry.sectionIndex >= 0 && entry.sectionIndex < 64
+            ? entry.sectionIndex
+            : null
       };
       const priorAt = messageIndex.get(messageId);
       if (priorAt === undefined) {
@@ -2651,17 +2981,20 @@
         // upgrading every message in a completed turn to `final:true` made interim prose look
         // like a sequence of finished answers and could let recovery treat the wrong one as
         // completion evidence.
+        const corroboratedTerminal =
+          !turn.endMessageId && turn === ownedPageTurn && settled?.terminalMessageId
+            ? settled.terminalMessageId
+            : null;
+        const terminalMessageId = turn.endMessageId || corroboratedTerminal;
         const exactTerminal = Boolean(
-          turn.endMessageId &&
-            (message.rawMessageId === turn.endMessageId || message.messageId === turn.endMessageId)
+          terminalMessageId &&
+            (message.rawMessageId === terminalMessageId || message.messageId === terminalMessageId)
         );
-        const state = turn.endMessageId
+        const state = terminalMessageId
           ? exactTerminal
             ? 'final'
             : 'streaming'
-          : generating && (index === activeTurnIndex || (activeTurnIndex < 0 && index === answer.turns.length - 1))
-            ? 'streaming'
-            : 'final';
+          : 'streaming';
         // The transcript is independent of MCP correlation and must be durable as soon as
         // ChatGPT exposes a public message id. A thought parent is a stronger logical anchor
         // when available, but it is not permission to record: waiting for it dropped the
@@ -2680,13 +3013,16 @@
         if (messagesReported.get(message.messageId) === signature) continue;
         messagesReported.set(message.messageId, signature);
         if (state === 'streaming') lastChangeAt = Date.now();
+        const liveAssistant =
+          Boolean(localOwner) ||
+          (generating && (index === activeTurnIndex || (activeTurnIndex < 0 && index === answer.turns.length - 1)));
         emit({
           kind: 'assistant_message',
           messageId: message.messageId,
           turnId: localOwner || undefined,
           text: message.rawText,
           renderedHtml: message.renderedHtml,
-          ...(message.createTime ? { time: message.createTime, authoredTime: true } : {}),
+          ...(!liveAssistant && message.createTime ? { time: message.createTime, authoredTime: true } : {}),
           state,
           final: state === 'final'
         });
@@ -2749,6 +3085,20 @@
       found = descriptor;
     }
     return found;
+  }
+
+  /** Fiber descriptor attached to one exact rendered assistant section, or null. */
+  function fiberTurnForNode(node) {
+    if (!fiberPresent || !node || !node.getAttribute) return null;
+    const stamp = node.getAttribute('data-clf-fiber-turn');
+    if (stamp === null || stamp === '') return null;
+    const split = stamp.lastIndexOf(':');
+    if (split <= 0 || stamp.slice(0, split) !== fiberScanToken) return null;
+    const rawIndex = stamp.slice(split + 1);
+    if (!/^\d+$/.test(rawIndex)) return null;
+    const index = Number(rawIndex);
+    if (!Number.isInteger(index) || index < 0) return null;
+    return fiberTurns.get(index) || null;
   }
 
   /**
@@ -3591,10 +3941,19 @@
       if (!prior || prior.role !== 'user') continue;
       const ids = new Set();
       for (const message of CLF_DOM.messagesIn(prior)) {
-        if (message && message.role === 'user' && message.id) ids.add(message.id);
+        if (
+          message &&
+          message.role === 'user' &&
+          message.id &&
+          userAnchorByMessage.has(message.id)
+        ) {
+          ids.add(message.id);
+        }
       }
       // A user turn with no stable id cannot anchor anything. More than one stable id is a
-      // renderer transition/branch we also refuse to guess through.
+      // renderer transition/branch we also refuse to guess through. Attachment/file message
+      // objects are excluded above because the recorder stores authored user text boundaries,
+      // not every page object nested inside that same user turn.
       if (ids.size !== 1) return null;
       return userAnchorByMessage.get(ids.values().next().value) || null;
     }
@@ -3689,6 +4048,36 @@
     if (kind === 'message') return entry.kind === 'assistant_message' && entry.messageId === value;
     if (kind === 'activity') return entry.kind === 'page_tool' && entry.messageId === value;
     return kind === 'request' && entry.kind === 'tool_call' && entry.requestId === value;
+  }
+
+  function strongStreamIdentityKeys(entries) {
+    const keys = new Set();
+    for (const entry of entries || []) {
+      const key = entry && entry.kind === 'assistant_message'
+        ? websiteKey('message', entry.messageId)
+        : entry && entry.kind === 'page_tool'
+          ? websiteKey('activity', entry.messageId)
+          : null;
+      if (key) keys.add(key);
+    }
+    return keys;
+  }
+
+  function priorStreamRootCompatible(priorKey, rendered) {
+    if (!priorKey) return false;
+    const root = streamRootsByKey.get(priorKey) || null;
+    if (!root || !root.isConnected) return false;
+    const current = strongStreamIdentityKeys(rendered);
+    if (current.size === 0) return true;
+    let previous = [];
+    try {
+      const parsed = JSON.parse(root.dataset.clfStrongKeys || '[]');
+      if (Array.isArray(parsed)) previous = parsed.filter((value) => typeof value === 'string');
+    } catch {
+      previous = [];
+    }
+    if (previous.length === 0) return false;
+    return previous.some((key) => current.has(key));
   }
 
   /**
@@ -4068,6 +4457,65 @@
     return Boolean(seen.tool && localTools.has(seen.tool) && ourConnectorApp(seen.app));
   }
 
+  function presentationScrollContainer(node) {
+    for (let parent = node && node.parentElement; parent; parent = parent.parentElement) {
+      try {
+        const style = globalThis.getComputedStyle ? globalThis.getComputedStyle(parent) : null;
+        const overflow = style ? String(style.overflowY || '') : '';
+        if (/(?:auto|scroll|overlay)/.test(overflow) && parent.scrollHeight > parent.clientHeight + 1) return parent;
+      } catch {
+        // Keep walking; the window/document fallback needs no computed style.
+      }
+    }
+    return null;
+  }
+
+  function presentationViewportAnchor(sourceTurns) {
+    const viewport = Number(globalThis.innerHeight) || Number(document.documentElement && document.documentElement.clientHeight) || 0;
+    const pick = (role) => {
+      let best = null;
+      for (const turn of sourceTurns || []) {
+        if (role && turn.role !== role) continue;
+        for (const node of turn.nodes || (turn.node ? [turn.node] : [])) {
+          if (!node || !node.isConnected || typeof node.getBoundingClientRect !== 'function') continue;
+          let rect;
+          try {
+            rect = node.getBoundingClientRect();
+          } catch {
+            continue;
+          }
+          const top = Number(rect && rect.top);
+          const bottom = Number(rect && rect.bottom);
+          if (!Number.isFinite(top) || !Number.isFinite(bottom)) continue;
+          if (bottom < 0 || (viewport > 0 && top > viewport)) continue;
+          const score = top >= 0 ? top : (viewport > 0 ? viewport : 100000) + Math.abs(top);
+          if (!best || score < best.score) best = { node, top, score, scrollRoot: presentationScrollContainer(node) };
+        }
+      }
+      return best;
+    };
+    return pick('user') || pick(null);
+  }
+
+  function restorePresentationViewport(anchor) {
+    if (!anchor || !anchor.node || !anchor.node.isConnected || typeof anchor.node.getBoundingClientRect !== 'function') return;
+    let after;
+    try {
+      after = Number(anchor.node.getBoundingClientRect().top);
+    } catch {
+      return;
+    }
+    if (!Number.isFinite(after)) return;
+    const delta = after - anchor.top;
+    if (!Number.isFinite(delta) || Math.abs(delta) < 0.5) return;
+    try {
+      if (anchor.scrollRoot && anchor.scrollRoot.isConnected) anchor.scrollRoot.scrollTop += delta;
+      else if (typeof globalThis.scrollBy === 'function') globalThis.scrollBy(0, delta);
+    } catch {
+      // Presentation compensation is best effort.
+    }
+  }
+
   function renderStreams() {
     // Do not mount chat A's durable stream into a fresh-composer DOM while its future chat B
     // still has no route id (or after the route changed before observe() processed it).
@@ -4077,7 +4525,9 @@
     // as the recorder's observation source, but it contributes zero visible ordering or
     // prose: the local event stream is rendered exactly in the order the app returns it.
     const enabled = renderStreamAllowed() && status.connected === true && status.paired === true;
+    if (enabled && presentationScrollActive()) return;
     const sourceTurns = typeof CLF_DOM.presentationTurns === 'function' ? CLF_DOM.presentationTurns() : CLF_DOM.turns();
+    const viewportAnchor = presentationViewportAnchor(sourceTurns);
     // A stable `data-turn-id` is not required for presentation. ChatGPT transiently and, in
     // some renderer builds, permanently exposes assistant sections without one. The preceding
     // user message id is a stronger durable boundary anyway, so an id-less response with an
@@ -4086,11 +4536,18 @@
     const groups = streamTurnGroups(streamEntries);
     const renderIndex = streamRenderIndex(streamEntries, groups);
     const newest = assistantTurns[assistantTurns.length - 1] || null;
+    const painted = new Set();
+    const seenStreamKeys = new Set();
     for (let turnIndex = 0; turnIndex < assistantTurns.length; turnIndex++) {
       const turn = assistantTurns[turnIndex];
       if (turn.role !== 'assistant') continue;
       const nodes = turn.nodes || (turn.node ? [turn.node] : []);
-      const existing = nodes.map((node) => node && node.querySelector ? node.querySelector('.clf-stream') : null).find(Boolean) || null;
+      const priorKeys = new Set(
+        nodes
+          .map((node) => node && node.dataset ? node.dataset.clfStreamKey : '')
+          .filter(Boolean)
+      );
+      const priorKey = priorKeys.size === 1 ? priorKeys.values().next().value : null;
       // Through the generation key, not the page's turn id. Everything this script reports
       // is now filed under a locally minted key, because ChatGPT reuses `data-turn-id` from
       // one turn to the next; comparing the DOM id against that key matches nothing, so the
@@ -4140,11 +4597,40 @@
           );
       const rendered = visibleStream(raw, group ? group.id : localId || turn.id);
 
+      const groupKey = group ? group.id : localId || null;
+      const renderedMessageIds = [...new Set(
+        rendered.map((entry) => entry && entry.messageId).filter(Boolean)
+      )];
+      const canonicalKey = renderedMessageIds.length > 0 ? `messages:${renderedMessageIds.join(',')}` : null;
+      const compatiblePriorKey = priorStreamRootCompatible(priorKey, rendered) ? priorKey : null;
+      const streamKey = groupKey || compatiblePriorKey || canonicalKey;
+      if (streamKey) seenStreamKeys.add(streamKey);
+      let existing = streamKey ? streamRootsByKey.get(streamKey) || null : null;
+      if (existing && !existing.isConnected) {
+        streamRootsByKey.delete(streamKey);
+        existing = null;
+      }
+      if (!existing) {
+        existing = nodes
+          .map((node) => node && node.querySelector ? node.querySelector('.clf-stream') : null)
+          .find(Boolean) || null;
+      }
+
       if (!enabled) {
         if (existing) existing.remove();
+        if (streamKey) streamRootsByKey.delete(streamKey);
+        for (const node of nodes) if (node && node.dataset) delete node.dataset.clfStreamKey;
         CLF_DOM.replaceTurn(turn, null, false);
         CLF_DOM.hideProgress(turn, false);
         for (const block of CLF_DOM.toolBlocks(turn)) block.removeAttribute('data-clf-native-hidden');
+        continue;
+      }
+
+      if (streamKey && painted.has(streamKey)) {
+        for (const node of nodes) if (node && node.dataset) node.dataset.clfStreamKey = streamKey;
+        CLF_DOM.hideProgress(turn, false);
+        for (const block of CLF_DOM.toolBlocks(turn)) block.removeAttribute('data-clf-native-hidden');
+        CLF_DOM.replaceTurn(turn, null, true);
         continue;
       }
 
@@ -4161,8 +4647,13 @@
           existing &&
           Number.isFinite(lastComplete) &&
           Date.now() - lastComplete < REPLACEMENT_GRACE_MS
-        ) continue;
+        ) {
+          if (groupKey) painted.add(groupKey);
+          continue;
+        }
         if (existing) existing.remove();
+        if (streamKey) streamRootsByKey.delete(streamKey);
+        for (const node of nodes) if (node && node.dataset) delete node.dataset.clfStreamKey;
         CLF_DOM.replaceTurn(turn, null, false);
         CLF_DOM.hideProgress(turn, false);
         for (const block of CLF_DOM.toolBlocks(turn)) block.removeAttribute('data-clf-native-hidden');
@@ -4171,6 +4662,11 @@
 
       const root = existing || document.createElement('div');
       root.className = 'clf-stream';
+      if (streamKey) {
+        root.dataset.clfKey = streamKey;
+        streamRootsByKey.set(streamKey, root);
+        for (const node of nodes) if (node && node.dataset) node.dataset.clfStreamKey = streamKey;
+      }
       root.dataset.clfCompleteAt = String(Date.now());
       root.dataset.clfTurn = turn.id || (group && group.id) || localId || 'anchored';
       // Commentary text is part of the signature: one caption grows in place under the same
@@ -4195,12 +4691,28 @@
         root.dataset.clfSignature = signature;
         root.replaceChildren(...rendered.map(streamRow));
       }
+      root.dataset.clfStrongKeys = JSON.stringify([...strongStreamIdentityKeys(rendered)]);
       // Clear the old selective-hiding state from pre-1.7.4 renderers. The section marker
       // below now owns visibility wholesale.
       CLF_DOM.hideProgress(turn, false);
       for (const block of CLF_DOM.toolBlocks(turn)) block.removeAttribute('data-clf-native-hidden');
       CLF_DOM.replaceTurn(turn, root, true);
+      if (streamKey) painted.add(streamKey);
     }
+    const now = Date.now();
+    for (const [key, root] of streamRootsByKey) {
+      if (!root || !root.isConnected) {
+        streamRootsByKey.delete(key);
+        continue;
+      }
+      if (seenStreamKeys.has(key)) continue;
+      const lastComplete = Number(root.dataset && root.dataset.clfCompleteAt);
+      if (!Number.isFinite(lastComplete) || now - lastComplete >= REPLACEMENT_GRACE_MS) {
+        root.remove();
+        streamRootsByKey.delete(key);
+      }
+    }
+    restorePresentationViewport(viewportAnchor);
   }
 
   /** Mutable structured page rows only. Canonical assistant messages update by messageId. */
@@ -4209,7 +4721,31 @@
   /** What a stream entry currently says, whichever field its kind keeps it in. */
   const snapshotText = (entry) => (entry ? (entry.kind === 'page_tool' ? entry.label : entry.text) : undefined);
 
+  let settingsPulling = false;
+
+  /** Read global browser settings for an id-less New Chat, which has no activity feed yet. */
+  async function pullSettings() {
+    if (settingsPulling) return;
+    settingsPulling = true;
+    try {
+      const reply = await ask({ type: 'settings_get' });
+      if (!alive || CLF_DOM.conversationId() || !reply || reply.ok !== true || !reply.data) return;
+      context = readContext(reply.data.context) || context;
+      if (reply.data.goal && typeof reply.data.goal === 'object') {
+        goalConfig = { ...reply.data.goal, objective: pendingObjective };
+      }
+      renderControl();
+      renderMenu();
+    } finally {
+      settingsPulling = false;
+    }
+  }
+
   async function pullActivity() {
+    if (!CLF_DOM.conversationId()) {
+      await pullSettings();
+      return;
+    }
     if (pulling || !conversationId || CLF_DOM.conversationId() !== conversationId) return;
     pulling = true;
     const forId = conversationId;
@@ -4351,6 +4887,8 @@
       tokens = Number.isFinite(Number(data.tokens)) ? Number(data.tokens) : 0;
       context = readContext(data.context);
       autoCompactReady = data.autoCompactReady === true;
+      goalConfig = data.goal && typeof data.goal === 'object' ? data.goal : null;
+      goalDraft = goalConfig ? goalConfig.draft || null : null;
       bootstrap = data.bootstrap === 'resume' || data.bootstrap === 'worker' ? data.bootstrap : null;
       if (job && job.busy) pressedAt = 0;
       // The local phase describes this tab's part of a native compaction, which is over
@@ -4378,10 +4916,21 @@
     } finally {
       pulling = false;
     }
+    if (
+      current() &&
+      CLF_DOM.conversationId() === forId &&
+      compactCapture &&
+      typeof compactCapture.summary === 'string' &&
+      compactCapture.summary.trim()
+    ) {
+      await deliverCapturedBrief();
+    }
     // Outside the guard, and last: startCompact runs for tens of seconds and polls this
     // same endpoint while it works, so firing it with `pulling` still set would deadlock
     // the run against the poll that started it.
+    if (current() && CLF_DOM.conversationId() === forId) maybeRecoverResumeGoalTurn();
     if (current() && CLF_DOM.conversationId() === forId) await maybeAutoCompact(forId, forEpoch);
+    if (current() && CLF_DOM.conversationId() === forId) await maybeSendGoalReply();
   }
 
   // ------------------------------------------------------- composer control
@@ -4455,9 +5004,109 @@
       };
     }
     if (!conversationId) {
-      return { mode: 'off', label: 'Compact', hint: 'Send a message first.', action: 'none' };
+      return {
+        mode: 'off',
+        label: 'Compact',
+        hint: 'Nothing to compact yet — send a message, or set a goal and it writes one.',
+        action: 'none'
+      };
     }
     return { mode: 'idle', label: 'Compact', hint: '', action: 'start' };
+  }
+
+  /** Pure projection for the gear sheet: app-owned settings plus chat-specific Goal state. */
+  function settingsView(input) {
+    const { context, goal, compact, editing } = input;
+    const blocked = goal && typeof goal.blocked === 'string' ? goal.blocked : '';
+    const auto = Boolean(context && context.auto) && blocked !== 'worker';
+    const threshold = context && context.threshold > 0 ? context.threshold : 0;
+    const goalOn = Boolean(goal && goal.enabled);
+    const hasKey = Boolean(goal && goal.hasKey);
+    const objective = goal && typeof goal.objective === 'string' ? goal.objective : '';
+    const from = threshold > 0 ? `from ${roundK(threshold)} tokens` : '';
+    return {
+      tip: [
+        auto ? `Auto-compaction on${from ? `, ${from}` : ''}` : 'Auto-compaction off',
+        blocked === 'worker'
+          ? 'Goal off — the prime writes this chat'
+          : objective
+            ? 'Goal on — chasing this chat’s goal'
+            : goalOn
+              ? hasKey
+                ? 'Goal on'
+                : 'Goal on — no API key'
+              : 'Goal off'
+      ].join('\n'),
+      rows: [
+        {
+          key: 'autoCompact',
+          label: 'Auto-compaction',
+          note:
+            blocked === 'worker'
+              ? 'off here: worker chats never auto-compact'
+              : auto
+                ? from || 'threshold set in the app'
+                : 'compact this chat by hand',
+          on: auto,
+          warn: false,
+          disabled: blocked === 'worker'
+        },
+        {
+          key: 'goal',
+          label: 'Goal',
+          note:
+            blocked === 'worker'
+              ? 'off here: the prime agent writes this worker’s messages'
+              : !hasKey
+                ? 'OpenRouter API key essential for goal feature'
+                : objective
+                  ? `on for this chat’s own goal, with ${modelLabel(goal.model)}`
+                  : goalOn
+                    ? `replies as you with ${modelLabel(goal.model)}`
+                    : 'reply as you until the goal is met',
+          on: goalOn,
+          warn: !hasKey || blocked === 'worker',
+          disabled: blocked === 'worker'
+        }
+      ],
+      objective: {
+        text: objective,
+        editing: Boolean(editing),
+        label: objective ? 'change the goal' : 'add specific goal',
+        summary: objective ? clampLine(objective, 120) : '',
+        hint: objective
+          ? 'Replace or clear the goal this chat is being driven towards.'
+          : 'Write what this chat has to reach. The loop then prompts until it is reached.',
+        available: hasKey && !blocked,
+        unavailable:
+          blocked === 'worker'
+            ? 'A worker chat is already driven by its prime.'
+            : !hasKey
+              ? 'Add an OpenRouter API key in the app first.'
+              : ''
+      },
+      action: {
+        label:
+          blocked === 'worker'
+            ? 'Compact & resume unavailable'
+            : compact.action === 'cancel'
+              ? 'Cancel compaction'
+              : 'Compact & resume now',
+        hint:
+          blocked === 'worker'
+            ? 'Worker chats stay in their existing conversation and are never manually compacted or resumed.'
+            : compact.hint,
+        action: blocked === 'worker' ? 'none' : compact.action
+      }
+    };
+  }
+
+  function clampLine(text, max) {
+    const flat = String(text || '').replace(/\s+/g, ' ').trim();
+    if (flat.length <= max) return flat;
+    const cut = flat.slice(0, max);
+    const space = cut.lastIndexOf(' ');
+    return `${(space > max * 0.6 ? cut.slice(0, space) : cut).trimEnd()}…`;
   }
 
   /**
@@ -4559,12 +5208,12 @@
       if (anchor && anchor !== tipFor && tipTimer === null) return;
       hideTip();
     };
-    document.addEventListener('pointerover', open, true);
-    document.addEventListener('focusin', open, true);
-    document.addEventListener('pointerout', close, true);
-    document.addEventListener('focusout', close, true);
-    document.addEventListener('pointerdown', hideTip, true);
-    window.addEventListener('scroll', hideTip, true);
+    listen(document, 'pointerover', open, true);
+    listen(document, 'focusin', open, true);
+    listen(document, 'pointerout', close, true);
+    listen(document, 'focusout', close, true);
+    listen(document, 'pointerdown', hideTip, true);
+    listen(window, 'scroll', hideTip, true);
   }
 
   /** The context settings out of /activity, or null if the app sent none. */
@@ -4638,7 +5287,9 @@
       alive &&
       conversationId === expectedConversation &&
       epoch === expectedEpoch &&
-      CLF_DOM.conversationId() === expectedConversation;
+      CLF_DOM.conversationId() === expectedConversation &&
+      !agent &&
+      bootstrap !== 'worker';
     if (!current()) return;
     if (!conversationId || !context || !context.auto || !autoCompactReady) return;
     // Anything already running owns this chat, including a run started by hand.
@@ -4650,6 +5301,16 @@
     // activeTurnId cover that gap. An idle or stale chat has none of the three, which is
     // what lets an old 500k conversation be opened and read without being compacted.
     if (!generating && !appActiveTurnId && !CLF_DOM.generating()) return;
+
+    // The activity snapshot that made this chat eligible can race worker-role publication.
+    // Re-prove role authority immediately before consuming the one automatic trigger; the
+    // app-side claim remains the second fence, but the page must not emit the claim at all
+    // from a worker chat.
+    if (!(await refreshCompactionAuthority(expectedConversation, expectedEpoch))) {
+      autoCompactReady = false;
+      return;
+    }
+    if (!current()) return;
 
     // Consume before touching ChatGPT. If the tab vanishes or the barrier fails after this,
     // this chat's automatic compaction is spent and the user can still press the button.
@@ -4670,14 +5331,31 @@
     interrupting: 'Stopping…',
     settling: 'Settling…',
     prompting: 'Asking…',
-    waiting: 'Writing…'
+    waiting: 'Writing…',
+    delivering: 'Saving…'
   };
 
   const ICON =
     '<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" ' +
     'stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' +
-    '<path d="M4 12h16"/><path d="M12 3v5.5"/><path d="M9 5.5 12 8.5 15 5.5"/>' +
-    '<path d="M12 21v-5.5"/><path d="M15 18.5 12 15.5 9 18.5"/></svg>';
+    '<circle cx="12" cy="12" r="3.1"/>' +
+    '<path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 ' +
+    '1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 8.6 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 ' +
+    '0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 ' +
+    '0 4.6 8.6a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 ' +
+    '0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 ' +
+    '2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/>' +
+    '</svg>';
+
+  function buildSwitch() {
+    const track = document.createElement('span');
+    track.className = 'clf-switch';
+    track.setAttribute('aria-hidden', 'true');
+    const knob = document.createElement('span');
+    knob.className = 'clf-switch-knob';
+    track.append(knob);
+    return track;
+  }
 
   let control = null;
   /** Local phase of a ChatGPT-native compaction this tab is driving. '' when idle. */
@@ -5074,33 +5752,38 @@
 
   async function sendAutoLoopPrompt(promptText) {
     if (!autoLoopActive) return false;
+    if (!acquireAutonomousSend('loop')) return false;
 
-    let fullPrompt = (promptText || '').trim();
-    if (!fullPrompt.startsWith('@Chat On Steroids')) {
-      fullPrompt = `${MCP_TRIGGER_PREFIX}${fullPrompt}`;
-    }
+    try {
+      let fullPrompt = (promptText || '').trim();
+      if (!fullPrompt.startsWith('@Chat On Steroids')) {
+        fullPrompt = `${MCP_TRIGGER_PREFIX}${fullPrompt}`;
+      }
 
-    const composer = CLF_DOM.composer();
-    if (composer && (composer.textContent || '').trim()) {
-      stopAutoLoop('User draft present in composer');
-      return false;
-    }
-
-    if (CLF_DOM.insertPrompt(fullPrompt)) {
-      await sleep(200);
-      const sent = await CLF_DOM.send();
-      if (sent) {
-        autoLoopTurns++;
-        markAutoLoopPromptSent();
-        renderControl();
-        return true;
-      } else {
-        recoverOrRolloverAutoLoop('ChatGPT failed to send message');
+      const composer = CLF_DOM.composer();
+      if (composer && (composer.textContent || '').trim()) {
+        stopAutoLoop('User draft present in composer');
         return false;
       }
-    } else {
-      recoverOrRolloverAutoLoop('Unable to write to composer');
-      return false;
+
+      if (CLF_DOM.insertPrompt(fullPrompt)) {
+        await sleep(200);
+        const sent = await CLF_DOM.send();
+        if (sent) {
+          autoLoopTurns++;
+          markAutoLoopPromptSent();
+          renderControl();
+          return true;
+        } else {
+          recoverOrRolloverAutoLoop('ChatGPT failed to send message');
+          return false;
+        }
+      } else {
+        recoverOrRolloverAutoLoop('Unable to write to composer');
+        return false;
+      }
+    } finally {
+      releaseAutonomousSend('loop');
     }
   }
 
@@ -5258,9 +5941,7 @@
     button.addEventListener('click', (event) => {
       event.preventDefault();
       event.stopPropagation();
-      const state = currentState();
-      if (state.action === 'start') void startCompact();
-      else if (state.action === 'cancel') void cancelCompact();
+      toggleMenu();
     });
     cancel.addEventListener('click', (event) => {
       event.preventDefault();
@@ -5296,14 +5977,8 @@
    * it cannot be interrupted by a repaint.
    */
   function injectControl() {
-    // A brand-new ChatGPT tab has nothing to compact yet. Do not burn half the composer
-    // on a disabled "send a message first" control: wait until ChatGPT has assigned the
-    // conversation id, which happens with the first sent turn. If navigation returns to a
-    // fresh chat, remove the old control immediately instead of leaving stale UI behind.
-    if (!CLF_DOM.conversationId()) {
-      if (control && control.root.isConnected) control.root.remove();
-      return;
-    }
+    // A New Chat still needs the gear: a specific goal written there creates its first
+    // message. Compaction itself remains unavailable until ChatGPT assigns a conversation id.
     const spot = CLF_DOM.composerActions();
     if (!spot || !spot.host) return;
     if (!control || !control.root.isConnected) {
@@ -5322,14 +5997,438 @@
     renderControl();
   }
 
+  let menuNode = null;
+  let menuOpen = false;
+  let menuBusy = false;
+  let menuEditing = false;
+  let menuDraft = '';
+
+  function buildMenu() {
+    const root = document.createElement('div');
+    root.className = 'clf-menu';
+    root.dataset.clfMenu = '1';
+    root.setAttribute('role', 'dialog');
+    root.setAttribute('aria-label', 'Chat On Steroids settings');
+    root.hidden = true;
+    (document.body || document.documentElement).append(root);
+    return root;
+  }
+
+  function menuElement() {
+    if (menuNode && menuNode.isConnected) return menuNode;
+    menuNode = buildMenu();
+    return menuNode;
+  }
+
+  function toggleMenu() {
+    if (menuOpen) return void closeMenu();
+    menuOpen = true;
+    hideTip();
+    renderMenu();
+  }
+
+  function closeMenu() {
+    menuOpen = false;
+    if (menuNode) menuNode.hidden = true;
+    if (control) control.button.setAttribute('aria-expanded', 'false');
+  }
+
+  async function setSetting(key, on) {
+    if (menuBusy) return;
+    if (key === 'autoCompact' && goalConfig && goalConfig.blocked === 'worker') return;
+    if (key === 'goal' && goalConfig && goalConfig.blocked === 'worker') return;
+    menuBusy = true;
+    renderMenu();
+    try {
+      const reply = await ask({
+        type: 'settings_set',
+        ...(conversationId && CLF_DOM.conversationId() === conversationId ? { conversationId } : {}),
+        [key]: on
+      });
+      if (reply && reply.ok === true && reply.data) {
+        context = readContext(reply.data.context) || context;
+        if (reply.data.goal && typeof reply.data.goal === 'object') {
+          goalConfig = { ...(goalConfig || {}), ...reply.data.goal, objective: pendingObjective || reply.data.goal.objective || '' };
+        }
+      }
+    } finally {
+      menuBusy = false;
+      renderMenu();
+      renderControl();
+    }
+    void pullActivity();
+  }
+
+  function menuView() {
+    return settingsView({ context, goal: goalConfig, compact: currentState(), editing: menuEditing });
+  }
+
+  function composerChat() {
+    const routeId = CLF_DOM.conversationId();
+    if (!routeId) return { id: '', state: 'new' };
+    if (routeId === conversationId) return { id: routeId, state: 'chat' };
+    return { id: '', state: 'moving' };
+  }
+
+  function openObjectiveEditor(current) {
+    menuEditing = true;
+    menuDraft = current;
+    objectiveError = '';
+    renderMenu();
+    const box = menuNode && menuNode.querySelector('[data-clf-goal-input]');
+    if (box) {
+      box.focus();
+      box.setSelectionRange(box.value.length, box.value.length);
+    }
+  }
+
+  function closeObjectiveEditor() {
+    menuEditing = false;
+    menuDraft = '';
+    renderMenu();
+  }
+
+  async function saveObjective(text) {
+    if (objectiveBusy) return;
+    const goal = String(text || '').trim().slice(0, MAX_OBJECTIVE_CHARS);
+    objectiveBusy = true;
+    objectiveError = '';
+    renderMenu();
+    try {
+      const where = composerChat();
+      if (where.state === 'moving') {
+        objectiveError = 'this chat is still opening — try again';
+        return;
+      }
+      if (where.state === 'new') {
+        if (!goal) {
+          pendingObjective = '';
+          pendingObjectiveSent = false;
+          return;
+        }
+        await openWithObjective(goal);
+        return;
+      }
+      const expectedEpoch = epoch;
+      const reply = await ask({ type: 'goal_objective', conversationId: where.id, text: goal });
+      if (!alive || epoch !== expectedEpoch || conversationId !== where.id || CLF_DOM.conversationId() !== where.id) return;
+      if (!reply || reply.ok !== true) {
+        objectiveError = replyError(reply) || 'the app did not answer';
+        return;
+      }
+      const stored = reply.data && typeof reply.data.objective === 'string' ? reply.data.objective : goal;
+      goalConfig = { ...(goalConfig || {}), objective: stored };
+      menuEditing = false;
+      menuDraft = '';
+      if (!stored) return;
+      if (!generating && !CLF_DOM.generating() && !goalBusy && !compactCapture && !nativeBusy && !(job && job.busy)) {
+        goalTurnId = `objective-${Date.now().toString(36)}`;
+        goalError = '';
+        const forTurn = goalTurnId;
+        goalBusy = true;
+        try {
+          await requestGoalDraft(
+            forTurn,
+            () => alive && conversationId === where.id && epoch === expectedEpoch && CLF_DOM.conversationId() === where.id && goalTurnId === forTurn
+          );
+        } finally {
+          goalBusy = false;
+        }
+      }
+    } finally {
+      objectiveBusy = false;
+      renderMenu();
+      renderControl();
+      injectStage();
+    }
+  }
+
+  async function openWithObjective(goal) {
+    const expectedEpoch = epoch;
+    pendingObjective = goal;
+    pendingObjectiveSent = false;
+    goalConfig = { ...(goalConfig || { enabled: true, hasKey: true, model: '' }), objective: goal };
+    menuEditing = false;
+    menuDraft = '';
+    closeMenu();
+    goalPhase = 'requesting';
+    goalError = '';
+    injectStage();
+    const reply = await ask({ type: 'goal_open', text: goal });
+    if (!alive || epoch !== expectedEpoch || composerChat().state !== 'new') {
+      pendingObjective = '';
+      pendingObjectiveSent = false;
+      goalConfig = null;
+      goalPhase = '';
+      injectStage();
+      return;
+    }
+    if (!reply || reply.ok !== true) {
+      goalPhase = 'requesting';
+      objectiveError = replyError(reply) || 'the app did not answer';
+      goalError = objectiveError;
+      injectStage();
+      return;
+    }
+    const opening = reply.data && typeof reply.data.reply === 'string' ? reply.data.reply : '';
+    if (reply.data && typeof reply.data.model === 'string') goalConfig.model = reply.data.model;
+    if (!opening) {
+      goalError = 'the model wrote nothing to open with';
+      injectStage();
+      return;
+    }
+    if (!acquireAutonomousSend('goal')) {
+      goalError = 'another autonomous action is using the message box';
+      injectStage();
+      return;
+    }
+    try {
+      if (!alive || epoch !== expectedEpoch || composerChat().state !== 'new') return;
+      goalPhase = 'sending';
+      injectStage();
+      if (!CLF_DOM.insertPrompt(opening)) {
+        goalError = 'the message box was in use, so nothing was sent';
+        injectStage();
+        return;
+      }
+      await sleep(200);
+      const composer = CLF_DOM.composer();
+      const exact = String(composer?.textContent || '').replace(/\s+/g, '') === String(opening).replace(/\s+/g, '');
+      if (!alive || epoch !== expectedEpoch || composerChat().state !== 'new' || !exact || generating || CLF_DOM.generating()) {
+        goalError = 'the chat changed before the opening Goal message could be sent';
+        injectStage();
+        return;
+      }
+      const sent = await CLF_DOM.send();
+      if (!sent) {
+        goalError = 'ChatGPT would not send the message';
+        injectStage();
+        return;
+      }
+      pendingObjectiveSent = true;
+      goalPhase = '';
+      goalError = '';
+      injectStage();
+    } finally {
+      releaseAutonomousSend('goal');
+    }
+  }
+
+  function buildObjective(objective) {
+    const box = document.createElement('div');
+    box.className = 'clf-menu-goal';
+    box.dataset.clfGoalOpen = objective.editing ? '1' : '0';
+    if (!objective.available) {
+      const why = document.createElement('span');
+      why.className = 'clf-menu-goal-note';
+      why.textContent = objective.unavailable;
+      box.append(why);
+      return box;
+    }
+    if (!objective.editing) {
+      if (objective.summary) {
+        const summary = document.createElement('span');
+        summary.className = 'clf-menu-goal-text';
+        summary.textContent = objective.summary;
+        box.append(summary);
+      }
+      const link = document.createElement('button');
+      link.type = 'button';
+      link.className = 'clf-menu-goal-link';
+      link.disabled = objectiveBusy || menuBusy;
+      link.setAttribute('data-clf-tip', objective.hint);
+      const word = document.createElement('span');
+      word.textContent = objectiveBusy ? 'working…' : objectiveError || objective.label;
+      if (objectiveError) word.dataset.clfWarn = '1';
+      const icon = document.createElement('span');
+      icon.className = 'clf-menu-goal-plus';
+      icon.textContent = objective.summary ? '✎' : '+';
+      icon.setAttribute('aria-hidden', 'true');
+      link.append(word, icon);
+      link.addEventListener('click', (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        openObjectiveEditor(objective.text);
+      });
+      box.append(link);
+      return box;
+    }
+
+    const input = document.createElement('textarea');
+    input.className = 'clf-menu-goal-input';
+    input.dataset.clfGoalInput = '1';
+    input.rows = 3;
+    input.maxLength = MAX_OBJECTIVE_CHARS;
+    input.placeholder = 'What does this chat have to reach?';
+    input.value = menuDraft;
+    input.disabled = objectiveBusy;
+    box.append(input);
+    const buttons = document.createElement('div');
+    buttons.className = 'clf-menu-goal-buttons';
+    const save = document.createElement('button');
+    save.type = 'button';
+    save.className = 'clf-menu-goal-save';
+    save.textContent = objectiveBusy ? 'Saving…' : 'Save';
+    save.disabled = objectiveBusy || !menuDraft.trim();
+    const cancel = document.createElement('button');
+    cancel.type = 'button';
+    cancel.className = 'clf-menu-goal-cancel';
+    cancel.textContent = 'Cancel';
+    cancel.disabled = objectiveBusy;
+    input.addEventListener('input', () => {
+      menuDraft = input.value;
+      save.disabled = objectiveBusy || !menuDraft.trim();
+    });
+    input.addEventListener('keydown', (event) => {
+      if (event.key === 'Enter' && !event.shiftKey) {
+        event.preventDefault();
+        void saveObjective(input.value);
+      }
+    });
+    save.addEventListener('click', (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      void saveObjective(menuDraft);
+    });
+    cancel.addEventListener('click', (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      closeObjectiveEditor();
+    });
+    buttons.append(save, cancel);
+    if (objective.text) {
+      const clear = document.createElement('button');
+      clear.type = 'button';
+      clear.className = 'clf-menu-goal-clear';
+      clear.textContent = 'Clear';
+      clear.disabled = objectiveBusy;
+      clear.addEventListener('click', (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        void saveObjective('');
+      });
+      buttons.append(clear);
+    }
+    box.append(buttons);
+    if (objectiveError) {
+      const failure = document.createElement('span');
+      failure.className = 'clf-menu-goal-note';
+      failure.dataset.clfWarn = '1';
+      failure.textContent = objectiveError;
+      box.append(failure);
+    }
+    return box;
+  }
+
+  function placeMenu(root, anchor) {
+    const at = anchor.getBoundingClientRect();
+    const width = root.offsetWidth;
+    const height = root.offsetHeight;
+    const left = Math.max(8, Math.min(at.right - width, window.innerWidth - width - 8));
+    const above = at.top - height - 10;
+    root.style.left = `${Math.round(left)}px`;
+    root.style.top = `${Math.round(above < 8 ? at.bottom + 10 : above)}px`;
+  }
+
+  function renderMenu() {
+    if (!menuOpen) return void closeMenu();
+    if (!control || !control.root.isConnected) return void closeMenu();
+    const root = menuElement();
+    const view = menuView();
+    const typing = root.querySelector('[data-clf-goal-input]');
+    const caret = typing && document.activeElement === typing
+      ? { start: typing.selectionStart, end: typing.selectionEnd }
+      : null;
+    root.replaceChildren();
+    root.dataset.clfBusy = menuBusy || objectiveBusy ? '1' : '0';
+    for (const row of view.rows) {
+      const line = document.createElement('button');
+      line.type = 'button';
+      line.className = 'clf-menu-row';
+      line.dataset.clfRow = row.key;
+      line.setAttribute('role', 'switch');
+      line.setAttribute('aria-checked', row.on ? 'true' : 'false');
+      line.disabled = menuBusy || row.disabled === true;
+      const label = document.createElement('span');
+      label.className = 'clf-menu-label';
+      const name = document.createElement('span');
+      name.className = 'clf-menu-name';
+      name.textContent = row.label;
+      const note = document.createElement('span');
+      note.className = 'clf-menu-note';
+      note.textContent = row.note;
+      if (row.warn) note.dataset.clfWarn = '1';
+      label.append(name, note);
+      const track = buildSwitch();
+      track.dataset.clfOn = row.on ? '1' : '0';
+      line.append(label, track);
+      if (!row.disabled) {
+        line.addEventListener('click', (event) => {
+          event.preventDefault();
+          event.stopPropagation();
+          void setSetting(row.key, !row.on);
+        });
+      }
+      root.append(line);
+      if (row.key === 'goal') root.append(buildObjective(view.objective));
+    }
+    const action = document.createElement('button');
+    action.type = 'button';
+    action.className = 'clf-menu-action';
+    action.textContent = view.action.label;
+    action.disabled = view.action.action === 'none' || menuBusy;
+    if (view.action.hint) action.setAttribute('data-clf-tip', view.action.hint);
+    action.addEventListener('click', (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      closeMenu();
+      if (view.action.action === 'start') void startCompact();
+      else if (view.action.action === 'cancel') void cancelCompact();
+    });
+    root.append(action);
+    root.hidden = false;
+    control.button.setAttribute('aria-expanded', 'true');
+    placeMenu(root, control.button);
+    if (caret) {
+      const box = root.querySelector('[data-clf-goal-input]');
+      if (box) {
+        box.focus();
+        try { box.setSelectionRange(caret.start, caret.end); } catch {}
+      }
+    }
+  }
+
+  function wireMenu() {
+    listen(document, 'pointerdown', (event) => {
+      if (!menuOpen) return;
+      const at = event.target;
+      if (at && at.nodeType === 1 && at.closest && (at.closest('[data-clf-menu]') || at.closest('.clf-compact-btn'))) return;
+      closeMenu();
+    }, true);
+    listen(document, 'keydown', (event) => {
+      if (!menuOpen || event.key !== 'Escape') return;
+      if (menuEditing) closeObjectiveEditor();
+      else closeMenu();
+    }, true);
+    listen(window, 'scroll', (event) => {
+      if (!menuOpen) return;
+      const at = event.target;
+      if (at && at.nodeType === 1 && at.closest && at.closest('[data-clf-menu]')) return;
+      closeMenu();
+    }, true);
+    listen(window, 'resize', closeMenu);
+  }
+
   function renderControl() {
     if (!control || !control.root.isConnected) return;
     const state = currentState();
     const busy = state.mode === 'busy' || state.mode === 'waiting';
     control.root.hidden = state.mode === 'hidden';
     control.root.dataset.clfMode = state.mode;
-    control.button.disabled = state.action === 'none';
-    control.button.setAttribute('aria-label', state.label);
+    control.button.disabled = false;
+    control.button.setAttribute('aria-label', 'Chat On Steroids settings');
+    control.button.setAttribute('aria-haspopup', 'dialog');
+    if (!control.button.hasAttribute('aria-expanded')) control.button.setAttribute('aria-expanded', 'false');
     // The meter only while the button is a button. During a run the control is saying what
     // it is doing, and a fill level is neither the question nor the answer any more.
     const meter = state.action === 'start' ? meterView() : null;
@@ -5338,7 +6437,9 @@
       control.meterFill.style.width = `${Math.round(meter.filled * 100)}%`;
       control.meter.dataset.clfLevel = meter.level;
     }
-    const tip = state.hint ? `${state.label} — ${state.hint}` : state.label;
+    const actionTip = state.hint ? `${state.label} — ${state.hint}` : state.label;
+    const settingsTip = menuView().tip;
+    const tip = busy || state.mode === 'error' ? actionTip : settingsTip;
     control.button.setAttribute('data-clf-tip', meter ? `${tip}\n${meter.tip}` : tip);
     control.pill.hidden = state.mode === 'idle' && !state.hint;
     control.cancel.hidden = state.action !== 'cancel';
@@ -5371,6 +6472,7 @@
         }
       }
     }
+    if (menuOpen) renderMenu();
   }
 
   /**
@@ -5415,6 +6517,290 @@
     node.append(box);
   }
 
+  const GOAL_STABLE_MS = 8_000;
+  const GOAL_POLL_MS = 1_000;
+  const GOAL_WATCH_MS = 5 * 60_000;
+  const GOAL_TYPING_WINDOW_MS = 2 * 60_000;
+  const MAX_OBJECTIVE_CHARS = 4000;
+  const GOAL_CONTINUABLE = new Set(['completed', 'interrupted']);
+  const GOAL_STEPS = ['Answer settling', 'Reading the chat', 'Writing the reply', 'Sending'];
+  const GOAL_STEP_AT = { settling: 0, requesting: 1, drafting: 2, sending: 3, failed: 1 };
+
+  function modelLabel(value) {
+    const model = String(value || '').trim();
+    if (!model) return 'Goal model';
+    const slash = model.lastIndexOf('/');
+    return slash >= 0 ? model.slice(slash + 1) : model;
+  }
+
+  function currentObjective() {
+    return goalConfig && typeof goalConfig.objective === 'string' ? goalConfig.objective : '';
+  }
+
+  function goalUsable() {
+    return Boolean(
+      conversationId &&
+        goalConfig &&
+        (goalConfig.enabled === true || currentObjective() !== '') &&
+        goalConfig.hasKey === true &&
+        goalConfig.blocked !== 'worker' &&
+        bootstrap !== 'worker'
+    );
+  }
+
+  function goalTurnMark(turn) {
+    if (!turn) return '';
+    return (turn.nodes || [turn.node])
+      .filter(Boolean)
+      .map((node) => sectionMark(node))
+      .join('\u0000');
+  }
+
+  function goalStageView(goal) {
+    if (!goal) return null;
+    const draft = goal.draft || null;
+    const who = modelLabel(goal.model);
+    const bar = (at, done = false) => ({ steps: GOAL_STEPS, at, done });
+    const failure = goal.error || (draft && draft.stage === 'failed' ? draft.error || 'OpenRouter did not answer' : '');
+    if (failure) {
+      const at = draft && draft.stage === 'failed' ? 2 : (GOAL_STEP_AT[goal.phase] ?? 1);
+      return { stage: 'The goal loop stopped', detail: failure, body: '', kind: 'goal-error', ...bar(at) };
+    }
+    if (goal.phase === 'done' || draft?.stage === 'no-reply') {
+      return { stage: 'Goal reached', detail: 'nothing was sent', body: '', kind: 'goal-done', ...bar(2, true) };
+    }
+    if (goal.phase === 'settling') {
+      return { stage: 'Checking the answer is finished', detail: '', body: '', kind: 'goal', ...bar(0) };
+    }
+    if (goal.phase === 'sending' && draft?.reply) {
+      return { stage: 'Sending it to ChatGPT', detail: '', body: draft.reply, kind: 'goal', ...bar(3) };
+    }
+    if (goal.phase === 'requesting' && !draft) {
+      return { stage: 'Sending the answer to OpenRouter', detail: who, body: '', kind: 'goal', ...bar(1) };
+    }
+    if (!draft) return null;
+    if (draft.stage === 'sending') {
+      return { stage: 'Sending the answer to OpenRouter', detail: who, body: '', kind: 'goal', ...bar(1) };
+    }
+    if (draft.stage === 'answering') {
+      return { stage: `${who} is answering`, detail: '', body: draft.text || '', kind: 'goal', ...bar(2) };
+    }
+    if (draft.stage === 'ready') {
+      return { stage: `${who} wrote the next message`, detail: '', body: draft.reply || '', kind: 'goal', ...bar(2, true) };
+    }
+    return null;
+  }
+
+  function noteGoalTurn(ended, outcome, endedTurnId) {
+    if (!endedTurnId || !goalUsable()) return;
+    if (!GOAL_CONTINUABLE.has(outcome)) return;
+    if (compactCapture || nativeBusy || (job && job.busy)) return;
+    if (goalTurnId === endedTurnId || goalBusy) return;
+    goalTurnId = endedTurnId;
+    goalError = '';
+    bindResumeGoalTurn(endedTurnId);
+    void ask({ type: 'goal_focus', conversationId, turnId: endedTurnId }).catch(() => undefined);
+    void watchGoalTurn(ended, endedTurnId);
+  }
+
+  async function watchGoalTurn(ended, forTurn) {
+    goalBusy = true;
+    goalPhase = 'settling';
+    const forId = conversationId;
+    const forEpoch = epoch;
+    const current = () =>
+      alive &&
+      conversationId === forId &&
+      epoch === forEpoch &&
+      CLF_DOM.conversationId() === forId &&
+      goalTurnId === forTurn;
+    try {
+      const deadline = Date.now() + GOAL_WATCH_MS;
+      let text = finalAnswerText(ended) || answerText(ended);
+      let activity = goalTurnMark(ended);
+      let stableSince = Date.now();
+      while (Date.now() < deadline) {
+        await sleep(GOAL_POLL_MS);
+        if (!current()) return;
+        if (generating || compactCapture || nativeBusy || (job && job.busy) || !goalUsable()) {
+          goalPhase = '';
+          return;
+        }
+        const nextText = finalAnswerText(ended) || answerText(ended);
+        const nextActivity = goalTurnMark(ended);
+        const pending = await peekPendingTools();
+        if (!current()) return;
+        const busy = CLF_DOM.generating() || pending === null || pending > 0;
+        if (busy || nextText !== text || nextActivity !== activity) {
+          text = nextText;
+          activity = nextActivity;
+          stableSince = Date.now();
+          continue;
+        }
+        if (Date.now() - stableSince < GOAL_STABLE_MS) continue;
+        if (!text.trim()) {
+          goalError = 'that answer had no text to continue from';
+          injectStage();
+          return;
+        }
+        await requestGoalDraft(forTurn, current);
+        return;
+      }
+      goalError = 'the answer never stopped changing, so nothing was written';
+    } finally {
+      goalBusy = false;
+      renderControl();
+      injectStage();
+    }
+  }
+
+  async function requestGoalDraft(forTurn, current) {
+    goalPhase = 'requesting';
+    goalTypingSince = 0;
+    injectStage();
+    const reply = await ask({ type: 'goal_draft', conversationId, turnId: forTurn });
+    if (!current()) return;
+    if (!reply || reply.ok !== true) {
+      goalError = replyError(reply) || 'the app did not answer';
+      injectStage();
+      return;
+    }
+    goalPhase = 'drafting';
+    goalDraft = (reply.data && reply.data.goal) || null;
+    injectStage();
+    void pullActivity();
+  }
+
+  function maybeRecoverResumeGoalTurn() {
+    const pending = resumeGoalPending;
+    if (!pending || !conversationId) return;
+    if (pending.conversationId !== conversationId) {
+      if (CLF_DOM.conversationId() && CLF_DOM.conversationId() !== pending.conversationId) clearResumeGoalPending();
+      return;
+    }
+    if (goalTurnId || goalDraft) return void clearResumeGoalPending();
+    if (!goalConfig) return;
+    if (!goalUsable()) return void clearResumeGoalPending();
+    if (goalBusy || generating || CLF_DOM.generating() || compactCapture || nativeBusy || (job && job.busy)) return;
+
+    const users = CLF_DOM.messages().filter(
+      (message) => message && message.role === 'user' && !retiredMessages.has(message.id) && !isStale(message.node)
+    );
+    if (users.length > 1) return void clearResumeGoalPending();
+    if (users.length !== 1) return;
+
+    const turns = CLF_DOM.turns();
+    const ended = pending.turnId
+      ? [...turns].reverse().find((candidate) => localGenerationOf(candidate) === pending.turnId) || null
+      : currentAssistantTurn(turns);
+    if (!ended || !(finalAnswerText(ended) || answerText(ended)).trim()) return;
+    let result = endOutcome(ended);
+    if (result.outcome === 'unknown') {
+      const fiber = fiberTurnFor(ended);
+      if (fiber?.endMessageId && !(fiber.calls || []).some((call) => !call || call.answered !== true)) {
+        result = { outcome: 'completed' };
+      }
+    }
+    if (result.outcome === 'unknown') return;
+    if (!GOAL_CONTINUABLE.has(result.outcome)) return void clearResumeGoalPending();
+    const recoveredTurnId = pending.turnId || `g-resume-${pending.commandId}`.slice(0, 200);
+    noteGoalTurn(ended, result.outcome, recoveredTurnId);
+    if (goalTurnId === recoveredTurnId) clearResumeGoalPending();
+  }
+
+  async function maybeSendGoalReply() {
+    const draft = goalDraft;
+    if (!draft || !conversationId || draft.conversationId !== conversationId) return;
+    if (goalBusy) return;
+    if (goalWasSpent(conversationId, draft.token)) {
+      goalDraft = null;
+      await ask({ type: 'goal_ack', conversationId, token: draft.token }).catch(() => undefined);
+      return;
+    }
+    if (!goalUsable()) {
+      goalPhase = '';
+      goalDraft = null;
+      await ask({ type: 'goal_ack', conversationId, token: draft.token }).catch(() => undefined);
+      return;
+    }
+    if (draft.stage === 'failed') {
+      goalPhase = 'drafting';
+      goalError = draft.error || 'OpenRouter did not answer';
+      goalDraft = null;
+      await ask({ type: 'goal_ack', conversationId, token: draft.token }).catch(() => undefined);
+      return;
+    }
+    if (draft.stage === 'no-reply') {
+      goalPhase = 'done';
+      goalError = '';
+      goalDraft = null;
+      await ask({ type: 'goal_ack', conversationId, token: draft.token }).catch(() => undefined);
+      injectStage();
+      return;
+    }
+    if (draft.stage !== 'ready' || !draft.reply) return;
+    if (generating || CLF_DOM.generating() || compactCapture || nativeBusy || (job && job.busy)) {
+      goalPhase = '';
+      goalDraft = null;
+      await ask({ type: 'goal_ack', conversationId, token: draft.token }).catch(() => undefined);
+      return;
+    }
+
+    goalBusy = true;
+    const expectedConversation = conversationId;
+    const expectedEpoch = epoch;
+    let ownsSendLease = false;
+    try {
+      if (goalTypingSince === 0) goalTypingSince = Date.now();
+      goalPhase = 'sending';
+      injectStage();
+      ownsSendLease = acquireAutonomousSend('goal');
+      if (!ownsSendLease) {
+        goalPhase = 'drafting';
+        return;
+      }
+      if (!CLF_DOM.insertPrompt(draft.reply)) {
+        if (Date.now() - goalTypingSince < GOAL_TYPING_WINDOW_MS) return;
+        goalError = 'the message box was in use, so nothing was sent';
+        goalDraft = null;
+        await ask({ type: 'goal_ack', conversationId, token: draft.token }).catch(() => undefined);
+        return;
+      }
+      await sleep(200);
+      const current =
+        alive &&
+        conversationId === expectedConversation &&
+        epoch === expectedEpoch &&
+        CLF_DOM.conversationId() === expectedConversation;
+      const composer = CLF_DOM.composer();
+      const exactDraft = String(composer?.textContent || '').replace(/\s+/g, '') === String(draft.reply).replace(/\s+/g, '');
+      const tools = current ? await peekPendingTools(expectedConversation) : null;
+      if (!current || !exactDraft || tools !== 0 || generating || CLF_DOM.generating()) {
+        goalDraft = null;
+        goalError = tools === null ? 'local tool state could not be verified, so nothing was sent' : 'the chat changed before the Goal reply could be sent';
+        await ask({ type: 'goal_ack', conversationId: expectedConversation, token: draft.token }).catch(() => undefined);
+        return;
+      }
+      const sent = await CLF_DOM.send();
+      goalDraft = null;
+      if (!sent) {
+        await ask({ type: 'goal_ack', conversationId: expectedConversation, token: draft.token }).catch(() => undefined);
+        goalError = 'ChatGPT would not send the message';
+        return;
+      }
+      rememberGoalSpent(expectedConversation, draft.token);
+      await ask({ type: 'goal_ack', conversationId: expectedConversation, token: draft.token }).catch(() => undefined);
+      goalPhase = '';
+      goalError = '';
+    } finally {
+      if (ownsSendLease) releaseAutonomousSend('goal');
+      goalBusy = false;
+      if (!goalDraft) goalTypingSince = 0;
+      renderControl();
+      injectStage();
+    }
+  }
+
   /**
    * What the panel above the composer should show, or null for "not there at all".
    *
@@ -5426,18 +6812,41 @@
    * idle beside a chat that is compacting shows nothing.
    */
   function stageView(input) {
-    const { job } = input;
-    if (!job || !job.busy) return null;
-    const stage =
-      job.stage === 'opening'
-        ? 'Opening a fresh chat'
-        : job.stage === 'waiting-for-browser'
-          ? 'Waiting for Chrome'
-          : 'ChatGPT is writing the handoff';
-    return { stage, detail: '', body: '', kind: 'none' };
+    const { job, goal } = input;
+    if (job && job.busy) {
+      const stage =
+        job.stage === 'opening'
+          ? 'Opening a fresh chat'
+          : job.stage === 'waiting-for-browser'
+            ? 'Waiting for Chrome'
+            : 'ChatGPT is writing the handoff';
+      return { stage, detail: '', body: '', kind: 'none', steps: [], at: 0, done: false };
+    }
+    return goalStageView(goal);
   }
 
   let stagePanel = null;
+
+  function removeStagePanel() {
+    if (!stagePanel) return;
+    stagePanel.root.remove();
+    stagePanel = null;
+  }
+
+  function goalStageDismissKey(view) {
+    if (!view || (view.kind !== 'goal-done' && view.kind !== 'goal-error')) return '';
+    return `${conversationId || 'unknown'}:${goalTurnId || 'terminal'}`;
+  }
+
+  function dismissTerminalGoalStage() {
+    const view = goalStageView(
+      goalConfig ? { phase: goalPhase, error: goalError, model: goalConfig.model, draft: goalDraft } : null
+    );
+    const key = goalStageDismissKey(view);
+    if (!key) return;
+    dismissedGoalStage = key;
+    removeStagePanel();
+  }
 
   function buildStage() {
     const root = document.createElement('div');
@@ -5452,13 +6861,66 @@
     title.className = 'clf-stage-title';
     const detail = document.createElement('span');
     detail.className = 'clf-stage-detail';
-    head.append(title, detail);
+    const close = document.createElement('button');
+    close.className = 'clf-stage-close';
+    close.type = 'button';
+    close.textContent = '×';
+    close.title = 'Dismiss';
+    close.setAttribute('aria-label', 'Dismiss Goal status');
+    close.hidden = true;
+    close.addEventListener('click', () => {
+      if (!stagePanel || stagePanel.root !== root || !stagePanel.dismissKey) return;
+      dismissedGoalStage = stagePanel.dismissKey;
+      removeStagePanel();
+    });
+    head.append(title, detail, close);
+
+    const steps = document.createElement('div');
+    steps.className = 'clf-stage-steps';
 
     const body = document.createElement('div');
     body.className = 'clf-stage-body';
 
-    root.append(head, body);
-    return { root, title, detail, body };
+    root.append(head, steps, body);
+    return { root, title, detail, close, steps, body, dismissKey: '' };
+  }
+
+  function paintStageSteps(host, view) {
+    const names = Array.isArray(view.steps) ? view.steps : [];
+    host.hidden = names.length === 0;
+    if (names.length === 0) {
+      host.replaceChildren();
+      host.dataset.clfStepNames = '';
+      return;
+    }
+    const key = names.join(' | ');
+    if (host.dataset.clfStepNames !== key) {
+      host.dataset.clfStepNames = key;
+      host.replaceChildren();
+      for (const name of names) {
+        const step = document.createElement('div');
+        step.className = 'clf-stage-step';
+        const track = document.createElement('div');
+        track.className = 'clf-stage-track';
+        const label = document.createElement('div');
+        label.className = 'clf-stage-name';
+        label.textContent = name;
+        step.append(track, label);
+        host.append(step);
+      }
+    }
+    const at = Number.isFinite(view.at) ? view.at : 0;
+    const stopped = view.kind === 'goal-error';
+    [...host.children].forEach((step, index) => {
+      step.dataset.clfStep =
+        index < at || (index === at && view.done === true)
+          ? 'done'
+          : index === at
+            ? stopped
+              ? 'stopped'
+              : 'now'
+            : 'next';
+    });
   }
 
   /**
@@ -5466,12 +6928,24 @@
    * control beside it: ChatGPT replaces this subtree whenever it feels like it.
    */
   function injectStage() {
-    const view = stageView({ job });
+    const opening = composerChat().state === 'new' && Boolean(pendingObjective);
+    if (!opening && (!conversationId || CLF_DOM.conversationId() !== conversationId)) {
+      removeStagePanel();
+      return;
+    }
+    const view = stageView({
+      job,
+      goal: goalConfig
+        ? { phase: goalPhase, error: goalError, model: goalConfig.model, draft: goalDraft }
+        : null
+    });
     if (!view) {
-      if (stagePanel) {
-        stagePanel.root.remove();
-        stagePanel = null;
-      }
+      removeStagePanel();
+      return;
+    }
+    const dismissKey = goalStageDismissKey(view);
+    if (dismissKey && dismissedGoalStage === dismissKey) {
+      removeStagePanel();
       return;
     }
     const spot = CLF_DOM.composerStack();
@@ -5498,7 +6972,10 @@
 
     if (stagePanel.title.textContent !== view.stage) stagePanel.title.textContent = view.stage;
     if (stagePanel.detail.textContent !== view.detail) stagePanel.detail.textContent = view.detail;
+    stagePanel.dismissKey = dismissKey;
+    stagePanel.close.hidden = dismissKey === '';
     stagePanel.root.dataset.clfStageKind = view.kind;
+    paintStageSteps(stagePanel.steps, view);
     if (stagePanel.body.textContent !== view.body) {
       // Measured before the text is replaced, not after: afterwards `scrollHeight` is
       // already the new content's, so the test would answer a question about the old
@@ -5511,13 +6988,36 @@
     stagePanel.body.hidden = view.body === '';
   }
 
+  async function refreshCompactionAuthority(expectedConversation, expectedEpoch) {
+    const current = () =>
+      alive &&
+      conversationId === expectedConversation &&
+      epoch === expectedEpoch &&
+      CLF_DOM.conversationId() === expectedConversation;
+    if (!current() || agent || bootstrap === 'worker') return false;
+    const reply = await ask({ type: 'activity', conversationId: expectedConversation, since });
+    if (!current() || !reply || reply.ok !== true || !reply.data) return false;
+    const data = reply.data;
+    if (data.bootstrap === 'worker' || data.goal?.blocked === 'worker' || data.retiredWorker) return false;
+    return true;
+  }
+
   async function startCompact() {
-    if (!conversationId) return;
+    const expectedConversation = conversationId;
+    const expectedEpoch = epoch;
+    const current = () =>
+      alive &&
+      conversationId === expectedConversation &&
+      epoch === expectedEpoch &&
+      CLF_DOM.conversationId() === expectedConversation;
+    if (!expectedConversation || !current()) return;
     // One press, one run. The native path spends tens of seconds interrupting and typing,
     // and a second press inside that window would submit the instruction twice — which is
     // the one thing the app cannot fix afterwards, because the second prompt is a second
     // request the model will try to answer — and then two turns each claim to be the brief.
     if (nativeBusy) return;
+    if (!(await refreshCompactionAuthority(expectedConversation, expectedEpoch))) return;
+    if (!current()) return;
     localError = '';
     pressedAt = Date.now();
     job = null;
@@ -5534,7 +7034,7 @@
     // summary of a machine state that had already moved on.
     // Automatic runs stop the turn exactly like a press does. They are *started* by a turn
     // being in flight, so refusing to interrupt one would refuse every automatic run.
-    const barrier = await stopAndSettle();
+    const barrier = await stopAndSettle(current, expectedConversation);
     if (barrier) {
       pressedAt = 0;
       nativeBusy = false;
@@ -5544,8 +7044,21 @@
       void pullActivity();
       return;
     }
+    if (!current()) {
+      pressedAt = 0;
+      nativeBusy = false;
+      nativePhase = '';
+      renderControl();
+      return;
+    }
 
-    const reply = await ask({ type: 'compact', conversationId, resume: true });
+    const reply = await ask({ type: 'compact', conversationId: expectedConversation, resume: true });
+    if (!current()) {
+      nativeBusy = false;
+      nativePhase = '';
+      pressedAt = 0;
+      return;
+    }
     if (!reply || reply.ok !== true) {
       pressedAt = 0;
       nativeBusy = false;
@@ -5573,7 +7086,7 @@
       void pullActivity();
       return;
     }
-    await runNativeCompaction(String(data.prompt), String(data.token || ''));
+    await runNativeCompaction(String(data.prompt), String(data.token || ''), expectedConversation, expectedEpoch);
   }
 
   /**
@@ -5588,7 +7101,8 @@
    * not hear about it, and the handoff would describe a machine that no longer exists by
    * the time the fresh chat reads it.
    */
-  async function stopAndSettle() {
+  async function stopAndSettle(current = () => true, toolConversation = conversationId) {
+    if (!current()) return 'The conversation changed before compaction could start.';
     // INTERRUPTING — stop the turn rather than wait it out. That is the whole request, by
     // hand or automatically: this happens because the turn is long, not because it is
     // nearly done.
@@ -5600,6 +7114,7 @@
       userStopped = true;
       const stopped = await waitUntil(() => !CLF_DOM.generating(), INTERRUPT_WAIT_MS);
       if (!stopped) return 'ChatGPT would not stop the current turn. Nothing was compacted.';
+      if (!current()) return 'The conversation changed while stopping the current turn.';
     }
 
     // SETTLING — bounded, and deliberately not fatal when the budget runs out: a call that
@@ -5612,13 +7127,33 @@
     // that says "Finishing local tools…" about an app that is not listening. A couple of
     // retries covers a dropped answer; past that, get on with it.
     let unanswered = 0;
-    await waitUntil(async () => {
-      const count = await peekPendingTools();
-      if (count === null) return ++unanswered >= SETTLE_UNKNOWN_TRIES;
+    let settleFailure = '';
+    let lastCount = null;
+    const settled = await waitUntil(async () => {
+      if (!current()) {
+        settleFailure = 'The conversation changed while local tools were settling.';
+        return true;
+      }
+      const count = await peekPendingTools(toolConversation);
+      if (!current()) {
+        settleFailure = 'The conversation changed while local tools were settling.';
+        return true;
+      }
+      if (count === null) {
+        if (++unanswered >= SETTLE_UNKNOWN_TRIES) {
+          settleFailure = 'Could not verify whether local tools are still running.';
+          return true;
+        }
+        return false;
+      }
       unanswered = 0;
+      lastCount = count;
       pendingTools = count;
       return count === 0;
     }, TOOL_SETTLE_MS);
+    if (settleFailure) return settleFailure;
+    if (!settled || lastCount !== 0) return 'Local tools are still running. Nothing was compacted.';
+    if (!current()) return 'The conversation changed while local tools were settling.';
     return '';
   }
 
@@ -5638,7 +7173,12 @@
    * and — when that exact generation settles — hands its own answer to the app as the brief.
    * See `compactCapture`.
    */
-  async function runNativeCompaction(prompt, token) {
+  async function runNativeCompaction(prompt, token, expectedConversation = conversationId, expectedEpoch = epoch) {
+    const current = () =>
+      alive &&
+      conversationId === expectedConversation &&
+      epoch === expectedEpoch &&
+      CLF_DOM.conversationId() === expectedConversation;
     const abandon = async (why) => {
       nativeBusy = false;
       nativePhase = '';
@@ -5646,13 +7186,17 @@
       localError = why;
       job = null;
       // Withdraw the app-side request so nothing can complete behind our back.
-      await ask({ type: 'compact', conversationId, cancel: true }).catch(() => undefined);
+      await ask({ type: 'compact', conversationId: expectedConversation, cancel: true }).catch(() => undefined);
       renderControl();
       void pullActivity();
     };
 
     if (!prompt) return void (await abandon('The app did not send the handoff instruction.'));
     if (!token) return void (await abandon('The app did not send a compaction token, so nothing could be tracked.'));
+    if (!current()) return void (await abandon('The conversation changed before the handoff instruction could be sent.'));
+    if (!acquireAutonomousSend('compact')) {
+      return void (await abandon('Another autonomous browser write already owns the composer. Nothing was compacted.'));
+    }
 
     try {
       // INTERRUPTING and SETTLING already happened, before the request that produced this
@@ -5668,10 +7212,37 @@
         ));
       }
       await sleep(400);
+      if (!current()) {
+        return void (await abandon('The conversation changed before the handoff instruction could be sent.'));
+      }
+      const composer = CLF_DOM.composer();
+      const squeeze = (value) => (value || '').replace(/\s+/g, '');
+      if (!composer || squeeze(composer.textContent) !== squeeze(prompt)) {
+        return void (await abandon('The composer changed before the handoff instruction could be sent.'));
+      }
+      const tools = await peekPendingTools(expectedConversation);
+      if (!current()) {
+        return void (await abandon('The conversation changed before the handoff instruction could be sent.'));
+      }
+      if (tools === null) {
+        return void (await abandon('Could not verify local tool state before sending the handoff instruction.'));
+      }
+      if (tools > 0) {
+        return void (await abandon('Local tools are still running. The handoff instruction was not sent.'));
+      }
       // Armed before the send rather than after it, because the turn can open between the
       // click and the next line of this function. An arming that is never claimed by a
       // generation expires on its own — see the observe() branch that binds it.
-      compactCapture = { token, conversationId, generation: null, priorGeneration: turnId || null, armedAt: Date.now() };
+      compactCapture = {
+        token,
+        conversationId: expectedConversation,
+        epoch: expectedEpoch,
+        generation: null,
+        priorGeneration: turnId || null,
+        armedAt: Date.now(),
+        summary: null,
+        settling: false
+      };
       rememberCapture();
       if (!CLF_DOM.send()) {
         releaseCapture();
@@ -5685,6 +7256,7 @@
     } catch (err) {
       await abandon(`Could not ask ChatGPT for a handoff: ${(err && err.message) || 'unknown error'}`);
     } finally {
+      releaseAutonomousSend('compact');
       // The guard is released either way; `nativePhase` is cleared by the app's job
       // reaching a terminal stage, or by abandon() above.
       nativeBusy = false;
@@ -5716,6 +7288,7 @@
    * one case: a reload inside that same unbound window. See `restoreCapture`.
    */
   let compactCapture = null;
+  let briefDeliveryBusy = false;
 
   /** Where the binding is kept so it survives a reload of this tab. */
   const COMPACT_CAPTURE_KEY = 'clf-compact-capture';
@@ -5769,10 +7342,19 @@
       rememberCapture();
       return;
     }
+    stored.epoch = epoch;
     compactCapture = stored;
+    if (typeof stored.summary === 'string' && stored.summary.trim()) {
+      nativeBusy = true;
+      nativePhase = 'delivering';
+      renderControl();
+      void deliverCapturedBrief();
+      return;
+    }
     if (stored.generation) {
       if (stored.generation === turnId && generating) {
         nativePhase = 'waiting';
+        nativeBusy = true;
         renderControl();
         return;
       }
@@ -5813,12 +7395,160 @@
    */
   async function abandonCapture(why) {
     const held = releaseCapture();
+    const current =
+      !held ||
+      (held.conversationId === conversationId &&
+        held.epoch === epoch &&
+        CLF_DOM.conversationId() === held.conversationId);
+    if (!current) return;
     nativeBusy = false;
     nativePhase = '';
     pressedAt = 0;
     job = null;
     localError = why;
-    if (held) await ask({ type: 'compact', conversationId, cancel: true }).catch(() => undefined);
+    if (held) await ask({ type: 'compact', conversationId: held.conversationId, cancel: true }).catch(() => undefined);
+    if (
+      held &&
+      (held.conversationId !== conversationId || held.epoch !== epoch || CLF_DOM.conversationId() !== held.conversationId)
+    ) {
+      return;
+    }
+    renderControl();
+    void pullActivity();
+  }
+
+  /** How long every observable part of a compaction answer must remain still. */
+  const BRIEF_STABLE_MS = 15_000;
+  /** How often a settling brief is sampled. */
+  const BRIEF_POLL_MS = 1_000;
+  /** Maximum time to wait for a compaction answer to become provably complete. */
+  const BRIEF_WATCH_MS = 10 * 60_000;
+
+  function briefSoFar(ended, known) {
+    const held = finalAnswerText(ended);
+    if (held.length > known.length) return held;
+    const turns = CLF_DOM.turns();
+    const latest = turns.length > 0 ? finalAnswerText(turns[turns.length - 1]) : '';
+    if (known && latest.length > known.length && latest.startsWith(known)) return latest;
+    return held.length >= known.length ? held : known;
+  }
+
+  function briefActivityMark(ended) {
+    const turns = CLF_DOM.turns();
+    const live = turns.length > 0 ? turns[turns.length - 1] : null;
+    const seen = [];
+    for (const turn of live && (!ended || live.node !== ended.node) ? [ended, live] : [ended]) {
+      if (!turn) continue;
+      const blocks = CLF_DOM.toolBlocks(turn);
+      seen.push(blocks.length);
+      for (const block of blocks) seen.push((block.textContent || '').length);
+    }
+    return seen.join(',');
+  }
+
+  async function settleBrief(ended, outcome) {
+    if (outcome === 'stopped' || outcome === 'interrupted' || outcome === 'failed') {
+      return void (await deliverBrief('', outcome));
+    }
+    const deadline = Date.now() + BRIEF_WATCH_MS;
+    let text = finalAnswerText(ended);
+    let activity = briefActivityMark(ended);
+    let stableSince = Date.now();
+    while (Date.now() < deadline) {
+      await sleep(BRIEF_POLL_MS);
+      if (
+        !alive ||
+        !sameChat() ||
+        !compactCapture ||
+        compactCapture.conversationId !== conversationId ||
+        compactCapture.epoch !== epoch ||
+        CLF_DOM.conversationId() !== compactCapture.conversationId
+      ) {
+        return;
+      }
+      const nextText = briefSoFar(ended, text);
+      const nextActivity = briefActivityMark(ended);
+      const pending = await peekPendingTools(compactCapture.conversationId);
+      if (
+        !alive ||
+        !sameChat() ||
+        !compactCapture ||
+        compactCapture.conversationId !== conversationId ||
+        compactCapture.epoch !== epoch ||
+        CLF_DOM.conversationId() !== compactCapture.conversationId
+      ) {
+        return;
+      }
+      const busy = CLF_DOM.generating() || pending === null || pending > 0;
+      if (busy || nextText !== text || nextActivity !== activity) {
+        text = nextText;
+        activity = nextActivity;
+        stableSince = Date.now();
+        continue;
+      }
+      if (Date.now() - stableSince >= BRIEF_STABLE_MS) return void (await deliverBrief(text, outcome));
+    }
+    await abandonCapture(
+      'The compaction turn was still going long after it looked finished — still writing, still running ' +
+        'tools, or the app could not be reached to ask — so the app stopped waiting rather than hand over ' +
+        'half a brief. Nothing was compacted; this chat still has its session. Press Compact & Resume again.'
+    );
+  }
+
+  function retryableBriefReply(reply) {
+    if (!reply) return true;
+    if (reply.data && reply.data.retryable === true) return true;
+    const code = Number(reply.status);
+    if (!Number.isFinite(code)) return true;
+    return code === 0 || code === 401 || code === 408 || code === 426 || code === 429 || code >= 500;
+  }
+
+  async function deliverCapturedBrief() {
+    const held = compactCapture;
+    const brief = held && typeof held.summary === 'string' ? held.summary.trim() : '';
+    if (!held || !brief || briefDeliveryBusy) return;
+    const current = () =>
+      alive &&
+      compactCapture === held &&
+      held.conversationId === conversationId &&
+      held.epoch === epoch &&
+      CLF_DOM.conversationId() === held.conversationId;
+    if (!current()) return;
+
+    briefDeliveryBusy = true;
+    let reply = null;
+    try {
+      reply = await ask({ type: 'compact', conversationId: held.conversationId, token: held.token, summary: brief });
+    } finally {
+      briefDeliveryBusy = false;
+    }
+    if (!current()) return;
+
+    if (reply && reply.ok === true) {
+      releaseCapture();
+      nativeBusy = false;
+      nativePhase = '';
+      localError = '';
+      if (reply.data && reply.data.job) job = reply.data.job;
+      renderControl();
+      void pullActivity();
+      return;
+    }
+    if (retryableBriefReply(reply)) {
+      nativeBusy = true;
+      nativePhase = 'delivering';
+      pressedAt = 0;
+      localError = replyError(reply) || 'The brief is finished, but the app has not stored it yet. Retrying…';
+      renderControl();
+      return;
+    }
+
+    releaseCapture();
+    nativeBusy = false;
+    nativePhase = '';
+    pressedAt = 0;
+    job = null;
+    localError = replyError(reply) || 'The app refused the brief, so nothing was moved.';
     renderControl();
     void pullActivity();
   }
@@ -5832,13 +7562,21 @@
    * nowhere rather than opening a chat nobody is waiting for.
    */
   async function deliverBrief(text, outcome) {
-    const held = releaseCapture();
+    const held = compactCapture;
     if (!held) return;
+    const current = () =>
+      alive &&
+      compactCapture === held &&
+      held.conversationId === conversationId &&
+      held.epoch === epoch &&
+      CLF_DOM.conversationId() === held.conversationId;
+    if (!current()) return;
     const brief = String(text || '').trim();
     // An interrupted or empty compaction is not a short brief — it is no brief. Half a
     // handoff reads exactly like a whole one to the chat that receives it, which is why
     // this is the one place the extension refuses to send something it has.
     if (!brief || outcome === 'stopped' || outcome === 'interrupted' || outcome === 'failed') {
+      releaseCapture();
       const why =
         outcome === 'stopped'
           ? 'The compaction turn was stopped, so nothing was compacted.'
@@ -5850,29 +7588,27 @@
       pressedAt = 0;
       job = null;
       localError = why;
-      await ask({ type: 'compact', conversationId, cancel: true }).catch(() => undefined);
+      await ask({ type: 'compact', conversationId: held.conversationId, cancel: true }).catch(() => undefined);
+      if (!alive || held.conversationId !== conversationId || held.epoch !== epoch || CLF_DOM.conversationId() !== held.conversationId) return;
       renderControl();
       void pullActivity();
       return;
     }
-    const reply = await ask({ type: 'compact', conversationId, token: held.token, summary: brief });
-    nativeBusy = false;
-    nativePhase = '';
-    if (!reply || reply.ok !== true) {
-      pressedAt = 0;
-      job = null;
-      localError = replyError(reply) || 'The app could not store the brief, so nothing was moved.';
-    } else if (reply.data && reply.data.job) {
-      job = reply.data.job;
+    if (typeof held.summary !== 'string' || !held.summary.trim()) {
+      held.summary = brief;
+      rememberCapture();
     }
+    nativeBusy = true;
+    nativePhase = 'delivering';
+    localError = '';
     renderControl();
-    void pullActivity();
+    await deliverCapturedBrief();
   }
 
   /** How long to wait for ChatGPT to actually stop after the stop button is pressed. */
   const INTERRUPT_WAIT_MS = 15_000;
   /** How long to wait for local tool calls to finish before prompting anyway. */
-  const TOOL_SETTLE_MS = 20_000;
+  const TOOL_SETTLE_MS = 30_000;
   /** How many silent answers about pending calls to sit through before going ahead. */
   const SETTLE_UNKNOWN_TRIES = 3;
 
@@ -5891,7 +7627,7 @@
     const reply = await ask({ type: 'activity', conversationId: targetConversation, since });
     if (!reply || reply.ok !== true || !reply.data) return null;
     const count = Number(reply.data.pendingTools);
-    return Number.isFinite(count) ? count : 0;
+    return Number.isFinite(count) && count >= 0 ? count : null;
   }
 
   /** Polls a condition. Resolves true when it holds, false when the budget runs out. */
@@ -5912,6 +7648,7 @@
 
   async function cancelCompact() {
     if (!conversationId) return;
+    if (compactCapture && compactCapture.conversationId === conversationId) releaseCapture();
     pressedAt = 0;
     nativeBusy = false;
     nativePhase = '';
@@ -5966,27 +7703,167 @@
     }
   }
 
+  /** The concrete conversation this document was opened at, before ChatGPT can retarget the SPA. */
+  const OPENED_CONVERSATION = (() => {
+    try {
+      const match = /^\/c\/([0-9a-f-]{8,64})/i.exec(location.pathname);
+      return match ? match[1] : null;
+    } catch {
+      return null;
+    }
+  })();
+
   /**
-   * Picks up the instruction this tab was opened for. Once per document, and that is all.
-   *
-   * Only ever on a conversation that does not exist yet — a worker's own chat, or the
-   * replacement for a compacted session. Never in an existing chat, and never over a
-   * composer the user has already started typing into.
-   *
-   * One page, one marker, one attempt, and every exit reports its outcome. This used to be
-   * three in-page attempts driven off the one-second observation tick, with a periodic
-   * `working` ack renewing the app's lease in between; between them those turned one press
-   * into an open-ended background process that could still be typing into a tab minutes
-   * after the user had given up on it. The transaction is now flat: redeem the marker, wait
-   * for the composer, insert, send, report which conversation it became. Anything that goes
-   * wrong is reported as a failure straight away, and the app ends the worker slot or the
-   * continuation rather than arranging for it to happen again somewhere else — which is
-   * what the user can act on, and what nothing else in this file has to know about.
-   *
-   * A message this tab actually sent is reported as sent even if the conversation id never
-   * turns up, because the alternative would be typing the same instruction twice.
+   * One page can receive more than one command over its lifetime: the first worker bootstrap,
+   * then later same-chat revivals. The bridge lease is acquired only after this document has
+   * proved it still owns the exact SPA target and the previous turn is durably settled.
    */
-  let commandDone = false;
+  const commandsHandled = new Set();
+  let commandAttempt = null;
+  let commandReadinessInitialized = false;
+  const commandReadinessWaiters = new Set();
+
+  function ownsCommandDocument(expectedEpoch) {
+    return (
+      alive &&
+      epoch === expectedEpoch &&
+      globalThis.__CLF_CONTENT_RECORDER__ === recorderHandle
+    );
+  }
+
+  function notifyCommandReadiness() {
+    for (const check of [...commandReadinessWaiters]) {
+      try {
+        check();
+      } catch {
+        // A waiter has not crossed the bridge ownership boundary yet. One broken wake must
+        // never disturb ordinary observation of the turn it is waiting on.
+      }
+    }
+  }
+
+  function revivalSubmitReady(target, expectedEpoch) {
+    if (!commandReadinessInitialized || !ownsCommandDocument(expectedEpoch)) return false;
+    if (!target || conversationId !== target || CLF_DOM.conversationId() !== target) return false;
+    if (generating || CLF_DOM.generating()) return false;
+    if (pendingTools > 0 || nativeBusy || compactCapture || (job && job.busy)) return false;
+    const composer = CLF_DOM.composer();
+    if (!composer || !composer.isConnected) return false;
+    return (composer.textContent || '').trim() === '';
+  }
+
+  function waitForRevivalSubmitReady(target, attempt, expectedEpoch) {
+    if (!target || attempt?.cancelled || !ownsCommandDocument(expectedEpoch)) return Promise.resolve(false);
+    if (CLF_DOM.conversationId() !== target) return Promise.resolve(false);
+    return new Promise((resolve) => {
+      let observer = null;
+      let done = false;
+      let flushingReadyBoundary = false;
+      let boundaryEntries = null;
+      const finish = (value) => {
+        if (done) return;
+        done = true;
+        commandReadinessWaiters.delete(check);
+        if (observer) observer.disconnect();
+        resolve(value);
+      };
+      const check = () => {
+        if (attempt?.cancelled || !ownsCommandDocument(expectedEpoch) || CLF_DOM.conversationId() !== target) {
+          return finish(false);
+        }
+        if (!revivalSubmitReady(target, expectedEpoch) || flushingReadyBoundary) return;
+        if (!boundaryEntries) boundaryEntries = new Set(queue);
+        const pendingBoundary = () => [...boundaryEntries].some((entry) => queue.includes(entry));
+        if (!pendingBoundary()) return finish(true);
+        flushingReadyBoundary = true;
+        void (async () => {
+          while (
+            !attempt?.cancelled &&
+            ownsCommandDocument(expectedEpoch) &&
+            CLF_DOM.conversationId() === target &&
+            revivalSubmitReady(target, expectedEpoch) &&
+            pendingBoundary()
+          ) {
+            const durable = await flush();
+            if (!durable) break;
+          }
+        })()
+          .then(() => {
+            flushingReadyBoundary = false;
+            if (attempt?.cancelled || !ownsCommandDocument(expectedEpoch) || CLF_DOM.conversationId() !== target) {
+              return finish(false);
+            }
+            if (revivalSubmitReady(target, expectedEpoch) && !pendingBoundary()) finish(true);
+          })
+          .catch(() => {
+            flushingReadyBoundary = false;
+          });
+      };
+      commandReadinessWaiters.add(check);
+      try {
+        observer = new MutationObserver(check);
+        observer.observe(document.documentElement, {
+          childList: true,
+          subtree: true,
+          characterData: true,
+          attributes: true
+        });
+      } catch {
+        // observe()/flush() also wake this waiter.
+      }
+      check();
+    });
+  }
+
+  async function waitForDeferredRevivalCustody(id, target, attempt, expectedEpoch) {
+    while (
+      !attempt?.cancelled &&
+      ownsCommandDocument(expectedEpoch) &&
+      CLF_DOM.conversationId() === target
+    ) {
+      const reply = await ask({ type: 'defer_revival', id, conversationId: target });
+      if (attempt?.cancelled || !ownsCommandDocument(expectedEpoch) || CLF_DOM.conversationId() !== target) return false;
+      if (reply && reply.ok === true && reply.deferred === true && reply.preferredElsewhere !== true) return true;
+      if (reply && reply.ok === true && reply.preferredElsewhere === true) return false;
+      await sleep(1000);
+    }
+    return false;
+  }
+
+  function dismissRequestLimitDialog() {
+    const dialogs = [...document.querySelectorAll('[role="dialog"]')];
+    for (const dialog of dialogs) {
+      const text = String(dialog.textContent || '').replace(/\s+/g, ' ').trim().toLocaleLowerCase();
+      const requestLimited =
+        text.includes('too many requests') ||
+        text.includes('rate limit') ||
+        text.includes('çok fazla istek') ||
+        text.includes('çok hızlı istek');
+      if (!requestLimited) continue;
+      const button = [...dialog.querySelectorAll('button')].find((candidate) => !candidate.disabled);
+      if (!button) return false;
+      button.click();
+      return true;
+    }
+    return false;
+  }
+
+  async function sendCommandPrompt(expectedText, stillOnTarget) {
+    const squeeze = (value) => String(value || '').replace(/\s+/g, '');
+    const expected = squeeze(expectedText);
+    let sent = await CLF_DOM.send();
+    await Promise.resolve();
+    const dismissed = dismissRequestLimitDialog();
+    if (sent) return true;
+    if (!dismissed || !stillOnTarget()) return false;
+    const composer = CLF_DOM.composer();
+    if (!composer || squeeze(composer.textContent) !== expected) return false;
+    sent = await CLF_DOM.send();
+    await Promise.resolve();
+    dismissRequestLimitDialog();
+    return sent;
+  }
+
   /**
    * Fresh app-opened chats do not journal their first observations until the command ACK.
    *
@@ -6035,46 +7912,101 @@
     });
   }
 
-  async function runCommand() {
-    const id = markerId();
-    if (commandDone || !id) return;
-    commandDone = true;
-    // `runCommand()` is invoked immediately before the first `observe()` and runs
-    // synchronously up to its first await, so this closes the race before any event can flush.
-    commandJournalGate = true;
+  async function runCommand(id = markerId(), fromUrl = true, onClaim = null, options = {}) {
+    const source = fromUrl ? 'url' : options.deferredRecovery === true ? 'recovery' : 'handoff';
+    const prior = commandAttempt;
+    const maySupersede =
+      Boolean(id) &&
+      prior &&
+      prior.id !== id &&
+      prior.source === 'recovery' &&
+      prior.phase === 'waiting' &&
+      source !== 'recovery';
+    if (maySupersede) {
+      prior.cancelled = true;
+      notifyCommandReadiness();
+    }
+    if (!id || (commandAttempt && !maySupersede) || commandsHandled.has(id)) {
+      if (typeof onClaim === 'function') onClaim(false);
+      return;
+    }
+    commandsHandled.add(id);
+    const attempt = { id, source, phase: 'waiting', cancelled: false };
+    commandAttempt = attempt;
+    const gateJournal = fromUrl && !OPENED_CONVERSATION;
+    if (gateJournal) commandJournalGate = true;
+    let claimReported = false;
+    const reportClaim = (claimed) => {
+      if (claimReported) return;
+      claimReported = true;
+      if (typeof onClaim === 'function') onClaim(claimed === true);
+    };
     try {
-      await deliverCommand(id);
+      await deliverCommand(id, fromUrl, reportClaim, attempt);
     } finally {
-      commandJournalGate = false;
+      reportClaim(false);
+      if (commandAttempt === attempt) commandAttempt = null;
+      if (gateJournal) commandJournalGate = false;
       void flush();
     }
   }
 
-  async function deliverCommand(id) {
-    // Every command opens a chat that does not exist yet, so a page that already has a
-    // conversation is not the page this command is for — a stale marker carried into an
-    // existing chat by history, a back button, or a copied URL. Refused before the redeem,
-    // so it neither types into somebody's chat nor claims a command the genuinely fresh tab
-    // is still holding.
-    if (CLF_DOM.conversationId()) return;
+  async function deliverCommand(id, fromUrl = true, reportClaim = () => undefined, attempt = null) {
+    const expectedEpoch = epoch;
+    const openedConversation = fromUrl ? OPENED_CONVERSATION : CLF_DOM.conversationId();
+    if (CLF_DOM.conversationId() && !openedConversation) return;
 
-    // RUN_ID names this document. It is what makes the command single-owner: a second tab
-    // on the same marker is a different document and is refused, while this one's own
-    // request is answered.
-    const reply = await ask({ type: 'redeem', id, client: RUN_ID });
+    if (openedConversation) {
+      if (!(await waitForDeferredRevivalCustody(id, openedConversation, attempt, expectedEpoch))) return;
+      if (!(await waitForRevivalSubmitReady(openedConversation, attempt, expectedEpoch))) return;
+    }
+    if (attempt?.cancelled || !ownsCommandDocument(expectedEpoch)) return;
+
+    if (attempt) attempt.phase = 'redeeming';
+    const reply = await ask({
+      type: 'redeem',
+      id,
+      client: RUN_ID,
+      ...(openedConversation ? { conversationId: openedConversation } : {})
+    });
     if (!reply || reply.ok !== true) {
-      // The app could not be reached at all, so there is nothing to acknowledge and nothing
-      // to acknowledge it to. Its own deadline ends the command; this page stops here.
+      reportClaim(false);
       return;
     }
     const boot = reply.command;
     if (!boot) {
-      // Cancelled, superseded, taken by another page, or from a previous run of the app.
-      // A stale marker types nothing.
+      if (openedConversation) void ask({ type: 'forget_revival', id, conversationId: openedConversation });
+      reportClaim(false);
       return;
     }
+    if (attempt) attempt.phase = 'claimed';
+    reportClaim(true);
 
     const fail = (why) => ask({ type: 'ack', id: boot.id, status: 'failed', error: why, client: RUN_ID });
+    const target = typeof boot.conversationId === 'string' && boot.conversationId ? boot.conversationId : null;
+    if (fromUrl && openedConversation && !target) return;
+    if (!fromUrl && !target) return void (await fail('the command did not name the existing chat it was offered to'));
+    if (target && openedConversation !== target) {
+      return void (await fail('the page that received this command was showing a different conversation'));
+    }
+
+    const onTarget = () => (target ? CLF_DOM.conversationId() === target : !CLF_DOM.conversationId());
+    const stillOnTarget = () =>
+      ownsCommandDocument(expectedEpoch) &&
+      (!fromUrl || markerId() === id) &&
+      onTarget();
+    const failIfRetargeted = async () => {
+      if (stillOnTarget()) return false;
+      if (ownsCommandDocument(expectedEpoch)) {
+        await fail(
+          target
+            ? 'the page changed away from the chat this command owned before send'
+            : 'the marked fresh chat changed before bootstrap send; nothing was sent'
+        );
+      }
+      return true;
+    };
+    if (await failIfRetargeted()) return;
 
     // Nothing half-written is ever overwritten. This is a normal failure rather than a
     // silent skip: the user may keep that draft indefinitely,
@@ -6089,46 +8021,66 @@
     // is what turned a fresh resume tab into a blank tab for a minute on a throttled page.
     const readyComposer = await waitForComposer();
     if (!readyComposer) return void (await fail('ChatGPT never exposed a usable composer for bootstrap'));
+    if (await failIfRetargeted()) return;
 
-
-    if (boot && boot.text && !boot.text.includes('@Chat On Steroids')) {
-      boot.text = '@Chat On Steroids Core\n\n' + boot.text;
+    const commandSendOwner = target ? 'revival' : 'bootstrap';
+    if (!acquireAutonomousSend(commandSendOwner)) {
+      return void (await fail('another autonomous browser write already owns the composer'));
     }
-    if (!CLF_DOM.insertPrompt(boot.text, true)) return void (await fail('ChatGPT refused the inserted text'));
-    // One short guard catches the React-hydration replacement this code was originally
-    // defending against. If React did replace the editing host, reinsert into the new empty
-    // host once instead of making the user wait through an arbitrary stability window.
-    await sleep(100);
-    let composer = CLF_DOM.composer();
-    // Compared with whitespace squeezed out of both sides. The composer is a rich-text
-    // editor: a blank line in the bootstrap becomes a paragraph break, and `textContent`
-    // stitches the paragraphs back together with no separator at all. Compare the entire
-    // whitespace-normalized value: a prefix proves insertion happened, but it would also
-    // approve user text appended after focus moved into this tab.
-    const squeeze = (value) => (value || '').replace(/\s+/g, '');
-    const expectedText = squeeze(boot.text);
-    if (!composer || squeeze(composer.textContent) !== expectedText) {
-      if (composer && !(composer.textContent || '').trim() && CLF_DOM.insertPrompt(boot.text, true)) {
-        await sleep(100);
-        composer = CLF_DOM.composer();
+    try {
+      if (boot && boot.text && !boot.text.includes('@Chat On Steroids')) {
+        boot.text = '@Chat On Steroids Core\n\n' + boot.text;
       }
+      if (!CLF_DOM.insertPrompt(boot.text)) return void (await fail('ChatGPT refused the inserted text'));
+      // A microtask is enough to expose synchronous React/input replacement without making a
+      // hidden worker tab depend on wall-clock timers before its irreversible send.
+      await Promise.resolve();
+      if (await failIfRetargeted()) return;
+      let composer = CLF_DOM.composer();
+      // Compared with whitespace squeezed out of both sides. The composer is a rich-text
+      // editor: a blank line in the bootstrap becomes a paragraph break, and `textContent`
+      // stitches the paragraphs back together with no separator at all. Compare the entire
+      // whitespace-normalized value: a prefix proves insertion happened, but it would also
+      // approve user text appended after focus moved into this tab.
+      const squeeze = (value) => (value || '').replace(/\s+/g, '');
+      const expectedText = squeeze(boot.text);
       if (!composer || squeeze(composer.textContent) !== expectedText) {
-        return void (await fail('ChatGPT replaced the composer while inserting the bootstrap'));
+        if (composer && !(composer.textContent || '').trim() && CLF_DOM.insertPrompt(boot.text)) {
+          await Promise.resolve();
+          if (await failIfRetargeted()) return;
+          composer = CLF_DOM.composer();
+        }
+        if (!composer || squeeze(composer.textContent) !== expectedText) {
+          return void (await fail('ChatGPT replaced the composer while inserting the bootstrap'));
+        }
       }
+      // The browser opener can focus this fresh tab while the user is typing elsewhere. The
+      // point-in-time empty check above is not enough: any edit after insertion must preserve
+      // the user's draft and abort, never submit a bootstrap/user-text mixture as a worker task.
+      composer = CLF_DOM.composer();
+      if (!composer || squeeze(composer.textContent) !== expectedText) {
+        return void (await fail('the composer changed before bootstrap send; the draft was preserved'));
+      }
+      if (await failIfRetargeted()) return;
+      if (!(await sendCommandPrompt(boot.text, stillOnTarget))) {
+        return void (await fail('ChatGPT did not accept the bootstrap send'));
+      }
+    } finally {
+      releaseAutonomousSend(commandSendOwner);
     }
-    // The browser opener can focus this fresh tab while the user is typing elsewhere. The
-    // point-in-time empty check above is not enough: any edit after insertion must preserve
-    // the user's draft and abort, never submit a bootstrap/user-text mixture as a worker task.
-    composer = CLF_DOM.composer();
-    if (!composer || squeeze(composer.textContent) !== expectedText) {
-      return void (await fail('the composer changed before bootstrap send; the draft was preserved'));
-    }
-    if (!(await CLF_DOM.send())) return void (await fail('ChatGPT did not accept the bootstrap send'));
     agent = boot.agent || null;
+    agentCommandId = agent && typeof boot.id === 'string' ? boot.id : null;
     try {
       if (agent) sessionStorage.setItem('cos_agent_worker', agent);
       else sessionStorage.removeItem('cos_agent_worker');
     } catch {}
+
+    // A revival already named and repeatedly proved its exact chat. ACK immediately after the
+    // accepted send; waiting on a background-tab timer here creates a duplicate-delivery window.
+    if (target) {
+      await ask({ type: 'ack', id: boot.id, status: 'sent', conversationId: target, agent, client: RUN_ID });
+      return;
+    }
 
     // The conversation id only exists once ChatGPT has accepted the message, and it is the
     // whole point of the report: for a worker it is what binds the slot to this chat and
@@ -6138,7 +8090,10 @@
       await sleep(500);
       const found = CLF_DOM.conversationId();
       if (found) {
-        await ask({ type: 'ack', id: boot.id, status: 'sent', conversationId: found, agent, client: RUN_ID });
+        const acknowledged = await ask({ type: 'ack', id: boot.id, status: 'sent', conversationId: found, agent, client: RUN_ID });
+        if (boot.type === 'resume' && acknowledged && acknowledged.ok === true) {
+          rememberResumeGoalPending(found, boot.id);
+        }
         if (agent) {
           void ask({ type: 'close_agent_tab' });
         }
@@ -6155,7 +8110,8 @@
 
   // ----------------------------------------------------------------- start
 
-  document.addEventListener(
+  listen(
+    document,
     'click',
     (event) => {
       const stop = CLF_DOM.stopButton();
@@ -6164,7 +8120,7 @@
     true
   );
 
-  window.addEventListener('pagehide', (event) => {
+  listen(window, 'pagehide', (event) => {
     // Hand over anything still queued before this script stops existing. The worker
     // outlives the page, so this is the last chance for these observations to survive.
     void flush();
@@ -6226,6 +8182,7 @@
         if (stagePanel && !stagePanel.root.isConnected) injectStage();
       });
       observer.observe(document.body, { childList: true, subtree: true });
+      rememberCleanup(() => observer.disconnect());
     } catch {
       // The one-second tick is the fallback, and it is enough on its own.
     }
@@ -6233,7 +8190,8 @@
 
   /** Apply popup changes immediately in every open ChatGPT tab. */
   if (globalThis.chrome && chrome.storage && chrome.storage.onChanged) {
-    chrome.storage.onChanged.addListener((changes, areaName) => {
+    const storageChanged = (changes, areaName) => {
+      if (!alive) return;
       if (areaName !== 'local' || !changes) return;
       let changed = false;
       if (changes[RENDER_STREAM_KEY]) {
@@ -6249,12 +8207,17 @@
       renderPreferenceReady = true;
       paint();
       renderStreams();
-    });
+    };
+    chrome.storage.onChanged.addListener(storageChanged);
+    if (typeof chrome.storage.onChanged.removeListener === 'function') {
+      rememberCleanup(() => chrome.storage.onChanged.removeListener(storageChanged));
+    }
   }
 
   /** Popup commands target this tab directly; no bridge credential is involved. */
   if (globalThis.chrome && chrome.runtime && chrome.runtime.onMessage) {
-    chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
+    const runtimeMessage = (message, _sender, sendResponse) => {
+      if (!alive) return false;
       if (!message || typeof message.type !== 'string') return false;
       // background.js uses this only to distinguish a live isolated-world recorder from the
       // dead context Chrome leaves behind when an unpacked extension is reloaded while the
@@ -6293,6 +8256,21 @@
         sendResponse({ ok: true, enabled: RENDER_STREAM });
         return false;
       }
+      if (message.type === 'clf-run-command') {
+        const wanted = typeof message.id === 'string' ? message.id : '';
+        const target = typeof message.conversationId === 'string' ? message.conversationId : '';
+        if (!wanted || !target || conversationId !== target || CLF_DOM.conversationId() !== target) {
+          sendResponse({ ok: false, error: 'wrong_conversation' });
+          return false;
+        }
+        void runCommand(
+          wanted,
+          false,
+          (claimed) => sendResponse({ ok: true, claimed: claimed === true }),
+          { deferredRecovery: message.deferredRecovery === true }
+        );
+        return true;
+      }
       if (message.type === 'clf-overwrite-now') {
         if (!renderStreamAllowed()) {
           sendResponse({ ok: false, error: 'overwrite_disabled' });
@@ -6308,7 +8286,11 @@
         return true;
       }
       return false;
-    });
+    };
+    chrome.runtime.onMessage.addListener(runtimeMessage);
+    if (typeof chrome.runtime.onMessage.removeListener === 'function') {
+      rememberCleanup(() => chrome.runtime.onMessage.removeListener(runtimeMessage));
+    }
   }
 
   function clearLegacyAutoLoopState() {
@@ -6453,15 +8435,28 @@
     }
     let promptToSend = transfer.rolloverText.trim();
     if (!promptToSend.startsWith('@Chat On Steroids')) promptToSend = `${MCP_TRIGGER_PREFIX}${promptToSend}`;
-    if (!CLF_DOM.insertPrompt(promptToSend)) {
-      stopAutoLoop('Recovery continuation could not be inserted');
+    if (!acquireAutonomousSend('loop')) {
+      stopAutoLoop('Another autonomous browser write already owns the composer');
       return;
     }
-    await sleep(250);
-    const sent = await CLF_DOM.send();
-    if (!sent) {
-      stopAutoLoop('Recovery continuation could not be sent');
-      return;
+    try {
+      const currentComposer = CLF_DOM.composer();
+      if (!currentComposer || (currentComposer.textContent || '').trim()) {
+        stopAutoLoop('User draft present in composer');
+        return;
+      }
+      if (!CLF_DOM.insertPrompt(promptToSend)) {
+        stopAutoLoop('Recovery continuation could not be inserted');
+        return;
+      }
+      await sleep(250);
+      const sent = await CLF_DOM.send();
+      if (!sent) {
+        stopAutoLoop('Recovery continuation could not be sent');
+        return;
+      }
+    } finally {
+      releaseAutonomousSend('loop');
     }
     autoLoopTurns++;
     markAutoLoopPromptSent();
@@ -6480,7 +8475,8 @@
   // which the established reload handshake remains unchanged: resumeOpenTurn() is still
   // awaited before the first observe() so a reloaded live turn cannot be duplicated.
   clearLegacyAutoLoopState();
-  const commandStartup = markerId() ? runCommand() : Promise.resolve();
+  const startupCommandId = markerId();
+  const commandStartup = startupCommandId && !OPENED_CONVERSATION ? runCommand(startupCommandId) : Promise.resolve();
   void commandStartup
     .catch(() => undefined)
     .then(loadRenderPreference)
@@ -6489,13 +8485,22 @@
     .then(() => restoreCapture().catch(() => undefined))
     .then(() => {
       observe();
+      commandReadinessInitialized = true;
+      notifyCommandReadiness();
       injectControl();
       injectStage();
+      if (startupCommandId && OPENED_CONVERSATION) void runCommand(startupCommandId);
     })
     .then(() => checkAndResumeAutoLoopRollover().catch(() => undefined));
 
   syncTheme();
   wireTips();
+  wireMenu();
+  if (typeof globalThis.addEventListener === 'function') {
+    listen(globalThis, 'wheel', notePresentationScrollInput, { capture: true, passive: true });
+    listen(globalThis, 'touchmove', notePresentationScrollInput, { capture: true, passive: true });
+    listen(globalThis, 'keydown', notePresentationScrollInput, true);
+  }
   watchComposer();
   watchToolRows();
   watchTranscript();
@@ -6515,7 +8520,7 @@
   });
   scheduleActivityPull(ACTIVITY_MS);
   if (typeof document !== 'undefined' && document.addEventListener) {
-    document.addEventListener('visibilitychange', () => {
+    listen(document, 'visibilitychange', () => {
       if (document.visibilityState !== 'visible') return;
       if (activityTimer !== null) clearTimeout(activityTimer);
       activityTimer = null;
@@ -6541,9 +8546,32 @@
     // no observation, evidence or command of its can reach the app afterwards. Its
     // intervals drain themselves on their next tick through every().
     alive = false;
+    if (commandAttempt) commandAttempt.cancelled = true;
+    notifyCommandReadiness();
     if (activityTimer !== null) {
       clearTimeout(activityTimer);
       activityTimer = null;
+    }
+    for (const cleanup of stopCleanups.splice(0).reverse()) {
+      try {
+        cleanup();
+      } catch {
+        // Takeover is best effort, but no one failed cleanup may preserve the rest.
+      }
+    }
+    try {
+      hideTip();
+      if (tipNode) tipNode.remove();
+      tipNode = null;
+      if (menuNode) menuNode.remove();
+      menuNode = null;
+      menuOpen = false;
+      if (control?.root) control.root.remove();
+      control = null;
+      if (stagePanel?.root) stagePanel.root.remove();
+      stagePanel = null;
+    } catch {
+      // Detached body/composer surfaces may already have disappeared during reinjection.
     }
     try {
       // Hand ChatGPT's own labels back before the successor paints its own.
@@ -6562,7 +8590,9 @@
     globalThis.CLF_TEST_HOOK({
       planLabels,
       controlState,
+      settingsView,
       stageView,
+      goalStageView,
       emit,
       flush,
       observe,
@@ -6572,10 +8602,16 @@
       renderStreams,
       foldBootstrap,
       injectControl,
+      renderControl,
+      toggleMenu,
+      closeMenu,
       injectStage,
       pullActivity,
       runCommand,
       startCompact,
+      noteGoalTurn,
+      maybeSendGoalReply,
+      sendAutoLoopPrompt,
       refreshFiber,
       fiberFor,
       readDescriptor,
@@ -6585,7 +8621,9 @@
       visibleStream,
       /** So a test settles a turn by the real window rather than a copy of the number. */
       TURN_SETTLE_MS,
+      GOAL_STABLE_MS,
       STALL_MS,
+      PRESENTATION_SCROLL_IDLE_MS,
       /** Test-only: production defaults ON; tests opt into renderer cases explicitly. */
       setRenderStream: (on) => {
         RENDER_STREAM = on === true;

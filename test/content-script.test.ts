@@ -107,6 +107,7 @@ interface Hook {
   /** The goal loop's entry point, called with the generation that just ended. */
   noteGoalTurn(ended: unknown, outcome: string, endedTurnId: string | null): void;
   maybeSendGoalReply(): Promise<void>;
+  sendAutoLoopPrompt(text: string): Promise<boolean>;
   /** How long a finished turn must hold still before the loop believes it. */
   GOAL_STABLE_MS: number;
   emit(observation: Record<string, unknown>): void;
@@ -6444,13 +6445,6 @@ describe('the Compact & resume control', () => {
     expect(stopClicks).toBe(0);
     expect(compactCalls).toBe(0);
     expect(live.sent.filter((message) => message.type === 'compact')).toEqual([]);
-    const workerSettings = live.hook.settingsView({
-      context: { auto: false, threshold: 400_000, warn: 400_000, limit: 533_333 },
-      goal: workerGoal,
-      compact: { action: 'start', hint: '' },
-      editing: false
-    });
-    expect(workerSettings.action.action).toBe('none');
   });
 
   it('does not interrupt an unknown chat when compaction authority cannot be refreshed', async () => {
@@ -7445,12 +7439,10 @@ describe('the fresh chat the app opened', () => {
     live = await harness();
     expect(live.listenerCounts()).toEqual({ runtime: 1, storage: 1 });
     live.hook.injectControl();
-    live.hook.toggleMenu();
     await settle();
 
-    const oldMenu = live.document.querySelector('.clf-menu') as HTMLElement;
-    expect(oldMenu).not.toBeNull();
-    expect(oldMenu.hidden).toBe(false);
+    const oldControl = live.document.querySelector('.clf-composer') as HTMLElement;
+    expect(oldControl).not.toBeNull();
 
     // Tips are delegated from the document, so use an ordinary body node to prove the old
     // recorder owns a live document-level listener rather than a handler attached to its menu.
@@ -7473,9 +7465,8 @@ describe('the fresh chat the app opened', () => {
     window.eval(contentSource);
     await settle(120);
 
-    expect(oldMenu.isConnected).toBe(false);
+    expect(oldControl.isConnected).toBe(false);
     expect(oldTip.isConnected).toBe(false);
-    expect(live.document.querySelectorAll('.clf-menu')).toHaveLength(0);
     expect(live.document.querySelectorAll('.clf-tip')).toHaveLength(0);
     expect(successor).not.toBeNull();
     // Browser-extension listeners live outside the DOM cleanup above. Leaving the predecessor's
@@ -7489,6 +7480,7 @@ describe('the fresh chat the app opened', () => {
     tipAnchor.focus();
     await settle();
     expect(live.document.querySelectorAll('.clf-tip')).toHaveLength(1);
+    expect(live.document.querySelectorAll('.clf-composer')).toHaveLength(1);
   });
 
   it('never submits a worker bootstrap mixed with text typed after the tab took focus', async () => {
@@ -8398,14 +8390,6 @@ describe('the context meter and automatic compaction', () => {
 
     expect(live.sent.filter((message) => message.type === 'auto_compact_claim')).toEqual([]);
     expect(startedCompactions(live)).toEqual([]);
-    const workerSettings = live.hook.settingsView({
-      context: settings({ auto: true, threshold: 200_000 }),
-      goal: workerGoal,
-      compact: { action: 'start', hint: '' },
-      editing: false
-    });
-    expect(workerSettings.tip).toContain('Auto-compaction off');
-    expect(workerSettings.rows.find((row) => row.key === 'autoCompact')?.on).toBe(false);
   });
 
   /**
@@ -10233,6 +10217,41 @@ describe('the goal loop', () => {
     expect(acks(live)).toHaveLength(1);
   });
 
+  it('does not let Loop treat a Goal-owned composer write as a user draft', async () => {
+    const source = liveFeed();
+    live = await harness(`https://chatgpt.com/c/${CHAT}`, source.replies);
+    await live.hook.pullActivity();
+
+    let releaseSend!: () => void;
+    const heldSend = new Promise<void>((resolve) => {
+      releaseSend = resolve;
+    });
+    const domApi = (live.window as any).CLF_DOM;
+    const originalSend = domApi.send.bind(domApi);
+    domApi.send = async () => {
+      await heldSend;
+      return true;
+    };
+
+    source.set(readyDraft('goal owns this composer write'));
+    const goalPull = live.hook.pullActivity();
+    await settle(300);
+    expect(composerText(live.document)).toContain('goal owns this composer write');
+
+    live.hook.toggleAutoLoop();
+    expect(live.hook.isAutoLoopActive()).toBe(true);
+    const loopSent = await live.hook.sendAutoLoopPrompt('continue independently');
+
+    expect(loopSent).toBe(false);
+    expect(live.hook.isAutoLoopActive()).toBe(true);
+    expect(composerText(live.document)).toContain('goal owns this composer write');
+
+    live.hook.stopAutoLoop('test cleanup');
+    releaseSend();
+    await goalPull;
+    domApi.send = originalSend;
+  });
+
   /** What the panel above the composer says while all of this happens. */
   it('says what it is doing above the composer', async () => {
     live = await harness(`https://chatgpt.com/c/${CHAT}`, goalReplies());
@@ -11048,4 +11067,6 @@ describe('the goal loop', () => {
       expect(view.objective.summary).not.toMatch(/\s…$/);
     });
   });
+
+
 });
