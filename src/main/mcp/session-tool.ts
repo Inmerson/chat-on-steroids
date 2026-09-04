@@ -1,9 +1,10 @@
 /**
  * Model-facing access to the local recording.
  *
- * One tool, two operations:
+ * One tool, two responsibility groups:
  *  - search discovers recordings and finds which recording contains a term;
  *  - read returns an exact transcript/tool-call view of one explicit recording.
+ *  - execution_* controls durable autonomous desktop execution without creating another tool.
  *
  * No operation guesses the calling ChatGPT conversation. That is deliberate: cross-chat
  * recovery and concurrent-worker observation are the point of this surface, and making either
@@ -15,7 +16,15 @@ import { z } from 'zod';
 import type { SessionEvent, SessionSummary, StoredText } from '../../shared/session.js';
 import { getSession, listAllSessions, readEvents } from '../session/store.js';
 import { noteCount, noteDetail } from './call-context.js';
-import { expandStored, fail, guard, ok, type SurfaceRegistrar, type ToolResult } from './kernel.js';
+import { expandStored, fail, friendlyError, guard, ok, type SurfaceRegistrar, type ToolResult } from './kernel.js';
+import {
+  MAX_EXECUTION_PLAN_CHARS,
+  createExecution,
+  executionRun,
+  noteExecutionCommand,
+  setExecutionStatus,
+  type ExecutionRun
+} from '../execution.js';
 
 const SEARCH_RESULT_TOKENS = 3_000;
 const READ_RESULT_TOKENS = 5_000;
@@ -25,6 +34,30 @@ const SEARCH_ROWS = 30;
 const SEARCH_SCAN_SESSIONS = 100;
 const READ_BODY_CHARS = READ_RESULT_CHARS - 5_000;
 const CURSOR_MAX_CHARS = 8_000;
+const EXECUTION_TITLE_MAX_CHARS = 160;
+
+interface ExecutionBrowserControl {
+  queueExecutionBootstrap(executionRunId: string): Promise<string>;
+  queueExecutionResume(executionRunId: string, conversationId: string): Promise<string>;
+  cancelExecutionCommands(executionRunId: string): Promise<void>;
+}
+
+let executionBrowserControlOverride: ExecutionBrowserControl | null = null;
+
+/** Test seam only; production lazily resolves the bridge when an execution action actually needs it. */
+export function setExecutionBrowserControlForTests(control: ExecutionBrowserControl | null): void {
+  executionBrowserControlOverride = control;
+}
+
+async function executionBrowserControl(): Promise<ExecutionBrowserControl> {
+  if (executionBrowserControlOverride) return executionBrowserControlOverride;
+  const bridge = await import('../bridge.js');
+  return {
+    queueExecutionBootstrap: bridge.queueExecutionBootstrap,
+    queueExecutionResume: bridge.queueExecutionResume,
+    cancelExecutionCommands: bridge.cancelExecutionCommands
+  };
+}
 
 const includeKind = z.enum(['user', 'assistant', 'tools', 'errors', 'agents']);
 type IncludeKind = z.infer<typeof includeKind>;
@@ -147,7 +180,17 @@ const cursorSchema = z.discriminatedUnion('kind', [
 
 const inputSchema = z
   .object({
-    action: z.enum(['search', 'read']).describe('search discovers recordings; read inspects one explicit recording.'),
+    action: z
+      .enum([
+        'search',
+        'read',
+        'execution_start',
+        'execution_status',
+        'execution_pause',
+        'execution_resume',
+        'execution_stop'
+      ])
+      .describe('Search/read local recordings or control one durable autonomous desktop execution.'),
     query: z.string().max(500).optional().describe('search only. Omit to list the 30 newest recordings.'),
     session_id: z.string().min(8).max(64).optional().describe('read only. Exact id returned by search.'),
     include: z
@@ -168,9 +211,32 @@ const inputSchema = z
       .min(1)
       .max(CURSOR_MAX_CHARS)
       .optional()
-      .describe('Opaque continuation, older-history, search-result or update checkpoint returned by this tool.')
+      .describe('Opaque continuation, older-history, search-result or update checkpoint returned by this tool.'),
+    plan: z
+      .string()
+      .min(1)
+      .max(MAX_EXECUTION_PLAN_CHARS)
+      .optional()
+      .describe('execution_start only. The complete approved plan to execute on the desktop.'),
+    title: z
+      .string()
+      .max(EXECUTION_TITLE_MAX_CHARS)
+      .optional()
+      .describe('execution_start only. Optional short label for the durable execution run.'),
+    mode: z
+      .enum(['standard', 'infinite'])
+      .optional()
+      .describe('execution_start only. Defaults to standard.'),
+    execution_id: z
+      .string()
+      .min(8)
+      .max(64)
+      .optional()
+      .describe('execution_status/pause/resume/stop only. Exact execution id returned by execution_start.')
   })
   .superRefine((input, ctx) => {
+    const executionFields = ['plan', 'title', 'mode', 'execution_id'] as const;
+    const recordingFields = ['query', 'session_id', 'include', 'tool_call', 'cursor'] as const;
     if (input.action === 'search') {
       for (const field of ['session_id', 'include', 'tool_call'] as const) {
         if (input[field] !== undefined) {
@@ -180,24 +246,60 @@ const inputSchema = z
       if (input.cursor && input.query !== undefined) {
         ctx.addIssue({ code: 'custom', path: ['query'], message: 'A search continuation cursor already contains its query' });
       }
+      for (const field of executionFields) {
+        if (input[field] !== undefined) {
+          ctx.addIssue({ code: 'custom', path: [field], message: `${field} is only valid with execution actions` });
+        }
+      }
       return;
     }
 
-    if (!input.session_id) {
-      ctx.addIssue({ code: 'custom', path: ['session_id'], message: 'session_id is required with action=read' });
+    if (input.action === 'read') {
+      if (!input.session_id) {
+        ctx.addIssue({ code: 'custom', path: ['session_id'], message: 'session_id is required with action=read' });
+      }
+      if (input.query !== undefined) {
+        ctx.addIssue({ code: 'custom', path: ['query'], message: 'query is only valid with action=search' });
+      }
+      if (input.cursor && (input.include !== undefined || input.tool_call !== undefined)) {
+        ctx.addIssue({
+          code: 'custom',
+          path: ['cursor'],
+          message: 'A read cursor already contains its filters and mode; do not combine it with include or tool_call'
+        });
+      }
+      if (input.tool_call && input.include !== undefined) {
+        ctx.addIssue({ code: 'custom', path: ['include'], message: 'include cannot be combined with tool_call' });
+      }
+      for (const field of executionFields) {
+        if (input[field] !== undefined) {
+          ctx.addIssue({ code: 'custom', path: [field], message: `${field} is only valid with execution actions` });
+        }
+      }
+      return;
     }
-    if (input.query !== undefined) {
-      ctx.addIssue({ code: 'custom', path: ['query'], message: 'query is only valid with action=search' });
+
+    for (const field of recordingFields) {
+      if (input[field] !== undefined) {
+        ctx.addIssue({ code: 'custom', path: [field], message: `${field} is only valid with action=search/read` });
+      }
     }
-    if (input.cursor && (input.include !== undefined || input.tool_call !== undefined)) {
-      ctx.addIssue({
-        code: 'custom',
-        path: ['cursor'],
-        message: 'A read cursor already contains its filters and mode; do not combine it with include or tool_call'
-      });
+    if (input.action === 'execution_start') {
+      if (!input.plan || !input.plan.trim()) {
+        ctx.addIssue({ code: 'custom', path: ['plan'], message: 'plan is required with action=execution_start' });
+      }
+      if (input.execution_id !== undefined) {
+        ctx.addIssue({ code: 'custom', path: ['execution_id'], message: 'execution_id is not valid with action=execution_start' });
+      }
+      return;
     }
-    if (input.tool_call && input.include !== undefined) {
-      ctx.addIssue({ code: 'custom', path: ['include'], message: 'include cannot be combined with tool_call' });
+    if (!input.execution_id) {
+      ctx.addIssue({ code: 'custom', path: ['execution_id'], message: `execution_id is required with action=${input.action}` });
+    }
+    for (const field of ['plan', 'title', 'mode'] as const) {
+      if (input[field] !== undefined) {
+        ctx.addIssue({ code: 'custom', path: [field], message: `${field} is only valid with action=execution_start` });
+      }
     }
   })
   .strict();
@@ -206,22 +308,133 @@ export function registerSessionTool(reg: SurfaceRegistrar): void {
   reg.register(
     'session',
     {
-      title: 'Recorded sessions',
+      title: 'Sessions and desktop execution',
       description:
-        'Search and read this app’s local recordings, including other and concurrently running chats. ' +
+        'Search/read this app’s local recordings or control a durable autonomous desktop execution. ' +
+        'execution_start accepts a complete approved plan and returns an execution_id; use execution_status, execution_pause, execution_resume or execution_stop with that id later, including from another authenticated ChatGPT conversation. ' +
+        'Execution state lives in Core and does not depend on the controlling chat staying open. ' +
+        'For recordings, search and read include other and concurrently running chats. ' +
         'action=search lists the 30 newest sessions when query is omitted, or finds recordings containing a term. ' +
         'action=read requires session_id and returns exact user/assistant text plus compact tool headlines. ' +
         'Save update_cursor and pass it later to receive only activity not already read; pass a short T… reference as tool_call to inspect exact arguments and result.',
       inputSchema,
-      annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false }
+      annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false }
     },
     async (input) =>
       guard('session', async () => {
-        if (!reg.sessionToolsLive) return reg.featureDisabled('Session recording', 'Record sessions');
-        if (input.action === 'search') return searchSessions(input.query, input.cursor);
-        return readSession(input.session_id!, input.include, input.tool_call, input.cursor);
+        if (input.action === 'search' || input.action === 'read') {
+          if (!reg.sessionToolsLive) return reg.featureDisabled('Session recording', 'Record sessions');
+          if (input.action === 'search') return searchSessions(input.query, input.cursor);
+          return readSession(input.session_id!, input.include, input.tool_call, input.cursor);
+        }
+        return executionAction(input);
       })
   );
+}
+
+function executionResult(run: ExecutionRun, heading = 'Desktop execution'): ToolResult {
+  return ok(
+    [
+      heading,
+      `execution_id: ${run.id}`,
+      `status: ${run.status}`,
+      `mode: ${run.mode}`,
+      run.title ? `title: ${run.title}` : null,
+      run.conversationId ? `conversation_id: ${run.conversationId}` : 'conversation_id: pending',
+      run.commandId ? `command_id: ${run.commandId}` : 'command_id: none',
+      run.lastError ? `last_error: ${run.lastError}` : null
+    ]
+      .filter((line): line is string => Boolean(line))
+      .join('\n')
+  );
+}
+
+async function executionAction(input: z.infer<typeof inputSchema>): Promise<ToolResult> {
+  if (input.action === 'execution_start') {
+    const run = await createExecution({
+      plan: input.plan!,
+      title: input.title,
+      mode: input.mode ?? 'standard'
+    });
+    try {
+      const browser = await executionBrowserControl();
+      const commandId = await browser.queueExecutionBootstrap(run.id);
+      const accepted = await noteExecutionCommand(run.id, commandId);
+      return executionResult(accepted, 'Desktop execution accepted for browser publication');
+    } catch (error) {
+      const message = friendlyError(error);
+      try {
+        await setExecutionStatus(run.id, 'failed', message);
+      } catch {
+        // The original durable run still exists. Report the browser failure rather than hiding
+        // it behind a second persistence exception; status can be queried separately.
+      }
+      return fail(`Desktop execution was not started: ${message}`);
+    }
+  }
+
+  const id = input.execution_id!;
+  const current = executionRun(id);
+  if (!current) return fail(`No desktop execution exists with id ${id}.`);
+  if (input.action === 'execution_status') return executionResult(current);
+
+  if (input.action === 'execution_pause') {
+    if (current.status === 'paused') return executionResult(current, 'Desktop execution already paused');
+    if (current.status === 'stopped' || current.status === 'failed' || current.status === 'completed') {
+      return fail(`Desktop execution ${id} is already ${current.status} and cannot be paused.`);
+    }
+    const paused = await setExecutionStatus(id, 'paused');
+    try {
+      const browser = await executionBrowserControl();
+      await browser.cancelExecutionCommands(id);
+    } catch (error) {
+      return fail(`Desktop execution is paused, but pending browser publication could not be retired: ${friendlyError(error)}`);
+    }
+    return executionResult(paused, 'Desktop execution paused');
+  }
+
+  if (input.action === 'execution_resume') {
+    if (current.status === 'running' || current.status === 'starting') {
+      return executionResult(current, `Desktop execution already ${current.status}`);
+    }
+    if (current.status === 'stopped' || current.status === 'failed' || current.status === 'completed') {
+      return fail(`Desktop execution ${id} is already ${current.status} and cannot be resumed.`);
+    }
+    const starting = await setExecutionStatus(id, 'starting');
+    try {
+      const browser = await executionBrowserControl();
+      const commandId = starting.conversationId
+        ? await browser.queueExecutionResume(id, starting.conversationId)
+        : await browser.queueExecutionBootstrap(id);
+      const accepted = await noteExecutionCommand(id, commandId);
+      return executionResult(accepted, 'Desktop execution resume accepted for browser publication');
+    } catch (error) {
+      const message = friendlyError(error);
+      try {
+        await setExecutionStatus(id, 'failed', message);
+      } catch {
+        // Preserve the first actionable failure in the tool result.
+      }
+      return fail(`Desktop execution was not resumed: ${message}`);
+    }
+  }
+
+  if (input.action === 'execution_stop') {
+    if (current.status === 'stopped') return executionResult(current, 'Desktop execution already stopped');
+    if (current.status === 'failed' || current.status === 'completed') {
+      return executionResult(current, `Desktop execution already ${current.status}`);
+    }
+    const stopped = await setExecutionStatus(id, 'stopped');
+    try {
+      const browser = await executionBrowserControl();
+      await browser.cancelExecutionCommands(id);
+    } catch (error) {
+      return fail(`Desktop execution is stopped, but pending browser publication could not be retired: ${friendlyError(error)}`);
+    }
+    return executionResult(stopped, 'Desktop execution stopped');
+  }
+
+  return fail(`Unsupported session action: ${input.action}`);
 }
 
 async function searchSessions(queryInput?: string, cursorInput?: string): Promise<ToolResult> {

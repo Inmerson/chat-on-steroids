@@ -40,6 +40,15 @@ import { execOwner, noteExecOwner, resetExecOwnershipForTests } from '../src/mai
 import { unifiedExecManager } from '../src/main/codex/manager.js';
 import { locateRipgrep } from '../src/main/ripgrep.js';
 import { IS_WINDOWS, makeTempDir, removeTempDir, writeTree } from './helpers.js';
+import { initDurableStore, writeDurableNow } from '../src/main/durable.js';
+import {
+  EXECUTION_STATE,
+  bindExecutionConversation,
+  executionRun,
+  resetExecutionsForTests,
+  setExecutionStatus,
+  snapshotExecutions
+} from '../src/main/execution.js';
 
 // ---------------------------------------------------------------- transport
 
@@ -227,6 +236,7 @@ beforeAll(async () => {
   // default now, so without a directory of its own the recorder wrote session folders
   // into the process's working directory — which for a test run is the repository.
   initSessionStore(base);
+  initDurableStore(base);
   approved = path.join(base, 'workspace');
   outside = path.join(base, 'private');
   await writeTree(approved, {
@@ -266,6 +276,10 @@ afterAll(async () => {
 beforeEach(async () => {
   if (endpoint) await endpoint.stop();
   resetWorkspaces();
+  resetExecutionsForTests();
+  await writeDurableNow(EXECUTION_STATE, null);
+  const sessionModule = (await import('../src/main/mcp/session-tool.js')) as any;
+  sessionModule.setExecutionBrowserControlForTests?.(null);
   ctx.caps = withCaps({});
   ctx.readOnly = true;
   ctx.roots = [{ name: 'workspace', path: approved }];
@@ -947,13 +961,13 @@ describe('2026-07-28 clients', () => {
 });
 
 describe('capability gating', () => {
-  it('hides every writing and running tool in read-only mode', async () => {
+  it('hides filesystem writing/running tools in read-only mode while keeping execution control available', async () => {
     // Everything on, but read-only, which is the state that must still be safe.
     const config = { ...defaultConfig(), capabilities: allCaps(), readOnly: true };
     ctx.caps = effectiveCapabilities(config);
     ctx.readOnly = true;
 
-    expect(toolNames(await core('tools/list'))).toEqual(['find', 'read', 'view_image']);
+    expect(toolNames(await core('tools/list'))).toEqual(['find', 'read', 'session', 'view_image']);
   });
 
   it('offers apply_patch only when a writing permission is on', async () => {
@@ -1032,8 +1046,8 @@ describe('capability gating', () => {
     expect(textOf(reply)).toContain('results_returned:');
   });
 
-  it('offers session and agents only when those features are on', async () => {
-    expect(toolNames(await core('tools/list'))).not.toContain('session');
+  it('always offers one session control surface while agents still follow their feature switch', async () => {
+    expect(toolNames(await core('tools/list'))).toContain('session');
     expect(toolNames(await core('tools/list'))).not.toContain('agents');
 
     ctx.sessionTools = true;
@@ -1284,11 +1298,23 @@ describe('capability gating', () => {
     expect(textOf(empty)).toMatch(/update_cursor: [A-Za-z0-9_-]+/);
   });
 
-  it('rejects the removed history/status contract and ambiguous read fields', async () => {
+  it('advertises recording plus execution actions and rejects action-specific fields that do not belong', async () => {
     ctx.sessionTools = true;
     const advertised = toolList(await core('tools/list')).find((tool) => tool.name === 'session');
     expect(advertised?.inputSchema).toMatchObject({
-      properties: { action: { enum: ['search', 'read'] } },
+      properties: {
+        action: {
+          enum: [
+            'search',
+            'read',
+            'execution_start',
+            'execution_status',
+            'execution_pause',
+            'execution_resume',
+            'execution_stop'
+          ]
+        }
+      },
       required: ['action']
     });
     expect(advertised?.inputSchema?.properties).not.toHaveProperty('limit');
@@ -1312,6 +1338,140 @@ describe('capability gating', () => {
       arguments: { action: 'search', limit: 40 }
     });
     expect(failed(oldLimit)).toBe(true);
+
+    expect(
+      failed(await core('tools/call', { name: 'session', arguments: { action: 'execution_start' } }))
+    ).toBe(true);
+    expect(
+      failed(
+        await core('tools/call', {
+          name: 'session',
+          arguments: { action: 'execution_start', plan: 'x'.repeat(120_001) }
+        })
+      )
+    ).toBe(true);
+    expect(
+      failed(await core('tools/call', { name: 'session', arguments: { action: 'search', plan: 'not allowed here' } }))
+    ).toBe(true);
+    expect(
+      failed(await core('tools/call', { name: 'session', arguments: { action: 'execution_status', query: 'wrong field' } }))
+    ).toBe(true);
+    expect(
+      failed(await core('tools/call', { name: 'session', arguments: { action: 'execution_status' } }))
+    ).toBe(true);
+  });
+
+  it('controls durable desktop execution through session without requiring recording', async () => {
+    ctx.sessionTools = false;
+    const browserCalls: Array<{ kind: string; id: string; conversationId?: string }> = [];
+    const sessionModule = (await import('../src/main/mcp/session-tool.js')) as any;
+    sessionModule.setExecutionBrowserControlForTests({
+      queueExecutionBootstrap: async (id: string) => {
+        expect(executionRun(id)?.plan).toBe('Implement the approved remote execution workflow.');
+        browserCalls.push({ kind: 'start', id });
+        return 'execution-command-start';
+      },
+      queueExecutionResume: async (id: string, conversationId: string) => {
+        browserCalls.push({ kind: 'resume', id, conversationId });
+        return 'execution-command-resume';
+      },
+      cancelExecutionCommands: async (id: string) => {
+        browserCalls.push({ kind: 'cancel', id });
+      }
+    });
+
+    const started = await core('tools/call', {
+      name: 'session',
+      arguments: {
+        action: 'execution_start',
+        plan: 'Implement the approved remote execution workflow.',
+        title: 'Remote execution',
+        mode: 'standard'
+      }
+    });
+    expect(failed(started), textOf(started)).toBe(false);
+    expect(textOf(started)).toContain('status: starting');
+    expect(textOf(started)).not.toMatch(/\bstarted\b/i);
+    const [created] = snapshotExecutions().runs;
+    expect(created).toMatchObject({ title: 'Remote execution', status: 'starting', commandId: 'execution-command-start' });
+    expect(browserCalls.map((call) => call.kind)).toEqual(['start']);
+
+    const status = await core('tools/call', {
+      name: 'session',
+      arguments: { action: 'execution_status', execution_id: created!.id }
+    });
+    expect(failed(status), textOf(status)).toBe(false);
+    expect(textOf(status)).toContain(`execution_id: ${created!.id}`);
+    expect(textOf(status)).toContain('status: starting');
+
+    const conversationId = 'aaaaaaaa-1111-2222-3333-444444444444';
+    await bindExecutionConversation(created!.id, conversationId);
+    await setExecutionStatus(created!.id, 'running');
+
+    const paused = await core('tools/call', {
+      name: 'session',
+      arguments: { action: 'execution_pause', execution_id: created!.id }
+    });
+    expect(failed(paused), textOf(paused)).toBe(false);
+    expect(executionRun(created!.id)?.status).toBe('paused');
+    const pausedAgain = await core('tools/call', {
+      name: 'session',
+      arguments: { action: 'execution_pause', execution_id: created!.id }
+    });
+    expect(failed(pausedAgain), textOf(pausedAgain)).toBe(false);
+    expect(browserCalls.filter((call) => call.kind === 'cancel')).toHaveLength(1);
+
+    const resumed = await core('tools/call', {
+      name: 'session',
+      arguments: { action: 'execution_resume', execution_id: created!.id }
+    });
+    expect(failed(resumed), textOf(resumed)).toBe(false);
+    expect(executionRun(created!.id)).toMatchObject({ status: 'starting', commandId: 'execution-command-resume' });
+    expect(browserCalls.filter((call) => call.kind === 'resume')).toEqual([
+      { kind: 'resume', id: created!.id, conversationId }
+    ]);
+    const resumedAgain = await core('tools/call', {
+      name: 'session',
+      arguments: { action: 'execution_resume', execution_id: created!.id }
+    });
+    expect(failed(resumedAgain), textOf(resumedAgain)).toBe(false);
+    expect(browserCalls.filter((call) => call.kind === 'resume')).toHaveLength(1);
+
+    const stopped = await core('tools/call', {
+      name: 'session',
+      arguments: { action: 'execution_stop', execution_id: created!.id }
+    });
+    expect(failed(stopped), textOf(stopped)).toBe(false);
+    expect(executionRun(created!.id)?.status).toBe('stopped');
+    const stoppedAgain = await core('tools/call', {
+      name: 'session',
+      arguments: { action: 'execution_stop', execution_id: created!.id }
+    });
+    expect(failed(stoppedAgain), textOf(stoppedAgain)).toBe(false);
+    expect(browserCalls.filter((call) => call.kind === 'cancel')).toHaveLength(2);
+  });
+
+  it('fails execution_start honestly when browser publication is rejected', async () => {
+    ctx.sessionTools = false;
+    const sessionModule = (await import('../src/main/mcp/session-tool.js')) as any;
+    sessionModule.setExecutionBrowserControlForTests({
+      queueExecutionBootstrap: async () => {
+        throw new Error('no managed browser window');
+      },
+      queueExecutionResume: async () => {
+        throw new Error('unexpected resume');
+      },
+      cancelExecutionCommands: async () => undefined
+    });
+
+    const reply = await core('tools/call', {
+      name: 'session',
+      arguments: { action: 'execution_start', plan: 'Do the durable work.' }
+    });
+    expect(failed(reply)).toBe(true);
+    expect(textOf(reply)).toContain('Desktop execution was not started');
+    expect(snapshotExecutions().runs).toHaveLength(1);
+    expect(snapshotExecutions().runs[0]).toMatchObject({ status: 'failed', lastError: 'no managed browser window' });
   });
 
   it('starts a fresh install with every capability effective', () => {
@@ -1395,11 +1555,11 @@ describe('capability gating', () => {
     expect(toolNames(await core('tools/list'))).not.toContain('find');
   });
 
-  it('always offers read, because that is what the app is for', async () => {
+  it('keeps only the execution control surface when every reading permission is off', async () => {
     ctx.caps = withCaps({ browse: false, search: false, read: false, metadata: false });
-    // Nothing is registered when every reading permission is off — but the snapshot is
-    // monotonic, so a surface that started with reading on keeps it and refuses instead.
-    expect(toolNames(await core('tools/list'))).toEqual([]);
+    // Recording/search disappears with the reading capability group, but the same `session`
+    // schema also owns durable execution control and is intentionally independent of recording.
+    expect(toolNames(await core('tools/list'))).toEqual(['session']);
   });
 });
 
@@ -1574,10 +1734,12 @@ describe('tool annotations', () => {
     const session = toolList(await core('tools/list')).find((tool) => tool.name === 'session');
     expect(read?.annotations?.readOnlyHint).toBe(true);
     expect(read?.annotations?.destructiveHint).toBe(false);
-    // Both session actions are inspection only. Marking this as a write tool makes clients
-    // apply confirmation/write semantics to searching and reading local recordings.
-    expect(session?.annotations?.readOnlyHint).toBe(true);
-    expect(session?.annotations?.destructiveHint).toBe(false);
+    // `session` now mixes recording reads with durable execution mutations. Tool-level
+    // annotations must describe the most powerful action rather than pretending the whole
+    // schema is inspection-only.
+    expect(session?.annotations?.readOnlyHint).toBe(false);
+    expect(session?.annotations?.destructiveHint).toBe(true);
+    expect(session?.annotations?.idempotentHint).toBe(false);
   });
 });
 

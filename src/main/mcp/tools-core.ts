@@ -136,7 +136,7 @@ import {
   type SurfaceRegistrar,
   type ToolResult
 } from './kernel.js';
-import { registerSessionTool as registerSessionSearchReadTool } from './session-tool.js';
+import { registerSessionTool } from './session-tool.js';
 
 /** Entries one `read` of a directory returns before it says it stopped. */
 const MAX_DIR_ENTRIES = 200;
@@ -866,7 +866,10 @@ export function registerCoreTools(reg: SurfaceRegistrar): void {
 
   // ---------------------------------------------------------------- session
 
-  if (reg.sessionToolsExposed) registerSessionSearchReadTool(reg);
+  // `session` is also the durable autonomous-execution control plane, so it must remain
+  // discoverable even when recording is disabled. The recording-only actions enforce
+  // `sessionToolsLive` inside their handler; execution_* does not depend on recording.
+  registerSessionTool(reg);
 
   // ----------------------------------------------------------------- agents
 
