@@ -58,7 +58,7 @@ describe('CoreSupervisor', () => {
     expect(adapter.spawn).toHaveBeenCalledTimes(1);
   });
 
-  it('uses the required bounded exponential backoff across a crash loop', async () => {
+  it('uses the required bounded exponential backoff when spawn itself fails', async () => {
     const { supervisor, adapter, sleeps, setHealthy } = harness();
     const spawn = vi.mocked(adapter.spawn);
     spawn.mockImplementation(async () => {
@@ -71,6 +71,39 @@ describe('CoreSupervisor', () => {
     }
 
     expect(sleeps).toEqual([2_000, 5_000, 10_000, 30_000, 60_000, 120_000, 180_000, 180_000]);
+  });
+
+  it('also grows backoff when a successfully spawned Core dies again before the healthy reset window', async () => {
+    let now = 0;
+    let healthy = false;
+    let pid = 40;
+    const sleeps: number[] = [];
+    const adapter: CoreProcessAdapter = {
+      probe: vi.fn(async () => healthy ? { healthy: true as const, pid } : { healthy: false as const }),
+      spawn: vi.fn(async () => {
+        pid += 1;
+        healthy = true;
+        return { pid, startedAt: now };
+      }),
+      stop: vi.fn(async () => { healthy = false; })
+    };
+    const supervisor = new CoreSupervisor({
+      adapter,
+      sleep: async (ms) => { sleeps.push(ms); },
+      now: () => now,
+      startupGraceMs: 1_000,
+      healthyResetMs: 300_000
+    });
+
+    await supervisor.ensureHost('ui-open');
+    healthy = false;
+    now = 2_000;
+    await supervisor.ensureHost('process-exit');
+    healthy = false;
+    now = 4_000;
+    await supervisor.ensureHost('process-exit');
+
+    expect(sleeps).toEqual([2_000, 5_000, 10_000]);
   });
 
   it('resets restart backoff after a healthy run', async () => {
@@ -89,13 +122,15 @@ describe('CoreSupervisor', () => {
       adapter,
       sleep: async (ms) => { sleeps.push(ms); },
       now: () => now,
+      startupGraceMs: 1_000,
       healthyResetMs: 300_000
     });
 
     await supervisor.ensureHost('ui-open');
     healthy = false;
+    now = 2_000;
     await supervisor.ensureHost('process-exit');
-    expect(sleeps.at(-1)).toBe(2_000);
+    expect(sleeps.at(-1)).toBe(5_000);
 
     healthy = true;
     now = 301_000;
