@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { evaluateAgentHealth } from '../src/main/agent-health.js';
+import { collectAgentHealthEvidence, evaluateAgentHealth } from '../src/main/agent-health.js';
 import type { AgentHealthEvidence, AgentHealthInput } from '../src/shared/agent-health.js';
 import type { AgentInfo, AgentState } from '../src/shared/session.js';
 
@@ -55,6 +55,100 @@ function state(value: AgentState): Partial<AgentInfo> {
 }
 
 describe('agent health projection', () => {
+  it('composes exact agent health evidence only when browser identity matches broker identity', () => {
+    const brokerState = broker();
+    expect(
+      collectAgentHealthEvidence({
+        id: brokerState.id,
+        broker: brokerState,
+        browser: {
+          agentId: brokerState.id,
+          conversationId: brokerState.conversationId,
+          browserPresent: true,
+          generating: true,
+          activeTurnId: true,
+          finiteWait: null
+        },
+        runningToolCalls: 3,
+        transfer: null,
+        workflowBlocked: false
+      })
+    ).toEqual({
+      identity: 'exact',
+      browserPresent: true,
+      runningToolCalls: 3,
+      generating: true,
+      activeTurnId: true,
+      workflowBlocked: false,
+      finiteWait: null
+    });
+  });
+
+  it('fails evidence composition closed on missing or conflicting conversation identity', () => {
+    expect(
+      collectAgentHealthEvidence({
+        id: 'worker-missing',
+        broker: null,
+        browser: null,
+        runningToolCalls: 0,
+        transfer: null,
+        workflowBlocked: false
+      }).identity
+    ).toBe('missing');
+
+    const brokerState = broker();
+    expect(
+      collectAgentHealthEvidence({
+        id: brokerState.id,
+        broker: brokerState,
+        browser: {
+          agentId: brokerState.id,
+          conversationId: 'different-chat',
+          browserPresent: true,
+          generating: false,
+          activeTurnId: false,
+          finiteWait: null
+        },
+        runningToolCalls: 0,
+        transfer: null,
+        workflowBlocked: false
+      }).identity
+    ).toBe('conflict');
+  });
+
+  it('gives Prime transfer health evidence precedence over bridge command wait evidence', () => {
+    const brokerState = broker({ id: 'prime', role: 'prime', conversationId: 'prime-chat' });
+    expect(
+      collectAgentHealthEvidence({
+        id: 'prime',
+        broker: brokerState,
+        browser: {
+          agentId: 'prime',
+          conversationId: 'prime-chat',
+          browserPresent: true,
+          generating: false,
+          activeTurnId: false,
+          finiteWait: {
+            kind: 'delivery',
+            startedAt: NOW - 1_000,
+            deadlineMs: 90_000,
+            exempt: false,
+            recommendedAction: 'retry_delivery'
+          }
+        },
+        runningToolCalls: 0,
+        transfer: { startedAt: NOW - 2_000, deadlineMs: 10 * 60_000, frozen: true },
+        workflowBlocked: false
+      }).finiteWait
+    ).toEqual({
+      kind: 'transfer',
+      startedAt: NOW - 2_000,
+      deadlineMs: 10 * 60_000,
+      exempt: true,
+      recommendedAction: 'observe'
+    });
+  });
+
   it('prioritizes an in-flight MCP call over generation and reports healthy work', () => {
     expect(evaluateAgentHealth(input({ runningToolCalls: 1, generating: true }), NOW)).toMatchObject({
       agentId: 'worker-1',

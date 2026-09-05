@@ -33,6 +33,7 @@ const { initSecretsPath, resetSecretsCacheForTests, setSecret } = await import('
 const {
   bridgePort,
   bridgeStatus,
+  bridgeHealthEvidenceForAgent,
   browserAgentTabTelemetry,
   cancelResume,
   commandUrl,
@@ -317,6 +318,79 @@ beforeEach(async () => {
   await flushDurable();
   await setSecret('bridgeToken', '');
   token = null;
+});
+
+describe('agent health evidence', () => {
+  it('reports exact live-turn health evidence only for the matching conversation', async () => {
+    await pair();
+    spawn({ workers: [{ task: 'observe a live turn' }], caller: { conversationId: PRIME_CHAT } });
+    const workerConversation = 'health-live-worker';
+    expect(bindConversation('worker-1', workerConversation)).toBe(true);
+    const now = Date.now();
+    await recordChatObservations(
+      workerConversation,
+      [{ kind: 'turn_start', time: now, turnId: 'health-turn-1' }],
+      'worker-1'
+    );
+
+    expect(bridgeHealthEvidenceForAgent('worker-1', workerConversation, now)).toMatchObject({
+      agentId: 'worker-1',
+      conversationId: workerConversation,
+      generating: true,
+      activeTurnId: true
+    });
+    expect(bridgeHealthEvidenceForAgent('worker-1', 'health-other-chat', now)).toMatchObject({
+      generating: false,
+      activeTurnId: false
+    });
+  });
+
+  it('reports queued and claimed worker command health with the existing transport deadlines', async () => {
+    await pair();
+    spawn({ workers: [{ task: 'inspect command health' }], caller: { conversationId: PRIME_CHAT } });
+
+    expect(bridgeHealthEvidenceForAgent('worker-1', null)).toMatchObject({
+      finiteWait: {
+        kind: 'stale_command',
+        deadlineMs: 30 * 60_000,
+        exempt: false,
+        recommendedAction: 'retry_delivery'
+      }
+    });
+
+    await waitForOpened(1);
+    expect(bridgeHealthEvidenceForAgent('worker-1', null)).toMatchObject({
+      finiteWait: {
+        kind: 'delivery',
+        deadlineMs: 90_000,
+        exempt: false,
+        recommendedAction: 'retry_delivery'
+      }
+    });
+  });
+
+  it('marks a revival waiting for page readiness as exempt command health evidence', async () => {
+    await pair();
+    spawn({ workers: [{ task: 'sleep and revive for health' }], caller: { conversationId: PRIME_CHAT } });
+    const bootstrap = await redeem();
+    const conversationId = 'a1a1a1a1-7654-4210-8edc-ba9876543210';
+    await request('POST', '/commands/ack', {
+      body: { id: bootstrap.id, status: 'sent', conversationId, agent: 'worker-1' }
+    });
+    finishAgent({ conversationId }, 'sleep before health evidence');
+
+    wake([{ to: 'worker-1', text: 'wake for health evidence' }]);
+    await waitForOpened(2);
+
+    expect(bridgeHealthEvidenceForAgent('worker-1', conversationId)).toMatchObject({
+      finiteWait: {
+        kind: 'delivery',
+        deadlineMs: 90_000,
+        exempt: true,
+        recommendedAction: 'retry_delivery'
+      }
+    });
+  });
 });
 
 // ------------------------------------------------------------------ origin

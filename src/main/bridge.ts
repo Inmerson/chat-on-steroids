@@ -57,6 +57,7 @@ import {
   sessionDurableModifiedAt
 } from './session/store.js';
 import { inFlightMcpRequests, runningToolCalls, settlingToolCalls } from './mcp/call-context.js';
+import type { AgentFiniteWaitEvidence } from '../shared/agent-health.js';
 import { nativeHandoffPrompt } from './session/handoff-prompt.js';
 import { briefShortfall, resumeBootstrapText } from './session/handoff.js';
 import {
@@ -903,6 +904,73 @@ function goalActiveFor(id: string): boolean {
 function chatIsWorking(conversationId: string): boolean {
   const current = liveConversations().find((entry) => entry.conversationId === conversationId);
   return Boolean(current && (current.generating || current.activeTurnId));
+}
+
+export interface AgentBridgeHealthEvidence {
+  agentId: string;
+  conversationId: string | null;
+  browserPresent: boolean;
+  generating: boolean;
+  activeTurnId: boolean;
+  finiteWait: AgentFiniteWaitEvidence | null;
+}
+
+/** Point-in-time, read-only bridge evidence for one exact broker identity. */
+export function bridgeHealthEvidenceForAgent(
+  agentId: string,
+  conversationId: string | null,
+  observedAt = Date.now()
+): AgentBridgeHealthEvidence {
+  void observedAt;
+  const live = conversationId
+    ? liveConversations().find((entry) => entry.conversationId === conversationId)
+    : null;
+  const matchingCommands = commands.filter((command) =>
+    command.spec.type === 'worker'
+      ? command.spec.agent === agentId
+      : command.spec.type === 'revive'
+        ? command.spec.agent === agentId && command.spec.conversationId === conversationId
+        : false
+  );
+  const command = matchingCommands.sort((left, right) => right.createdAt - left.createdAt)[0] ?? null;
+
+  let finiteWait: AgentFiniteWaitEvidence | null = null;
+  if (command) {
+    if (waitingForRevivalReadiness(command)) {
+      finiteWait = {
+        kind: 'delivery',
+        startedAt: command.claimedAt!,
+        deadlineMs: COMMAND_DEADLINE_MS,
+        exempt: true,
+        recommendedAction: 'retry_delivery'
+      };
+    } else if (command.claimedAt !== null) {
+      finiteWait = {
+        kind: 'delivery',
+        startedAt: command.claimedAt,
+        deadlineMs: COMMAND_DEADLINE_MS,
+        exempt: false,
+        recommendedAction: 'retry_delivery'
+      };
+    } else {
+      finiteWait = {
+        kind: 'stale_command',
+        startedAt: command.createdAt,
+        deadlineMs: COMMAND_TTL_MS,
+        exempt: false,
+        recommendedAction: 'retry_delivery'
+      };
+    }
+  }
+
+  return {
+    agentId,
+    conversationId,
+    browserPresent: browserPresent(),
+    generating: Boolean(live?.generating),
+    activeTurnId: Boolean(live?.activeTurnId),
+    finiteWait
+  };
 }
 
 async function handle(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {

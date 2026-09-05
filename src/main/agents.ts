@@ -278,6 +278,12 @@ interface PrimeTransfer {
   frozen: boolean;
 }
 
+export interface PrimeTransferHealthEvidence {
+  startedAt: number;
+  deadlineMs: number;
+  frozen: boolean;
+}
+
 interface Run {
   runId: string;
   primeConversationId: string;
@@ -2737,6 +2743,14 @@ export function swarmTransferActive(): boolean {
   if (run) run.transfer = null;
   changed();
   return false;
+}
+
+/** Read-only Compact & Resume evidence for health projection. */
+export function primeTransferHealthEvidence(conversationId: string): PrimeTransferHealthEvidence | null {
+  if (!conversationId || run?.primeConversationId !== conversationId) return null;
+  const transfer = run.transfer;
+  if (!transfer || transfer.from !== conversationId) return null;
+  return { startedAt: transfer.at, deadlineMs: TRANSFER_TTL_MS, frozen: transfer.frozen };
 }
 
 /**

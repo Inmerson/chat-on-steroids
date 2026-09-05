@@ -29,6 +29,7 @@ const {
   PRIME_ID,
   acknowledgeOffers,
   acknowledgeOffersForConversation,
+  beginPrimeTransfer,
   bindConversation,
   clearAgent,
   claimWorkerRevival,
@@ -57,6 +58,7 @@ const {
   onReviveRequest,
   pendingWorkerRevivals,
   primeConversationGone,
+  primeTransferHealthEvidence,
   WORKER_CONTEXT_CEILING_TOKENS,
   freeWorkerSlots,
   releaseQuiescentRun,
@@ -80,6 +82,8 @@ const {
   swarmRunning,
   swarmState,
   swarmStateForCaller,
+  swarmTransferActive,
+  TRANSFER_TTL_MS,
   statusForCaller,
   workerConversationGone,
   workerRevivalClaimed
@@ -167,6 +171,36 @@ function fillContext(conversationId: string): void {
 }
 
 describe('spawning a run', () => {
+  it('transfer health evidence reads an expired Prime transfer without clearing it', () => {
+    const startedAt = 2_000_000_000;
+    const now = vi.spyOn(Date, 'now').mockReturnValue(startedAt);
+    try {
+      startSwarm(1);
+      expect(beginPrimeTransfer(PRIME_CHAT)).toBe(true);
+      const stateBefore = structuredClone(swarmState());
+
+      expect(primeTransferHealthEvidence(PRIME_CHAT)).toEqual({
+        startedAt,
+        deadlineMs: TRANSFER_TTL_MS,
+        frozen: false
+      });
+      expect(swarmState()).toEqual(stateBefore);
+
+      now.mockReturnValue(startedAt + TRANSFER_TTL_MS + 1);
+      expect(primeTransferHealthEvidence(PRIME_CHAT)).toEqual({
+        startedAt,
+        deadlineMs: TRANSFER_TTL_MS,
+        frozen: false
+      });
+      expect(swarmState()).toEqual(stateBefore);
+
+      expect(swarmTransferActive()).toBe(false);
+      expect(primeTransferHealthEvidence(PRIME_CHAT)).toBeNull();
+    } finally {
+      now.mockRestore();
+    }
+  });
+
   it('refuses the feature while it is switched off', async () => {
     await setEnabled(false);
     expect(() => spawn({ workers: [{ task: 'x' }], caller: prime })).toThrow(/not enabled|switched off|disabled/i);

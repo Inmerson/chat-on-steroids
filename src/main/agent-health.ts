@@ -1,10 +1,53 @@
 import type {
   AgentActivity,
   AgentFiniteWaitEvidence,
+  AgentHealthEvidence,
   AgentHealthInput,
   AgentHealthRecommendedAction,
   AgentHealthSnapshot
 } from '../shared/agent-health.js';
+import type { AgentInfo } from '../shared/session.js';
+import type { PrimeTransferHealthEvidence } from './agents.js';
+import type { AgentBridgeHealthEvidence } from './bridge.js';
+
+export interface CollectAgentHealthEvidenceInput {
+  id: string;
+  broker: AgentInfo | null;
+  browser: AgentBridgeHealthEvidence | null;
+  runningToolCalls: number;
+  transfer: PrimeTransferHealthEvidence | null;
+  workflowBlocked: boolean;
+}
+
+export function collectAgentHealthEvidence(input: CollectAgentHealthEvidenceInput): AgentHealthEvidence {
+  const conversationId = input.broker?.conversationId ?? null;
+  const missing = !input.broker || !conversationId;
+  const conflict = Boolean(
+    !missing &&
+      input.browser &&
+      (input.browser.agentId !== input.id || input.browser.conversationId !== conversationId)
+  );
+  const browser = !missing && !conflict ? input.browser : null;
+  const finiteWait: AgentFiniteWaitEvidence | null = input.transfer
+    ? {
+        kind: 'transfer',
+        startedAt: input.transfer.startedAt,
+        deadlineMs: input.transfer.deadlineMs,
+        exempt: input.transfer.frozen,
+        recommendedAction: 'observe'
+      }
+    : browser?.finiteWait ?? null;
+
+  return {
+    identity: missing ? 'missing' : conflict ? 'conflict' : 'exact',
+    browserPresent: browser?.browserPresent ?? null,
+    runningToolCalls: input.runningToolCalls,
+    generating: browser?.generating ?? false,
+    activeTurnId: browser?.activeTurnId ?? false,
+    workflowBlocked: input.workflowBlocked,
+    finiteWait
+  };
+}
 
 function activityFor(input: AgentHealthInput): AgentActivity {
   const broker = input.broker;
