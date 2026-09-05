@@ -172,7 +172,8 @@ describe('Control Center read surface', () => {
 
     const reply = (await handler!(null, undefined)) as any;
     expect(reply.ok).toBe(true);
-    expect(reply.data.version).toBe(1);
+    expect(reply.data.version).toBe(2);
+    expect(reply.data.recoveryPolicy).toBe('off');
     expect(reply.data.run).toBeNull();
     expect(reply.data.tasks).toEqual([]);
     expect(reply.data.agents).toEqual([]);

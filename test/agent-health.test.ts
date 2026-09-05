@@ -1,3 +1,4 @@
+import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
 import { collectAgentHealthEvidence, evaluateAgentHealth } from '../src/main/agent-health.js';
 import type { AgentHealthEvidence, AgentHealthInput } from '../src/shared/agent-health.js';
@@ -326,5 +327,33 @@ describe('agent health projection', () => {
       health: 'unknown',
       recommendedAction: 'observe'
     });
+  });
+
+  it('keeps health projection and Control Center health wiring read-only by source contract', () => {
+    const healthSource = readFileSync(new URL('../src/main/agent-health.ts', import.meta.url), 'utf8');
+    const controlCenterSource = readFileSync(
+      new URL('../src/main/orchestration/control-center.ts', import.meta.url),
+      'utf8'
+    );
+
+    for (const forbidden of [
+      'wake(',
+      'sleepWorker(',
+      'finishAgent(',
+      'failAgent(',
+      'terminateProcess(',
+      'terminateProcessIfUnusedSince(',
+      'process.kill',
+      'taskkill',
+      'setInterval('
+    ]) {
+      expect(healthSource, `agent-health.ts must not contain ${forbidden}`).not.toContain(forbidden);
+    }
+
+    for (const forbidden of ['sleepWorker', 'finishAgent', 'failAgent', 'workerConversationGone']) {
+      expect(controlCenterSource, `control-center.ts must not import or call ${forbidden}`).not.toMatch(
+        new RegExp(`\\b${forbidden}\\b`)
+      );
+    }
   });
 });
