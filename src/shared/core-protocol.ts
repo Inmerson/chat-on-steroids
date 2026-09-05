@@ -1,17 +1,24 @@
 import type { ConnectionStatus } from './types.js';
 
-export const CORE_PROTOCOL_VERSION = 3;
+export const CORE_PROTOCOL_VERSION = 4;
 
 export const CORE_CAPABILITIES = [
   'connection-status',
   'connection-control',
   'settings-apply',
   'execution-probe',
-  'structured-health'
+  'structured-health',
+  'secret-storage'
 ] as const;
 
 export type CoreCapability = (typeof CORE_CAPABILITIES)[number];
 export type CoreOverallState = 'CONNECTED' | 'DEGRADED' | 'RECONNECTING' | 'OFFLINE' | 'AUTH_REQUIRED';
+export type CoreSecretKey = 'openaiApiKey' | 'openRouterApiKey';
+
+export interface CoreSecretStatus {
+  hasApiKey: boolean;
+  hasGoalKey: boolean;
+}
 
 export interface CoreHealthStatus {
   overall: CoreOverallState;
@@ -52,13 +59,24 @@ export interface CoreStatusEnvelope {
   health?: CoreHealthStatus;
 }
 
-export type CoreCommandName = 'hello' | 'status' | 'connect' | 'disconnect' | 'apply-settings' | 'shutdown-core';
+export type CoreCommandName =
+  | 'hello'
+  | 'status'
+  | 'connect'
+  | 'disconnect'
+  | 'apply-settings'
+  | 'secret-status'
+  | 'set-secret'
+  | 'shutdown-core';
 
-export interface CoreRequest {
+interface CoreRequestBase {
   id: string;
   token: string;
-  command: CoreCommandName;
 }
+
+export type CoreRequest =
+  | (CoreRequestBase & { command: Exclude<CoreCommandName, 'set-secret'> })
+  | (CoreRequestBase & { command: 'set-secret'; key: CoreSecretKey; value: string });
 
 export interface CoreResponse<T = unknown> {
   id: string;
