@@ -36,12 +36,12 @@ export interface CoreHello {
   coreVersion: string;
   corePid: number;
   generation: number;
-  capabilities: CoreCapability[];
+  capabilities: readonly CoreCapability[];
 }
 
 export interface CoreCompatibilityRequirement {
   protocolVersion: number;
-  requiredCapabilities: CoreCapability[];
+  requiredCapabilities: readonly CoreCapability[];
 }
 
 export type CoreStatusProjection = Pick<ConnectionStatus, 'state'> & Partial<Omit<ConnectionStatus, 'state'>>;
