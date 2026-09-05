@@ -1,11 +1,17 @@
 import { createHash } from 'node:crypto';
 import { promises as fs } from 'node:fs';
-import { createConnection, createServer, type Server } from 'node:net';
+import { createConnection, createServer, type Server, type Socket } from 'node:net';
 import path from 'node:path';
+
+const CONTROL_TIMEOUT_MS = 1_000;
 
 export interface CoreSupervisorLock {
   endpoint: string;
   close: () => Promise<void>;
+}
+
+export interface CoreSupervisorLockOptions {
+  onShutdown?: () => void;
 }
 
 export function supervisorEndpointForUserData(
@@ -19,26 +25,78 @@ export function supervisorEndpointForUserData(
   return path.join(userDataDir, 'core', 'supervisor.sock');
 }
 
-async function endpointIsLive(endpoint: string): Promise<boolean> {
-  return new Promise<boolean>((resolve) => {
+async function controlRequest(endpoint: string, command: 'ping' | 'shutdown'): Promise<string | null> {
+  return new Promise<string | null>((resolve) => {
     const socket = createConnection(endpoint);
-    const finish = (live: boolean): void => {
+    let settled = false;
+    let buffer = '';
+    const finish = (value: string | null): void => {
+      if (settled) return;
+      settled = true;
       socket.removeAllListeners();
       socket.destroy();
-      resolve(live);
+      resolve(value);
     };
-    socket.setTimeout(300, () => finish(false));
-    socket.once('connect', () => finish(true));
-    socket.once('error', () => finish(false));
+    socket.setTimeout(CONTROL_TIMEOUT_MS, () => finish(null));
+    socket.once('error', () => finish(null));
+    socket.once('connect', () => socket.write(`${command}\n`));
+    socket.on('data', (chunk: Buffer) => {
+      buffer += chunk.toString('utf8');
+      const newline = buffer.indexOf('\n');
+      if (newline !== -1) finish(buffer.slice(0, newline).trim());
+    });
+  });
+}
+
+async function endpointIsLive(endpoint: string): Promise<boolean> {
+  return (await controlRequest(endpoint, 'ping')) === 'ok';
+}
+
+/**
+ * Explicit updater/system-shutdown control. This is deliberately narrow: no PID, executable or
+ * arbitrary command crosses the endpoint. Absence is a normal result because a profile may not
+ * have started its persistent supervisor yet.
+ */
+export async function requestCoreSupervisorStop(userDataDir: string): Promise<boolean> {
+  return (await controlRequest(supervisorEndpointForUserData(userDataDir), 'shutdown')) === 'stopping';
+}
+
+function serveControl(socket: Socket, options: CoreSupervisorLockOptions): void {
+  let buffer = '';
+  socket.setTimeout(CONTROL_TIMEOUT_MS, () => socket.destroy());
+  socket.on('error', () => undefined);
+  socket.on('data', (chunk: Buffer) => {
+    buffer += chunk.toString('utf8');
+    if (buffer.length > 64) {
+      socket.end('invalid\n');
+      return;
+    }
+    const newline = buffer.indexOf('\n');
+    if (newline === -1) return;
+    const command = buffer.slice(0, newline).trim();
+    if (command === 'ping') {
+      socket.end('ok\n');
+      return;
+    }
+    if (command === 'shutdown') {
+      socket.end('stopping\n');
+      setImmediate(() => options.onShutdown?.());
+      return;
+    }
+    socket.end('invalid\n');
   });
 }
 
 /**
  * Owns supervisor uniqueness with an OS endpoint rather than a PID file. A stale Unix socket can
  * be recovered after a crash, while a live listener always wins and keeps duplicate supervisors
- * from racing to restart the same Core.
+ * from racing to restart the same Core. The same endpoint exposes only ping/shutdown so NSIS can
+ * quiesce the watchdog before replacing its executable.
  */
-export async function acquireCoreSupervisorLock(userDataDir: string): Promise<CoreSupervisorLock> {
+export async function acquireCoreSupervisorLock(
+  userDataDir: string,
+  options: CoreSupervisorLockOptions = {}
+): Promise<CoreSupervisorLock> {
   const endpoint = supervisorEndpointForUserData(userDataDir);
   if (process.platform !== 'win32') {
     await fs.mkdir(path.dirname(endpoint), { recursive: true, mode: 0o700 });
@@ -51,7 +109,7 @@ export async function acquireCoreSupervisorLock(userDataDir: string): Promise<Co
     }
   }
 
-  const server: Server = createServer((socket) => socket.end('ok\n'));
+  const server: Server = createServer((socket) => serveControl(socket, options));
   await new Promise<void>((resolve, reject) => {
     const onError = (error: NodeJS.ErrnoException): void => {
       server.off('listening', onListening);
