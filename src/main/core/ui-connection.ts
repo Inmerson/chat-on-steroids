@@ -6,6 +6,8 @@ import {
   isCoreCompatible,
   type CoreHealthStatus,
   type CoreHello,
+  type CoreSecretKey,
+  type CoreSecretStatus,
   type CoreStatusEnvelope
 } from '../../shared/core-protocol.js';
 import { CoreIpcClient, coreEndpointForUserData, ensureCoreIpcToken, shouldAcceptCoreEnvelope } from './ipc.js';
@@ -17,6 +19,8 @@ interface CoreClient {
   connect(): Promise<CoreStatusEnvelope>;
   disconnect(): Promise<CoreStatusEnvelope>;
   applySettings(): Promise<CoreStatusEnvelope>;
+  secretStatus(): Promise<CoreSecretStatus>;
+  setSecret(key: CoreSecretKey, value: string): Promise<void>;
   shutdownCore(): Promise<boolean>;
 }
 
@@ -56,6 +60,8 @@ export interface UiConnectionFacade {
   connect(): Promise<void>;
   disconnect(): Promise<void>;
   applySettings(): Promise<void>;
+  secretStatus(): Promise<CoreSecretStatus>;
+  setSecret(key: CoreSecretKey, value: string): Promise<void>;
   shutdownConnection(): Promise<void>;
   isServerRunning(): boolean;
   tunnelHealthBase(): null;
@@ -177,6 +183,17 @@ export function createUiConnectionFacade(options: UiConnectionFacadeOptions): Ui
     }
   };
 
+  const runCoreCall = async <T>(call: (client: CoreClient) => Promise<T>): Promise<T> => {
+    if (finalShutdown) throw new Error('UI Core client is shutting down');
+    try {
+      return await call(await attach());
+    } catch (error) {
+      activeClient = null;
+      publishUnavailable();
+      throw error;
+    }
+  };
+
   return {
     getStatus: () => ({ ...status }),
     getCoreHealth: () => (health ? { ...health } : null),
@@ -194,6 +211,8 @@ export function createUiConnectionFacade(options: UiConnectionFacadeOptions): Ui
     connect: () => runCommand((client) => client.connect()),
     disconnect: () => runCommand((client) => client.disconnect()),
     applySettings: () => runCommand((client) => client.applySettings()),
+    secretStatus: () => runCoreCall((client) => client.secretStatus()),
+    setSecret: (key, value) => runCoreCall((client) => client.setSecret(key, value)),
     shutdownConnection: async () => {
       // UI lifecycle is not Core lifecycle. Stop only this process's polling/admission to IPC.
       finalShutdown = true;
