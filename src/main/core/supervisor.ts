@@ -27,6 +27,7 @@ export interface CoreSupervisorOptions {
   sleep?: (ms: number) => Promise<void>;
   now?: () => number;
   healthyResetMs?: number;
+  startupGraceMs?: number;
 }
 
 export interface EnsureHostResult {
@@ -51,15 +52,19 @@ export class CoreSupervisor {
   private readonly sleep: (ms: number) => Promise<void>;
   private readonly now: () => number;
   private readonly healthyResetMs: number;
+  private readonly startupGraceMs: number;
   private recovery: Promise<EnsureHostResult> | null = null;
   private restartFailures = 0;
   private stalePid: number | null = null;
+  private lastSpawnPid: number | null = null;
+  private lastSpawnAt: number | null = null;
 
   constructor(options: CoreSupervisorOptions) {
     this.adapter = options.adapter;
     this.sleep = options.sleep ?? sleepDefault;
     this.now = options.now ?? Date.now;
     this.healthyResetMs = options.healthyResetMs ?? 300_000;
+    this.startupGraceMs = options.startupGraceMs ?? 5_000;
   }
 
   async ensureHost(_reason: string): Promise<EnsureHostResult> {
@@ -74,15 +79,38 @@ export class CoreSupervisor {
     }
   }
 
+  private recordRapidDeath(now: number): void {
+    if (this.lastSpawnAt === null) return;
+    const age = now - this.lastSpawnAt;
+    if (age < this.startupGraceMs) return;
+    if (age < this.healthyResetMs) {
+      this.restartFailures = Math.min(this.restartFailures + 1, CORE_RESTART_BACKOFF_MS.length - 1);
+    } else {
+      this.restartFailures = 0;
+    }
+    this.lastSpawnAt = null;
+    this.lastSpawnPid = null;
+  }
+
   private async ensureHostOnce(): Promise<EnsureHostResult> {
+    const now = this.now();
     const existing = await this.adapter.probe();
     if (existing.healthy) {
-      if (existing.startedAt !== undefined && this.now() - existing.startedAt >= this.healthyResetMs) {
+      if (existing.startedAt !== undefined && now - existing.startedAt >= this.healthyResetMs) {
         this.restartFailures = 0;
+        this.lastSpawnAt = null;
+        this.lastSpawnPid = null;
       }
       this.stalePid = null;
       return { state: 'attached', pid: existing.pid };
     }
+
+    // A just-spawned host may still be opening safeStorage/config/IPC. Do not create a second
+    // instance during that bounded grace window; endpoint ownership will settle the race.
+    if (this.lastSpawnAt !== null && now - this.lastSpawnAt < this.startupGraceMs && this.lastSpawnPid !== null) {
+      return { state: 'spawned', pid: this.lastSpawnPid };
+    }
+    this.recordRapidDeath(now);
 
     const delay =
       CORE_RESTART_BACKOFF_MS[Math.min(this.restartFailures, CORE_RESTART_BACKOFF_MS.length - 1)] ??
@@ -100,9 +128,13 @@ export class CoreSupervisor {
     try {
       const child = await this.adapter.spawn();
       this.stalePid = null;
+      this.lastSpawnPid = child.pid;
+      this.lastSpawnAt = child.startedAt ?? this.now();
       return { state: 'spawned', pid: child.pid };
     } catch (error) {
       this.restartFailures = Math.min(this.restartFailures + 1, CORE_RESTART_BACKOFF_MS.length - 1);
+      this.lastSpawnAt = null;
+      this.lastSpawnPid = null;
       throw error;
     }
   }
