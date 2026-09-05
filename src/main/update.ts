@@ -37,7 +37,6 @@
  * wrong.
  */
 
-import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { chmod, copyFile, mkdir, rename, rm } from 'node:fs/promises';
 import { createReadStream, createWriteStream, existsSync } from 'node:fs';
@@ -48,6 +47,9 @@ import { app } from 'electron';
 import { logInfo, logWarn } from './logger.js';
 import { APP_VERSION } from './version.js';
 import { isNewer, type UpdateStatus } from '../shared/types.js';
+import { startWindowsInstallerHandoff } from './update/handoff.js';
+import { windowsInstallPlan } from './update/handoff-policy.js';
+import { ownsWindowsInstallation } from './update/windows-installation.js';
 
 const REPO = 'Inmerson/chat-on-steroids';
 const LATEST_RELEASE_API = `https://api.github.com/repos/${REPO}/releases/latest`;
@@ -108,7 +110,7 @@ const CLEAR: UpdateStatus = { current: APP_VERSION, latest: null, stage: 'idle',
 let status: UpdateStatus = CLEAR;
 let staged: { version: string; file: string; kind: 'installer' | 'appimage'; target: string } | null = null;
 let pass: Promise<void> | null = null;
-/** Set by `markInstallOnQuit`: the user pressed Install, so bring the app back afterwards. */
+/** Set by `markInstallOnQuit`: the user pressed Install, so the handoff uses the explicit path. */
 let runAfterInstall = false;
 const listeners = new Set<() => void>();
 
@@ -322,7 +324,6 @@ async function download(version: string, name: string, expected: string): Promis
 }
 
 /**
-/**
  * Records that the user pressed Install, and says whether there was anything to install.
  *
  * It deliberately installs nothing itself. The handoff belongs at the end of the ordinary
@@ -341,53 +342,53 @@ export function markInstallOnQuit(): boolean {
 }
 
 /**
- * Hands a staged update to the platform, during the quit this app is already performing.
+ * Hands a staged update to the platform during the quit this app is already performing.
  *
- * This is the only thing that installs anything, and it runs at the end of the shutdown
- * sequence — after the bridge, the child processes and every durable flush — so the version the
- * user next starts is the new one and nothing was interrupted to achieve that.
- *
- * Windows gets the NSIS installer in silent mode. It is a per-user install (electron-builder.yml
- * sets `perMachine: false`), so `/S` needs no elevation and shows no prompt. Detached, because
- * this process is about to stop existing.
+ * Windows is a two-process handoff. This process persists a helper request and starts a hidden
+ * waiter, but does NOT start NSIS. The waiter owns the ordering boundary and launches NSIS only
+ * after this exact UI PID is gone. This avoids the process-running/file-lock race that exists
+ * when the installer is created inside Electron's final shutdown continuation.
  *
  * An AppImage has no installer: the file that is running is the whole application, so the update
- * is a rename over it. A rename rather than a copy, because the running AppImage is mounted from
- * that path — writing through it would corrupt the process that is still shutting down, while a
- * rename gives the new build a new inode and leaves the old one alive until it exits.
+ * remains a rename over it. A rename gives the new build a new inode and leaves the old one alive
+ * until this process exits.
  */
 export async function applyStagedUpdate(): Promise<void> {
   const ready = staged;
-  const relaunch = runAfterInstall;
+  const explicit = runAfterInstall;
   staged = null;
   runAfterInstall = false;
   if (!ready) return;
   try {
     if (ready.kind === 'installer') {
-      // `--updated` tells the assisted NSIS installer this is an upgrade of the install it
-      // already owns, so it keeps the location and the shortcuts instead of asking about them.
-      // `--force-run` is added only when the user pressed Install and is waiting for the app to
-      // come back; an update applied on the way out of an ordinary quit must not reopen it.
-      const args = relaunch ? ['/S', '--updated', '--force-run'] : ['/S', '--updated'];
-      const installer = spawn(ready.file, args, { detached: true, stdio: 'ignore', windowsHide: true });
-      // An installer that cannot start reports it asynchronously, and an unhandled 'error' on a
-      // child process would take the quit down with it.
-      installer.on('error', (err: Error) => logWarn(`the ${ready.version} installer did not start: ${err.message}`));
-      installer.unref();
+      const ownsInstallation = ownsWindowsInstallation(process.execPath);
+      const plan = windowsInstallPlan({ explicit, ownsInstallation });
+      if (!plan.launch) {
+        logInfo(`update: ${ready.version} remains staged; win-unpacked previews do not silently install on ordinary quit`);
+        return;
+      }
+      await startWindowsInstallerHandoff({
+        parentPid: process.pid,
+        installerPath: ready.file,
+        args: plan.args,
+        windowsHide: plan.windowsHide,
+        userDataDir: app.getPath('userData')
+      });
+      logInfo(
+        `update: ${ready.version} handoff helper started (${plan.mode}); waiting for UI PID ${process.pid} to exit before NSIS`
+      );
     } else {
       const next = `${ready.target}.new`;
       await copyFile(ready.file, next);
       await chmod(next, 0o755);
       await rename(next, ready.target);
-      // No installer to hand the "start it again" to, so this process arranges its own successor.
-      // Electron spawns it as this one exits, which is the app.exit() that ends the shutdown.
-      if (relaunch) app.relaunch({ execPath: ready.target });
+      if (explicit) app.relaunch({ execPath: ready.target });
+      logInfo(
+        explicit
+          ? `update: installing ${ready.version} now; the AppImage starts itself again as the new version`
+          : `update: ${ready.version} handed over; the next start of this app is the new version`
+      );
     }
-    logInfo(
-      relaunch
-        ? `update: installing ${ready.version} now; the app starts itself again as the new version`
-        : `update: ${ready.version} handed over; the next start of this app is the new version`
-    );
   } catch (err) {
     // Nothing is retried and nothing is left half-applied. The next app start checks again.
     logWarn(`could not apply the staged ${ready.version} update: ${(err as Error).message}`);

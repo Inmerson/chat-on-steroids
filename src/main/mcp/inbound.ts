@@ -1,4 +1,5 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
+import { markCurrentMcpRequestForwarded } from '../core/request-lifecycle.js';
 
 /**
  * The id ChatGPT puts on the HTTP request that carries a tool call.
@@ -16,8 +17,12 @@ import { AsyncLocalStorage } from 'node:async_hooks';
  */
 const store = new AsyncLocalStorage<string | null>();
 
-/** Runs `body` with the request id of the HTTP request currently being served. */
+/** Runs `body` with the request id of the validated MCP request currently being served. */
 export function withInboundRequestId<T>(requestId: string | null, body: () => T): T {
+  // request-lifecycle.ts captured the HTTP request at Node's request.start boundary. Reaching
+  // this function proves server.ts accepted the tokenized route and request guards, so this is
+  // the exact point where the lifecycle may be marked as forwarded to MCP.
+  markCurrentMcpRequestForwarded(requestId);
   return store.run(requestId, body);
 }
 

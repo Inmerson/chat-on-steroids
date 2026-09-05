@@ -1,54 +1,21 @@
 /**
- * Main process entry: window, tray, and the security posture for the renderer.
+ * Electron UI process: window/tray and renderer security only.
+ *
+ * The model-facing runtime is owned by the independent Core Host. This process deliberately does
+ * not initialize session/durable/swarm/bridge/execution singletons, and ordinary UI quit never
+ * tears those resources down. That process boundary is the reliability contract.
  */
 
 import path from 'node:path';
 import { mkdirSync } from 'node:fs';
-import { app, BrowserWindow, Menu, Tray, nativeImage, nativeTheme, screen, session, shell } from 'electron';
+import { app, BrowserWindow, Menu, Tray, nativeImage, nativeTheme, screen, session } from 'electron';
 import { getConfig, initConfigPath, loadConfig } from './config.js';
 import { connect, disconnect, getStatus, onStatusChange, shutdownConnection } from './connection.js';
 import { registerIpc } from './ipc.js';
 import { initLogFile, logError, logInfo, logWarn } from './logger.js';
-import { unifiedExecManager } from './codex/manager.js';
 import { initSecretsPath } from './secrets.js';
-import { setBrowserOpener, setWindowPresenter, shutdownBridge, startBridge } from './bridge.js';
-import { flushSessions, initSessionStore, pruneSessions } from './session/store.js';
-import {
-  flushRecorder,
-  queueDeterministicAttributionRepair,
-  setAgentBinder,
-  setAgentConversationLookup
-} from './session/recorder.js';
-import {
-  agentConversation,
-  bindConversation,
-  onRetiredWorkersPersist,
-  onRetiredWorkersPersistNow,
-  onSwarmPersist,
-  onSwarmPersistNow,
-  pauseSwarmForDisable,
-  repairPrimeConversationAfterRecovery,
-  restoreRetiredWorkers,
-  restoreSwarm,
-  snapshotRetiredWorkers,
-  snapshotSwarm,
-  type RetiredWorkersSnapshot,
-  type SwarmSnapshot
-} from './agents.js';
-import { flushDurable, initDurableStore, readDurable, writeDurableNow, writeDurableSoon } from './durable.js';
-import { restoreRequestCorrelations } from './session/correlation.js';
-import { stopComputerHelper } from './computer/index.js';
-import { GOAL_OBJECTIVES_STATE, restoreGoalObjectives, type GoalObjectivesSnapshot } from './goal.js';
-import {
-  CONTINUATIONS_STATE,
-  restoreContinuations,
-  setContinuationRecoveryHooks,
-  type ContinuationSnapshot
-} from './session/continuation.js';
-import { startSessionRetentionMaintenance } from './session/retention.js';
 import { runShutdownSequence } from './shutdown.js';
 import { windowLayoutForWorkArea } from './window-layout.js';
-import { openInPreferredBrowser } from './browser.js';
 import {
   createWindowActivationGate,
   ownsAppRuntime,
@@ -60,49 +27,31 @@ import { trayGuidArgsForPlatform, trayImageSpec } from './tray-image.js';
 import { browserWindowIconPath } from './window-icon.js';
 import { isBackgroundStartup, syncLoginStartup } from './background-startup.js';
 import { ensureDesktopShortcut } from './desktop-shortcut.js';
-import {
-  EXECUTION_STATE,
-  restoreExecutions,
-  type ExecutionSnapshot
-} from './execution.js';
 import { applyStagedUpdate, startUpdateChecks } from './update.js';
-
-/** Durable state file holding the multi-agent run. Hashes only, never credentials. */
-const SWARM_STATE = 'swarm';
-const RETIRED_WORKERS_STATE = 'retired-workers';
 
 let window: BrowserWindow | null = null;
 let tray: Tray | null = null;
 let quitting = false;
 let shutdownStarted = false;
 let shutdownComplete = false;
-let stopSessionRetention: (() => void) | null = null;
 const backgroundStartup = isBackgroundStartup();
 
-// Development previews can opt into an isolated Electron profile so they do not collide with
-// the user's normal Chat On Steroids instance or touch its config/durable state. Packaged builds
-// intentionally ignore this escape hatch.
 if (!app.isPackaged && process.env.COS_DEV_USER_DATA?.trim()) {
   const isolatedUserData = path.resolve(process.env.COS_DEV_USER_DATA.trim());
   mkdirSync(isolatedUserData, { recursive: true });
   app.setPath('userData', isolatedUserData);
 }
 
-// One instance only: two copies would fight over the tunnel and the config file.
+// This lock is UI-only now. Core Host and Core Supervisor have their own exclusive IPC ownership
+// endpoints, so a UI relaunch cannot create duplicate model-facing runtimes.
 const hasSingleInstanceLock = app.requestSingleInstanceLock();
 if (!hasSingleInstanceLock) {
-  // Mark this process as terminal secondary instance immediately.
   quitting = true;
-  // If native ProcessSingleton IPC failed (e.g. error 32 on Windows), notify the primary instance
-  // directly via the local loopback bridge before terminating.
+  // Native ProcessSingleton normally focuses the primary. Keep the old loopback fallback for the
+  // rare Windows case where that native message fails; Core owns the bridge port and may service
+  // /show independently of this secondary process.
   void import('node:http').then(({ request }) => {
-    const req = request({
-      hostname: '127.0.0.1',
-      port: 8765,
-      path: '/show',
-      method: 'POST',
-      timeout: 1000
-    });
+    const req = request({ hostname: '127.0.0.1', port: 8765, path: '/show', method: 'POST', timeout: 1000 });
     req.on('error', () => app.quit());
     req.on('response', () => app.quit());
     req.end();
@@ -119,7 +68,6 @@ function createWindow(): void {
     fullscreenable: false,
     show: true,
     autoHideMenuBar: true,
-    // Painted before the renderer loads, so a dark window never flashes white.
     backgroundColor: getConfig().ui.theme === 'dark' ? '#0e0e11' : '#ffffff',
     title: 'Chat On Steroids',
     webPreferences: {
@@ -128,7 +76,6 @@ function createWindow(): void {
       nodeIntegration: false,
       sandbox: true,
       webviewTag: false,
-      // The renderer only ever loads our own local files.
       webSecurity: true
     }
   });
@@ -139,8 +86,6 @@ function createWindow(): void {
   window.focus();
 
   window.once('ready-to-show', () => {
-    // A renderer can finish loading after Cmd+Q has already entered bounded teardown. Never let
-    // that late native event make the app visible again while `will-quit` is draining.
     if (!quitting && window && !window.isDestroyed()) {
       window.restore();
       window.center();
@@ -157,7 +102,6 @@ function createWindow(): void {
     }
   });
 
-  // Fallback: in case ready-to-show is delayed or missed on some Windows GPU setups
   setTimeout(() => {
     if (!quitting && window && !window.isDestroyed() && !window.isVisible()) {
       window.show();
@@ -172,19 +116,13 @@ function createWindow(): void {
     }
   }, 600);
 
-  // A renderer that fails to load leaves a blank window with no other clue, so
-  // record it where the diagnostics panel can show it.
   window.webContents.on('did-finish-load', () => logInfo('window loaded'));
   window.webContents.on('did-fail-load', (_event, code, description) =>
     logError(`window failed to load (${code}): ${description}`)
   );
-  // Renderer errors are otherwise invisible from here. Only errors, and only the
-  // message text — never anything the page was working with.
   window.webContents.on('console-message', (details) => {
     if (details.level === 'error') logError(`renderer: ${details.message}`);
   });
-
-  // Nothing in this app should ever open a second window or navigate away.
   window.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
   window.webContents.on('will-navigate', (event) => event.preventDefault());
   window.webContents.on('will-redirect', (event) => event.preventDefault());
@@ -196,50 +134,29 @@ function createWindow(): void {
       window?.hide();
     }
   });
-
-  // Electron keeps the object after the window is gone, and every member on it throws from
-  // then on. Holding that reference made `getWindow()` answer "yes, there is a window" for
-  // the rest of the process, so the renderer pushes and the tray's Open both aimed at a
-  // corpse. Dropping it is what makes those paths take their existing null branch.
   window.on('closed', () => {
     window = null;
   });
 
-  if (process.env.ELECTRON_RENDERER_URL) {
-    void window.loadURL(process.env.ELECTRON_RENDERER_URL);
-  } else {
-    void window.loadFile(path.join(__dirname, '../renderer/index.html'));
-  }
+  if (process.env.ELECTRON_RENDERER_URL) void window.loadURL(process.env.ELECTRON_RENDERER_URL);
+  else void window.loadFile(path.join(__dirname, '../renderer/index.html'));
 }
 
 function showWindow(): void {
   logInfo(`showWindow called (quitting=${quitting}, hasWindow=${Boolean(window)})`);
   if (quitting) return;
   if (!window || window.isDestroyed()) {
-    logInfo('showWindow: creating new window');
     createWindow();
     return;
   }
   try {
-    const wasVisible = window.isVisible();
-    const wasMinimized = window.isMinimized();
-    const currentBounds = window.getBounds();
-    logInfo(`showWindow: before -> visible=${wasVisible}, minimized=${wasMinimized}, bounds=${JSON.stringify(currentBounds)}`);
-
-    if (window.isMinimized()) {
-      window.restore();
-    }
+    if (window.isMinimized()) window.restore();
     window.show();
     window.center();
-
-    // Windows OS foreground elevation:
-    // Toggling setAlwaysOnTop(true) -> moveTop() -> focus() forces DWM to bring
-    // the window in front of other full-screen windows (like Chrome).
     window.setAlwaysOnTop(true);
     window.moveTop();
     window.focus();
     app.focus({ steal: true });
-
     setTimeout(() => {
       if (window && !window.isDestroyed()) {
         window.setAlwaysOnTop(false);
@@ -247,19 +164,13 @@ function showWindow(): void {
         window.focus();
       }
     }, 250);
-
-    logInfo(`showWindow: after -> visible=${window.isVisible()}, minimized=${window.isMinimized()}, bounds=${JSON.stringify(window.getBounds())}`);
-  } catch (err) {
-    logError(`showWindow error: ${(err as Error).message}`);
+  } catch (error) {
+    logError(`showWindow error: ${(error as Error).message}`);
   }
 }
 
-// Electron promises `second-instance` only after its own `ready`, not after our async startup.
-// Until CSP/permission handlers and IPC are installed below, a re-launch is only a focus request
-// for the initial window that startup is already going to show, so do not construct one early.
 const windowActivation = createWindowActivationGate(showWindow);
 
-/** Build the native tray image from encoded PNGs, never platform-dependent bitmap bytes. */
 function trayIcon(running: boolean): Electron.NativeImage {
   const spec = trayImageSpec(process.platform, running);
   const [base, ...highDpi] = spec.representations;
@@ -279,9 +190,8 @@ function refreshTray(): void {
   const state = getStatus().state;
   const connected = state === 'connected';
   const offline = state === 'offline';
-  // Offline keeps the running icon: the bridge is up, the internet is not.
-  const running = connected || offline;
-  const label = connected ? 'Connected' : offline ? 'No internet' : 'Not connected';
+  const running = connected || offline || state === 'connecting-tunnel' || state === 'starting-server';
+  const label = connected ? 'Connected' : offline ? 'No internet' : running ? 'Reconnecting' : 'Not connected';
   tray.setImage(trayIcon(running));
   tray.setToolTip(`Chat On Steroids — ${label.toLowerCase()}`);
   tray.setContextMenu(
@@ -305,107 +215,21 @@ function refreshTray(): void {
   );
 }
 
-app.on('second-instance', () => {
-  logInfo('second-instance event received (desktop shortcut or second launch)');
-  showWindow();
-});
+app.on('second-instance', () => showWindow());
 
 void app.whenReady().then(async () => {
-  // This guard is intentionally before even app.getPath/init* calls. A secondary instance, or a
-  // primary that was told to quit before ready, must never touch the primary's shared userData.
   if (!shouldBeginAppBootstrap(hasSingleInstanceLock, quitting)) return;
   const userData = app.getPath('userData');
   initConfigPath(userData);
   initSecretsPath(userData);
-  initSessionStore(userData);
-  initDurableStore(userData);
   initLogFile(path.join(userData, 'app.log'));
   await loadConfig();
   if (windowActivation.isDisabled()) return;
+
   syncLoginStartup(app, getConfig().ui.autoConnect);
   ensureDesktopShortcut(app.isPackaged, process.execPath);
-  // The renderer has its own explicit light/dark palette, so native chrome must follow the same
-  // user choice instead of Electron's default `system` theme. On macOS this controls the window
-  // frame, application menus and OS dialogs; on Linux/Windows it covers Electron-native UI.
   nativeTheme.themeSource = getConfig().ui.theme;
-  const savedGoalObjectives = await readDurable<GoalObjectivesSnapshot>(GOAL_OBJECTIVES_STATE);
-  if (windowActivation.isDisabled()) return;
-  restoreGoalObjectives(savedGoalObjectives);
-  // Execution command restore is validated against the durable run that owns each command.
-  // Load that authority before the bridge can bind a loopback port and call restoreCommands(),
-  // otherwise a valid pending execution bootstrap would look orphaned and be retired at startup.
-  const savedExecutions = await readDurable<ExecutionSnapshot>(EXECUTION_STATE);
-  if (windowActivation.isDisabled()) return;
-  restoreExecutions(savedExecutions);
-  // Request ownership must exist before either side of the bridge can race in. A request id
-  // that was proved yesterday remains the same workflow today even if its ChatGPT tab closed.
-  await restoreRequestCorrelations();
-  if (windowActivation.isDisabled()) return;
-  setAgentConversationLookup(agentConversation);
-  // The prime's chat is the user's own, so no extension report can name it. It is bound
-  // when the recorder manages to place the prime's first call. See recordToolCall.
-  setAgentBinder(bindConversation);
-  // Before anything can call an agent tool, and before a run is restored: the broker
-  // decides whether a previous run has been abandoned partly from which ChatGPT tabs are
-  // open, and without this it can only answer "I cannot see" — which it treats, on
-  // purpose, as a reason to leave the existing run alone.
-  // How a fresh chat actually opens. The app asks the OS to open the ChatGPT URL, which
-  // launches the browser if it is closed and creates the tab if there is none — the two
-  // cases the old "wait for a ChatGPT tab to poll us" delivery could never handle. Wired
-  // before any restored command is delivered, so a resume queued yesterday opens as soon
-  // as the bridge starts rather than waiting for the user to visit ChatGPT.
-  setBrowserOpener(async (url) => {
-    try {
-      const browser = await openInPreferredBrowser(url);
-      if (browser) return;
-    } catch (error) {
-      logWarn(`could not open ChatGPT in the preferred Chromium browser: ${(error as Error).message}`);
-    }
-    logWarn(
-      'Chrome/Chromium was not found for a browser-backed worker/resume command; falling back to the default browser. ' +
-        'If that browser does not have the Chat On Steroids extension loaded, open the generated ChatGPT URL in Chrome instead.'
-    );
-    await shell.openExternal(url);
-  });
 
-  // Persistence is a process-lifetime dependency of the broker, not a feature-toggle
-  // dependency. Multi-agent can be enabled from Settings without restarting the process;
-  // keeping both sinks wired from startup guarantees the first spawn can cross its durable
-  // acceptance barrier even when this launch began with multi-agent disabled.
-  onSwarmPersist(() => writeDurableSoon(SWARM_STATE, snapshotSwarm()));
-  onSwarmPersistNow((snapshot) => writeDurableNow(SWARM_STATE, snapshot));
-
-  // A multi-agent run outlives this process. Restoring it before the bridge starts
-  // means a worker that never joined gets its chat re-requested through the same queue
-  // as a fresh one, rather than being stranded with a key nobody has.
-  onRetiredWorkersPersist(() => writeDurableSoon(RETIRED_WORKERS_STATE, snapshotRetiredWorkers()));
-  onRetiredWorkersPersistNow((snapshot) => writeDurableNow(RETIRED_WORKERS_STATE, snapshot));
-  const retiredWorkers = await readDurable<RetiredWorkersSnapshot>(RETIRED_WORKERS_STATE);
-  if (windowActivation.isDisabled()) return;
-  restoreRetiredWorkers(retiredWorkers);
-  const savedSwarm = await readDurable<SwarmSnapshot>(SWARM_STATE);
-  if (windowActivation.isDisabled()) return;
-  restoreSwarm(savedSwarm);
-  if (!getConfig().multiAgent.enabled) {
-    // A feature toggle is a pause, not Clear swarm. Canonicalize any active incarnation left by
-    // a crash into stopped prime-owned history before the bridge exists, then make that safer
-    // projection durable. Re-enabling later in this process or after another restart recovers the
-    // same exact worker conversations without letting disabled workers consume execution slots.
-    pauseSwarmForDisable('multi-agent mode is disabled');
-    await writeDurableNow(SWARM_STATE, snapshotSwarm());
-    if (windowActivation.isDisabled()) return;
-  }
-  // Continuation recovery is after swarm restore because an interrupted durable rebind may
-  // have to finish publishing the prime transfer that was frozen in that snapshot.
-  setContinuationRecoveryHooks({
-    repairPrimeTransfer: repairPrimeConversationAfterRecovery
-  });
-  const savedContinuations = await readDurable<ContinuationSnapshot>(CONTINUATIONS_STATE);
-  if (windowActivation.isDisabled()) return;
-  await restoreContinuations(savedContinuations);
-  if (windowActivation.isDisabled()) return;
-
-  // Strict CSP for our own page. There is no remote content and no inline script.
   session.defaultSession.webRequest.onHeadersReceived((details, callback) => {
     callback({
       responseHeaders: {
@@ -416,12 +240,8 @@ void app.whenReady().then(async () => {
       }
     });
   });
-
-  // Deny every permission request; the UI needs none of them.
   session.defaultSession.setPermissionRequestHandler((_wc, _permission, callback) => callback(false));
 
-  // From here on a second launch may safely focus/recreate the window: renderer security policy
-  // is installed and the renderer's fixed IPC methods already have handlers before it can load.
   registerIpc(
     () => window,
     () => {
@@ -431,104 +251,54 @@ void app.whenReady().then(async () => {
   );
   windowActivation.enable();
   if (!backgroundStartup) windowActivation.request();
-  // macOS `activate` can fire on first launch, so do not wire it at module load where it could
-  // create a BrowserWindow before Electron is ready. Once the initial window path is established,
-  // Dock activation/re-launch can safely recreate or focus it.
   registerNativeWindowActivation(app, windowActivation.request);
 
   tray = new Tray(trayIcon(false), ...trayGuidArgsForPlatform());
   tray.on('click', () => showWindow());
   refreshTray();
+  // Registering this listener also starts Core IPC polling. Core is therefore supervised even
+  // when autoConnect is off; autoConnect controls publication, not whether the Core process exists.
   onStatusChange(refreshTray);
 
-  logInfo('app started');
-
-  // Historical Unattributed repair may legitimately scan and rewrite a large legacy bucket.
-  // It is maintenance, not a prerequisite for showing the app or accepting new exact-id
-  // traffic, so never make startup/reload wait behind years of old session history.
-  queueDeterministicAttributionRepair();
-
-  // The bridge serves recording and multi-agent mode both: recording needs the
-  // extension to observe the chat, and multi-agent mode needs it to open worker tabs.
-  // Either switch being on starts it. ipc.ts applies the same rule on a settings save.
-  setWindowPresenter(showWindow);
-  if (getConfig().sessions.record || getConfig().multiAgent.enabled) {
-    void startBridge();
-  }
-  // Retention governs recordings already stored on disk, independent of whether recording is
-  // currently enabled. The tray app can stay alive for days, so run once now and keep a coarse
-  // maintenance timer rather than making expiry depend on the next process restart.
-  stopSessionRetention = startSessionRetentionMaintenance({
-    retainDays: () => getConfig().sessions.retainDays,
-    prune: pruneSessions,
-    onRemoved: (removed) => logInfo(`removed ${removed} session(s) past the retention window`),
-    onError: (err) => logError(`session pruning failed: ${err.message}`)
-  });
-
+  logInfo('UI started; Core runtime is independently supervised');
+  // The Core reads the same durable config and decides whether it should publish. Calling connect
+  // here preserves the existing explicit auto-connect UX without creating a local tunnel owner.
   if (getConfig().ui.autoConnect) void connect();
-
-  // Update checks are background-only and never gate startup. State changes arrive through the
-  // same monotonic renderer state push used by connection and bridge status.
   startUpdateChecks();
 });
 
 app.on('before-quit', () => {
   if (!ownsAppRuntime(hasSingleInstanceLock)) return;
   quitting = true;
-  // From this point `will-quit` owns a bounded teardown. A Dock click/relaunch arriving while
-  // that sequence drains must not recreate or reveal a window after the tray has disappeared.
   windowActivation.disable();
 });
 
 app.on('window-all-closed', () => {
   if (!ownsAppRuntime(hasSingleInstanceLock)) return;
-  // macOS convention: closing the last window is not quitting the application. The Dock/menu
-  // bar stay alive and `activate` recreates it. Windows/Linux retain the explicit close-to-tray
-  // preference; Cmd+Q / app.quit bypasses this event and still enters the shutdown sequence.
   if (shouldQuitOnWindowAllClosed(process.platform, getConfig().ui.minimizeToTray)) app.quit();
 });
 
 app.on('will-quit', (event) => {
-  // A secondary instance called app.quit() only to get out of the primary's way. It must be
-  // allowed to exit normally: preventing that quit and flushing/stopping the primary's shared
-  // stores from a process that never initialized or owns them is both a hang and data race.
   if (!ownsAppRuntime(hasSingleInstanceLock)) return;
   if (shutdownComplete) return;
   event.preventDefault();
   if (shutdownStarted) return;
   shutdownStarted = true;
-  stopSessionRetention?.();
-  stopSessionRetention = null;
   tray?.destroy();
   tray = null;
 
   void runShutdownSequence(
     [
-      // Phase 1: stop both listeners from admitting work and let accepted requests drain.
-      // The budget has to clear the drains it contains, or it would silently defeat them:
-      // the bridge force-closes wedged localhost sockets at 15s and the MCP endpoint forces
-      // its own drain at 30s. This is the outer bound on both, not a competing one.
-      { name: 'admission/drain', budgetMs: 40_000, run: () => [shutdownConnection(), shutdownBridge()] },
-      // Phase 2: only after request handlers are done may their owned child processes go.
-      {
-        name: 'process cleanup',
-        budgetMs: 15_000,
-        run: () => [unifiedExecManager.terminateAllProcesses(), stopComputerHelper()]
-      },
-      // Phase 3: recorder work can enqueue both session projections and named durable state.
-      { name: 'recorder flush', budgetMs: 10_000, run: () => [flushRecorder()] },
-      // These are independent writers. One rejection must never skip the other flush.
-      { name: 'durable flush', budgetMs: 10_000, run: () => [flushSessions(), flushDurable()] },
-      // Last: nothing replaces executable files until every request and durable write has landed.
+      // UI lifecycle is not Core lifecycle. This only stops the UI's status-polling client.
+      { name: 'UI Core detach', budgetMs: 3_000, run: () => [shutdownConnection()] },
+      // The updater owns the exceptional installed-update Core quiesce/file-lock handoff. A normal
+      // user quit reaches this phase with no staged update and leaves Core completely untouched.
       { name: 'update handoff', budgetMs: 5_000, run: () => [applyStagedUpdate()] }
     ],
     {
       info: logInfo,
       warn: logWarn,
       error: logError,
-      // Not `app.quit()`. See the note on ShutdownHooks.exit: a quit raised from the
-      // continuation that ends this sequence is dropped by Electron, and the app is left
-      // running with nothing to click and the single-instance lock still held.
       exit: () => {
         shutdownComplete = true;
         app.exit(0);
@@ -537,8 +307,6 @@ app.on('will-quit', (event) => {
   );
 });
 
-// Belt and braces: no web contents anywhere in this app may open a window or
-// navigate. External links go through the vetted allowlist in ipc.ts instead.
 app.on('web-contents-created', (_event, contents) => {
   contents.setWindowOpenHandler(() => ({ action: 'deny' }));
   contents.on('will-navigate', (event) => event.preventDefault());

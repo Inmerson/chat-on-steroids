@@ -41,4 +41,26 @@ jobs:
         run: npm ci
 
       - name: Verify
-        run: npm run verify:ci
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -o pipefail
+          npm run verify:ci 2>&1 | tee verify.log
+
+      - name: Verify
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          cmd /d /s /c "npm run verify:ci > verify.log 2>&1"
+          $code = $LASTEXITCODE
+          Get-Content -LiteralPath verify.log
+          exit $code
+
+      - name: Upload failed verify log
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: verify-${{ matrix.name }}
+          path: verify.log
+          if-no-files-found: ignore
+          retention-days: 3
