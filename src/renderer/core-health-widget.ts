@@ -74,7 +74,7 @@ async function paint(): Promise<void> {
   container.prepend(...coreHealthFacts(reply.data).map(factNode));
 }
 
-if (window.api && typeof window.api.getCoreHealth === 'function') {
+if (typeof window !== 'undefined' && window.api && typeof window.api.getCoreHealth === 'function') {
   window.api.onStateChanged(() => void paint());
   void paint();
   setTimeout(() => void paint(), 400);
