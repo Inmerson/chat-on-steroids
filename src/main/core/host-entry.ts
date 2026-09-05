@@ -1,7 +1,9 @@
 import path from 'node:path';
 import { app } from 'electron';
 import { CORE_CAPABILITIES, CORE_PROTOCOL_VERSION, type CoreStatusEnvelope } from '../../shared/core-protocol.js';
+import { retireGoalDrafts } from '../goal.js';
 import { initLogFile, logError, logInfo } from '../logger.js';
+import { hasSecret, setSecret } from '../secrets.js';
 import { APP_VERSION } from '../version.js';
 import { ensureCoreIpcToken, startCoreIpcServer } from './ipc.js';
 import { startCoreRuntime, type CoreRuntime } from './runtime.js';
@@ -32,6 +34,11 @@ export async function runCoreHost(options: CoreHostEntryOptions): Promise<void> 
     abort.abort();
   };
 
+  const requireRuntime = (): CoreRuntime => {
+    if (!runtime) throw new Error('Core Host is still starting');
+    return runtime;
+  };
+
   const ipc = await startCoreIpcServer({
     userDataDir: options.userDataDir,
     token,
@@ -44,16 +51,26 @@ export async function runCoreHost(options: CoreHostEntryOptions): Promise<void> 
     }),
     status: () => runtime?.statusEnvelope() ?? STARTING_STATUS,
     connect: async () => {
-      if (!runtime) throw new Error('Core Host is still starting');
-      await runtime.connect();
+      await requireRuntime().connect();
     },
     disconnect: async () => {
-      if (!runtime) throw new Error('Core Host is still starting');
-      await runtime.disconnect();
+      await requireRuntime().disconnect();
     },
     applySettings: async () => {
-      if (!runtime) throw new Error('Core Host is still starting');
-      await runtime.reloadSettings();
+      await requireRuntime().reloadSettings();
+    },
+    secretStatus: async () => {
+      requireRuntime();
+      return {
+        hasApiKey: await hasSecret('openaiApiKey'),
+        hasGoalKey: await hasSecret('openRouterApiKey')
+      };
+    },
+    setSecret: async (key, value) => {
+      requireRuntime();
+      await setSecret(key, value);
+      if (key === 'openRouterApiKey') retireGoalDrafts();
+      logInfo(`${key === 'openRouterApiKey' ? 'openrouter key' : 'api key'} ${value.trim() === '' ? 'cleared' : 'stored'}`);
     },
     shutdownCore: async () => {
       // Return the IPC acknowledgement before closing the listener/socket underneath it.
