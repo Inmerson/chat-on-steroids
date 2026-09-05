@@ -2,17 +2,17 @@ import path from 'node:path';
 import { shell } from 'electron';
 import type { ConnectionStatus } from '../../shared/types.js';
 import type { CoreStatusEnvelope } from '../../shared/core-protocol.js';
-import { agentConversation, bindConversation, onRetiredWorkersPersist, onRetiredWorkersPersistNow, onSwarmPersist, onSwarmPersistNow, pauseSwarmForDisable, repairPrimeConversationAfterRecovery, restoreRetiredWorkers, restoreSwarm, snapshotRetiredWorkers, snapshotSwarm, type RetiredWorkersSnapshot, type SwarmSnapshot } from '../agents.js';
-import { setBrowserOpener, shutdownBridge, startBridge } from '../bridge.js';
+import { agentConversation, bindConversation, onRetiredWorkersPersist, onRetiredWorkersPersistNow, onSwarmPersist, onSwarmPersistNow, pauseSwarmForDisable, persistAgentAuthorityNow, repairPrimeConversationAfterRecovery, restoreRetiredWorkers, restoreSwarm, snapshotRetiredWorkers, snapshotSwarm, type RetiredWorkersSnapshot, type SwarmSnapshot } from '../agents.js';
+import { cancelWorkerCommands, setBrowserOpener, shutdownBridge, startBridge, stopBridge } from '../bridge.js';
 import { openInPreferredBrowser } from '../browser.js';
 import { unifiedExecManager } from '../codex/manager.js';
 import { connect, disconnect, getStatus, isServerRunning, shutdownConnection } from '../connection.js';
 import { getConfig, initConfigPath, loadConfig } from '../config.js';
 import { flushDurable, initDurableStore, readDurable, writeDurableNow, writeDurableSoon } from '../durable.js';
 import { EXECUTION_STATE, restoreExecutions, type ExecutionSnapshot } from '../execution.js';
-import { GOAL_OBJECTIVES_STATE, restoreGoalObjectives, type GoalObjectivesSnapshot } from '../goal.js';
+import { GOAL_OBJECTIVES_STATE, restoreGoalObjectives, retireGoalDrafts, type GoalObjectivesSnapshot } from '../goal.js';
 import { initLogFile, logError, logInfo, logWarn } from '../logger.js';
-import { selfTestHeaders } from '../mcp/server.js';
+import { forgetExposedSurface, selfTestHeaders } from '../mcp/server.js';
 import { stopComputerHelper } from '../computer/index.js';
 import { initSecretsPath } from '../secrets.js';
 import { CONTINUATIONS_STATE, restoreContinuations, setContinuationRecoveryHooks, type ContinuationSnapshot } from '../session/continuation.js';
@@ -23,6 +23,7 @@ import { flushSessions, initSessionStore, pruneSessions } from '../session/store
 import { CoreHealthController } from './health-controller.js';
 import { probeLocalMcp } from './probe.js';
 import { setConnectionGenerationProvider } from './request-lifecycle.js';
+import { reconcileCoreSettingsEffects } from './settings-effects.js';
 
 const SWARM_STATE = 'swarm';
 const RETIRED_WORKERS_STATE = 'retired-workers';
@@ -165,9 +166,19 @@ export async function startCoreRuntime(userDataDir: string): Promise<CoreRuntime
       await tick();
     },
     reloadSettings: async () => {
+      const before = structuredClone(getConfig());
       await loadConfig();
-      // connection.ts reads config live for tools; a transport-changing setting is reconciled
-      // through the existing serialized applySettings path by the host entry.
+      const after = structuredClone(getConfig());
+      await reconcileCoreSettingsEffects(before, after, {
+        startBridge,
+        stopBridge,
+        pauseSwarmForDisable,
+        cancelWorkerCommands,
+        persistAgentAuthorityNow,
+        retireGoalDrafts,
+        forgetExposedSurface
+      });
+      // Connection/tunnel reconciliation remains serialized by the existing connection owner.
       const { applySettings } = await import('../connection.js');
       await applySettings();
       await tick();
