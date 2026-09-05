@@ -27,9 +27,7 @@ export function coreEndpointForUserData(
     const digest = createHash('sha256').update(path.resolve(userDataDir)).digest('hex').slice(0, 24);
     return `\\\\.\\pipe\\chat-on-steroids-core-${digest}`;
   }
-  // Do not let the host running a cross-platform test choose the separator for the target OS.
-  // On a real POSIX host this is identical to path.join; on Windows it still models the Unix
-  // socket path the requested platform would actually use.
+  // Choose separators for the target platform, not the machine executing a cross-platform test.
   return path.posix.join(userDataDir.replace(/\\/g, '/'), 'core', 'core.sock');
 }
 
@@ -91,97 +89,116 @@ export interface CoreIpcServer {
   close: () => Promise<void>;
 }
 
-function responseLine(response: CoreResponse): string {
-  const line = `${JSON.stringify(response)}\n`;
-  if (Buffer.byteLength(line) > MAX_IPC_MESSAGE_BYTES) {
-    return `${JSON.stringify({ id: response.id, ok: false, error: 'Core IPC response too large' } satisfies CoreResponse)}\n`;
-  }
-  return line;
+function response(socket: Socket, value: CoreResponse): void {
+  socket.end(`${JSON.stringify(value)}\n`);
 }
 
-function serveSocket(socket: Socket, handlers: CoreIpcHandlers): void {
-  let buffer = Buffer.alloc(0);
-  let handled = false;
-  const finish = (response: CoreResponse): void => {
-    if (handled) return;
-    handled = true;
-    socket.end(responseLine(response));
+async function dispatch(request: CoreRequest, handlers: CoreIpcHandlers): Promise<unknown> {
+  switch (request.command) {
+    case 'hello':
+      return handlers.hello();
+    case 'status':
+      return handlers.status();
+    case 'connect':
+      await handlers.connect();
+      return handlers.status();
+    case 'disconnect':
+      await handlers.disconnect();
+      return handlers.status();
+    case 'apply-settings':
+      await handlers.applySettings();
+      return handlers.status();
+    case 'shutdown-core':
+      await handlers.shutdownCore();
+      return true;
+  }
+}
+
+function handleSocket(socket: Socket, handlers: CoreIpcHandlers): void {
+  let buffered = '';
+  let finished = false;
+  const fail = (id: string, error: string): void => {
+    if (finished) return;
+    finished = true;
+    response(socket, { id, ok: false, error });
   };
 
-  socket.setTimeout(IPC_TIMEOUT_MS, () => finish({ id: '', ok: false, error: 'Core IPC request timed out' }));
+  socket.setTimeout(IPC_TIMEOUT_MS, () => fail('', 'Core IPC request timed out'));
   socket.on('error', () => undefined);
   socket.on('data', (chunk: Buffer) => {
-    if (handled) return;
-    buffer = Buffer.concat([buffer, chunk]);
-    if (buffer.length > MAX_IPC_MESSAGE_BYTES) {
-      finish({ id: '', ok: false, error: 'Core IPC request too large' });
+    if (finished) return;
+    buffered += chunk.toString('utf8');
+    if (Buffer.byteLength(buffered) > MAX_IPC_MESSAGE_BYTES) {
+      fail('', 'Core IPC request is too large');
       return;
     }
-    const newline = buffer.indexOf(0x0a);
+    const newline = buffered.indexOf('\n');
     if (newline === -1) return;
-    const raw = buffer.subarray(0, newline).toString('utf8');
-    void (async () => {
-      let request: CoreRequest;
-      try {
-        request = JSON.parse(raw) as CoreRequest;
-      } catch {
-        finish({ id: '', ok: false, error: 'Invalid Core IPC JSON' });
-        return;
-      }
-      if (!request || typeof request.id !== 'string' || typeof request.token !== 'string' || typeof request.command !== 'string') {
-        finish({ id: typeof request?.id === 'string' ? request.id : '', ok: false, error: 'Invalid Core IPC request' });
-        return;
-      }
-      if (!safeTokenEqual(request.token, handlers.token)) {
-        finish({ id: request.id, ok: false, error: 'Core IPC authentication failed' });
-        return;
-      }
-      try {
-        switch (request.command) {
-          case 'hello':
-            finish({ id: request.id, ok: true, data: await handlers.hello() });
-            return;
-          case 'status':
-            finish({ id: request.id, ok: true, data: await handlers.status() });
-            return;
-          case 'connect':
-            await handlers.connect();
-            finish({ id: request.id, ok: true });
-            return;
-          case 'disconnect':
-            await handlers.disconnect();
-            finish({ id: request.id, ok: true });
-            return;
-          case 'apply-settings':
-            await handlers.applySettings();
-            finish({ id: request.id, ok: true });
-            return;
-          case 'shutdown-core':
-            await handlers.shutdownCore();
-            finish({ id: request.id, ok: true });
-            return;
-          default:
-            finish({ id: request.id, ok: false, error: 'Unknown Core IPC command' });
-        }
-      } catch (error) {
-        finish({ id: request.id, ok: false, error: (error as Error).message });
-      }
-    })();
+    finished = true;
+    const line = buffered.slice(0, newline);
+    let request: CoreRequest;
+    try {
+      request = JSON.parse(line) as CoreRequest;
+    } catch {
+      response(socket, { id: '', ok: false, error: 'Invalid Core IPC request' });
+      return;
+    }
+    if (!request || typeof request.id !== 'string' || typeof request.command !== 'string' || typeof request.token !== 'string') {
+      response(socket, { id: '', ok: false, error: 'Invalid Core IPC request' });
+      return;
+    }
+    if (!safeTokenEqual(request.token, handlers.token)) {
+      response(socket, { id: request.id, ok: false, error: 'Unauthorized Core IPC client' });
+      return;
+    }
+    void Promise.resolve(dispatch(request, handlers)).then(
+      (data) => response(socket, { id: request.id, ok: true, data }),
+      (error: unknown) => response(socket, {
+        id: request.id,
+        ok: false,
+        error: error instanceof Error ? error.message : String(error)
+      })
+    );
   });
 }
 
+async function unixEndpointIsLive(endpoint: string): Promise<boolean> {
+  return new Promise<boolean>((resolve) => {
+    const socket = createConnection(endpoint);
+    const finish = (live: boolean): void => {
+      socket.removeAllListeners();
+      socket.destroy();
+      resolve(live);
+    };
+    socket.setTimeout(300, () => finish(false));
+    socket.once('connect', () => finish(true));
+    socket.once('error', () => finish(false));
+  });
+}
+
+/**
+ * Binds the ownership endpoint. A live listener is the single-instance lock; a dead Unix socket
+ * left by a crash is removed only after a connection attempt proves nobody owns it.
+ */
 export async function startCoreIpcServer(handlers: CoreIpcHandlers): Promise<CoreIpcServer> {
   const endpoint = coreEndpointForUserData(handlers.userDataDir);
   if (process.platform !== 'win32') {
     await fs.mkdir(path.dirname(endpoint), { recursive: true, mode: 0o700 });
-    await fs.rm(endpoint, { force: true }).catch(() => undefined);
+    try {
+      await fs.stat(endpoint);
+      if (await unixEndpointIsLive(endpoint)) throw new Error('Core is already running for this profile');
+      await fs.rm(endpoint, { force: true });
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+    }
   }
 
-  const server: Server = createServer((socket) => serveSocket(socket, handlers));
+  const server: Server = createServer((socket) => handleSocket(socket, handlers));
   await new Promise<void>((resolve, reject) => {
-    const onError = (error: Error): void => {
+    const onError = (error: NodeJS.ErrnoException): void => {
       server.off('listening', onListening);
-      reject(error);
+      if (error.code === 'EADDRINUSE') reject(new Error('Core endpoint is already owned by another process'));
+      else reject(error);
     };
     const onListening = (): void => {
       server.off('error', onError);
@@ -204,52 +221,77 @@ export async function startCoreIpcServer(handlers: CoreIpcHandlers): Promise<Cor
   };
 }
 
-export interface CoreIpcClientOptions {
-  userDataDir: string;
-  token: string;
-  timeoutMs?: number;
-}
+export class CoreIpcClient {
+  constructor(
+    private readonly endpoint: string,
+    private readonly token: string,
+    private readonly timeoutMs = IPC_TIMEOUT_MS
+  ) {}
 
-export async function callCoreIpc<T = unknown>(
-  options: CoreIpcClientOptions,
-  command: CoreRequest['command']
-): Promise<T> {
-  const endpoint = coreEndpointForUserData(options.userDataDir);
-  const request: CoreRequest = { id: randomUUID(), token: options.token, command };
-  const timeoutMs = options.timeoutMs ?? IPC_TIMEOUT_MS;
-
-  return new Promise<T>((resolve, reject) => {
-    const socket = createConnection(endpoint);
-    let buffer = Buffer.alloc(0);
-    let settled = false;
-    const fail = (error: Error): void => {
-      if (settled) return;
-      settled = true;
-      socket.destroy();
-      reject(error);
-    };
-    socket.setTimeout(timeoutMs, () => fail(new Error('Core IPC request timed out')));
-    socket.once('error', fail);
-    socket.once('connect', () => socket.write(`${JSON.stringify(request)}\n`));
-    socket.on('data', (chunk: Buffer) => {
-      if (settled) return;
-      buffer = Buffer.concat([buffer, chunk]);
-      if (buffer.length > MAX_IPC_MESSAGE_BYTES) {
-        fail(new Error('Core IPC response too large'));
-        return;
-      }
-      const newline = buffer.indexOf(0x0a);
-      if (newline === -1) return;
-      settled = true;
-      socket.destroy();
-      try {
-        const response = JSON.parse(buffer.subarray(0, newline).toString('utf8')) as CoreResponse<T>;
-        if (response.id !== request.id) throw new Error('Core IPC response id mismatch');
-        if (!response.ok) throw new Error(response.error || 'Core IPC request failed');
-        resolve(response.data as T);
-      } catch (error) {
-        reject(error);
-      }
+  private async request<T>(command: CoreRequest['command']): Promise<T> {
+    const id = randomUUID();
+    const wire: CoreRequest = { id, token: this.token, command };
+    return new Promise<T>((resolve, reject) => {
+      const socket = createConnection(this.endpoint);
+      let buffered = '';
+      let settled = false;
+      const finish = (error?: Error, value?: T): void => {
+        if (settled) return;
+        settled = true;
+        socket.destroy();
+        if (error) reject(error);
+        else resolve(value as T);
+      };
+      socket.setTimeout(this.timeoutMs, () => finish(new Error('Core IPC request timed out')));
+      socket.once('error', (error) => finish(error));
+      socket.once('connect', () => socket.write(`${JSON.stringify(wire)}\n`));
+      socket.on('data', (chunk: Buffer) => {
+        buffered += chunk.toString('utf8');
+        if (Buffer.byteLength(buffered) > MAX_IPC_MESSAGE_BYTES) {
+          finish(new Error('Core IPC response is too large'));
+          return;
+        }
+        const newline = buffered.indexOf('\n');
+        if (newline === -1) return;
+        try {
+          const parsed = JSON.parse(buffered.slice(0, newline)) as CoreResponse<T>;
+          if (parsed.id !== id) {
+            finish(new Error('Core IPC response id mismatch'));
+            return;
+          }
+          if (!parsed.ok) {
+            finish(new Error(parsed.error || 'Core IPC request failed'));
+            return;
+          }
+          finish(undefined, parsed.data as T);
+        } catch {
+          finish(new Error('Invalid Core IPC response'));
+        }
+      });
     });
-  });
+  }
+
+  hello(): Promise<CoreHello> {
+    return this.request('hello');
+  }
+
+  status(): Promise<CoreStatusEnvelope> {
+    return this.request('status');
+  }
+
+  connect(): Promise<CoreStatusEnvelope> {
+    return this.request('connect');
+  }
+
+  disconnect(): Promise<CoreStatusEnvelope> {
+    return this.request('disconnect');
+  }
+
+  applySettings(): Promise<CoreStatusEnvelope> {
+    return this.request('apply-settings');
+  }
+
+  shutdownCore(): Promise<boolean> {
+    return this.request('shutdown-core');
+  }
 }
