@@ -171,12 +171,14 @@ Use the existing `TRANSFER_TTL_MS` (10 minutes) for finite, non-frozen transfer 
 - A finite transfer that genuinely exceeds its existing deadline may project `stalled`.
 - A frozen transfer is mid-commit and remains exempt according to existing lifecycle semantics.
 
-### Command timeout
+### Command deadlines
 
-Use the existing `COMMAND_TTL_MS` (30 minutes) for finite command/bootstrap/revival delivery where that timeout already applies.
+Reuse both existing bridge command clocks according to their current meanings:
 
-- Expired delivery may project `waiting + stalled` and recommend `retry_delivery` or `user_attention`, depending on the owning workflow state.
-- Exact revival states that are intentionally exempt from the wall-clock timeout remain exempt in health too.
+- `COMMAND_DEADLINE_MS` (90 seconds) is the finite deadline for a page that has claimed a command to redeem/type/report that delivery.
+- `COMMAND_TTL_MS` (30 minutes) is the stale-command age for ordinary queued/restored command records.
+
+Health must not collapse these into one timeout. A claimed delivery that exceeds its 90-second deadline may project `waiting + stalled` and recommend `retry_delivery` or `user_attention`; an ordinary queued/restored command that exceeds the 30-minute TTL may also project stalled/stale according to the same lifecycle decision the bridge already makes. Exact revival states that are intentionally exempt from wall-clock expiry remain exempt in health too.
 
 ### Workflow blockers
 
