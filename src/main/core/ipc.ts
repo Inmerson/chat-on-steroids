@@ -13,9 +13,6 @@ import type {
 } from '../../shared/core-protocol.js';
 
 const MAX_IPC_REQUEST_BYTES = 128 * 1024;
-// Session/event projections are intentionally bounded by the renderer, but can legitimately exceed
-// 128 KiB. Keep the authenticated local response ceiling above that UI budget without making IPC
-// an unbounded memory channel.
 const MAX_IPC_RESPONSE_BYTES = 4 * 1024 * 1024;
 const IPC_TIMEOUT_MS = 2_000;
 const MAX_SECRET_VALUE_CHARS = 500;
@@ -250,7 +247,7 @@ export class CoreIpcClient {
         if (error) reject(error);
         else resolve(value as T);
       };
-      socket.setTimeout(this.timeoutMs, () => finish(new Error('Core IPC request timed out'));
+      socket.setTimeout(this.timeoutMs, () => finish(new Error('Core IPC request timed out')));
       socket.once('error', (error) => finish(error));
       socket.once('connect', () => socket.write(`${JSON.stringify(wire)}\n`));
       socket.on('data', (chunk: Buffer) => {
