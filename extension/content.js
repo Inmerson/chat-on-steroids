@@ -2093,7 +2093,10 @@
     try {
       const path = location.pathname;
       if (path === seededPath) return true;
-      const named = /^\/c\//.test(path) && !/^\/c\//.test(seededPath || '');
+      // Use the canonical conversation parser so a Project fresh-chat route gaining its id
+      // remains the same chat instead of looking like a navigation to another conversation.
+      const named =
+        CLF_DOM.conversationFromPath(path) !== null && CLF_DOM.conversationFromPath(seededPath) === null;
       seededPath = path;
       return named;
     } catch {

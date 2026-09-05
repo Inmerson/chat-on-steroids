@@ -7638,6 +7638,44 @@ describe('the fresh chat the app opened', () => {
     ]);
   });
 
+  it('acquires its id when a Project route names the fresh chat', async () => {
+    live = await harness(
+      'https://chatgpt.com/g/g-p-68abcdef1234/project?clf=cmd-project#clf=cmd-project',
+      {
+        redeem: () => ({
+          ok: true,
+          command: {
+            id: 'cmd-project',
+            type: 'resume',
+            text: 'Continue the previous ChatGPT session. Handoff: h-project',
+            agent: null
+          }
+        }),
+        ack: () => ({ ok: true })
+      },
+      (document, dom) => {
+        document.querySelector('[data-testid="send-button"]')!.addEventListener('click', () => {
+          dom.reconfigure({
+            url: 'https://chatgpt.com/g/g-p-68abcdef1234/c/77777777-6666-5555-4444-333333333333'
+          });
+        });
+      }
+    );
+
+    await settle(400);
+
+    expect(live.sent.filter((message) => message.type === 'redeem')).toHaveLength(1);
+    expect(live.document.querySelector('#prompt-textarea')!.textContent).toContain('Handoff: h-project');
+    expect(live.sent.filter((message) => message.type === 'ack')).toMatchObject([
+      {
+        type: 'ack',
+        id: 'cmd-project',
+        status: 'sent',
+        conversationId: '77777777-6666-5555-4444-333333333333'
+      }
+    ]);
+  });
+
   it('abandons a redeemed bootstrap if SPA navigation retargets the tab before insertion', async () => {
     let page: JSDOM | null = null;
     let sends = 0;
