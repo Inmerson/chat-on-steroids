@@ -13,8 +13,12 @@
  */
 
 import { requestCorrelation } from '../session/correlation.js';
+import { unifiedExecManager } from './manager.js';
+import type { BackgroundExecState } from './unified-exec.js';
 
 /** Attribution owners, keyed by the process id `exec_command` handed back as `session_id`. */
+export const MAX_UNREAD_EXEC_RESULTS_PER_CONVERSATION = 4;
+
 const owners = new Map<number, string | null>();
 
 /**
@@ -44,6 +48,14 @@ export function forgetExecOwner(processId: number | null): void {
 /** The conversation that opened this session, or null when it was never proven. */
 export function execOwner(processId: number): string | null {
   return owners.get(processId) ?? null;
+}
+
+/** Retained background work attributed to one proven conversation; never an auth decision. */
+export function backgroundExecObligations(conversationId: string | null | undefined): BackgroundExecState {
+  if (!conversationId) return { running: [], exitedUnread: [] };
+  const processIds = new Set<number>();
+  for (const [processId, owner] of owners) if (owner === conversationId) processIds.add(processId);
+  return unifiedExecManager.backgroundState(processIds);
 }
 
 /**
