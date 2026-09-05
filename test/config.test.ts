@@ -77,6 +77,7 @@ describe('settings migration', () => {
     // publishing Desktop at all.
     expect(loaded.tunnel.tunnelId).toBe(oldConfig.tunnel.tunnelId);
     expect(loaded.tunnel.desktopTunnelId).toBe('');
+    expect(loaded.tunnel.steromiTunnelId).toBe('');
   });
 
   it('folds a PowerShell-only permission into the single command permission', async () => {
@@ -135,19 +136,21 @@ describe('settings migration', () => {
     expect(new Set(loaded.roots.map((root) => root.name)).size).toBe(loaded.roots.length);
   });
 
-  it('round-trips a second tunnel id for the Desktop connector', async () => {
+  it('round-trips separate tunnel ids for the optional Desktop and Steromi connectors', async () => {
     const config = defaultConfig();
     await saveConfig({
       ...config,
       tunnel: {
         ...config.tunnel,
         tunnelId: 'tunnel_0123456789abcdef0123456789abcdef',
-        desktopTunnelId: 'tunnel_fedcba9876543210fedcba9876543210'
+        desktopTunnelId: 'tunnel_fedcba9876543210fedcba9876543210',
+        steromiTunnelId: 'tunnel_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
       }
     });
     const loaded = await loadConfig();
     expect(loaded.tunnel.tunnelId).toBe('tunnel_0123456789abcdef0123456789abcdef');
     expect(loaded.tunnel.desktopTunnelId).toBe('tunnel_fedcba9876543210fedcba9876543210');
+    expect(loaded.tunnel.steromiTunnelId).toBe('tunnel_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa');
   });
 
   /**

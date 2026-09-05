@@ -217,6 +217,8 @@ const configSchema = z.object({
     // loads unchanged and simply has no Desktop tunnel yet — which is also the correct
     // state for it, since the user has not created that connector in ChatGPT either.
     desktopTunnelId: z.string().max(128).optional().default(''),
+    // Optional third connector. Empty is normal until the user creates Steromi in ChatGPT.
+    steromiTunnelId: z.string().max(128).optional().default(''),
     binaryPath: z.string().max(4096)
   }),
   ui: z.object({
@@ -323,7 +325,7 @@ export function defaultConfig(_platform: NodeJS.Platform = process.platform): Co
     readOnly: true,
     allComputer: false,
     previousRoots: [],
-    tunnel: { kind: 'openai', tunnelId: '', desktopTunnelId: '', binaryPath: '' },
+    tunnel: { kind: 'openai', tunnelId: '', desktopTunnelId: '', steromiTunnelId: '', binaryPath: '' },
     ui: { minimizeToTray: true, autoConnect: false, privacyScreenshots: false, theme: 'dark' },
     sessions: { ...DEFAULT_SESSIONS },
     compaction: { ...DEFAULT_COMPACTION },

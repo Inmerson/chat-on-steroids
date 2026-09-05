@@ -19,6 +19,8 @@ let endpoint: McpEndpoint | null = null;
 let tunnel: TunnelHandle | null = null;
 let desktopTunnel: TunnelHandle | null = null;
 let desktopTunnelId: string | null = null;
+let steromiTunnel: TunnelHandle | null = null;
+let steromiTunnelId: string | null = null;
 let activeCoreTransport: Pick<TunnelSettings, 'kind' | 'tunnelId' | 'binaryPath'> | null = null;
 let status: ConnectionStatus = {
   state: 'disconnected',
@@ -99,19 +101,19 @@ function desktopUnavailableDetail(id: SurfaceId): string {
 function toolsFor(id: SurfaceId): string[] {
   const config = getConfig();
   const caps = effectiveCapabilities(config);
-  if (id === 'desktop') {
-    const computer = caps.control || caps.clipboardRead || caps.clipboardWrite;
-    return [...(caps.screen ? ['observe'] : []), ...(computer ? ['computer'] : [])];
-  }
-  const tools: string[] = [];
-  if (caps.read || caps.browse || caps.metadata) tools.push('read');
-  if (caps.read) tools.push('view_image');
-  if (!caps.command && caps.search) tools.push('find');
-  if (caps.create || caps.edit || caps.move || caps.deleteFile) tools.push('apply_patch');
-  if (caps.command) tools.push('exec_command', 'write_stdin');
-  if (config.sessions.record) tools.push('session');
-  if (config.multiAgent.enabled) tools.push('agents');
-  return tools;
+  const computer = caps.control || caps.clipboardRead || caps.clipboardWrite;
+  const desktopTools = [...(caps.screen ? ['observe'] : []), ...(computer ? ['computer'] : [])];
+  const coreTools: string[] = [];
+  if (caps.read || caps.browse || caps.metadata) coreTools.push('read');
+  if (caps.read) coreTools.push('view_image');
+  if (!caps.command && caps.search) coreTools.push('find');
+  if (caps.create || caps.edit || caps.move || caps.deleteFile) coreTools.push('apply_patch');
+  if (caps.command) coreTools.push('exec_command', 'write_stdin');
+  if (config.sessions.record) coreTools.push('session');
+  if (config.multiAgent.enabled) coreTools.push('agents');
+  if (id === 'desktop') return desktopTools;
+  if (id === 'steromi') return ['steromi_dashboard', ...coreTools, ...desktopTools];
+  return coreTools;
 }
 
 function updateSurface(id: SurfaceId, next: Partial<SurfaceStatus>): void {
@@ -219,10 +221,11 @@ async function connectImpl(): Promise<void> {
           ...(report.publicUrl === undefined ? {} : { publicUrl: report.publicUrl })
         });
         if (config.tunnel.kind !== 'openai' && report.publicUrl !== undefined) {
-          const desktop = status.surfaces.find((entry) => entry.id === 'desktop');
-          if (desktop?.available) {
-            updateSurface('desktop', {
-              publicUrl: siblingPublicUrl(report.publicUrl, desktop.localUrl),
+          for (const id of ['desktop', 'steromi'] as const) {
+            const sibling = status.surfaces.find((entry) => entry.id === id);
+            if (!sibling?.available) continue;
+            updateSurface(id, {
+              publicUrl: siblingPublicUrl(report.publicUrl, sibling.localUrl),
               state: surfaceStateForConnection(report.state),
               detail: report.detail
             });
@@ -237,6 +240,7 @@ async function connectImpl(): Promise<void> {
     }
     tunnel = startedTunnel;
     await startDesktopTunnel(generation, config.tunnel, apiKey);
+    await startSteromiTunnel(generation, config.tunnel, apiKey);
   } catch (err) {
     if (shutdownRequested || generation !== connectionGeneration) {
       await disconnectImpl(30_000);
@@ -310,6 +314,67 @@ async function stopDesktopTunnel(detail: string): Promise<void> {
   updateSurface('desktop', { state: 'off', detail, publicUrl: null });
 }
 
+async function startSteromiTunnel(
+  generation: number,
+  settings: TunnelSettings,
+  apiKey: string | null
+): Promise<void> {
+  if (settings.kind !== 'openai') return;
+  const steromi = status.surfaces.find((entry) => entry.id === 'steromi');
+  if (!steromi?.available || !endpoint) return;
+  if (!settings.steromiTunnelId) {
+    updateSurface('steromi', {
+      state: 'off',
+      detail: 'Not published yet. Create a third Secure Tunnel for Steromi and paste its tunnel id in Settings.'
+    });
+    return;
+  }
+
+  updateSurface('steromi', { state: 'starting', detail: 'Connecting…' });
+  try {
+    steromiTunnelId = settings.steromiTunnelId;
+    const startedSteromiTunnel = await startTunnel({
+      localUrl: endpoint.urls.steromi,
+      settings: { ...settings, tunnelId: settings.steromiTunnelId },
+      apiKey,
+      discoveryHeaders: tunnelProbeHeaders(),
+      label: 'steromi',
+      report: (report) => {
+        if (generation !== connectionGeneration) return;
+        updateSurface('steromi', {
+          state: surfaceStateForConnection(report.state),
+          detail: report.detail,
+          ...(report.publicUrl === undefined ? {} : { publicUrl: report.publicUrl })
+        });
+      }
+    });
+    if (shutdownRequested || generation !== connectionGeneration) {
+      await startedSteromiTunnel.stop().catch(() => {});
+      steromiTunnelId = null;
+      return;
+    }
+    steromiTunnel = startedSteromiTunnel;
+  } catch (err) {
+    if (shutdownRequested || generation !== connectionGeneration) {
+      steromiTunnelId = null;
+      return;
+    }
+    const message = err instanceof TunnelError ? err.message : (err as Error).message;
+    logWarn(`steromi connector not published: ${message}`);
+    steromiTunnelId = null;
+    updateSurface('steromi', { state: 'error', detail: message });
+  }
+}
+
+async function stopSteromiTunnel(detail: string): Promise<void> {
+  if (!steromiTunnel) return;
+  await steromiTunnel.stop().catch(() => {});
+  steromiTunnel = null;
+  steromiTunnelId = null;
+  logInfo('steromi connector unpublished');
+  updateSurface('steromi', { state: 'off', detail, publicUrl: null });
+}
+
 async function applySettingsImpl(): Promise<void> {
   if (shutdownRequested) return;
   if (!endpoint) return;
@@ -322,15 +387,18 @@ async function applySettingsImpl(): Promise<void> {
     return;
   }
   const caps = effectiveCapabilities(config);
-  const available = surfaceIsUseful('desktop', caps);
+  const desktopAvailable = surfaceIsUseful('desktop', caps);
+  const steromiAvailable = surfaceIsUseful('steromi', caps);
   if (desktopAutomationSupported() && (caps.screen || caps.control)) void prewarmComputerHelper();
   setStatus({ surfaces: describeSurfaces() });
 
   if (config.tunnel.kind !== 'openai') {
-    if (available) {
-      const desktop = status.surfaces.find((entry) => entry.id === 'desktop');
-      updateSurface('desktop', {
-        publicUrl: siblingPublicUrl(status.publicUrl, desktop?.localUrl ?? null),
+    for (const id of ['desktop', 'steromi'] as const) {
+      const available = id === 'desktop' ? desktopAvailable : steromiAvailable;
+      if (!available) continue;
+      const sibling = status.surfaces.find((entry) => entry.id === id);
+      updateSurface(id, {
+        publicUrl: siblingPublicUrl(status.publicUrl, sibling?.localUrl ?? null),
         state: surfaceStateForConnection(status.state),
         detail: status.detail
       });
@@ -338,13 +406,19 @@ async function applySettingsImpl(): Promise<void> {
     return;
   }
 
-  if (!available) {
+  if (!desktopAvailable) {
     await stopDesktopTunnel('Turn a desktop permission back on to publish this connector.');
-    return;
+  } else if (!desktopTunnel || desktopTunnelId !== config.tunnel.desktopTunnelId) {
+    await stopDesktopTunnel('Reconnecting with the new tunnel…');
+    await startDesktopTunnel(connectionGeneration, config.tunnel, await getSecret('openaiApiKey'));
   }
-  if (desktopTunnel && desktopTunnelId === config.tunnel.desktopTunnelId) return;
-  await stopDesktopTunnel('Reconnecting with the new tunnel…');
-  await startDesktopTunnel(connectionGeneration, config.tunnel, await getSecret('openaiApiKey'));
+
+  if (!steromiAvailable) {
+    await stopSteromiTunnel('Steromi is not available with the current permissions.');
+  } else if (!steromiTunnel || steromiTunnelId !== config.tunnel.steromiTunnelId) {
+    await stopSteromiTunnel('Reconnecting with the new tunnel…');
+    await startSteromiTunnel(connectionGeneration, config.tunnel, await getSecret('openaiApiKey'));
+  }
 }
 
 export function applySettings(): Promise<void> {
@@ -364,6 +438,11 @@ async function disconnectImpl(endpointForceAfterMs?: number): Promise<void> {
     desktopTunnel = null;
   }
   desktopTunnelId = null;
+  if (steromiTunnel) {
+    await steromiTunnel.stop().catch(() => {});
+    steromiTunnel = null;
+  }
+  steromiTunnelId = null;
   if (tunnel) {
     await tunnel.stop().catch(() => {});
     tunnel = null;

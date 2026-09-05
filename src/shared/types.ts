@@ -111,6 +111,8 @@ export interface TunnelSettings {
    * and the API (`docs/tool-surface.md` §6.5). One id per connector is what actually works.
    */
   desktopTunnelId: string;
+  /** OpenAI tunnel id for the optional Steromi all-in-one connector. */
+  steromiTunnelId: string;
   /** Optional explicit path to tunnel-client / cloudflared. */
   binaryPath: string;
 }
@@ -289,7 +291,7 @@ export interface ConnectionStatus {
 }
 
 /** The identifiers of the connectors this app publishes. Mirrors `mcp/surfaces.ts`. */
-export type SurfaceId = 'core' | 'desktop';
+export type SurfaceId = 'core' | 'desktop' | 'steromi';
 
 export interface SurfaceStatus {
   id: SurfaceId;

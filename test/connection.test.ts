@@ -20,7 +20,7 @@ const mocks = vi.hoisted(() => {
     roots: [{ name: 'workspace', path: 'C:\\workspace' }],
     readOnly: true,
     capabilities: caps,
-    tunnel: { kind: 'cloudflared', tunnelId: '', desktopTunnelId: '', binaryPath: '' },
+    tunnel: { kind: 'cloudflared', tunnelId: '', desktopTunnelId: '', steromiTunnelId: '', binaryPath: '' },
     ui: { privacyScreenshots: false },
     sessions: { record: false },
     multiAgent: { enabled: false }
@@ -62,7 +62,8 @@ vi.mock('../src/main/mcp/server.js', () => ({
       url: 'http://127.0.0.1:45678/mcp/core/core-token',
       urls: {
         core: 'http://127.0.0.1:45678/mcp/core/core-token',
-        desktop: 'http://127.0.0.1:45678/mcp/desktop/desktop-token'
+        desktop: 'http://127.0.0.1:45678/mcp/desktop/desktop-token',
+        steromi: 'http://127.0.0.1:45678/mcp/steromi/steromi-token'
       },
       stop: mocks.endpointStop
     };
@@ -124,6 +125,8 @@ describe('connection surface state', () => {
     mocks.config.readOnly = true;
     mocks.config.tunnel.kind = 'cloudflared';
     mocks.config.tunnel.tunnelId = '';
+    mocks.config.tunnel.desktopTunnelId = '';
+    mocks.config.tunnel.steromiTunnelId = '';
     mocks.config.tunnel.binaryPath = '';
     vi.resetModules();
   });
@@ -146,6 +149,28 @@ describe('connection surface state', () => {
       publicUrl: null,
       detail: ''
     });
+  });
+
+  it('publishes Steromi on whole-origin transports using its own protected MCP path', async () => {
+    const connection = await import('../src/main/connection.js');
+
+    await connection.connect();
+
+    expect(connection.getStatus().surfaces.find((surface) => surface.id === 'steromi')).toMatchObject({
+      state: 'live',
+      publicUrl: 'https://example.trycloudflare.com/mcp/steromi/steromi-token'
+    });
+  });
+
+  it('starts an independent OpenAI tunnel for Steromi when its tunnel id is configured', async () => {
+    mocks.config.tunnel.kind = 'openai';
+    mocks.config.tunnel.steromiTunnelId = 'tunnel_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
+    const connection = await import('../src/main/connection.js');
+
+    await connection.connect();
+
+    expect(mocks.starts).toBe(2);
+    expect(connection.getStatus().surfaces.find((surface) => surface.id === 'steromi')?.state).toBe('live');
   });
 
   it('keeps ordinary disconnect graceful and reserves forced MCP drain for final shutdown', async () => {
