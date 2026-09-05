@@ -3,6 +3,7 @@ import type { CoreUiOperation } from '../../shared/core-protocol.js';
 import { tokenPressure } from '../../shared/session.js';
 import { bridgeStatus, cancelWorkerCommands, unpair } from '../bridge.js';
 import { getConfig } from '../config.js';
+import { runDiagnostics } from '../diagnostics.js';
 import { listGoalModels, MODEL_PAGE_SIZE } from '../goal.js';
 import { controlCenterStatus } from '../orchestration/control-center.js';
 import {
@@ -36,6 +37,7 @@ export interface CoreUiDispatcherDeps {
   clearAgent: (id: string) => Promise<unknown>;
   controlCenter: () => Promise<unknown> | unknown;
   goalModels: (offset: number) => Promise<unknown>;
+  diagnostics: () => Promise<unknown>;
 }
 
 export type CoreUiDispatcher = (operation: CoreUiOperation, payload: unknown) => Promise<unknown>;
@@ -94,6 +96,9 @@ export function createCoreUiDispatcher(deps: CoreUiDispatcherDeps): CoreUiDispat
         const { offset } = z.object({ offset: z.number().int().min(0).max(2000).default(0) }).parse(payload ?? {});
         return deps.goalModels(offset);
       }
+      case 'diagnostics-run':
+        z.null().parse(payload);
+        return deps.diagnostics();
     }
   };
 }
@@ -158,7 +163,8 @@ const defaultDeps: CoreUiDispatcherDeps = {
     return { cleared: outcome.cleared, reason: outcome.reason, swarm: swarmState() };
   },
   controlCenter: controlCenterStatus,
-  goalModels: (offset) => listGoalModels(offset, MODEL_PAGE_SIZE)
+  goalModels: (offset) => listGoalModels(offset, MODEL_PAGE_SIZE),
+  diagnostics: runDiagnostics
 };
 
 export const coreUiDispatcher = createCoreUiDispatcher(defaultDeps);
