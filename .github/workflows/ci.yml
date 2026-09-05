@@ -41,10 +41,20 @@ jobs:
         run: npm ci
 
       - name: Verify
+        if: runner.os != 'Windows'
         shell: bash
         run: |
           set -o pipefail
           npm run verify:ci 2>&1 | tee verify.log
+
+      - name: Verify
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          cmd /d /s /c "npm run verify:ci > verify.log 2>&1"
+          $code = $LASTEXITCODE
+          Get-Content -LiteralPath verify.log
+          exit $code
 
       - name: Upload failed verify log
         if: failure()
