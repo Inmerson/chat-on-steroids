@@ -2,8 +2,8 @@ import path from 'node:path';
 import { shell } from 'electron';
 import type { ConnectionStatus } from '../../shared/types.js';
 import type { CoreStatusEnvelope } from '../../shared/core-protocol.js';
-import { agentConversation, bindConversation, onRetiredWorkersPersist, onRetiredWorkersPersistNow, onSwarmPersist, onSwarmPersistNow, pauseSwarmForDisable, persistAgentAuthorityNow, repairPrimeConversationAfterRecovery, restoreRetiredWorkers, restoreSwarm, snapshotRetiredWorkers, snapshotSwarm, type RetiredWorkersSnapshot, type SwarmSnapshot } from '../agents.js';
-import { cancelWorkerCommands, setBrowserOpener, shutdownBridge, startBridge, stopBridge } from '../bridge.js';
+import { agentConversation, bindConversation, onRetiredWorkersPersist, onRetiredWorkersPersistNow, onSwarmChange, onSwarmPersist, onSwarmPersistNow, pauseSwarmForDisable, persistAgentAuthorityNow, repairPrimeConversationAfterRecovery, restoreRetiredWorkers, restoreSwarm, snapshotRetiredWorkers, snapshotSwarm, type RetiredWorkersSnapshot, type SwarmSnapshot } from '../agents.js';
+import { cancelWorkerCommands, onBridgeChange, setBrowserOpener, shutdownBridge, startBridge, stopBridge } from '../bridge.js';
 import { openInPreferredBrowser } from '../browser.js';
 import { unifiedExecManager } from '../codex/manager.js';
 import { connect, disconnect, getStatus, isServerRunning, shutdownConnection } from '../connection.js';
@@ -17,9 +17,10 @@ import { stopComputerHelper } from '../computer/index.js';
 import { initSecretsPath } from '../secrets.js';
 import { CONTINUATIONS_STATE, restoreContinuations, setContinuationRecoveryHooks, type ContinuationSnapshot } from '../session/continuation.js';
 import { restoreRequestCorrelations } from '../session/correlation.js';
-import { flushRecorder, queueDeterministicAttributionRepair, setAgentBinder, setAgentConversationLookup } from '../session/recorder.js';
+import { flushRecorder, onSessionChange, queueDeterministicAttributionRepair, setAgentBinder, setAgentConversationLookup } from '../session/recorder.js';
 import { startSessionRetentionMaintenance } from '../session/retention.js';
 import { flushSessions, initSessionStore, pruneSessions } from '../session/store.js';
+import { forgetWorkspaceRoot, renameWorkspaceRoot } from '../workspace.js';
 import { CoreHealthController } from './health-controller.js';
 import { probeLocalMcp } from './probe.js';
 import { setConnectionGenerationProvider } from './request-lifecycle.js';
@@ -54,13 +55,11 @@ function projectedStatus(legacy: ConnectionStatus, health: ReturnType<CoreHealth
     };
   }
   if (legacy.state === 'connected') {
-    // Transport-only green is never allowed through the Core IPC boundary.
     return { ...legacy, state: 'offline', detail: 'Connection transport is up, but end-to-end execution is not verified.' };
   }
   return legacy;
 }
 
-/** Initializes every backend singleton a model-facing Core tool can reach. */
 async function restoreCoreState(userDataDir: string): Promise<() => void> {
   initConfigPath(userDataDir);
   initSecretsPath(userDataDir);
@@ -112,6 +111,12 @@ export async function startCoreRuntime(userDataDir: string): Promise<CoreRuntime
   const stopRetention = await restoreCoreState(userDataDir);
   let watchdog: NodeJS.Timeout | null = null;
   let shuttingDown = false;
+  let bridgeRevision = 0;
+  let sessionRevision = 0;
+  let swarmRevision = 0;
+  const dropBridgeRevision = onBridgeChange(() => { bridgeRevision += 1; });
+  const dropSessionRevision = onSessionChange(() => { sessionRevision += 1; });
+  const dropSwarmRevision = onSwarmChange(() => { swarmRevision += 1; });
 
   const health = new CoreHealthController({
     getStatus,
@@ -130,9 +135,6 @@ export async function startCoreRuntime(userDataDir: string): Promise<CoreRuntime
       );
     }
   });
-  // Request lifecycle records must carry the same generation that status/recovery uses. This
-  // provider is read at the actual HTTP request-start boundary, so an in-flight request keeps the
-  // generation it entered under even if recovery increments the controller before its response.
   setConnectionGenerationProvider(() => health.snapshot().connectionGeneration);
 
   const tick = async (): Promise<void> => {
@@ -154,7 +156,10 @@ export async function startCoreRuntime(userDataDir: string): Promise<CoreRuntime
       return {
         generation: healthSnapshot.connectionGeneration,
         status: projectedStatus(getStatus(), healthSnapshot),
-        health: healthSnapshot
+        health: healthSnapshot,
+        bridgeRevision,
+        sessionRevision,
+        swarmRevision
       };
     },
     connect: async () => {
@@ -176,9 +181,10 @@ export async function startCoreRuntime(userDataDir: string): Promise<CoreRuntime
         cancelWorkerCommands,
         persistAgentAuthorityNow,
         retireGoalDrafts,
-        forgetExposedSurface
+        forgetExposedSurface,
+        forgetWorkspaceRoot,
+        renameWorkspaceRoot
       });
-      // Connection/tunnel reconciliation remains serialized by the existing connection owner.
       const { applySettings } = await import('../connection.js');
       await applySettings();
       await tick();
@@ -188,6 +194,9 @@ export async function startCoreRuntime(userDataDir: string): Promise<CoreRuntime
       shuttingDown = true;
       if (watchdog) clearInterval(watchdog);
       watchdog = null;
+      dropBridgeRevision();
+      dropSessionRevision();
+      dropSwarmRevision();
       stopRetention();
       await Promise.allSettled([shutdownConnection(), shutdownBridge()]);
       await Promise.allSettled([unifiedExecManager.terminateAllProcesses(), stopComputerHelper()]);
