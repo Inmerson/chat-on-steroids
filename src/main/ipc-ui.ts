@@ -23,6 +23,7 @@ import {
   onStatusChange,
   setCoreSecret
 } from './connection.js';
+import { loadConfig } from './config.js';
 import { formatLogAsJson, formatLogForClipboard, getLog, logInfo, onLog } from './logger.js';
 import { isEncryptionAvailable, secureStorageStatus } from './secrets.js';
 import { bundledVersion, locateBinary } from './tunnel/locate.js';
@@ -70,6 +71,12 @@ async function buildState(): Promise<AppState> {
   };
 }
 
+async function refreshUiConfigMirror(): Promise<void> {
+  // Core is the only writer. The Electron presentation process reloads the durable config only so
+  // native-only behavior (close-to-tray, theme, login startup) follows the authoritative state.
+  await loadConfig();
+}
+
 function handle<T>(channel: string, fn: (payload: unknown) => Promise<T>): void {
   ipcMain.handle(channel, async (_event, payload: unknown) => {
     try {
@@ -93,6 +100,7 @@ export function registerUiIpc(getWindow: () => BrowserWindow | null, quitToInsta
   handle('settings:save', async (payload) => {
     const request = z.object({ base: z.record(z.string(), z.unknown()), patch: z.record(z.string(), z.unknown()) }).parse(payload);
     const next = await callCoreUi<Config>('settings-save', request);
+    await refreshUiConfigMirror();
     syncLoginStartup(app, next.ui.autoConnect);
     nativeTheme.themeSource = next.ui.theme;
     getWindow()?.setBackgroundColor(next.ui.theme === 'dark' ? '#0e0e11' : '#ffffff');
@@ -106,18 +114,21 @@ export function registerUiIpc(getWindow: () => BrowserWindow | null, quitToInsta
     const result = await dialog.showOpenDialog(window, { title: 'Approve a folder for ChatGPT', properties: ['openDirectory'] });
     if (!result.canceled && result.filePaths[0]) {
       await callCoreUi<Config>('root-add-path', { path: result.filePaths[0] });
+      await refreshUiConfigMirror();
     }
     return buildState();
   });
 
   handle('roots:allComputer:toggle', async () => {
     await callCoreUi<Config>('roots-all-computer-toggle');
+    await refreshUiConfigMirror();
     return buildState();
   });
 
   handle('roots:remove', async (payload) => {
     const value = z.object({ name: z.string().min(1).max(32) }).parse(payload);
     await callCoreUi<Config>('root-remove', value);
+    await refreshUiConfigMirror();
     return buildState();
   });
 
@@ -127,6 +138,7 @@ export function registerUiIpc(getWindow: () => BrowserWindow | null, quitToInsta
       newName: z.string().min(1).max(32).regex(/^[a-z0-9][a-z0-9._-]*$/)
     }).parse(payload);
     await callCoreUi<Config>('root-rename', value);
+    await refreshUiConfigMirror();
     return buildState();
   });
 
@@ -158,6 +170,7 @@ export function registerUiIpc(getWindow: () => BrowserWindow | null, quitToInsta
     });
     if (!result.canceled && result.filePaths[0]) {
       await callCoreUi<Config>('tunnel-binary-path', { path: result.filePaths[0] });
+      await refreshUiConfigMirror();
     }
     return buildState();
   });
@@ -262,8 +275,5 @@ export function registerUiIpc(getWindow: () => BrowserWindow | null, quitToInsta
   onUpdateChange(pushState);
   onLog((entry) => push('log:entry', entry));
 
-  // State requests already expose health through the visible status projection. This channel is
-  // intentionally read-only and useful to tests/debug tooling without putting Core internals into
-  // every AppState snapshot.
   handle('core:health', async () => getCoreHealth());
 }
