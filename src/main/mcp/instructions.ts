@@ -15,10 +15,14 @@ import type { ToolContext } from './kernel.js';
 import { surfaceDefinition, type SurfaceId } from './surfaces.js';
 
 export function serverInstructions(ctx: ToolContext, surface: SurfaceId = 'core'): string {
-  return surface === 'desktop' ? desktopInstructions(ctx) : coreInstructions(ctx);
+  return surface === 'desktop'
+    ? desktopInstructions(ctx)
+    : surface === 'steromi'
+      ? steromiInstructions(ctx)
+      : coreInstructions(ctx);
 }
 
-function coreInstructions(ctx: ToolContext): string {
+function coreInstructions(ctx: ToolContext, includeConnectorRedirect = true): string {
   const config = getConfig();
   const sessionTools = ctx.sessionTools ?? config.sessions.record;
   const agentTools = ctx.agentTools ?? config.multiAgent.enabled;
@@ -55,7 +59,10 @@ function coreInstructions(ctx: ToolContext): string {
     'Output is capped. When a result says it was truncated, narrow the request instead of repeating it.'
   ];
 
-  if (ctx.caps.screen || ctx.caps.control || ctx.caps.clipboardRead || ctx.caps.clipboardWrite) {
+  if (
+    includeConnectorRedirect &&
+    (ctx.caps.screen || ctx.caps.control || ctx.caps.clipboardRead || ctx.caps.clipboardWrite)
+  ) {
     lines.push(
       '',
       // Named rather than hinted at: the model can see this connector but not the other, and
@@ -113,7 +120,7 @@ function coreInstructions(ctx: ToolContext): string {
   return lines.join('\n');
 }
 
-function desktopInstructions(ctx: ToolContext): string {
+function desktopInstructions(ctx: ToolContext, includeConnectorRedirect = true): string {
   const lines = [
     'Local Windows desktop control: look at this PC’s screen and windows, and drive its mouse and keyboard.',
     '',
@@ -137,11 +144,24 @@ function desktopInstructions(ctx: ToolContext): string {
     );
   }
 
-  lines.push(
-    '',
-    `Files, patches and commands live in a separate connector, "${surfaceDefinition('core').connectorName}".`,
-    'This one cannot read or change files. If a task needs that and it is not available here, say so.'
-  );
+  if (includeConnectorRedirect) {
+    lines.push(
+      '',
+      `Files, patches and commands live in a separate connector, "${surfaceDefinition('core').connectorName}".`,
+      'This one cannot read or change files. If a task needs that and it is not available here, say so.'
+    );
+  }
 
   return lines.join('\n');
+}
+
+function steromiInstructions(ctx: ToolContext): string {
+  return [
+    'Steromi all-in-one combines the coding and Windows desktop surfaces in one connector.',
+    'Use steromi_dashboard when an interactive Screen, Terminal, Files and Sessions panel would help the user.',
+    '',
+    coreInstructions(ctx, false),
+    '',
+    desktopInstructions(ctx, false)
+  ].join('\n');
 }

@@ -154,7 +154,7 @@ const STEROMI: SurfaceDefinition = {
     'project checkpoints & rollback, and Unity tooling in one single unified connector.',
   cardSummary: 'All-in-One Powerhouse: All 66+ tools, coding, LSP, voice, browser, and desktop control in a single connector.',
   required: false,
-  tools: ['observe', 'computer', ...ALL_TOOLS]
+  tools: ['steromi_dashboard', 'observe', 'computer', ...ALL_TOOLS]
 };
 
 export const SURFACES: Record<SurfaceId, SurfaceDefinition> = {

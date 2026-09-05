@@ -19,6 +19,7 @@ import { registerCoreTools } from './tools-core.js';
 import { registerProjectInmersionTools } from './tools-project-inmersion.js';
 import { registerPowerAgentTools } from './tools-power-agent.js';
 import { registerDesktopTools } from './tools-desktop.js';
+import { registerSteromiApp } from './steromi-app.js';
 import { surfaceDefinition, type SurfaceId } from './surfaces.js';
 import { serverInstructions } from './instructions.js';
 import { APP_VERSION } from './../version.js';
@@ -42,6 +43,7 @@ export function buildServer(ctx: ToolContext, surface: SurfaceId): McpServer {
     registerProjectInmersionTools(registrar);
     registerPowerAgentTools(registrar);
   } else {
+    registerSteromiApp(server, registrar);
     registerCoreTools(registrar);
     registerDesktopTools(registrar);
     registerProjectInmersionTools(registrar);
