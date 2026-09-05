@@ -105,8 +105,6 @@ export class CoreSupervisor {
       return { state: 'attached', pid: existing.pid };
     }
 
-    // A just-spawned host may still be opening safeStorage/config/IPC. Do not create a second
-    // instance during that bounded grace window; endpoint ownership will settle the race.
     if (this.lastSpawnAt !== null && now - this.lastSpawnAt < this.startupGraceMs && this.lastSpawnPid !== null) {
       return { state: 'spawned', pid: this.lastSpawnPid };
     }
@@ -117,8 +115,6 @@ export class CoreSupervisor {
       MAX_CORE_RESTART_BACKOFF_MS;
     await this.sleep(delay);
 
-    // Another independently-launched UI/supervisor may have won ownership while our backoff was
-    // running. Re-probe before spawning; the IPC endpoint is authoritative, not stale PID data.
     const afterBackoff = await this.adapter.probe();
     if (afterBackoff.healthy) {
       this.stalePid = null;
@@ -145,9 +141,19 @@ export class CoreSupervisor {
   }
 
   /**
-   * Metadata from a previous process may aid logs, but never blocks a healthy-IPC decision.
-   * The next ensure pass probes the endpoint and may replace this PID immediately.
+   * Explicit supervisor/system/update shutdown. If a restart is currently in flight, let that
+   * single flight settle first and then stop the resulting host, so an update cannot race a late
+   * spawn that reopens the installed executable after quiesce began.
    */
+  async stopHost(): Promise<void> {
+    const inFlight = this.recovery;
+    if (inFlight) await inFlight.catch(() => undefined);
+    await this.adapter.stop();
+    this.lastSpawnAt = null;
+    this.lastSpawnPid = null;
+    this.stalePid = null;
+  }
+
   async noteStalePid(pid: number): Promise<void> {
     this.stalePid = pid;
   }
