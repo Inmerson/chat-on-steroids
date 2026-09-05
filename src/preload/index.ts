@@ -82,6 +82,7 @@ const api = {
   getLogJson: () => call<string>('log:json'),
   writeClipboard: (text: string) => call<boolean>('clipboard:write', { text }),
   openLink: (url: string) => call<boolean>('link:open', { url }),
+  installUpdate: () => call<boolean>('update:install'),
 
   // Sessions, compaction and the browser bridge. Everything here is read-only or a
   // named action; there is still no channel that takes a path or a command.

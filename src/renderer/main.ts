@@ -21,6 +21,8 @@ import {
   CAPABILITY_LABELS,
   CAPABILITY_TOOLS,
   DESKTOP_CAPABILITIES,
+  isNewer,
+  RELEASES_PAGE,
   WRITE_CAPABILITIES
 } from '../shared/types.js';
 import type { SwarmState } from '../shared/session.js';
@@ -664,6 +666,71 @@ function paintRoots(roots: AppState['config']['roots']): void {
 
 // ----------------------------------------------------------------- render
 
+type UpdateTone = 'ok' | 'work' | 'bad';
+let updateAnnounced = false;
+
+function updateSummary(next: AppState): { text: string; tone: UpdateTone; notice: boolean } | null {
+  // Older test/dev state snapshots predate the updater. Production AppState always carries it.
+  if (!next.update) return null;
+  const { bridge, update } = next;
+  const extensionVersion = bridge.present ? bridge.extensionVersion : null;
+  const stale = extensionVersion && isNewer(update.current, extensionVersion) ? extensionVersion : null;
+  if (!stale && !update.latest && update.stage === 'idle' && !update.checkedAt) return null;
+
+  const lines: string[] = [];
+  let tone: UpdateTone = 'work';
+  if (update.latest) {
+    lines.push(
+      update.stage === 'ready'
+        ? `Chat On Steroids ${update.latest} is downloaded and ready. Install it now, or it installs the next time you quit.`
+        : update.stage === 'downloading'
+          ? `Chat On Steroids ${update.latest} is downloading. Keep working; you can install it when it lands.`
+          : update.stage === 'failed'
+            ? `Chat On Steroids ${update.latest} could not be downloaded: ${update.error ?? 'the download stopped'}.`
+            : `Chat On Steroids ${update.latest} is out. This installation has to be updated by hand.`
+    );
+    if (update.stage === 'failed') tone = 'bad';
+  } else if (update.stage === 'failed') {
+    lines.push(`Could not check for a newer version: ${update.error ?? 'the check stopped'}.`);
+    tone = 'bad';
+  } else if (update.stage === 'checking') {
+    lines.push('Checking for a newer version…');
+  } else if (!stale) {
+    lines.push(`Up to date! Chat On Steroids ${update.current}${extensionVersion ? ` · extension ${extensionVersion}` : ''}`);
+    tone = 'ok';
+  }
+  if (stale) {
+    lines.push(`The browser extension is ${stale} and this app is ${update.current}. Load the extension folder again in Chrome.`);
+    tone = 'bad';
+  }
+  return { text: lines.join(' '), tone, notice: Boolean(update.latest || stale) };
+}
+
+function paintUpdate(next: AppState): void {
+  const notice = $('updateNotice');
+  const line = $('updateLine');
+  const summary = updateSummary(next);
+  if (!summary || !next.update) {
+    notice.hidden = true;
+    line.hidden = true;
+    $<HTMLButtonElement>('installUpdate').hidden = true;
+    return;
+  }
+  $('updateText').textContent = summary.text;
+  $<HTMLButtonElement>('updateGet').hidden = !next.update.latest || next.update.stage === 'downloading' || next.update.stage === 'ready';
+  const installable = next.update.stage === 'ready';
+  $<HTMLButtonElement>('updateInstall').hidden = !installable;
+  $<HTMLButtonElement>('installUpdate').hidden = !installable;
+  notice.hidden = !summary.notice;
+  line.textContent = summary.text;
+  line.className = `upline${summary.tone === 'ok' ? ' is-ok' : summary.tone === 'bad' ? ' is-bad' : ''}`;
+  line.hidden = false;
+  if (!updateAnnounced && next.update.stage !== 'checking' && next.update.stage !== 'downloading') {
+    updateAnnounced = true;
+    toast(summary.text);
+  }
+}
+
 function apply(next: AppState): void {
   const previousState = state;
   state = next;
@@ -703,6 +770,8 @@ function apply(next: AppState): void {
   $('connectLabel').textContent = running ? 'Disconnect' : 'Connect';
   connectBtn.disabled = !running && missing !== null;
   connectBtn.title = !running && missing ? missing.text : '';
+
+  paintUpdate(next);
 
   // ---- health numbers and facts
   paintClock();
@@ -1366,6 +1435,13 @@ $('wizExpand').addEventListener('click', () => {
   showAllSteps = !showAllSteps;
   if (state) apply(state);
 });
+$('updateGet').addEventListener('click', () => void run(api.openLink(RELEASES_PAGE)));
+function installUpdate(): void {
+  toast('Installing the update. Chat On Steroids closes and starts again as the new version.');
+  void run(api.installUpdate());
+}
+$('updateInstall').addEventListener('click', installUpdate);
+$('installUpdate').addEventListener('click', installUpdate);
 $('connectBtn').addEventListener('click', () => void toggleConnection());
 $('wizConnect').addEventListener('click', () => void toggleConnection());
 

@@ -80,6 +80,10 @@
           <button class="btn btn-icon" id="themeBtn" type="button" title="Switch to dark mode">
             <svg class="ico" viewBox="0 0 24 24"><use href="#i-moon" id="themeIcon" /></svg>
           </button>
+          <button class="btn btn-install" id="installUpdate" type="button" hidden>
+            <svg class="ico" viewBox="0 0 24 24"><use href="#i-bolt" /></svg>
+            <span>Install update</span>
+          </button>
           <span class="live" id="live">
             <span class="dot"></span>
             <span id="liveState">Not connected</span>
@@ -91,6 +95,13 @@
           </button>
         </span>
       </header>
+
+      <div class="notice" id="updateNotice" hidden>
+        <svg class="ico" viewBox="0 0 24 24"><use href="#i-bolt" /></svg>
+        <span id="updateText"></span>
+        <button class="btn btn-quiet" id="updateGet" type="button" hidden>Get it</button>
+        <button class="btn btn-quiet" id="updateInstall" type="button" hidden>Install now</button>
+      </div>
 
       <main>
         <!-- ============================================================ Home -->
@@ -173,6 +184,7 @@
               </span>
             </h2>
             <div class="scroll feed" id="homeFeed"></div>
+            <p class="upline" id="updateLine" hidden></p>
           </section>
         </section>
 

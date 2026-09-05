@@ -49,7 +49,7 @@ const expectedPlist = {
   CFBundleShortVersionString: packageVersion,
   CFBundleVersion: packageVersion,
   LSApplicationCategoryType: 'public.app-category.developer-tools',
-  LSMinimumSystemVersion: '12.0'
+  LSMinimumSystemVersion: '13.0'
 };
 for (const [key, expected] of Object.entries(expectedPlist)) {
   const actual = plistValue(key);

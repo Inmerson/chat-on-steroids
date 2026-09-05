@@ -13,6 +13,36 @@ the app refuses the extension and asks you to reload the matching copy.
 
 No changes yet.
 
+## [2.1.1] — 2026-09-05
+
+2.1.1 is a reliability and distribution patch that brings selected upstream hardening back onto
+the 2.1 autonomous-execution line without replacing the newer orchestration architecture.
+
+### Added
+- **Verified self-update staging.** Packaged Windows installs and Linux AppImages check this fork's
+  GitHub releases, verify the published SHA-256 manifest, keep a staged installer across restarts,
+  and install only after the user presses **Install**. Debian packages and unsigned macOS builds
+  remain manual-update surfaces and link to the release instead of silently replacing themselves.
+- **Current tunnel-client release gate.** Release preflight now fails closed when the pinned OpenAI
+  `tunnel-client` is not the current stable release.
+- **Per-path read ranges and missing-path guidance.** `read` accepts `path:12-40` / `path:12` and,
+  when browsing is allowed, reports the nearest existing folder contents after a missing-path error.
+
+### Changed
+- Bundled OpenAI `tunnel-client` moves to **v0.0.14** with pinned checksums for every release
+  platform/architecture. Because those native macOS binaries require it, the packaged macOS floor
+  moves from Monterey 12 to **Ventura 13**.
+- Session continuation cursors are short checksum-bound tokens rather than long base64 JSON blobs;
+  damaged or cross-session copies fail explicitly instead of being misread as stale history.
+- Standalone extension recovery follows this fork's versioned release assets, matching the updater
+  channel instead of requesting a fork-only app version from the original repository.
+
+### Fixed
+- Windows NSIS install/update now repairs the installed app tree ACL required by Electron's sandbox
+  before startup, without disabling the sandbox or broadening permissions outside the install tree.
+- Update state is exposed through the existing app-state/IPC path, and the renderer shows install or
+  manual-update actions without disrupting the Control Center layout.
+
 ## [2.1.0] — 2026-09-05
 
 2.1.0 integrates Agent System 3.0, Control Center, durable autonomous execution, Infinite Loop,

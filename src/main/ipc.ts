@@ -10,7 +10,13 @@
 
 import { app, BrowserWindow, clipboard, dialog, ipcMain, nativeTheme, shell } from 'electron';
 import { z } from 'zod';
-import { CAPABILITIES, GOAL_REASONING_LEVELS, type AppState, type Config } from '../shared/types.js';
+import {
+  CAPABILITIES,
+  GOAL_REASONING_LEVELS,
+  RELEASES_PAGE,
+  type AppState,
+  type Config
+} from '../shared/types.js';
 import { MAX_GOAL_SYSTEM_PROMPT_CHARS } from '../shared/goal.js';
 import { applySettings, connect, disconnect, getStatus, onStatusChange } from './connection.js';
 import { getConfig, updateConfig } from './config.js';
@@ -60,6 +66,7 @@ import { forgetWorkspaceRoot, renameWorkspaceRoot } from './workspace.js';
 import { hostPlatformInfo } from './platform.js';
 import { syncLoginStartup } from './background-startup.js';
 import { controlCenterStatus } from './orchestration/control-center.js';
+import { markInstallOnQuit, onUpdateChange, updateStatus } from './update.js';
 
 /** The only URLs the renderer may ask the OS to open. */
 const ALLOWED_LINKS = new Set([
@@ -74,7 +81,8 @@ const ALLOWED_LINKS = new Set([
   // Where the key for the goal loop comes from. The button beside the key field is useless
   // without this: `link:open` refuses anything not named here, so it threw where nobody
   // was looking and the button did nothing at all.
-  'https://openrouter.ai/settings/keys'
+  'https://openrouter.ai/settings/keys',
+  RELEASES_PAGE
 ]);
 
 const capabilityPatch = z.object(
@@ -249,7 +257,8 @@ async function buildState(): Promise<AppState> {
     hasGoalKey: await hasSecret('openRouterApiKey'),
     resolvedBinary: resolvedBinary(config),
     bundledTunnelVersion: bundledVersion(),
-    bridge: await bridgeStatus()
+    bridge: await bridgeStatus(),
+    update: updateStatus()
   };
 }
 
@@ -272,7 +281,7 @@ function handle<T>(channel: string, fn: (payload: unknown) => Promise<T>): void 
   });
 }
 
-export function registerIpc(getWindow: () => BrowserWindow | null): void {
+export function registerIpc(getWindow: () => BrowserWindow | null, quitToInstall: () => void = () => {}): void {
   handle('state:get', async () => {
     const state = await buildState();
     // Native package smoke uses this as the end-to-end renderer readiness barrier. Unlike
@@ -642,6 +651,15 @@ export function registerIpc(getWindow: () => BrowserWindow | null): void {
 
   handle('bridge:extensionPath', async () => extensionDir());
 
+  // A renderer can request only "install the verified artifact already staged". It cannot
+  // choose a path, version or executable, and a request with nothing staged never quits.
+  handle('update:install', async () => {
+    if (!markInstallOnQuit()) throw new Error('There is no downloaded update to install yet');
+    logInfo('update: install requested; quitting to hand the update over');
+    quitToInstall();
+    return true;
+  });
+
   // -------------------------------------------------------- Control Center
 
   // Read-only, input-free projection of already-authoritative orchestration/broker state.
@@ -713,6 +731,7 @@ export function registerIpc(getWindow: () => BrowserWindow | null): void {
   };
   onStatusChange(pushState);
   onBridgeChange(pushState);
+  onUpdateChange(pushState);
   onLog((entry) => push('log:entry', entry));
   onSessionChange(() => push('session:changed'));
   onSwarmChange(() => push('swarm:changed', swarmState()));

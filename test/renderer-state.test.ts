@@ -477,6 +477,36 @@ async function mountChat(
 
 const settle = () => new Promise((resolve) => setTimeout(resolve, 0));
 
+it('shows a verified staged update without breaking the shell and installs only from the ready state', async () => {
+  const installUpdate = vi.fn(() => Promise.resolve({ ok: true as const, data: true }));
+  const mounted = await mountChat(
+    {
+      update: { current: '2.1.0', latest: '2.1.1', stage: 'ready', error: null, checkedAt: Date.now() }
+    },
+    [],
+    { installUpdate }
+  );
+  const doc = mounted.window.document;
+
+  expect(doc.querySelector('.app')).not.toBeNull();
+  expect(doc.getElementById('updateNotice')!.hidden).toBe(false);
+  expect(doc.getElementById('updateLine')!.textContent).toContain('2.1.1 is downloaded and ready');
+  expect((doc.getElementById('updateInstall') as HTMLButtonElement).hidden).toBe(false);
+  expect((doc.getElementById('installUpdate') as HTMLButtonElement).hidden).toBe(false);
+
+  (doc.getElementById('updateInstall') as HTMLButtonElement).click();
+  await settle();
+  expect(installUpdate).toHaveBeenCalledTimes(1);
+
+  mounted.push({
+    ...mounted.state,
+    update: { current: '2.1.0', latest: '2.1.1', stage: 'downloading', error: null, checkedAt: Date.now() }
+  });
+  await settle();
+  expect((doc.getElementById('updateInstall') as HTMLButtonElement).hidden).toBe(true);
+  expect((doc.getElementById('installUpdate') as HTMLButtonElement).hidden).toBe(true);
+});
+
 it('preserves Windows-only Desktop permissions when saving unrelated settings on Linux', async () => {
   const mounted = await mountChat({
     platform: { family: 'linux', name: 'Linux', desktopAutomation: false }

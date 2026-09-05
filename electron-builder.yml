@@ -67,6 +67,7 @@ win:
       filter: ['**/*']
 
 nsis:
+  include: scripts/windows-installer-acl.nsh
   oneClick: false
   perMachine: false
   buildUniversalInstaller: false
@@ -84,7 +85,7 @@ mac:
     - zip
   icon: build/icon.png
   category: public.app-category.developer-tools
-  minimumSystemVersion: "12.0"
+  minimumSystemVersion: "13.0"
   # v2.0.2 intentionally ships unsigned/unnotarized macOS artifacts. Make that policy
   # deterministic instead of depending on whatever identities or Apple env vars happen to be
   # present on a hosted runner. Remove these two lines when real signing credentials are wired.

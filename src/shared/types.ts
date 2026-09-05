@@ -369,6 +369,8 @@ export interface BridgeStatus {
   present: boolean;
   /** Epoch ms of the last message from the extension, or null. */
   lastSeenAt: number | null;
+  /** Version reported by the currently connected extension process, when known. */
+  extensionVersion: string | null;
 }
 
 /**
@@ -382,6 +384,30 @@ export interface BridgeStatus {
 export function browserExtensionRequired(config: Pick<Config, 'sessions' | 'multiAgent'>): boolean {
   return config.sessions.record || config.multiAgent.enabled;
 }
+
+/** Compare release versions numerically so 2.0.10 is newer than 2.0.9. */
+export function isNewer(candidate: string, current: string): boolean {
+  const left = candidate.split('.').map(Number);
+  const right = current.split('.').map(Number);
+  for (let index = 0; index < 3; index += 1) {
+    const a = left[index] ?? 0;
+    const b = right[index] ?? 0;
+    if (a !== b) return a > b;
+  }
+  return false;
+}
+
+/** Latest-release state for the app updater. */
+export interface UpdateStatus {
+  current: string;
+  latest: string | null;
+  stage: 'idle' | 'checking' | 'downloading' | 'ready' | 'failed';
+  error: string | null;
+  checkedAt: number | null;
+}
+
+/** Where this fork publishes the builds its updater is allowed to install. */
+export const RELEASES_PAGE = 'https://github.com/Inmerson/chat-on-steroids/releases/latest';
 
 export interface AppState {
   config: Config;
@@ -397,6 +423,7 @@ export interface AppState {
   /** Version of the tunnel-client copy shipped inside the app, for diagnostics. */
   bundledTunnelVersion: string | null;
   bridge: BridgeStatus;
+  update: UpdateStatus;
 }
 
 export const DEFAULT_CAPABILITIES: Capabilities = {

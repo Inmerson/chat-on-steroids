@@ -150,9 +150,15 @@ code {
 /* The whole window: header, one scrolling middle, nav. Nothing else grows. */
 .app {
   height: 100%;
-  display: grid;
-  grid-template-rows: auto minmax(0, 1fr) auto;
+  display: flex;
+  flex-direction: column;
   background: var(--page);
+}
+
+.app > header,
+.app > .notice,
+.app > nav {
+  flex: none;
 }
 
 /* ------------------------------------------------------------------ header */
@@ -284,6 +290,7 @@ header {
 /* ------------------------------------------------------------------ panels */
 
 main {
+  flex: 1 1 auto;
   min-height: 0;
   display: grid;
   grid-template-rows: minmax(0, 1fr);
@@ -859,6 +866,46 @@ main {
 
 .btn-quiet {
   padding: 2px 4px;
+}
+
+.btn-install {
+  background: var(--ink);
+  color: var(--page);
+  padding: 8px 14px;
+  font-size: 12.5px;
+  font-weight: 600;
+}
+
+.btn-install:hover:not(:disabled) {
+  background: var(--ink);
+  color: var(--page);
+  filter: brightness(1.35);
+}
+
+:root[data-theme='dark'] .btn-install:hover:not(:disabled) {
+  filter: brightness(0.86);
+}
+
+/* A single actionable release/status sentence between the fixed header and scrolling main. */
+.notice {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 18px;
+  font-size: 12px;
+  color: var(--ink);
+  background: var(--wash);
+  border-bottom: 1px solid var(--line);
+}
+
+.notice .ico {
+  flex: none;
+  color: var(--blue);
+}
+
+.notice #updateText {
+  flex: 1 1 auto;
+  min-width: 0;
 }
 
 .btn-icon {
@@ -2556,6 +2603,23 @@ nav {
   padding: 7px 16px 9px;
   border-top: 1px solid var(--line);
   background: color-mix(in srgb, var(--page) 92%, transparent);
+}
+
+.upline {
+  padding: 7px 14px;
+  border-top: 1px solid var(--line);
+  font-size: 11px;
+  color: var(--soft);
+}
+
+.upline.is-ok {
+  background: var(--green-wash);
+  color: var(--green);
+}
+
+.upline.is-bad {
+  background: var(--red-wash);
+  color: var(--red);
 }
 
 nav button {

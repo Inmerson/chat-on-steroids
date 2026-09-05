@@ -12,6 +12,8 @@ import * as packagingTargets from '../scripts/packaging-targets.mjs';
 // @ts-ignore Build scripts are intentionally plain ESM JavaScript.
 import { assertReleaseAbsent } from '../scripts/check-release-absent.mjs';
 // @ts-ignore Build scripts are intentionally plain ESM JavaScript.
+import { assertCurrentTunnelRelease } from '../scripts/verify-current-tunnel.mjs';
+// @ts-ignore Build scripts are intentionally plain ESM JavaScript.
 import * as macOSAuditUtils from '../scripts/macos-audit-utils.mjs';
 const { RIPGREP, TUNNEL_CLIENT } = packagingVersions;
 const {
@@ -50,6 +52,7 @@ describe('cross-platform packaging targets', () => {
   });
 
   it('pins tunnel-client and ripgrep for every release OS/CPU pair', () => {
+    expect(TUNNEL_CLIENT.version).toBe('v0.0.14');
     for (const platform of SUPPORTED_PLATFORMS) {
       for (const arch of SUPPORTED_ARCHES) {
         expect(TUNNEL_CLIENT.targets[platform][arch].sha256).toMatch(/^[0-9a-f]{64}$/);
@@ -59,6 +62,27 @@ describe('cross-platform packaging targets', () => {
     }
     expect(RIPGREP.targets.linux.x64.triple).toBe('unknown-linux-musl');
     expect(RIPGREP.targets.linux.arm64.triple).toBe('unknown-linux-musl');
+  });
+
+  it('fails closed unless the pinned tunnel-client is OpenAI\'s current stable release', async () => {
+    const response = (body: Record<string, unknown>, status = 200) => async () =>
+      new Response(JSON.stringify(body), {
+        status,
+        headers: { 'content-type': 'application/json' }
+      });
+
+    await expect(assertCurrentTunnelRelease({
+      pinnedVersion: 'v0.0.14',
+      fetchImpl: response({ tag_name: 'v0.0.14', draft: false, prerelease: false })
+    })).resolves.toMatchObject({ tag_name: 'v0.0.14' });
+    await expect(assertCurrentTunnelRelease({
+      pinnedVersion: 'v0.0.12',
+      fetchImpl: response({ tag_name: 'v0.0.14', draft: false, prerelease: false })
+    })).rejects.toThrow(/Pinned tunnel-client v0\.0\.12 is stale/);
+    await expect(assertCurrentTunnelRelease({
+      pinnedVersion: 'v0.0.14',
+      fetchImpl: response({ message: 'rate limited' }, 403)
+    })).rejects.toThrow(/refusing to publish without proving the pin is current/);
   });
 
   it('selects only target Sharp packages and unpacked directory families', () => {
@@ -103,6 +127,27 @@ describe('cross-platform packaging targets', () => {
     expect(smoke).toContain('const expectedElectronVersion = sourcePackage.devDependencies?.electron;');
     expect(smoke).toContain('electron: process.versions.electron');
     expect(smoke).toContain('runtime.electron !== expectedElectronVersion');
+  });
+
+  it('repairs only the installed app tree for Windows sandbox startup', () => {
+    const config = yamlFile('electron-builder.yml');
+    const installer = readFileSync(path.join(root, 'scripts', 'windows-installer-acl.nsh'), 'utf8');
+
+    expect(config.nsis.include).toBe('scripts/windows-installer-acl.nsh');
+    expect(installer).toContain('!macro customInit');
+    expect(installer).toContain('!macro customInstall');
+    expect(installer).toContain('${FileExists} "$INSTDIR\\${APP_EXECUTABLE_FILENAME}"');
+    expect(installer).toContain('!insertmacro grantSandboxReadAccess');
+    expect(installer).toContain('$SYSDIR\\icacls.exe');
+    expect(installer).toContain('\\"$INSTDIR\\"');
+    expect(installer).toContain('*S-1-15-2-2:(OI)(CI)(RX)');
+    expect(installer).toContain('ExecWait');
+    expect(installer).toContain('${If} ${Errors}');
+    expect(installer).toContain('${If} $0 != 0');
+    expect(installer).toContain('Abort "Windows could not set the folder access needed');
+    expect(installer).not.toMatch(/\/(?:reset|remove|T)\b/i);
+    expect(installer).not.toContain('nsExec::');
+    expect(installer).not.toMatch(/(?:no-sandbox|disable-gpu-sandbox)/i);
   });
 
   it('assembles every platform artifact in the reusable release workflow', () => {
@@ -388,7 +433,7 @@ describe('cross-platform packaging targets', () => {
     expect(builder.mac.identity).toBeNull();
     expect(builder.mac.notarize).toBe(false);
     expect(builder.mac.category).toBe('public.app-category.developer-tools');
-    expect(builder.mac.minimumSystemVersion).toBe('12.0');
+    expect(builder.mac.minimumSystemVersion).toBe('13.0');
     expect(builder.mac.artifactName).toBe('Chat-On-Steroids-macOS-${arch}.${ext}');
     const nativePrep = readFileSync(path.join(root, 'scripts', 'prepare-packaging-native.mjs'), 'utf8');
     expect(nativePrep).toContain("await chmod(path.join(payloadRoot, 'node-pty', 'prebuilds', prebuildDir, 'spawn-helper'), 0o755)");
@@ -401,7 +446,7 @@ describe('cross-platform packaging targets', () => {
       'CFBundleShortVersionString: packageVersion',
       'CFBundleVersion: packageVersion',
       "LSApplicationCategoryType: 'public.app-category.developer-tools'",
-      "LSMinimumSystemVersion: '12.0'",
+      "LSMinimumSystemVersion: '13.0'",
       "path.join(ptyDir, 'spawn-helper')",
       "path.join(nodeModules, 'tree-sitter', 'prebuilds'",
       "path.join(nodeModules, 'tree-sitter-bash', 'prebuilds'",
@@ -427,7 +472,8 @@ describe('cross-platform packaging targets', () => {
 
     const readme = readFileSync(path.join(root, 'README.md'), 'utf8');
     const notes = readFileSync(path.join(root, 'docs', 'release-notes', 'v2.0.2.md'), 'utf8');
-    expect(readme).toContain('macOS 12 Monterey or newer');
+    expect(readme).toContain('macOS 13 Ventura or newer');
+    // Historical release notes remain historical: 2.0.2 still shipped the older tunnel-client.
     expect(notes).toContain('macOS 12');
     expect(notes).toContain('Monterey or newer');
   });

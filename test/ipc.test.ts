@@ -343,7 +343,9 @@ describe('bounded IPC identities and OS launch results', () => {
 
     expect(reply).toEqual({ ok: true, data: true });
     expect(shell.openExternal).toHaveBeenCalledWith(extensionDownloadUrl('1.8.8'));
-    expect(vi.mocked(shell.openExternal).mock.calls[0]?.[0]).not.toContain('/releases/latest/');
+    expect(vi.mocked(shell.openExternal).mock.calls[0]?.[0]).toBe(
+      'https://github.com/Inmerson/chat-on-steroids/releases/download/v1.8.8/Chat-On-Steroids-Extension.zip'
+    );
   });
 
   it('bounds and validates an agent id before it reaches the global broker', async () => {

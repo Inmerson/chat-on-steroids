@@ -65,6 +65,7 @@ import {
   restoreExecutions,
   type ExecutionSnapshot
 } from './execution.js';
+import { applyStagedUpdate, startUpdateChecks } from './update.js';
 
 /** Durable state file holding the multi-agent run. Hashes only, never credentials. */
 const SWARM_STATE = 'swarm';
@@ -421,7 +422,13 @@ void app.whenReady().then(async () => {
 
   // From here on a second launch may safely focus/recreate the window: renderer security policy
   // is installed and the renderer's fixed IPC methods already have handlers before it can load.
-  registerIpc(() => window);
+  registerIpc(
+    () => window,
+    () => {
+      quitting = true;
+      app.quit();
+    }
+  );
   windowActivation.enable();
   if (!backgroundStartup) windowActivation.request();
   // macOS `activate` can fire on first launch, so do not wire it at module load where it could
@@ -459,6 +466,10 @@ void app.whenReady().then(async () => {
   });
 
   if (getConfig().ui.autoConnect) void connect();
+
+  // Update checks are background-only and never gate startup. State changes arrive through the
+  // same monotonic renderer state push used by connection and bridge status.
+  startUpdateChecks();
 });
 
 app.on('before-quit', () => {
@@ -507,7 +518,9 @@ app.on('will-quit', (event) => {
       // Phase 3: recorder work can enqueue both session projections and named durable state.
       { name: 'recorder flush', budgetMs: 10_000, run: () => [flushRecorder()] },
       // These are independent writers. One rejection must never skip the other flush.
-      { name: 'durable flush', budgetMs: 10_000, run: () => [flushSessions(), flushDurable()] }
+      { name: 'durable flush', budgetMs: 10_000, run: () => [flushSessions(), flushDurable()] },
+      // Last: nothing replaces executable files until every request and durable write has landed.
+      { name: 'update handoff', budgetMs: 5_000, run: () => [applyStagedUpdate()] }
     ],
     {
       info: logInfo,

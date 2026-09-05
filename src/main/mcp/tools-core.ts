@@ -228,7 +228,7 @@ export function registerCoreTools(reg: SurfaceRegistrar): void {
           'a PNG/JPEG/GIF/WebP comes back as an image, and anything else returns its metadata and why it was not decoded. ' +
           'Paths may contain * ? and ** and are expanded here. Every result starts with a header giving size, timestamps and line count. ' +
           `The line-number prefix is display metadata, not file content — strip it before quoting text into apply_patch. ` +
-          `A line range applies to every file the call resolves to. A typical 1,500-line source file fits in the default read: do not pre-paginate it. ` +
+          `A call-wide line range applies to every file the call resolves to; a path may instead carry its own range as path:12-40 or path:12, so several ranges of one file fit in one call. A typical 1,500-line source file fits in the default read: do not pre-paginate it. ` +
           `Batch related paths in one call; only continue from a line when the returned header says more lines follow. The aggregate payload remains bounded at about ${formatBytes(MAX_READ_BYTES)}.`,
         inputSchema: z
           .object({
@@ -265,15 +265,16 @@ export function registerCoreTools(reg: SurfaceRegistrar): void {
               'TOOL_DISABLED: read is disabled by the current Chat On Steroids permissions. Ask the user to enable reading in the app.'
             );
           }
-          const targets: string[] = [];
+          const targets: ReadTarget[] = [];
           const notes: string[] = [];
-          for (const requested of paths) {
+          for (const item of paths) {
             if (targets.length >= MAX_READ_TARGETS) {
               notes.push(`(stopped expanding at ${MAX_READ_TARGETS} paths)`);
               break;
             }
+            const { path: requested, range } = splitLineRange(item);
             if (!hasGlob(requested)) {
-              targets.push(requested);
+              targets.push({ path: requested, range });
               continue;
             }
             const expanded = await expandGlob(ctx.roots, requested);
@@ -285,7 +286,9 @@ export function registerCoreTools(reg: SurfaceRegistrar): void {
               );
               continue;
             }
-            targets.push(...expanded.matches.slice(0, MAX_READ_TARGETS - targets.length));
+            targets.push(
+              ...expanded.matches.slice(0, MAX_READ_TARGETS - targets.length).map((match) => ({ path: match, range }))
+            );
             if (expanded.truncated === 'matches') {
               notes.push(`${requested}: more than ${MAX_GLOB_MATCHES} matches, narrow the pattern`);
             } else if (expanded.truncated === 'scan') {
@@ -308,9 +311,10 @@ export function registerCoreTools(reg: SurfaceRegistrar): void {
           // sessions, and every one of them was a caller that had already said what it
           // wanted. Globs are still resolved first, since one pattern is what usually turns
           // a single-path call into a multi-path one.
-          if (targets.length > 1 && ranged) {
+          const sharedRange = targets.filter((target) => target.range === null).length;
+          if (sharedRange > 1 && ranged) {
             notes.push(
-              `(start_line/end_line applied to each of the ${targets.length} files this call resolved to; ` +
+              `(start_line/end_line applied to each of the ${sharedRange} files this call resolved to; ` +
                 'every header states the lines actually returned)'
             );
           }
@@ -326,12 +330,12 @@ export function registerCoreTools(reg: SurfaceRegistrar): void {
               break;
             }
             try {
-              const section = await readOne(target, {
+              const section = await readOne(target.path, {
                 roots: ctx.roots,
                 canRead: caps.read,
                 canBrowse: caps.browse,
-                startLine: start_line,
-                endLine: end_line,
+                startLine: target.range ? target.range.start : start_line,
+                endLine: target.range ? target.range.end : end_line,
                 maxBytes: Math.min(max_bytes ?? DEFAULT_READ_BYTES, remaining),
                 aggregateBytes: remaining
               });
@@ -343,7 +347,8 @@ export function registerCoreTools(reg: SurfaceRegistrar): void {
               failures++;
               // One stale or missing path must not destroy the useful reads. The requested
               // virtual path is safe to echo; friendlyError never exposes real paths.
-              sections.push(`--- ${target} — ERROR ---\n${friendlyError(err)}`);
+              const nearby = caps.browse ? await nearestFolderListing(ctx.roots, target.path, err) : '';
+              sections.push(`--- ${target.path} — ERROR ---\n${friendlyError(err)}${nearby}`);
             }
           }
 
@@ -1835,6 +1840,59 @@ async function expandGlob(
     matches.push(candidate);
   }
   return { matches, truncated: scanTruncated ? 'scan' : null };
+}
+
+interface ReadTarget {
+  path: string;
+  /** A range the caller attached to this one path, or null for the call-wide range. */
+  range: { start: number; end: number | undefined } | null;
+}
+
+/** Reads a `path:12-40` or `path:12` suffix off one requested path. */
+function splitLineRange(requested: string): { path: string; range: ReadTarget['range'] } {
+  const match = /^(.*[^\\/:]):(\d{1,9})(?:-(\d{1,9}))?$/.exec(requested);
+  if (!match) return { path: requested, range: null };
+  const start = Number(match[2]);
+  const end = match[3] === undefined ? undefined : Number(match[3]);
+  if (start < 1 || (end !== undefined && end < start)) return { path: requested, range: null };
+  return { path: match[1]!, range: { start, end } };
+}
+
+/** How many entries a not-found error lists from the nearest folder that does exist. */
+const MISSING_PATH_LISTING = 40;
+
+/** For a path that does not exist, list the nearest approved folder above it that does. */
+async function nearestFolderListing(roots: Root[], requested: string, err: unknown): Promise<string> {
+  if (!(err instanceof SandboxError) || !err.message.startsWith('Not found:')) return '';
+  let candidate = requested;
+  for (let depth = 0; depth < 8; depth++) {
+    const parent = candidate.replace(/[\\/]+[^\\/]+[\\/]*$/, '');
+    if (parent === candidate || parent === '' || /^[A-Za-z]:$/.test(parent)) return '';
+    candidate = parent;
+    let resolved;
+    try {
+      resolved = await resolveIn(roots, candidate);
+    } catch (error) {
+      if (error instanceof SandboxError && error.message.startsWith('Not found:')) continue;
+      return '';
+    }
+    try {
+      const { entries, truncated } = await listDirectoryLevel(
+        resolved.real,
+        resolved.virtual,
+        MISSING_PATH_LISTING,
+        false
+      );
+      const names = entries.map((entry) => `${entry.type === 'directory' ? 'd' : 'f'} ${entry.name}`);
+      const more = truncated ? ', …' : '';
+      return `\nThe nearest existing folder is ${resolved.virtual}${
+        entries.length === 0 ? ', and it is empty.' : `; it contains: ${names.join(', ')}${more}`
+      }`;
+    } catch {
+      return '';
+    }
+  }
+  return '';
 }
 
 interface ReadOneOptions {

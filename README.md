@@ -65,7 +65,7 @@ The app has no replacement chat UI and does not host a model. It runs quietly in
 
 ## Requirements
 
-- **Windows 10/11**, **macOS 12 Monterey or newer**, or a modern desktop **Linux** distribution, on x64 or ARM64 matching the downloaded build.
+- **Windows 10/11**, **macOS 13 Ventura or newer**, or a modern desktop **Linux** distribution, on x64 or ARM64 matching the downloaded build.
 - **Chrome 116+** if you want session attribution, Compact & Resume, Overwrite, or worker chats.
 - **Linux:** a working Secret Service/keyring backend such as GNOME Keyring or KWallet when you use stored API keys or the companion extension. Electron's unencrypted `basic_text` fallback is deliberately refused.
 - A ChatGPT workspace where **Developer mode** and custom MCP apps are available on the web. OpenAI currently documents full MCP support, including write/modify actions, as a **beta rollout for Business, Enterprise and Edu**; **Pro** can connect custom MCPs for read/fetch only. Business developer mode is admin/owner controlled, while Enterprise/Edu can additionally use workspace permissions/RBAC. Availability, policy and UI can change, so check OpenAI's current [Developer mode and MCP apps](https://help.openai.com/en/articles/12584461-developer-mode-and-mcp-apps-in-chatgpt) documentation if your workspace differs.

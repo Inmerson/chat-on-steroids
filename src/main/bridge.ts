@@ -435,7 +435,8 @@ export async function bridgeStatus(): Promise<BridgeStatus> {
     port,
     paired: stored !== null && stored !== BROWSER_DISCONNECTED,
     present: browserPresent(),
-    lastSeenAt
+    lastSeenAt,
+    extensionVersion
   };
 }
 
