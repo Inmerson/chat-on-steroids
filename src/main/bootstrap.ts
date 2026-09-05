@@ -9,6 +9,9 @@ if (mode.kind === 'ui') {
   process.env.COS_CORE_UI_CLIENT = '1';
   await import('./index.js');
 } else {
+  // Detached children inherit the UI environment. Clear the facade selector before importing
+  // any Core module or the helper would recursively behave as another UI IPC client.
+  delete process.env.COS_CORE_UI_CLIENT;
   // Helper processes must share the exact installed profile with the UI. Set it before any
   // config/secrets/session module is initialized.
   app.setPath('userData', mode.userDataDir);
