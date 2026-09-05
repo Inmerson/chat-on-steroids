@@ -73,6 +73,14 @@ export function backgroundExecRecoveryNotices(conversationId: string | null | un
   return notices;
 }
 
+export function execProcessIdsOwnedBy(conversationId: string): number[] {
+  if (!conversationId) return [];
+  return [...owners.entries()]
+    .filter(([, owner]) => owner === conversationId)
+    .map(([processId]) => processId)
+    .sort((left, right) => left - right);
+}
+
 /**
  * Whether `processId` is unknown to the connector. Conversation identity is deliberately not
  * consulted for authorization; all authenticated MCP chats share the enabled Core authority.

@@ -373,6 +373,196 @@ describe('Codex unified exec runtime parity', () => {
     expect(instance.listProcesses()).toEqual([]);
   });
 
+  it('lists runtime process metadata for live sessions only, sorted by process id', () => {
+    const instance = manager();
+    managers.push(instance);
+    const store = (instance as unknown as { processes: Map<number, unknown> }).processes;
+
+    store.set(22, {
+      processId: 22,
+      process: { pid: 2200, hasExited: () => false, terminate: async () => {} },
+      cwd: '/virtual/two',
+      hookCommand: 'second command',
+      tty: true,
+      lastUsed: 222,
+      initialExecCommandActive: false
+    });
+    store.set(11, {
+      processId: 11,
+      process: { pid: 1100, hasExited: () => false, terminate: async () => {} },
+      cwd: '/virtual/one',
+      hookCommand: 'first command',
+      tty: false,
+      lastUsed: 111,
+      initialExecCommandActive: true
+    });
+    store.set(33, {
+      processId: 33,
+      process: { pid: 3300, hasExited: () => true },
+      cwd: '/virtual/exited',
+      hookCommand: 'exited command',
+      tty: false,
+      lastUsed: 333,
+      initialExecCommandActive: false
+    });
+
+    expect(instance.listRuntimeProcesses()).toEqual([
+      {
+        processId: 11,
+        pid: 1100,
+        command: 'first command',
+        cwd: '/virtual/one',
+        tty: false,
+        lastUsed: 111,
+        initialExecCommandActive: true
+      },
+      {
+        processId: 22,
+        pid: 2200,
+        command: 'second command',
+        cwd: '/virtual/two',
+        tty: true,
+        lastUsed: 222,
+        initialExecCommandActive: false
+      }
+    ]);
+  });
+
+  it('conditionally terminates only when a runtime process is not recent', async () => {
+    const instance = manager();
+    managers.push(instance);
+    let terminated = false;
+    const store = (instance as unknown as { processes: Map<number, unknown> }).processes;
+    store.set(41, {
+      processId: 41,
+      process: {
+        hasExited: () => false,
+        interactionLock: { tryLock: () => () => {} },
+        terminate: async () => {
+          terminated = true;
+        }
+      },
+      cwd: '/virtual/recent',
+      hookCommand: 'recent command',
+      tty: false,
+      lastUsed: 501,
+      initialExecCommandActive: false
+    });
+
+    await expect(instance.terminateProcessIfUnusedSince(41, 500)).resolves.toBe('recent');
+    expect(terminated).toBe(false);
+    expect(store.has(41)).toBe(true);
+  });
+
+  it('conditionally terminates no busy runtime process while its lock or initial exec is active', async () => {
+    const instance = manager();
+    managers.push(instance);
+    let initialReleaseCount = 0;
+    const store = (instance as unknown as { processes: Map<number, unknown> }).processes;
+    store.set(51, {
+      processId: 51,
+      process: {
+        hasExited: () => false,
+        interactionLock: { tryLock: () => null },
+        terminate: async () => {
+          throw new Error('busy lock process must not terminate');
+        }
+      },
+      cwd: '/virtual/locked',
+      hookCommand: 'locked command',
+      tty: false,
+      lastUsed: 100,
+      initialExecCommandActive: false
+    });
+    store.set(52, {
+      processId: 52,
+      process: {
+        hasExited: () => false,
+        interactionLock: {
+          tryLock: () => () => {
+            initialReleaseCount += 1;
+          }
+        },
+        terminate: async () => {
+          throw new Error('initial exec process must not terminate');
+        }
+      },
+      cwd: '/virtual/initial',
+      hookCommand: 'initial command',
+      tty: false,
+      lastUsed: 100,
+      initialExecCommandActive: true
+    });
+
+    await expect(instance.terminateProcessIfUnusedSince(51, 500)).resolves.toBe('busy');
+    await expect(instance.terminateProcessIfUnusedSince(52, 500)).resolves.toBe('busy');
+    expect(store.has(51)).toBe(true);
+    expect(store.has(52)).toBe(true);
+    expect(initialReleaseCount).toBe(1);
+  });
+
+  it('conditionally terminates and releases an idle runtime process at the cutoff', async () => {
+    const instance = manager();
+    managers.push(instance);
+    let terminated = false;
+    let released = 0;
+    const store = (instance as unknown as { processes: Map<number, unknown> }).processes;
+    store.set(61, {
+      processId: 61,
+      process: {
+        hasExited: () => false,
+        interactionLock: {
+          tryLock: () => () => {
+            released += 1;
+          }
+        },
+        terminate: async () => {
+          terminated = true;
+        }
+      },
+      cwd: '/virtual/idle',
+      hookCommand: 'idle command',
+      tty: false,
+      lastUsed: 500,
+      initialExecCommandActive: false
+    });
+
+    await expect(instance.terminateProcessIfUnusedSince(61, 500)).resolves.toBe('terminated');
+    expect(terminated).toBe(true);
+    expect(released).toBe(1);
+    expect(store.has(61)).toBe(false);
+  });
+
+  it('conditionally terminates by releasing an already exited runtime process without terminating twice', async () => {
+    const instance = manager();
+    managers.push(instance);
+    let released = 0;
+    const store = (instance as unknown as { processes: Map<number, unknown> }).processes;
+    store.set(62, {
+      processId: 62,
+      process: {
+        hasExited: () => true,
+        interactionLock: {
+          tryLock: () => () => {
+            released += 1;
+          }
+        },
+        terminate: async () => {
+          throw new Error('already exited process must not terminate again');
+        }
+      },
+      cwd: '/virtual/exited',
+      hookCommand: 'exited command',
+      tty: false,
+      lastUsed: 499,
+      initialExecCommandActive: false
+    });
+
+    await expect(instance.terminateProcessIfUnusedSince(62, 500)).resolves.toBe('exited');
+    expect(released).toBe(1);
+    expect(store.has(62)).toBe(false);
+  });
+
   it.runIf(process.platform === 'win32')('Ctrl-C on a Windows pipe session terminates the whole process tree', async () => {
     const root = await mkdtemp(path.join(tmpdir(), 'clf-pipe-interrupt-parity-'));
     tempRoots.push(root);

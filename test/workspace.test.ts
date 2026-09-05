@@ -14,6 +14,7 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { emptyEvidence, runInCallContext, type CallContext } from '../src/main/mcp/call-context.js';
 import {
   execOwner,
+  execProcessIdsOwnedBy,
   execOwnershipDenied,
   moveExecConversationOwners,
   noteExecOwner,
@@ -96,6 +97,15 @@ beforeEach(() => {
 });
 
 describe('live process ownership across chat replacement', () => {
+  it('lists only process ids with the exact proven conversation owner', () => {
+    noteExecOwner(404, 'chat-a');
+    noteExecOwner(101, 'chat-a');
+    noteExecOwner(202, null);
+    noteExecOwner(303, 'chat-other');
+
+    expect(execProcessIdsOwnedBy('chat-a')).toEqual([101, 404]);
+  });
+
   it('moves only the exact proven A attribution to B without restricting authenticated continuation', () => {
     noteExecOwner(101, 'chat-a');
     noteExecOwner(102, null);

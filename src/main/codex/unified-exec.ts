@@ -624,6 +624,13 @@ export interface BackgroundTerminalInfo {
   tty: boolean;
 }
 
+export interface ManagedProcessRuntimeInfo extends BackgroundTerminalInfo {
+  lastUsed: number;
+  initialExecCommandActive: boolean;
+}
+
+export type ConditionalTerminationResult = 'terminated' | 'missing' | 'busy' | 'recent' | 'exited';
+
 interface ProcessEntry {
   process: UnifiedExecProcess;
   processId: number;
@@ -631,6 +638,7 @@ interface ProcessEntry {
   hookCommand: string;
   tty: boolean;
   initialExecCommandActive: boolean;
+  lastUsed: number;
 }
 
 export interface BackgroundExecState {
@@ -700,7 +708,8 @@ export class UnifiedExecProcessManager {
         cwd: request.displayCwd,
         hookCommand: request.hookCommand,
         tty: request.tty,
-        initialExecCommandActive: true
+        initialExecCommandActive: true,
+        lastUsed: start
       });
     }
 
@@ -766,6 +775,7 @@ export class UnifiedExecProcessManager {
     try {
       const current = this.processes.get(request.processId);
       if (!current || current.process !== locked) throw UnifiedExecError.unknownProcessId(request.processId);
+      current.lastUsed = Date.now();
       const { process, tty } = { process: current.process, tty: current.tty };
 
       let statusAfterWrite: ProcessStatus | null = null;
@@ -888,6 +898,44 @@ export class UnifiedExecProcessManager {
       running: running.sort((left, right) => left - right),
       exitedUnread: exitedUnread.sort((left, right) => left.processId - right.processId)
     };
+  }
+
+  listRuntimeProcesses(): ManagedProcessRuntimeInfo[] {
+    return [...this.processes.values()]
+      .filter((entry) => !entry.process.hasExited())
+      .sort((left, right) => left.processId - right.processId)
+      .map((entry) => ({
+        processId: entry.processId,
+        command: entry.hookCommand,
+        cwd: entry.cwd,
+        pid: entry.process.pid,
+        tty: entry.tty,
+        lastUsed: entry.lastUsed,
+        initialExecCommandActive: entry.initialExecCommandActive
+      }));
+  }
+
+  async terminateProcessIfUnusedSince(processId: number, cutoff: number): Promise<ConditionalTerminationResult> {
+    const entry = this.processes.get(processId);
+    if (!entry) return 'missing';
+    const release = entry.process.interactionLock.tryLock();
+    if (!release) return 'busy';
+    try {
+      const current = this.processes.get(processId);
+      if (!current || current.process !== entry.process) return 'missing';
+      if (current.initialExecCommandActive) return 'busy';
+      if (current.lastUsed > cutoff) return 'recent';
+      if (current.process.hasExited()) {
+        this.releaseProcessId(processId);
+        return 'exited';
+      }
+      await current.process.terminate();
+      const after = this.processes.get(processId);
+      if (after?.process === current.process) this.releaseProcessId(processId);
+      return 'terminated';
+    } finally {
+      release();
+    }
   }
 
   async terminateProcess(processId: number): Promise<boolean> {
