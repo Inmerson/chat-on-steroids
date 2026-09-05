@@ -1,6 +1,8 @@
 import type { ConnectionStatus } from './types.js';
 
-export const CORE_PROTOCOL_VERSION = 5;
+// v6 adds the fixed config-authority UI operations. A v5 Core must be replaced rather than
+// silently accepted by a v6 UI, because otherwise the UI would fall back to a second config writer.
+export const CORE_PROTOCOL_VERSION = 6;
 
 export const CORE_CAPABILITIES = [
   'connection-status',
@@ -9,7 +11,8 @@ export const CORE_CAPABILITIES = [
   'execution-probe',
   'structured-health',
   'secret-storage',
-  'ui-runtime'
+  'ui-runtime',
+  'config-authority'
 ] as const;
 
 export type CoreCapability = (typeof CORE_CAPABILITIES)[number];
@@ -58,17 +61,20 @@ export interface CoreStatusEnvelope {
   generation: number;
   status: CoreStatusProjection;
   health?: CoreHealthStatus;
-  /** Monotonic Core-owned runtime revisions used to drive renderer refresh without polling data stores. */
   bridgeRevision?: number;
   sessionRevision?: number;
   swarmRevision?: number;
 }
 
-/**
- * Fixed UI operations whose authoritative state lives in the persistent Core Host.
- * This is intentionally an enum rather than a method/path string supplied by the renderer.
- */
+/** Fixed UI operations whose authoritative state lives in the persistent Core Host. */
 export type CoreUiOperation =
+  | 'config-get'
+  | 'settings-save'
+  | 'root-add-path'
+  | 'roots-all-computer-toggle'
+  | 'root-remove'
+  | 'root-rename'
+  | 'tunnel-binary-path'
   | 'bridge-status'
   | 'bridge-unpair'
   | 'session-list'
@@ -99,9 +105,7 @@ interface CoreRequestBase {
 }
 
 export type CoreRequest =
-  | (CoreRequestBase & {
-      command: Exclude<CoreCommandName, 'set-secret' | 'ui-call'>;
-    })
+  | (CoreRequestBase & { command: Exclude<CoreCommandName, 'set-secret' | 'ui-call'> })
   | (CoreRequestBase & { command: 'set-secret'; key: CoreSecretKey; value: string })
   | (CoreRequestBase & { command: 'ui-call'; operation: CoreUiOperation; payload: unknown });
 
