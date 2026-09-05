@@ -2,7 +2,7 @@ import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { defaultConfig, initConfigPath, loadConfig, saveConfig, updateConfig } from '../src/main/config.js';
-import { DEFAULT_CAPABILITIES, type Capability } from '../src/shared/types.js';
+import { DEFAULT_CAPABILITIES } from '../src/shared/types.js';
 import { makeTempDir, removeTempDir } from './helpers.js';
 
 let dir: string;

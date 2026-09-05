@@ -30,6 +30,7 @@ import {
 } from '../shared/goal.js';
 import { logError } from './logger.js';
 import { RESERVED_ROOT_NAMES } from './sandbox.js';
+import { capabilitiesForPlatform } from './platform.js';
 
 /**
  * Defaults for the newer sections, in one place so the schema and defaultConfig()
