@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { CORE_PROTOCOL_VERSION } from '../src/shared/core-protocol.js';
+import { CORE_CAPABILITIES, CORE_PROTOCOL_VERSION } from '../src/shared/core-protocol.js';
 import {
   createCoreProcessAdapter,
   startCoreSupervisorDetached,
@@ -21,7 +21,7 @@ describe('Core process adapter', () => {
       coreVersion: '2.1.2',
       corePid: 4321,
       generation: 9,
-      capabilities: ['connection-status', 'connection-control', 'settings-apply', 'execution-probe', 'structured-health'] as const
+      capabilities: CORE_CAPABILITIES
     }));
     const adapter = createCoreProcessAdapter({
       execPath: 'C:\\Program Files\\Chat On Steroids\\Chat On Steroids.exe',
