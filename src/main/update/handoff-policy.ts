@@ -16,12 +16,12 @@ export interface WindowsInstallPlan {
 export function windowsInstallPlan(input: WindowsInstallPlanInput): WindowsInstallPlan {
   if (input.explicit) {
     return input.ownsInstallation
-      ? { launch: true, args: ['--updated'], windowsHide: false, mode: 'assisted-upgrade' }
-      : { launch: true, args: [], windowsHide: false, mode: 'fresh-install' };
+      ? { launch: true, args: ['/currentuser', '--updated'], windowsHide: false, mode: 'assisted-upgrade' }
+      : { launch: true, args: ['/currentuser'], windowsHide: false, mode: 'fresh-install' };
   }
 
   if (input.ownsInstallation) {
-    return { launch: true, args: ['/S', '--updated'], windowsHide: true, mode: 'silent-upgrade' };
+    return { launch: true, args: ['/S', '/currentuser', '--updated'], windowsHide: true, mode: 'silent-upgrade' };
   }
 
   return { launch: false, args: [], windowsHide: true, mode: 'none' };

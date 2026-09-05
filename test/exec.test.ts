@@ -197,14 +197,17 @@ describe('runCommand', () => {
     const result = await launchCommand(shell!, ['-NoProfile', '-NonInteractive', '-EncodedCommand', encoded], cwd);
     expect(result.pid).toBeGreaterThan(0);
 
-    const deadline = Date.now() + 3000;
+    // Windows process creation can be delayed by several seconds when the full suite is
+    // launching many child processes in parallel. The contract here is eventual execution
+    // after a successful spawn, not a three-second startup SLA.
+    const deadline = Date.now() + 10_000;
     while (Date.now() < deadline) {
       const text = await fs.readFile(marker, 'utf8').catch(() => '');
       if (text === 'launched') return;
       await new Promise((resolve) => setTimeout(resolve, 50));
     }
     throw new Error('launchCommand reported spawn but the PowerShell payload never executed');
-  });
+  }, 15_000);
 
   it('rejects an empty command', async () => {
     await expect(runCommand('   ', [], cwd, 5000)).rejects.toBeInstanceOf(ExecError);

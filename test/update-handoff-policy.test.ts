@@ -22,7 +22,7 @@ describe('Windows installer policy', () => {
   it('uses a visible assisted upgrade for explicit install on a true NSIS installation', () => {
     expect(windowsInstallPlan({ explicit: true, ownsInstallation: true })).toEqual({
       launch: true,
-      args: ['--updated'],
+      args: ['/currentuser', '--updated'],
       windowsHide: false,
       mode: 'assisted-upgrade'
     });
@@ -31,7 +31,7 @@ describe('Windows installer policy', () => {
   it('uses a visible fresh-install wizard for explicit install from win-unpacked', () => {
     expect(windowsInstallPlan({ explicit: true, ownsInstallation: false })).toEqual({
       launch: true,
-      args: [],
+      args: ['/currentuser'],
       windowsHide: false,
       mode: 'fresh-install'
     });
@@ -40,7 +40,7 @@ describe('Windows installer policy', () => {
   it('retains silent ordinary-quit upgrades only for a true installation', () => {
     expect(windowsInstallPlan({ explicit: false, ownsInstallation: true })).toEqual({
       launch: true,
-      args: ['/S', '--updated'],
+      args: ['/S', '/currentuser', '--updated'],
       windowsHide: true,
       mode: 'silent-upgrade'
     });

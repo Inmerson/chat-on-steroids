@@ -2093,7 +2093,10 @@
     try {
       const path = location.pathname;
       if (path === seededPath) return true;
-      const named = /^\/c\//.test(path) && !/^\/c\//.test(seededPath || '');
+      // Use the canonical conversation parser so a Project fresh-chat route gaining its id
+      // remains the same chat instead of looking like a navigation to another conversation.
+      const named =
+        CLF_DOM.conversationFromPath(path) !== null && CLF_DOM.conversationFromPath(seededPath) === null;
       seededPath = path;
       return named;
     } catch {
@@ -4356,8 +4359,11 @@
   /** Bounded app-owned metadata for a tool disclosure. Raw arguments/results never enter it. */
   function streamToolDetails(entry) {
     const tool = typeof entry.tool === 'string' ? entry.tool.slice(0, 160) : 'tool';
-    const outcome = entry.outcome === 'ok' ? 'completed' : entry.outcome === 'error' ? 'failed'
-      : entry.outcome === 'rejected' ? 'refused' : 'unknown';
+    const outcome = entry.outcome === 'ok' ? 'completed'
+      : entry.outcome === 'process_exit_nonzero' ? 'process exited non-zero'
+      : entry.outcome === 'tool_rejected' || entry.outcome === 'rejected' ? 'refused'
+      : entry.outcome === 'tool_internal_error' || entry.outcome === 'error' ? 'failed'
+      : 'unknown';
     const duration = typeof entry.durationMs === 'number' && Number.isFinite(entry.durationMs) && entry.durationMs >= 0
       ? ` · ${Math.round(entry.durationMs)} ms` : '';
     const lines = [{ kind: 'meta', text: `${tool} · ${outcome}${duration}` }];

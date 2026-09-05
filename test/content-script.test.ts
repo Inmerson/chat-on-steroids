@@ -2160,6 +2160,38 @@ describe('the app-owned chronological stream', () => {
     expect(disclosure.textContent).not.toContain('private-result-sentinel');
   });
 
+  it('renders canonical process, refusal and internal-error outcomes without exposing payloads', async () => {
+    const withOutcomes = () => {
+      const payload = activity();
+      const process = payload.data.stream.find((entry) => entry.seq === 4)!;
+      const refusal = payload.data.stream.find((entry) => entry.seq === 3)!;
+      Object.assign(process, { outcome: 'process_exit_nonzero', args: 'raw-process-args', result: 'raw-process-result' });
+      Object.assign(refusal, { outcome: 'tool_rejected', args: 'raw-refusal-args', result: 'raw-refusal-result' });
+      return payload;
+    };
+    live = await harness(undefined, { activity: withOutcomes });
+    renderingOn();
+    const section = assistantTurn(live.document, turnId, []);
+    await bindFiberRequest(section, 'wfr-app-stream');
+    live.hook.renderStreams();
+
+    const panels = overwriteRows(section, '.clf-stream-tool-panel');
+    expect(panels.some((node) => node.textContent?.includes('read_file · process exited non-zero'))).toBe(true);
+    expect(panels.some((node) => node.textContent?.includes('read_file · refused'))).toBe(true);
+    expect(section.textContent).not.toContain('raw-process-args');
+    expect(section.textContent).not.toContain('raw-process-result');
+    expect(section.textContent).not.toContain('raw-refusal-args');
+    expect(section.textContent).not.toContain('raw-refusal-result');
+
+    const internal = withOutcomes();
+    Object.assign(internal.data, { resetActivity: true });
+    Object.assign(internal.data.stream.find((entry) => entry.seq === 4)!, { outcome: 'tool_internal_error' });
+    live.reply.set('activity', () => internal);
+    await live.hook.pullActivity();
+    live.hook.renderStreams();
+    expect(overwriteRows(section, '.clf-stream-tool-panel').some((node) => node.textContent?.includes('failed'))).toBe(true);
+  });
+
   it('keeps only the same calls expanded when activity rows are repainted', async () => {
     live = await harness(undefined, { activity });
     renderingOn();
@@ -7634,6 +7666,44 @@ describe('the fresh chat the app opened', () => {
         agent: null,
         client: redeems[0]!.client,
         navigationEpoch: expect.any(Number)
+      }
+    ]);
+  });
+
+  it('acquires its id when a Project route names the fresh chat', async () => {
+    live = await harness(
+      'https://chatgpt.com/g/g-p-68abcdef1234/project?clf=cmd-project#clf=cmd-project',
+      {
+        redeem: () => ({
+          ok: true,
+          command: {
+            id: 'cmd-project',
+            type: 'resume',
+            text: 'Continue the previous ChatGPT session. Handoff: h-project',
+            agent: null
+          }
+        }),
+        ack: () => ({ ok: true })
+      },
+      (document, dom) => {
+        document.querySelector('[data-testid="send-button"]')!.addEventListener('click', () => {
+          dom.reconfigure({
+            url: 'https://chatgpt.com/g/g-p-68abcdef1234/c/77777777-6666-5555-4444-333333333333'
+          });
+        });
+      }
+    );
+
+    await settle(400);
+
+    expect(live.sent.filter((message) => message.type === 'redeem')).toHaveLength(1);
+    expect(live.document.querySelector('#prompt-textarea')!.textContent).toContain('Handoff: h-project');
+    expect(live.sent.filter((message) => message.type === 'ack')).toMatchObject([
+      {
+        type: 'ack',
+        id: 'cmd-project',
+        status: 'sent',
+        conversationId: '77777777-6666-5555-4444-333333333333'
       }
     ]);
   });

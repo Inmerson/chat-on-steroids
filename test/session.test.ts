@@ -63,7 +63,8 @@ import {
   originTitle,
   tokenPressure,
   type SessionEvent,
-  type SessionOrigin
+  type SessionOrigin,
+  type ToolOutcome
 } from '../src/shared/session.js';
 import { makeTempDir, removeTempDir } from './helpers.js';
 
@@ -915,6 +916,68 @@ describe('session store', () => {
     });
   });
 
+  const taxonomyToolCall = (callId: string, tool: string, outcome: string, metric: string | undefined, seq: number) => ({
+    time: 100 + seq,
+    source: 'app' as const,
+    kind: 'tool_call' as const,
+    call: {
+      callId,
+      tool,
+      attribution: 'unattributed' as const,
+      requestId: null,
+      conversationId: null,
+      attributionMethod: 'unattributed' as const,
+      args: { text: '{}', truncated: false, chars: 2 },
+      result: { text: 'ok', truncated: false, chars: 2 },
+      outcome: outcome as ToolOutcome,
+      durationMs: 1,
+      summary: { title: callId, tone: 'neutral' as const, kind: 'run' as const, ...(metric ? { metric } : {}) }
+    }
+  });
+
+  it('charges the reliability error count only for connector/tool implementation defects', async () => {
+    const summary = await createSession({ title: 'reliability numerator' });
+    await appendEvent(summary.id, taxonomyToolCall('clean', 'exec_command', 'ok', undefined, 1));
+    await appendEvent(summary.id, taxonomyToolCall('failing-build', 'exec_command', 'process_exit_nonzero', '✕ exit 1', 2));
+    await appendEvent(summary.id, taxonomyToolCall('refused', 'apply_patch', 'tool_rejected', 'refused', 3));
+    expect(await getSession(summary.id)).toMatchObject({ toolCalls: 3, errors: 0 });
+
+    await appendEvent(summary.id, taxonomyToolCall('broken', 'read', 'tool_internal_error', '✕ failed', 4));
+    expect(await getSession(summary.id)).toMatchObject({
+      toolCalls: 4,
+      processExitNonzero: 1,
+      toolRejected: 1,
+      toolInternalErrors: 1,
+      errors: 1
+    });
+  });
+
+  it('re-derives outcome counters for a session recorded before the taxonomy existed', async () => {
+    const summary = await createSession({ title: 'legacy outcome projection' });
+    await appendEvent(summary.id, taxonomyToolCall('legacy-exit', 'exec_command', 'error', '✕ exit 7', 1));
+    await appendEvent(summary.id, taxonomyToolCall('legacy-refusal', 'apply_patch', 'rejected', 'refused', 2));
+    await appendEvent(summary.id, taxonomyToolCall('legacy-ambiguous', 'read', 'error', undefined, 3));
+    await flushSessions();
+
+    const metaPath = path.join(sessionsRoot(), summary.id, 'meta.json');
+    const stored = JSON.parse(await fs.readFile(metaPath, 'utf8')) as Record<string, unknown>;
+    delete stored.processExitNonzero;
+    delete stored.toolRejected;
+    delete stored.toolInternalErrors;
+    stored.errors = 3;
+    await fs.writeFile(metaPath, JSON.stringify(stored, null, 2), 'utf8');
+
+    resetSessionStoreForTests();
+    const expected = { processExitNonzero: 1, toolRejected: 1, toolInternalErrors: 0, errors: 0 };
+    expect(await getSession(summary.id)).toMatchObject({ toolCalls: 3, ...expected });
+    expect(JSON.parse(await fs.readFile(metaPath, 'utf8'))).toMatchObject(expected);
+
+    const outcomes = (await readEvents(summary.id))
+      .filter((event): event is Extract<SessionEvent, { kind: 'tool_call' }> => event.kind === 'tool_call')
+      .map((event) => event.call.outcome);
+    expect(outcomes).toEqual(['error', 'rejected', 'error']);
+  });
+
   it('reconciles a canonical message revision newer than the metadata checkpoint', async () => {
     const summary = await createSession({ title: 'stale meta canonical recovery' });
     const messageId = 'canonical-crash-revision';
@@ -1528,6 +1591,84 @@ describe('canonical recorder 1.8', () => {
       requestId
     });
 
+  it('recursively redacts common credential fields before tool arguments become durable history', async () => {
+    const conversationId = 'conv-recorder-credential-redaction';
+    const requestId = 'wfr_recorder_credential_redaction';
+    const sessionId = await sessionForConversation(conversationId);
+    const now = Date.now();
+    await recordChatObservations(conversationId, [{
+      kind: 'tool_evidence',
+      time: now,
+      fiberConversationId: conversationId,
+      calls: [{ messageId: 'credential-call', tool: 'read', order: 0, answered: false, requestId }]
+    }]);
+
+    const secrets = [
+      'bearer-value',
+      'generic-token',
+      'access-value',
+      'refresh-value',
+      'password-value',
+      'passwd-value',
+      'api-key-value',
+      'apikey-value',
+      'secret-value',
+      'cookie-value',
+      'set-cookie-value',
+      'client-secret-value'
+    ];
+    await recordToolCall({
+      tool: 'read',
+      args: {
+        path: '/project/src/main.ts',
+        diagnostics: { exitCode: 7, label: 'keep this metadata' },
+        auth: {
+          Authorization: secrets[0],
+          token: secrets[1],
+          access_token: secrets[2],
+          Refresh_Token: secrets[3],
+          password: secrets[4],
+          passwd: secrets[5],
+          api_key: secrets[6],
+          apiKey: secrets[7],
+          nested: [
+            { secret: secrets[8], cookie: secrets[9] },
+            { 'Set-Cookie': secrets[10], client_secret: secrets[11], label: 'keep nested label' }
+          ]
+        }
+      },
+      content: [{ type: 'text', text: 'ok' }],
+      outcome: 'ok',
+      durationMs: 1,
+      startedAt: now + 1,
+      requestId
+    });
+
+    const [event] = await readEvents(sessionId!, { kinds: ['tool_call'] });
+    expect(event?.kind).toBe('tool_call');
+    if (event?.kind !== 'tool_call') throw new Error('tool call was not recorded');
+    const serialized = event.call.args.text;
+    for (const value of secrets) expect(serialized).not.toContain(value);
+
+    const recorded = JSON.parse(serialized) as Record<string, any>;
+    expect(recorded.path).toBe('/project/src/main.ts');
+    expect(recorded.diagnostics).toEqual({ exitCode: 7, label: 'keep this metadata' });
+    expect(recorded.auth.Authorization).toBe('<removed>');
+    expect(recorded.auth.token).toBe('<removed>');
+    expect(recorded.auth.access_token).toBe('<removed>');
+    expect(recorded.auth.Refresh_Token).toBe('<removed>');
+    expect(recorded.auth.password).toBe('<removed>');
+    expect(recorded.auth.passwd).toBe('<removed>');
+    expect(recorded.auth.api_key).toBe('<removed>');
+    expect(recorded.auth.apiKey).toBe('<removed>');
+    expect(recorded.auth.nested[0]).toEqual({ secret: '<removed>', cookie: '<removed>' });
+    expect(recorded.auth.nested[1]).toEqual({
+      'Set-Cookie': '<removed>',
+      client_secret: '<removed>',
+      label: 'keep nested label'
+    });
+  });
+
   it('creates exactly one session when the same conversation is first observed concurrently', async () => {
     const conversationId = 'conv-concurrent-first-sight';
     const [first, second] = await Promise.all([
@@ -2048,7 +2189,7 @@ describe('naming the chats this app opened', () => {
 // --------------------------------------------------------------- summaries
 
 describe('tool summaries', () => {
-  const summarize = (tool: string, args: unknown, patch: Partial<ReturnType<typeof emptyEvidence>> = {}, outcome: 'ok' | 'error' | 'rejected' = 'ok', durationMs = 10) =>
+  const summarize = (tool: string, args: unknown, patch: Partial<ReturnType<typeof emptyEvidence>> = {}, outcome: ToolOutcome = 'ok', durationMs = 10) =>
     summarizeToolCall({ tool, args, evidence: evidence(patch), outcome, durationMs, resultHead: 'head line' });
 
   /** The patch text a summary reads its intent off. */
@@ -2157,14 +2298,14 @@ describe('tool summaries', () => {
   it('keeps the subject but not the claim when a call fails or is refused', () => {
     const refused = summarize('apply_patch', { patch: patch('Delete File', '/p/x.ts') }, {
       changes: [{ path: '/p/x.ts', added: 0, removed: 3, approximate: false }]
-    }, 'rejected');
+    }, 'tool_rejected');
     expect(refused.title).toBe('Refused to delete x.ts');
     expect(refused.metric).toBe('refused');
     expect(refused.tone).toBe('warn');
 
     const errored = summarize('apply_patch', { patch: patch('Update File', '/p/x.ts') }, {
       changes: [{ path: '/p/x.ts', added: 1, removed: 1, approximate: false }]
-    }, 'error');
+    }, 'tool_internal_error');
     expect(errored.title).toBe('Could not edit x.ts');
     expect(errored.metric).toBe('✕ failed');
     expect(errored.detail).toBe('head line');
@@ -2188,7 +2329,7 @@ describe('tool summaries', () => {
       ['some_future_tool', {}, 'Could not run some_future_tool']
     ];
     for (const [tool, args, title] of cases) {
-      const summary = summarize(tool, args, {}, 'error');
+      const summary = summarize(tool, args, {}, 'tool_internal_error');
       expect(summary.title, tool).toBe(title);
       // Nothing may still read as an accomplished action.
       expect(summary.title, tool).not.toMatch(/^(Read|Applied|Created|Searched|Ran|Messaged|Reported|Looked) /);

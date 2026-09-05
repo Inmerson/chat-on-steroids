@@ -200,7 +200,7 @@ describe('staging the new version', () => {
       {
         parentPid: process.pid,
         installerPath: staged,
-        args: ['/S', '--updated'],
+        args: ['/S', '/currentuser', '--updated'],
         windowsHide: true,
         userDataDir: userData
       }
@@ -267,7 +267,7 @@ describe('installed Windows versus win-unpacked', () => {
       {
         parentPid: process.pid,
         installerPath: path.join(userData, 'updates', NEXT, WINDOWS_ASSET),
-        args: [],
+        args: ['/currentuser'],
         windowsHide: false,
         userDataDir: userData
       }
@@ -343,7 +343,7 @@ describe('a download that survives the process that fetched it', () => {
     expect(handoffs).toHaveLength(1);
     expect(handoffs[0]).toMatchObject({
       installerPath: path.join(userData, 'updates', NEXT, WINDOWS_ASSET),
-      args: ['/S', '--updated'],
+      args: ['/S', '/currentuser', '--updated'],
       windowsHide: true
     });
   });
@@ -385,7 +385,7 @@ describe('installing on request', () => {
       {
         parentPid: process.pid,
         installerPath: path.join(userData, 'updates', NEXT, WINDOWS_ASSET),
-        args: ['--updated'],
+        args: ['/currentuser', '--updated'],
         windowsHide: false,
         userDataDir: userData
       }
@@ -425,6 +425,6 @@ describe('installing on request', () => {
     await asPlatform('win32', undefined, () => checkForUpdates());
     await applyStagedUpdate();
     expect(handoffs).toHaveLength(1);
-    expect(handoffs[0]).toMatchObject({ args: ['/S', '--updated'], windowsHide: true });
+    expect(handoffs[0]).toMatchObject({ args: ['/S', '/currentuser', '--updated'], windowsHide: true });
   });
 });

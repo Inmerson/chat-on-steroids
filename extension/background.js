@@ -1883,7 +1883,8 @@ function conversationFromUrl(value) {
   try {
     const url = new URL(String(value || ''));
     if (url.protocol !== 'https:' || (url.hostname !== 'chatgpt.com' && url.hostname !== 'chat.openai.com')) return null;
-    const match = /^\/c\/([0-9a-f-]{8,64})/i.exec(url.pathname);
+    // Match chatgpt-dom.js: one optional Project prefix is valid; shared snapshots are not.
+    const match = /^\/(?:g\/[^/]+\/)?c\/([0-9a-f-]{8,64})(?:\/|$)/i.exec(url.pathname);
     return match ? match[1] : null;
   } catch {
     return null;

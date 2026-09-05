@@ -70,7 +70,8 @@ import {
   recordToolCall
 } from '../session/recorder.js';
 import { readOverflowText } from '../session/store.js';
-import type { StoredText } from '../../shared/session.js';
+import { backgroundExecRecoveryNotices } from '../codex/ownership.js';
+import type { StoredText, ToolOutcome } from '../../shared/session.js';
 
 export interface ToolContext {
   roots: Root[];
@@ -191,7 +192,7 @@ export async function guard(name: string, fn: () => Promise<ToolResult>): Promis
         ?.slice(0, 500);
       // A rejected edit, disabled permission, stale cursor, etc. is a normal tool
       // outcome, not evidence that the connector itself is unhealthy.
-      noteOutcomeSafely('rejected');
+      noteOutcomeSafely('tool_rejected');
       logInfo(`tool ${name} rejected in ${elapsed} ms${summary ? `: ${summary}` : ''}`);
     } else {
       noteOutcomeSafely('ok');
@@ -208,10 +209,10 @@ export async function guard(name: string, fn: () => Promise<ToolResult>): Promis
       err instanceof ExecError ||
       err instanceof AgentError
     ) {
-      noteOutcomeSafely('rejected');
+      noteOutcomeSafely('tool_rejected');
       logInfo(`tool ${name} rejected in ${elapsed} ms: ${message}`);
     } else {
-      noteOutcomeSafely('error');
+      noteOutcomeSafely('tool_internal_error');
       logWarn(`tool ${name} failed in ${elapsed} ms: ${message}`);
     }
     return fail(message);
@@ -220,7 +221,7 @@ export async function guard(name: string, fn: () => Promise<ToolResult>): Promis
 
 // noteOutcome is only meaningful inside a call context; guard is also used by tests and
 // by internal paths that have none, and a missing context must not turn into an error.
-function noteOutcomeSafely(outcome: 'ok' | 'rejected' | 'error'): void {
+function noteOutcomeSafely(outcome: ToolOutcome): void {
   try {
     noteOutcome(outcome);
   } catch {
@@ -334,6 +335,22 @@ function noteTransportIdentity(transportKey: string | null): void {
  * Messages are *offered* here, not retired. They are retired when this agent calls
  * again, because that is the first real evidence this result reached ChatGPT.
  */
+/** Appends same-conversation background reminders without consuming terminal output. */
+function withBackgroundExecRecovery(
+  conversationId: string | null | undefined,
+  result: ToolResult
+): ToolResult {
+  const notices = backgroundExecRecoveryNotices(conversationId);
+  if (notices.length === 0) return result;
+  return {
+    ...result,
+    content: [
+      ...result.content,
+      { type: 'text', text: `\n--- Background command recovery ---\n${notices.join('\n')}` }
+    ]
+  };
+}
+
 function withInbox(
   conversationId: string | null | undefined,
   agent: string | null,
@@ -521,13 +538,17 @@ async function dispatchTracked(
   // Inbox messages are part of the MCP result ChatGPT actually receives. Build the delivered
   // result before recording so session(action=read, tool_call=T…) is genuine wire forensics rather than a
   // subtly earlier internal value that omits the worker report most likely to matter later.
-  const delivered = withInbox(context.caller.conversationId, context.agent, result, isFinish);
+  const delivered = withBackgroundExecRecovery(
+    context.caller.conversationId,
+    withInbox(context.caller.conversationId, context.agent, result, isFinish)
+  );
   const recorderStartedAt = Date.now();
   const recording = recordToolCall({
     tool: name,
     args,
     content: delivered.content,
-    outcome: context.outcome ?? (result.isError ? 'rejected' : 'ok'),
+    // guard() marks unexpected defects; an otherwise unclassified isError is an expected refusal.
+    outcome: context.outcome ?? (result.isError ? 'tool_rejected' : 'ok'),
     durationMs,
     startedAt,
     evidence: context.evidence,

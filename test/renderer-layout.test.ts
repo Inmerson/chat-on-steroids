@@ -43,6 +43,17 @@ function rule(selector: string): string {
   return match ? match[1]!.replace(/\s+/g, ' ').trim() : '';
 }
 
+describe('setup authority copy', () => {
+  it('limits the approved-folder claim to file tools and discloses terminal OS-user scope', () => {
+    const copy = document.querySelector('[data-step="folder"] p')!.textContent!.replace(/\s+/g, ' ').trim();
+    expect(copy).toContain('File tools can reach only the folders you approve.');
+    expect(copy).toContain('Terminal commands');
+    expect(copy).toContain('run as your OS user');
+    expect(copy).toContain('are not limited to those folders');
+    expect(copy).not.toContain('Nothing outside the folders you approve is reachable.');
+  });
+});
+
 describe('the session card header', () => {
   /**
    * A gear, and nothing that starts work. Compact & resume is pressed in the ChatGPT tab,
