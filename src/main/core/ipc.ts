@@ -8,12 +8,26 @@ import type {
   CoreResponse,
   CoreSecretKey,
   CoreSecretStatus,
-  CoreStatusEnvelope
+  CoreStatusEnvelope,
+  CoreUiOperation
 } from '../../shared/core-protocol.js';
 
 const MAX_IPC_MESSAGE_BYTES = 128 * 1024;
 const IPC_TIMEOUT_MS = 2_000;
 const MAX_SECRET_VALUE_CHARS = 500;
+const CORE_UI_OPERATIONS = new Set<CoreUiOperation>([
+  'bridge-status',
+  'bridge-unpair',
+  'session-list',
+  'session-events',
+  'session-delete',
+  'handoff-get',
+  'swarm-get',
+  'swarm-reset',
+  'swarm-clear-agent',
+  'control-center-status',
+  'goal-models'
+]);
 
 /**
  * User-scoped rendezvous endpoint for the persistent Core Host.
@@ -86,6 +100,7 @@ export interface CoreIpcHandlers {
   applySettings: () => Promise<void>;
   secretStatus: () => CoreSecretStatus | Promise<CoreSecretStatus>;
   setSecret: (key: CoreSecretKey, value: string) => Promise<void>;
+  uiCall: (operation: CoreUiOperation, payload: unknown) => Promise<unknown>;
   shutdownCore: () => Promise<void>;
 }
 
@@ -100,6 +115,10 @@ function response(socket: Socket, value: CoreResponse): void {
 
 function validSecretKey(value: unknown): value is CoreSecretKey {
   return value === 'openaiApiKey' || value === 'openRouterApiKey';
+}
+
+function validUiOperation(value: unknown): value is CoreUiOperation {
+  return typeof value === 'string' && CORE_UI_OPERATIONS.has(value as CoreUiOperation);
 }
 
 async function dispatch(request: CoreRequest, handlers: CoreIpcHandlers): Promise<unknown> {
@@ -125,6 +144,9 @@ async function dispatch(request: CoreRequest, handlers: CoreIpcHandlers): Promis
       }
       await handlers.setSecret(request.key, request.value);
       return undefined;
+    case 'ui-call':
+      if (!validUiOperation(request.operation)) throw new Error('Invalid Core UI operation');
+      return handlers.uiCall(request.operation, request.payload);
     case 'shutdown-core':
       await handlers.shutdownCore();
       return true;
@@ -259,7 +281,7 @@ export class CoreIpcClient {
         if (error) reject(error);
         else resolve(value as T);
       };
-      socket.setTimeout(this.timeoutMs, () => finish(new Error('Core IPC request timed out')));
+      socket.setTimeout(this.timeoutMs, () => finish(new Error('Core IPC request timed out'));
       socket.once('error', (error) => finish(error));
       socket.once('connect', () => socket.write(`${JSON.stringify(wire)}\n`));
       socket.on('data', (chunk: Buffer) => {
@@ -314,6 +336,10 @@ export class CoreIpcClient {
 
   setSecret(key: CoreSecretKey, value: string): Promise<void> {
     return this.request('set-secret', { key, value });
+  }
+
+  uiCall<T>(operation: CoreUiOperation, payload: unknown): Promise<T> {
+    return this.request('ui-call', { operation, payload });
   }
 
   shutdownCore(): Promise<boolean> {
