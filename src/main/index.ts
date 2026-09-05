@@ -11,7 +11,7 @@ import { mkdirSync } from 'node:fs';
 import { app, BrowserWindow, Menu, Tray, nativeImage, nativeTheme, screen, session } from 'electron';
 import { getConfig, initConfigPath, loadConfig } from './config.js';
 import { connect, disconnect, getStatus, onStatusChange, shutdownConnection } from './connection.js';
-import { registerIpc } from './ipc.js';
+import { registerUiIpc } from './ipc-ui.js';
 import { initLogFile, logError, logInfo, logWarn } from './logger.js';
 import { initSecretsPath } from './secrets.js';
 import { runShutdownSequence } from './shutdown.js';
@@ -42,14 +42,9 @@ if (!app.isPackaged && process.env.COS_DEV_USER_DATA?.trim()) {
   app.setPath('userData', isolatedUserData);
 }
 
-// This lock is UI-only now. Core Host and Core Supervisor have their own exclusive IPC ownership
-// endpoints, so a UI relaunch cannot create duplicate model-facing runtimes.
 const hasSingleInstanceLock = app.requestSingleInstanceLock();
 if (!hasSingleInstanceLock) {
   quitting = true;
-  // Native ProcessSingleton normally focuses the primary. Keep the old loopback fallback for the
-  // rare Windows case where that native message fails; Core owns the bridge port and may service
-  // /show independently of this secondary process.
   void import('node:http').then(({ request }) => {
     const req = request({ hostname: '127.0.0.1', port: 8765, path: '/show', method: 'POST', timeout: 1000 });
     req.on('error', () => app.quit());
@@ -134,16 +129,13 @@ function createWindow(): void {
       window?.hide();
     }
   });
-  window.on('closed', () => {
-    window = null;
-  });
+  window.on('closed', () => { window = null; });
 
   if (process.env.ELECTRON_RENDERER_URL) void window.loadURL(process.env.ELECTRON_RENDERER_URL);
   else void window.loadFile(path.join(__dirname, '../renderer/index.html'));
 }
 
 function showWindow(): void {
-  logInfo(`showWindow called (quitting=${quitting}, hasWindow=${Boolean(window)})`);
   if (quitting) return;
   if (!window || window.isDestroyed()) {
     createWindow();
@@ -176,10 +168,7 @@ function trayIcon(running: boolean): Electron.NativeImage {
   const [base, ...highDpi] = spec.representations;
   const image = nativeImage.createFromBuffer(base.png, { scaleFactor: base.scaleFactor });
   for (const representation of highDpi) {
-    image.addRepresentation({
-      scaleFactor: representation.scaleFactor,
-      dataURL: `data:image/png;base64,${representation.png.toString('base64')}`
-    });
+    image.addRepresentation({ scaleFactor: representation.scaleFactor, dataURL: `data:image/png;base64,${representation.png.toString('base64')}` });
   }
   if (spec.template) image.setTemplateImage(true);
   return image;
@@ -194,25 +183,14 @@ function refreshTray(): void {
   const label = connected ? 'Connected' : offline ? 'No internet' : running ? 'Reconnecting' : 'Not connected';
   tray.setImage(trayIcon(running));
   tray.setToolTip(`Chat On Steroids — ${label.toLowerCase()}`);
-  tray.setContextMenu(
-    Menu.buildFromTemplate([
-      { label, enabled: false },
-      { type: 'separator' },
-      { label: 'Open', click: () => showWindow() },
-      {
-        label: running ? 'Disconnect' : 'Connect',
-        click: () => void (running ? disconnect() : connect())
-      },
-      { type: 'separator' },
-      {
-        label: 'Quit',
-        click: () => {
-          quitting = true;
-          app.quit();
-        }
-      }
-    ])
-  );
+  tray.setContextMenu(Menu.buildFromTemplate([
+    { label, enabled: false },
+    { type: 'separator' },
+    { label: 'Open', click: () => showWindow() },
+    { label: running ? 'Disconnect' : 'Connect', click: () => void (running ? disconnect() : connect()) },
+    { type: 'separator' },
+    { label: 'Quit', click: () => { quitting = true; app.quit(); } }
+  ]));
 }
 
 app.on('second-instance', () => showWindow());
@@ -231,24 +209,14 @@ void app.whenReady().then(async () => {
   nativeTheme.themeSource = getConfig().ui.theme;
 
   session.defaultSession.webRequest.onHeadersReceived((details, callback) => {
-    callback({
-      responseHeaders: {
-        ...details.responseHeaders,
-        'Content-Security-Policy': [
-          "default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; connect-src 'self'; form-action 'none'; base-uri 'none'; frame-ancestors 'none'"
-        ]
-      }
-    });
+    callback({ responseHeaders: {
+      ...details.responseHeaders,
+      'Content-Security-Policy': ["default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; connect-src 'self'; form-action 'none'; base-uri 'none'; frame-ancestors 'none'"]
+    } });
   });
   session.defaultSession.setPermissionRequestHandler((_wc, _permission, callback) => callback(false));
 
-  registerIpc(
-    () => window,
-    () => {
-      quitting = true;
-      app.quit();
-    }
-  );
+  registerUiIpc(() => window, () => { quitting = true; app.quit(); });
   windowActivation.enable();
   if (!backgroundStartup) windowActivation.request();
   registerNativeWindowActivation(app, windowActivation.request);
@@ -256,13 +224,9 @@ void app.whenReady().then(async () => {
   tray = new Tray(trayIcon(false), ...trayGuidArgsForPlatform());
   tray.on('click', () => showWindow());
   refreshTray();
-  // Registering this listener also starts Core IPC polling. Core is therefore supervised even
-  // when autoConnect is off; autoConnect controls publication, not whether the Core process exists.
   onStatusChange(refreshTray);
 
   logInfo('UI started; Core runtime is independently supervised');
-  // The Core reads the same durable config and decides whether it should publish. Calling connect
-  // here preserves the existing explicit auto-connect UX without creating a local tunnel owner.
   if (getConfig().ui.autoConnect) void connect();
   startUpdateChecks();
 });
@@ -289,20 +253,14 @@ app.on('will-quit', (event) => {
 
   void runShutdownSequence(
     [
-      // UI lifecycle is not Core lifecycle. This only stops the UI's status-polling client.
       { name: 'UI Core detach', budgetMs: 3_000, run: () => [shutdownConnection()] },
-      // The updater owns the exceptional installed-update Core quiesce/file-lock handoff. A normal
-      // user quit reaches this phase with no staged update and leaves Core completely untouched.
       { name: 'update handoff', budgetMs: 5_000, run: () => [applyStagedUpdate()] }
     ],
     {
       info: logInfo,
       warn: logWarn,
       error: logError,
-      exit: () => {
-        shutdownComplete = true;
-        app.exit(0);
-      }
+      exit: () => { shutdownComplete = true; app.exit(0); }
     }
   );
 });
