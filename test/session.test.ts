@@ -1528,6 +1528,84 @@ describe('canonical recorder 1.8', () => {
       requestId
     });
 
+  it('recursively redacts common credential fields before tool arguments become durable history', async () => {
+    const conversationId = 'conv-recorder-credential-redaction';
+    const requestId = 'wfr_recorder_credential_redaction';
+    const sessionId = await sessionForConversation(conversationId);
+    const now = Date.now();
+    await recordChatObservations(conversationId, [{
+      kind: 'tool_evidence',
+      time: now,
+      fiberConversationId: conversationId,
+      calls: [{ messageId: 'credential-call', tool: 'read', order: 0, answered: false, requestId }]
+    }]);
+
+    const secrets = [
+      'bearer-value',
+      'generic-token',
+      'access-value',
+      'refresh-value',
+      'password-value',
+      'passwd-value',
+      'api-key-value',
+      'apikey-value',
+      'secret-value',
+      'cookie-value',
+      'set-cookie-value',
+      'client-secret-value'
+    ];
+    await recordToolCall({
+      tool: 'read',
+      args: {
+        path: '/project/src/main.ts',
+        diagnostics: { exitCode: 7, label: 'keep this metadata' },
+        auth: {
+          Authorization: secrets[0],
+          token: secrets[1],
+          access_token: secrets[2],
+          Refresh_Token: secrets[3],
+          password: secrets[4],
+          passwd: secrets[5],
+          api_key: secrets[6],
+          apiKey: secrets[7],
+          nested: [
+            { secret: secrets[8], cookie: secrets[9] },
+            { 'Set-Cookie': secrets[10], client_secret: secrets[11], label: 'keep nested label' }
+          ]
+        }
+      },
+      content: [{ type: 'text', text: 'ok' }],
+      outcome: 'ok',
+      durationMs: 1,
+      startedAt: now + 1,
+      requestId
+    });
+
+    const [event] = await readEvents(sessionId!, { kinds: ['tool_call'] });
+    expect(event?.kind).toBe('tool_call');
+    if (event?.kind !== 'tool_call') throw new Error('tool call was not recorded');
+    const serialized = event.call.args.text;
+    for (const value of secrets) expect(serialized).not.toContain(value);
+
+    const recorded = JSON.parse(serialized) as Record<string, any>;
+    expect(recorded.path).toBe('/project/src/main.ts');
+    expect(recorded.diagnostics).toEqual({ exitCode: 7, label: 'keep this metadata' });
+    expect(recorded.auth.Authorization).toBe('[redacted]');
+    expect(recorded.auth.token).toBe('[redacted]');
+    expect(recorded.auth.access_token).toBe('[redacted]');
+    expect(recorded.auth.Refresh_Token).toBe('[redacted]');
+    expect(recorded.auth.password).toBe('[redacted]');
+    expect(recorded.auth.passwd).toBe('[redacted]');
+    expect(recorded.auth.api_key).toBe('[redacted]');
+    expect(recorded.auth.apiKey).toBe('[redacted]');
+    expect(recorded.auth.nested[0]).toEqual({ secret: '[redacted]', cookie: '[redacted]' });
+    expect(recorded.auth.nested[1]).toEqual({
+      'Set-Cookie': '[redacted]',
+      client_secret: '[redacted]',
+      label: 'keep nested label'
+    });
+  });
+
   it('creates exactly one session when the same conversation is first observed concurrently', async () => {
     const conversationId = 'conv-concurrent-first-sight';
     const [first, second] = await Promise.all([
