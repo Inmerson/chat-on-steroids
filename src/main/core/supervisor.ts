@@ -35,6 +35,7 @@ export interface EnsureHostResult {
 }
 
 export const CORE_RESTART_BACKOFF_MS = [2_000, 5_000, 10_000, 30_000, 60_000, 120_000, 180_000] as const;
+const MAX_CORE_RESTART_BACKOFF_MS = CORE_RESTART_BACKOFF_MS[CORE_RESTART_BACKOFF_MS.length - 1]!;
 
 const sleepDefault = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -83,7 +84,9 @@ export class CoreSupervisor {
       return { state: 'attached', pid: existing.pid };
     }
 
-    const delay = CORE_RESTART_BACKOFF_MS[Math.min(this.restartFailures, CORE_RESTART_BACKOFF_MS.length - 1)];
+    const delay =
+      CORE_RESTART_BACKOFF_MS[Math.min(this.restartFailures, CORE_RESTART_BACKOFF_MS.length - 1)] ??
+      MAX_CORE_RESTART_BACKOFF_MS;
     await this.sleep(delay);
 
     // Another independently-launched UI/supervisor may have won ownership while our backoff was
