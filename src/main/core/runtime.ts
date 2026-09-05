@@ -22,6 +22,7 @@ import { startSessionRetentionMaintenance } from '../session/retention.js';
 import { flushSessions, initSessionStore, pruneSessions } from '../session/store.js';
 import { CoreHealthController } from './health-controller.js';
 import { probeLocalMcp } from './probe.js';
+import { setConnectionGenerationProvider } from './request-lifecycle.js';
 
 const SWARM_STATE = 'swarm';
 const RETIRED_WORKERS_STATE = 'retired-workers';
@@ -128,6 +129,10 @@ export async function startCoreRuntime(userDataDir: string): Promise<CoreRuntime
       );
     }
   });
+  // Request lifecycle records must carry the same generation that status/recovery uses. This
+  // provider is read at the actual HTTP request-start boundary, so an in-flight request keeps the
+  // generation it entered under even if recovery increments the controller before its response.
+  setConnectionGenerationProvider(() => health.snapshot().connectionGeneration);
 
   const tick = async (): Promise<void> => {
     if (shuttingDown) return;
