@@ -11,9 +11,14 @@ const hello: CoreHello = {
   capabilities: CORE_CAPABILITIES
 };
 
-function envelope(generation = 3, state: CoreStatusEnvelope['status']['state'] = 'connected'): CoreStatusEnvelope {
+function envelope(
+  generation = 3,
+  state: CoreStatusEnvelope['status']['state'] = 'connected',
+  revisions = { bridgeRevision: 0, sessionRevision: 0, swarmRevision: 0 }
+): CoreStatusEnvelope {
   return {
     generation,
+    ...revisions,
     status: {
       state,
       detail: state === 'connected' ? 'Connected' : 'Reconnecting',
@@ -54,6 +59,7 @@ function client(overrides: Record<string, unknown> = {}) {
     applySettings: vi.fn(async () => envelope()),
     secretStatus: vi.fn(async () => ({ hasApiKey: true, hasGoalKey: false })),
     setSecret: vi.fn(async () => undefined),
+    uiCall: vi.fn(async () => null),
     shutdownCore: vi.fn(async () => true),
     ...overrides
   };
@@ -151,5 +157,42 @@ describe('UI persistent-Core connection facade', () => {
     await facade.setSecret('openaiApiKey', 'sk-new');
     expect(peer.setSecret).toHaveBeenCalledWith('openaiApiKey', 'sk-new');
     expect(JSON.stringify(await facade.secretStatus())).not.toContain('sk-new');
+  });
+
+  it('emits bridge/session/swarm runtime changes from monotonic Core revisions', async () => {
+    const peer = client({
+      status: vi.fn()
+        .mockResolvedValueOnce(envelope(3, 'connected', { bridgeRevision: 1, sessionRevision: 5, swarmRevision: 2 }))
+        .mockResolvedValueOnce(envelope(3, 'connected', { bridgeRevision: 2, sessionRevision: 5, swarmRevision: 3 }))
+    });
+    const facade = createUiConnectionFacade({
+      userDataDir: () => 'profile',
+      token: async () => 'a'.repeat(64),
+      client: () => peer,
+      startSupervisor: vi.fn(),
+      sleep: async () => undefined
+    });
+    const changed: string[] = [];
+    facade.onRuntimeChange((kind) => changed.push(kind));
+
+    await facade.refresh();
+    changed.length = 0;
+    await facade.refresh();
+
+    expect(changed).toEqual(['bridge', 'swarm']);
+  });
+
+  it('routes fixed UI runtime calls through the attached Core client', async () => {
+    const peer = client({ uiCall: vi.fn(async () => ({ running: true })) });
+    const facade = createUiConnectionFacade({
+      userDataDir: () => 'profile',
+      token: async () => 'a'.repeat(64),
+      client: () => peer,
+      startSupervisor: vi.fn(),
+      sleep: async () => undefined
+    });
+
+    await expect(facade.uiCall('bridge-status', null)).resolves.toEqual({ running: true });
+    expect(peer.uiCall).toHaveBeenCalledWith('bridge-status', null);
   });
 });
