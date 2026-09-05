@@ -58,6 +58,10 @@ export interface CoreStatusEnvelope {
   generation: number;
   status: CoreStatusProjection;
   health?: CoreHealthStatus;
+  /** Monotonic Core-owned runtime revisions used to drive renderer refresh without polling data stores. */
+  bridgeRevision?: number;
+  sessionRevision?: number;
+  swarmRevision?: number;
 }
 
 /**
@@ -75,7 +79,8 @@ export type CoreUiOperation =
   | 'swarm-reset'
   | 'swarm-clear-agent'
   | 'control-center-status'
-  | 'goal-models';
+  | 'goal-models'
+  | 'diagnostics-run';
 
 export type CoreCommandName =
   | 'hello'
