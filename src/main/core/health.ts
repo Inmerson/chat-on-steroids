@@ -1,22 +1,7 @@
-export type OverallConnectionState = 'CONNECTED' | 'DEGRADED' | 'RECONNECTING' | 'OFFLINE' | 'AUTH_REQUIRED';
+import type { CoreHealthStatus, CoreOverallState } from '../../shared/core-protocol.js';
 
-export interface CoreHealthSnapshot {
-  overall: OverallConnectionState;
-  authHealthy: boolean;
-  remoteTransportHealthy: boolean;
-  remoteSubscriptionHealthy: boolean;
-  coreProcessHealthy: boolean;
-  localMcpHealthy: boolean;
-  toolProbeHealthy: boolean;
-  lastToolSuccessAt: number | null;
-  lastRemoteHeartbeatAt: number | null;
-  lastProbeAt: number | null;
-  reconnectAttempt: number;
-  connectionGeneration: number;
-  corePid: number | null;
-  recovering: boolean;
-  authRequired: boolean;
-}
+export type OverallConnectionState = CoreOverallState;
+export type CoreHealthSnapshot = CoreHealthStatus;
 
 export type CoreHealthEvent =
   | { type: 'CORE_STARTED'; pid: number }
@@ -72,8 +57,6 @@ export function overallConnectionState(state: Omit<CoreHealthSnapshot, 'overall'
     return 'CONNECTED';
   }
 
-  // A live Core/transport with a broken execution plane is the false-green state this arbiter
-  // exists to prevent. Keep it distinguishable from a fully unreachable connection.
   if (
     state.coreProcessHealthy &&
     (state.remoteTransportHealthy || state.remoteSubscriptionHealthy) &&
@@ -90,7 +73,7 @@ function finalize(next: CoreHealthSnapshot): CoreHealthSnapshot {
 }
 
 export function reduceCoreHealth(current: CoreHealthSnapshot, event: CoreHealthEvent): CoreHealthSnapshot {
-  let next: CoreHealthSnapshot = { ...current };
+  const next: CoreHealthSnapshot = { ...current };
 
   switch (event.type) {
     case 'CORE_STARTED':
