@@ -8,7 +8,7 @@
  */
 
 import type { ConnectionStatus } from '../shared/types.js';
-import type { CoreHealthStatus, CoreSecretKey, CoreSecretStatus } from '../shared/core-protocol.js';
+import type { CoreHealthStatus, CoreSecretKey, CoreSecretStatus, CoreUiOperation } from '../shared/core-protocol.js';
 import * as local from './connection-local.js';
 import { hasSecret, setSecret } from './secrets.js';
 import { uiConnectionFacade } from './core/ui-connection.js';
@@ -17,6 +17,10 @@ const UI_CLIENT_MODE = process.env.COS_CORE_UI_CLIENT === '1';
 
 function ui() {
   return uiConnectionFacade();
+}
+
+export function isUiConnectionClientMode(): boolean {
+  return UI_CLIENT_MODE;
 }
 
 export function getStatus(): ConnectionStatus {
@@ -45,6 +49,11 @@ export function disconnect(): Promise<void> {
 
 export function applySettings(): Promise<void> {
   return UI_CLIENT_MODE ? ui().applySettings() : local.applySettings();
+}
+
+export function callCoreUi<T>(operation: CoreUiOperation, payload: unknown = null): Promise<T> {
+  if (!UI_CLIENT_MODE) throw new Error('Core UI runtime calls are only available from the UI client process');
+  return ui().uiCall<T>(operation, payload);
 }
 
 /** Secret plaintext is write-only across the UI/Core boundary. */
