@@ -4380,7 +4380,7 @@ export const BROWSER_PLACEMENT_MS = 20_000;
  */
 let placementCollector: string | null = null;
 
-/** The one fresh chat currently offered to its home page, and the fallback that outlives it. */
+/** The one fresh chat currently offered to its home page. Resume placement owns its own fallback timer. */
 let placementOffer: { id: string; conversationId: string; background: boolean } | null = null;
 let placementTimer: NodeJS.Timeout | null = null;
 
@@ -4407,6 +4407,14 @@ function offerPlacement(command: Command): boolean {
   if (command.spec.type !== 'worker' && home !== placementCollector) return false;
   clearPlacementOffer();
   placementOffer = { id: command.id, conversationId: home, background: command.spec.type === 'worker' };
+  // A worker already has one short redeem deadline whose only retry is the OS opener. Do not
+  // create a second timer for the same fallback here: if Prime never collects/opens this offer,
+  // that worker deadline remains the single owner of the one permitted reopen. Resume commands
+  // do not have that worker retry path, so their placement still needs its own bounded fallback.
+  if (command.spec.type === 'worker') {
+    logInfo(`bridge: offering ${specKey(command.spec)} to ${home}'s own browser window`);
+    return true;
+  }
   placementTimer = setTimeout(() => {
     placementTimer = null;
     placementOffer = null;
@@ -6298,6 +6306,10 @@ function expire(command: Command): void {
  * its chance to place this one.
  */
 async function reopenWorkerChat(command: Command): Promise<void> {
+  // The worker deadline is now taking ownership of the one fallback open. Retire any still-live
+  // home-page offer first so a late /activity poll cannot create another tab beside Prime after
+  // the OS reopen has already begun.
+  if (placementOffer?.id === command.id) clearPlacementOffer();
   if (!(await persistCommandLease(command, null, Date.now()))) {
     if (commands.includes(command)) {
       drop(command, 'the chat this app opened did not report back in time');
