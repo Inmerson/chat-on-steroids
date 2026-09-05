@@ -1425,6 +1425,11 @@ $('readOnlyBtn').addEventListener('click', () => {
 
 $('addFolder').addEventListener('click', () => void addFolder());
 $('wizAddFolder').addEventListener('click', () => void addFolder());
+$('wizManageFolders').addEventListener('click', () => {
+  showTab('home');
+  $('foldersCard').scrollIntoView({ block: 'nearest' });
+  $('addFolder').focus({ preventScroll: true });
+});
 $('allComputerBtn').addEventListener('click', () => void toggleAllComputer());
 const wizAllComputer = document.getElementById('wizAllComputer');
 if (wizAllComputer) {
