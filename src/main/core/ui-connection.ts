@@ -8,7 +8,8 @@ import {
   type CoreHello,
   type CoreSecretKey,
   type CoreSecretStatus,
-  type CoreStatusEnvelope
+  type CoreStatusEnvelope,
+  type CoreUiOperation
 } from '../../shared/core-protocol.js';
 import { CoreIpcClient, coreEndpointForUserData, ensureCoreIpcToken, shouldAcceptCoreEnvelope } from './ipc.js';
 import { startCoreSupervisorDetached } from './process.js';
@@ -21,6 +22,7 @@ interface CoreClient {
   applySettings(): Promise<CoreStatusEnvelope>;
   secretStatus(): Promise<CoreSecretStatus>;
   setSecret(key: CoreSecretKey, value: string): Promise<void>;
+  uiCall<T>(operation: CoreUiOperation, payload: unknown): Promise<T>;
   shutdownCore(): Promise<boolean>;
 }
 
@@ -62,6 +64,7 @@ export interface UiConnectionFacade {
   applySettings(): Promise<void>;
   secretStatus(): Promise<CoreSecretStatus>;
   setSecret(key: CoreSecretKey, value: string): Promise<void>;
+  uiCall<T>(operation: CoreUiOperation, payload: unknown): Promise<T>;
   shutdownConnection(): Promise<void>;
   isServerRunning(): boolean;
   tunnelHealthBase(): null;
@@ -213,6 +216,7 @@ export function createUiConnectionFacade(options: UiConnectionFacadeOptions): Ui
     applySettings: () => runCommand((client) => client.applySettings()),
     secretStatus: () => runCoreCall((client) => client.secretStatus()),
     setSecret: (key, value) => runCoreCall((client) => client.setSecret(key, value)),
+    uiCall: <T>(operation: CoreUiOperation, payload: unknown) => runCoreCall((client) => client.uiCall<T>(operation, payload)),
     shutdownConnection: async () => {
       // UI lifecycle is not Core lifecycle. Stop only this process's polling/admission to IPC.
       finalShutdown = true;
