@@ -202,6 +202,8 @@ function toolBlock(label = 'Called tool'): FakeNode {
 }
 
 interface DomApi {
+  conversationId(): string | null;
+  conversationFromPath(pathname: unknown): string | null;
   turns(): Array<{ node: FakeNode; nodes: FakeNode[]; id: string | null; role: string | null }>;
   messages(): Array<{ id: string; role: string; text: string; turnId: string | null }>;
   progressLine(turn: unknown): string | null;
@@ -212,12 +214,12 @@ interface DomApi {
   errors(): string[];
 }
 
-function loadDom(sections: FakeNode[]): DomApi {
+function loadDom(sections: FakeNode[], pathname = '/c/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee'): DomApi {
   const document = {
     querySelectorAll: (selector: string) => (selector === TURN_SELECTOR ? sections : []),
     querySelector: () => null
   };
-  const context = vm.createContext({ document, location: { pathname: '/c/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee' } });
+  const context = vm.createContext({ document, location: { pathname } });
   vm.runInContext(domSource, context, { filename: 'chatgpt-dom.js' });
   return (context as unknown as { CLF_DOM: DomApi }).CLF_DOM;
 }
@@ -227,6 +229,40 @@ function turn(role: 'user' | 'assistant', id: string): FakeNode {
 }
 
 describe('ChatGPT DOM adapter', () => {
+  const CONVERSATION = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee';
+
+  it('recognises root and Project conversation routes but rejects shared snapshots', () => {
+    const dom = loadDom([]);
+    for (const accepted of [
+      `/c/${CONVERSATION}`,
+      `/c/${CONVERSATION}/`,
+      `/g/g-p-68abcdef1234/c/${CONVERSATION}`,
+      `/g/g-p-68abcdef1234/c/${CONVERSATION}/`,
+      `/g/g-abcdef/c/${CONVERSATION}`
+    ]) {
+      expect(dom.conversationFromPath(accepted), accepted).toBe(CONVERSATION);
+    }
+
+    for (const rejected of [
+      '/',
+      '/c/short',
+      `/share/c/${CONVERSATION}`,
+      `/share/${CONVERSATION}`,
+      `/gpts/c/${CONVERSATION}`,
+      `/g/g-p-one/g/g-p-two/c/${CONVERSATION}`
+    ]) {
+      expect(dom.conversationFromPath(rejected), rejected).toBeNull();
+    }
+    expect(dom.conversationFromPath(null)).toBeNull();
+    expect(dom.conversationFromPath(undefined)).toBeNull();
+  });
+
+  it('reads the live Project route through the shared path parser', () => {
+    expect(loadDom([], `/g/g-p-68abcdef1234/c/${CONVERSATION}`).conversationId()).toBe(CONVERSATION);
+    expect(loadDom([], `/share/c/${CONVERSATION}`).conversationId()).toBeNull();
+    expect(loadDom([], '/').conversationId()).toBeNull();
+  });
+
   it('groups split assistant sections that share one data-turn-id before counting tool blocks', () => {
     const user = turn('user', 'user-1');
     const a1 = turn('assistant', 'request-1').with(TOOL_SELECTOR, [toolBlock(), toolBlock()]);
@@ -1779,6 +1815,25 @@ describe('extension revival delivery', () => {
     expect(worker.windowsUpdate).not.toHaveBeenCalled();
   });
 
+  it('reuses an existing worker chat inside a ChatGPT Project route', async () => {
+    const worker = loadWorker({ local: new FakeStorageArea(paired), session: new FakeStorageArea(), fetch: quiet() });
+    worker.tabsQuery.mockResolvedValue([{ id: 4, windowId: 7, url: `https://chatgpt.com/g/g-p-project/c/${CHAT}` }]);
+    worker.tabsSendMessage.mockImplementation(async (_id: number, message: { type: string }) =>
+      message.type === 'clf-recorder-ping'
+        ? { ok: true, recorderVersion: 10 }
+        : { ok: true, claimed: true }
+    );
+
+    await worker.createTab({ id: 12, pendingUrl: REVIVAL_URL });
+
+    expect(worker.tabsSendMessage).toHaveBeenCalledWith(4, {
+      type: 'clf-run-command',
+      id: 'cmd-wake',
+      conversationId: CHAT
+    });
+    expect(worker.tabsRemove).toHaveBeenCalledWith(12);
+  });
+
   it('reuses a supported legacy chat.openai.com worker tab', async () => {
     const worker = loadWorker({ local: new FakeStorageArea(paired), session: new FakeStorageArea(), fetch: quiet() });
     worker.tabsQuery.mockResolvedValue([{ id: 4, windowId: 7, url: `https://chat.openai.com/c/${CHAT}` }]);
@@ -2123,6 +2178,35 @@ describe('extension observation journal', () => {
 
     await worker.send({ type: 'ack', id: 'resume-command', status: 'sent' });
     expect(session.data.settled).toEqual(['resume-command']);
+  });
+
+  it('keeps a worker command tab open after bootstrap ACK until broker lifecycle releases it', async () => {
+    const local = new FakeStorageArea({ port: 8765, token: 'paired-token' });
+    const session = new FakeStorageArea();
+    const fetch = vi.fn(async (input: string) => {
+      const url = new URL(input);
+      if (url.pathname === '/hello') return response(200, { app: 'chat-on-steroids', paired: true });
+      if (url.pathname === '/commands/ack') return response(200, { ok: true, committed: true });
+      return response(404, {});
+    });
+    const worker = loadWorker({ local, session, fetch });
+    const commandId = 'worker-command-kept-open';
+    const conversationId = '11111111-2222-3333-4444-555555555555';
+    const tab = {
+      id: 82,
+      windowId: 7,
+      url: `https://chatgpt.com/?clf=${commandId}#clf=${commandId}`
+    };
+    const documentId = 'worker-command-document';
+
+    await worker.registerDocument(tab, documentId);
+    await worker.sendFrom(
+      { type: 'ack', id: commandId, status: 'sent', agent: 'worker-1', conversationId },
+      tab,
+      documentId
+    );
+
+    expect(worker.tabsRemove).not.toHaveBeenCalled();
   });
 
   it('preserves the observation journal on a 426 protocol mismatch', async () => {

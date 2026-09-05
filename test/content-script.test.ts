@@ -2130,6 +2130,185 @@ describe('the app-owned chronological stream', () => {
     }
   });
 
+  it('exposes bounded metadata through native, keyboard-operable tool disclosures', async () => {
+    const withDetails = () => {
+      const payload = activity();
+      Object.assign(payload.data.stream.find((entry) => entry.seq === 4)!, {
+        changes: [{ path: 'src/third.ts', added: 2, removed: 1 }],
+        args: 'private-argument-sentinel',
+        result: 'private-result-sentinel'
+      });
+      return payload;
+    };
+    live = await harness(undefined, { activity: withDetails });
+    renderingOn();
+    const section = assistantTurn(live.document, turnId, []);
+    await bindFiberRequest(section, 'wfr-app-stream');
+    live.hook.renderStreams();
+
+    const details = overwriteRows(section, 'details.clf-stream-tool-disclosure') as HTMLDetailsElement[];
+    expect(details).toHaveLength(2);
+    const disclosure = details.find((node) => node.textContent?.includes('Read third.ts'))!;
+    const summary = disclosure.querySelector('summary')!;
+    expect(summary.classList.contains('clf-stream-tool_call')).toBe(true);
+    expect(disclosure.open).toBe(false);
+    summary.click();
+    expect(disclosure.open).toBe(true);
+    expect(disclosure.querySelector('.clf-stream-tool-panel')?.textContent).toContain('read_file · completed · 3 ms');
+    expect(disclosure.textContent).toContain('src/third.ts  +2 −1');
+    expect(disclosure.textContent).not.toContain('private-argument-sentinel');
+    expect(disclosure.textContent).not.toContain('private-result-sentinel');
+  });
+
+  it('renders canonical process, refusal and internal-error outcomes without exposing payloads', async () => {
+    const withOutcomes = () => {
+      const payload = activity();
+      const process = payload.data.stream.find((entry) => entry.seq === 4)!;
+      const refusal = payload.data.stream.find((entry) => entry.seq === 3)!;
+      Object.assign(process, { outcome: 'process_exit_nonzero', args: 'raw-process-args', result: 'raw-process-result' });
+      Object.assign(refusal, { outcome: 'tool_rejected', args: 'raw-refusal-args', result: 'raw-refusal-result' });
+      return payload;
+    };
+    live = await harness(undefined, { activity: withOutcomes });
+    renderingOn();
+    const section = assistantTurn(live.document, turnId, []);
+    await bindFiberRequest(section, 'wfr-app-stream');
+    live.hook.renderStreams();
+
+    const panels = overwriteRows(section, '.clf-stream-tool-panel');
+    expect(panels.some((node) => node.textContent?.includes('read_file · process exited non-zero'))).toBe(true);
+    expect(panels.some((node) => node.textContent?.includes('read_file · refused'))).toBe(true);
+    expect(section.textContent).not.toContain('raw-process-args');
+    expect(section.textContent).not.toContain('raw-process-result');
+    expect(section.textContent).not.toContain('raw-refusal-args');
+    expect(section.textContent).not.toContain('raw-refusal-result');
+
+    const internal = withOutcomes();
+    Object.assign(internal.data, { resetActivity: true });
+    Object.assign(internal.data.stream.find((entry) => entry.seq === 4)!, { outcome: 'tool_internal_error' });
+    live.reply.set('activity', () => internal);
+    await live.hook.pullActivity();
+    live.hook.renderStreams();
+    expect(overwriteRows(section, '.clf-stream-tool-panel').some((node) => node.textContent?.includes('failed'))).toBe(true);
+  });
+
+  it('keeps only the same calls expanded when activity rows are repainted', async () => {
+    live = await harness(undefined, { activity });
+    renderingOn();
+    const section = assistantTurn(live.document, turnId, []);
+    await bindFiberRequest(section, 'wfr-app-stream');
+    live.hook.renderStreams();
+    const first = overwriteRows(section, 'details.clf-stream-tool-disclosure') as HTMLDetailsElement[];
+    expect(first).toHaveLength(2);
+    first[0]!.querySelector('summary')!.click();
+    first[0]!.querySelector('summary')!.focus();
+
+    live.hook.setShowTimes(true);
+    live.hook.renderStreams();
+
+    const second = overwriteRows(section, 'details.clf-stream-tool-disclosure') as HTMLDetailsElement[];
+    expect(second[0]).not.toBe(first[0]);
+    expect(second.map((node) => node.open)).toEqual([true, false]);
+    expect(live.document.activeElement).toBe(second[0]!.querySelector('summary'));
+    expect(second[0]!.dataset.clfCall).toBe(first[0]!.dataset.clfCall);
+  });
+
+  it('refreshes disclosure details when the authoritative activity tail changes', async () => {
+    let revision = 0;
+    const withDetails = () => {
+      const payload = activity();
+      Object.assign(payload.data, { resetActivity: true });
+      Object.assign(payload.data.stream.find((entry) => entry.seq === 4)!, {
+        durationMs: revision ? 8 : 3,
+        changes: [{ path: revision ? 'src/revised.ts' : 'src/third.ts', added: revision, removed: 0 }]
+      });
+      return payload;
+    };
+    live = await harness(undefined, { activity: withDetails });
+    renderingOn();
+    const section = assistantTurn(live.document, turnId, []);
+    await bindFiberRequest(section, 'wfr-app-stream');
+    live.hook.renderStreams();
+    const before = overwriteRows(section, 'details.clf-stream-tool-disclosure')
+      .find((node) => node.textContent?.includes('Read third.ts')) as HTMLDetailsElement;
+    expect(before).toBeDefined();
+    before.querySelector('summary')!.click();
+
+    revision++;
+    await live.hook.pullActivity();
+    live.hook.renderStreams();
+
+    const after = overwriteRows(section, 'details.clf-stream-tool-disclosure')
+      .find((node) => node.textContent?.includes('Read third.ts')) as HTMLDetailsElement;
+    expect(after.open).toBe(true);
+    expect(after.textContent).toContain('8 ms');
+    expect(after.textContent).toContain('src/revised.ts');
+    expect(after.textContent).not.toContain('src/third.ts');
+  });
+
+  it('bounds changed paths, escapes markup and does not invent a successful outcome', async () => {
+    const withDetails = () => {
+      const payload = activity();
+      Object.assign(payload.data.stream.find((entry) => entry.seq === 4)!, {
+        outcome: undefined,
+        durationMs: null,
+        changes: Array.from({ length: 14 }, (_, index) => ({
+          path: index === 0 ? '<img src=x onerror=alert(1)>' : `src/file-${index}.ts`,
+          added: index === 0 ? -1 : index,
+          removed: 0,
+          approximate: true
+        }))
+      });
+      return payload;
+    };
+    live = await harness(undefined, { activity: withDetails });
+    renderingOn();
+    const section = assistantTurn(live.document, turnId, []);
+    await bindFiberRequest(section, 'wfr-app-stream');
+    live.hook.renderStreams();
+
+    const panel = overwriteRows(section, '.clf-stream-tool-panel').find((node) => node.textContent?.includes('unknown'))!;
+    expect(panel).toBeDefined();
+    expect(panel.querySelectorAll('.clf-stream-tool-change')).toHaveLength(12);
+    expect(panel.textContent).toContain('2 more changed files');
+    expect(panel.textContent).toContain('<img src=x onerror=alert(1)>');
+    expect(panel.querySelector('img')).toBeNull();
+    expect(panel.textContent).not.toContain('0 ms');
+    expect(panel.textContent).not.toContain('+-1');
+    expect(panel.textContent).toContain('≈');
+  });
+
+  it('does not carry disclosure expansion into another conversation with reused call ids', async () => {
+    live = await harness(undefined, { activity });
+    renderingOn();
+    const section = assistantTurn(live.document, turnId, []);
+    await bindFiberRequest(section, 'wfr-app-stream');
+    live.hook.renderStreams();
+    const original = overwriteRows(section, 'details.clf-stream-tool-disclosure')[0] as HTMLDetailsElement;
+    expect(original).toBeDefined();
+    original.querySelector('summary')!.click();
+
+    live.dom.reconfigure({ url: 'https://chatgpt.com/c/bbbbbbbb-cccc-dddd-eeee-ffffffffffff' });
+    live.hook.observe();
+    await settle();
+    live.document.querySelector('#thread')!.replaceChildren();
+    const replacement = assistantTurn(live.document, turnId, []);
+    live.hook.observe();
+    await settle();
+    await bindFiberTurns([{ section: replacement, turn: {
+      turnId,
+      conversationId: 'bbbbbbbb-cccc-dddd-eeee-ffffffffffff',
+      calls: [{ messageId: 'fiber-wfr-app-stream', tool: 'read_file', order: 0, answered: true, requestId: 'wfr-app-stream' }]
+    } }]);
+    await live.hook.pullActivity();
+    live.hook.renderStreams();
+
+    const disclosures = overwriteRows(replacement, 'details.clf-stream-tool-disclosure') as HTMLDetailsElement[];
+    expect(disclosures).toHaveLength(2);
+    expect(disclosures.every((node) => !node.open)).toBe(true);
+    expect(original.isConnected).toBe(false);
+  });
+
   it('shows local calls even when ChatGPT rendered no native tool row for them', async () => {
     live = await harness(undefined, { activity });
     renderingOn();
@@ -7487,6 +7666,44 @@ describe('the fresh chat the app opened', () => {
         agent: null,
         client: redeems[0]!.client,
         navigationEpoch: expect.any(Number)
+      }
+    ]);
+  });
+
+  it('acquires its id when a Project route names the fresh chat', async () => {
+    live = await harness(
+      'https://chatgpt.com/g/g-p-68abcdef1234/project?clf=cmd-project#clf=cmd-project',
+      {
+        redeem: () => ({
+          ok: true,
+          command: {
+            id: 'cmd-project',
+            type: 'resume',
+            text: 'Continue the previous ChatGPT session. Handoff: h-project',
+            agent: null
+          }
+        }),
+        ack: () => ({ ok: true })
+      },
+      (document, dom) => {
+        document.querySelector('[data-testid="send-button"]')!.addEventListener('click', () => {
+          dom.reconfigure({
+            url: 'https://chatgpt.com/g/g-p-68abcdef1234/c/77777777-6666-5555-4444-333333333333'
+          });
+        });
+      }
+    );
+
+    await settle(400);
+
+    expect(live.sent.filter((message) => message.type === 'redeem')).toHaveLength(1);
+    expect(live.document.querySelector('#prompt-textarea')!.textContent).toContain('Handoff: h-project');
+    expect(live.sent.filter((message) => message.type === 'ack')).toMatchObject([
+      {
+        type: 'ack',
+        id: 'cmd-project',
+        status: 'sent',
+        conversationId: '77777777-6666-5555-4444-333333333333'
       }
     ]);
   });

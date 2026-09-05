@@ -13,6 +13,49 @@ the app refuses the extension and asks you to reload the matching copy.
 
 No changes yet.
 
+## [2.1.2] — 2026-09-05
+
+2.1.2 is a selective upstream-synchronization and reliability patch for the 2.1 autonomous-
+execution line. It keeps Agent System 3.0, Control Center, autonomous execution, Infinite Loop,
+worker lifecycle, and the fork release/update channel intact while re-deriving a small set of
+newer upstream fixes on top of the fork architecture.
+
+### Added
+- **Bounded tool activity disclosures.** App-owned tool rows can be expanded with native keyboard-
+  operable disclosures that show only bounded metadata such as tool identity, outcome, duration,
+  and changed-file counts/paths. Raw arguments, results, credentials, and arbitrary nested payloads
+  are never rendered into this surface.
+- **Persistent folder-management entry.** Folder access remains discoverable after initial setup,
+  so approved roots can be reviewed or changed later without altering the existing permission or
+  root-authorization model.
+
+### Changed
+- Historical upstream release notes for **2.0.3, 2.0.4, and 2.0.5** are restored under
+  `docs/release-notes/` with explicit provenance: they document the original upstream line and are
+  not presented as Inmerson fork release tags.
+- The bridge shutdown regression now synchronizes on request acceptance instead of timer ordering,
+  making the accepted-request drain contract deterministic without changing the production bridge
+  protocol.
+
+### Fixed
+- **Worker tab lifecycle release.** A worker command tab no longer closes merely because its
+  bootstrap prompt was acknowledged. The tab stays alive until the dedicated agent-tab lifecycle
+  observes durable sleeping or terminal evidence, preserving exact request/conversation attribution
+  while the worker can still issue identity-sensitive MCP calls.
+- **Desktop helper reply provenance.** A desktop request that outlives the helper process generation
+  that issued it can no longer accept a reply from the replacement helper. Stale frame/ref and
+  window-state evidence stays bound to the helper generation that produced it.
+- The AppImage launcher packaging assertion no longer spends its per-test timeout loading the heavy
+  `app-builder-lib` dependency graph. The helper is loaded during suite setup, eliminating a
+  full-suite-only timeout while preserving the same packaging assertions.
+
+### Preserved fork behavior
+
+This release does **not** wholesale-merge or rebase onto upstream. Agent System 3.0, Manager
+authority/plans, Control Center, durable autonomous execution, managed Execution/Agent windows,
+Infinite Loop/scoped recovery, worker lifecycle/tab budgeting, authenticated terminal continuation,
+and the Inmerson updater/release channel remain the fork-owned behavior.
+
 ## [2.1.1] — 2026-09-05
 
 2.1.1 is a reliability and distribution patch that brings selected upstream hardening back onto
@@ -42,6 +85,14 @@ the 2.1 autonomous-execution line without replacing the newer orchestration arch
   before startup, without disabling the sandbox or broadening permissions outside the install tree.
 - Update state is exposed through the existing app-state/IPC path, and the renderer shows install or
   manual-update actions without disrupting the Control Center layout.
+
+### Upstream lineage between 2.0.2 and the fork's 2.1.x line
+
+The original `totec448-spec/chat-on-steroids` project continued through upstream releases
+2.0.3, 2.0.4 and 2.0.5 before and while this fork's 2.1.x architecture was developed. Their
+historical release notes are preserved under `docs/release-notes/` for provenance. These are
+not Inmerson fork release tags. The fork's 2.1.x line selectively incorporates relevant
+upstream hardening while retaining Agent System 3.0, Control Center and autonomous execution.
 
 ## [2.1.0] — 2026-09-05
 

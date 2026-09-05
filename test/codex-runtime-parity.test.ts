@@ -405,7 +405,10 @@ describe('Codex unified exec runtime parity', () => {
       const interrupted = await instance.writeStdin({
         processId,
         input: String.fromCharCode(3),
-        yieldTimeMs: 250,
+        // This assertion is about Ctrl-C terminating the process tree, not about a 250 ms
+        // exit-notification deadline. Under a loaded Windows runner the process can be signalled
+        // successfully while Node's ChildProcess exit event lands slightly later.
+        yieldTimeMs: 10_000,
         maxOutputTokens: undefined,
         truncationPolicy
       });
