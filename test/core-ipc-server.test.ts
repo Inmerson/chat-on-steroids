@@ -70,6 +70,32 @@ describe('Core local IPC', () => {
     await expect(intruder.status()).rejects.toThrow(/unauthorized/i);
   });
 
+  it('keeps secret values write-only while making Core the mutation authority', async () => {
+    const dir = await root();
+    const token = await ensureCoreIpcToken(dir);
+    const setSecret = vi.fn(async () => undefined);
+    const secretStatus = vi.fn(async () => ({ hasApiKey: false, hasGoalKey: true }));
+    const server = await startCoreIpcServer({
+      userDataDir: dir,
+      token,
+      hello,
+      status: () => ({ generation: 4, status: { state: 'connected' } }),
+      connect: async () => undefined,
+      disconnect: async () => undefined,
+      applySettings: async () => undefined,
+      shutdownCore: async () => undefined,
+      setSecret,
+      secretStatus
+    } as any);
+    servers.push(server);
+
+    const client = new CoreIpcClient(server.endpoint, token) as any;
+    await expect(client.secretStatus()).resolves.toEqual({ hasApiKey: false, hasGoalKey: true });
+    await expect(client.setSecret('openaiApiKey', 'sk-test-value')).resolves.toBeUndefined();
+    expect(setSecret).toHaveBeenCalledWith('openaiApiKey', 'sk-test-value');
+    expect(JSON.stringify(await client.secretStatus())).not.toContain('sk-test-value');
+  });
+
   it('uses exclusive endpoint ownership so a second Core cannot bind the same profile', async () => {
     const dir = await root();
     const token = await ensureCoreIpcToken(dir);
