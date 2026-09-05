@@ -197,6 +197,8 @@ function sessionRow(summary: SessionSummary): HTMLElement {
     `${summary.userMessages} message${summary.userMessages === 1 ? '' : 's'}`,
     `${summary.toolCalls} tool${summary.toolCalls === 1 ? '' : 's'}`
   ];
+  if (summary.processExitNonzero > 0) bits.push(`${summary.processExitNonzero} non-zero exit${summary.processExitNonzero === 1 ? '' : 's'}`);
+  if (summary.toolRejected > 0) bits.push(`${summary.toolRejected} rejected`);
   if (summary.errors > 0) bits.push(`${summary.errors} error${summary.errors === 1 ? '' : 's'}`);
   if (summary.agents.length > 0)
     bits.push(`${summary.agents.length} agent${summary.agents.length === 1 ? '' : 's'}`);

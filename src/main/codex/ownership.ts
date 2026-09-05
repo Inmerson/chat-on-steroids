@@ -13,8 +13,12 @@
  */
 
 import { requestCorrelation } from '../session/correlation.js';
+import { unifiedExecManager } from './manager.js';
+import type { BackgroundExecState } from './unified-exec.js';
 
 /** Attribution owners, keyed by the process id `exec_command` handed back as `session_id`. */
+export const MAX_UNREAD_EXEC_RESULTS_PER_CONVERSATION = 4;
+
 const owners = new Map<number, string | null>();
 
 /**
@@ -44,6 +48,29 @@ export function forgetExecOwner(processId: number | null): void {
 /** The conversation that opened this session, or null when it was never proven. */
 export function execOwner(processId: number): string | null {
   return owners.get(processId) ?? null;
+}
+
+/** Retained background work attributed to one proven conversation; never an auth decision. */
+export function backgroundExecObligations(conversationId: string | null | undefined): BackgroundExecState {
+  if (!conversationId) return { running: [], exitedUnread: [] };
+  const processIds = new Set<number>();
+  for (const [processId, owner] of owners) if (owner === conversationId) processIds.add(processId);
+  return unifiedExecManager.backgroundState(processIds);
+}
+
+/** Bounded same-conversation reminders. This projection never drains terminal output. */
+export function backgroundExecRecoveryNotices(conversationId: string | null | undefined): string[] {
+  const exited = backgroundExecObligations(conversationId).exitedUnread;
+  if (exited.length === 0) return [];
+  const notices = exited.slice(0, 3).map(
+    (session) =>
+      `Background session ${session.processId} finished with exit code ${session.exitCode ?? 'unknown'} and has unread output. ` +
+      `Poll it with write_stdin(session_id=${session.processId}, chars="").`
+  );
+  if (exited.length > notices.length) {
+    notices.push(`${exited.length - notices.length} more background session result(s) are waiting to be polled.`);
+  }
+  return notices;
 }
 
 /**

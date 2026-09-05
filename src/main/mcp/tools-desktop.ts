@@ -29,6 +29,7 @@ import {
   type Action,
   type VerificationSpec
 } from '../computer/index.js';
+import { browserTabChord, isBrowserProcess } from '../computer/browser-chords.js';
 import { logInfo } from '../logger.js';
 import { noteCount, noteDetail } from './call-context.js';
 import {
@@ -45,6 +46,32 @@ import {
 } from './kernel.js';
 
 const DEFAULT_WINDOW_RESULTS = 60;
+
+/**
+ * Refuse blind browser tab/window/address-bar shortcuts before native dispatch. The browser may
+ * contain this app's own ChatGPT prime/worker tabs, and a keyboard chord cannot identify which
+ * tab it will affect. The target is the last explicit focus in the batch, otherwise foreground.
+ */
+async function browserChordRefusal(actions: Action[]): Promise<string | null> {
+  let focused: number | null = null;
+  for (const action of actions) {
+    if (action.type === 'focus') focused = action.window;
+    if (action.type !== 'keypress') continue;
+    const chord = browserTabChord(action.keys);
+    if (!chord) continue;
+    const target =
+      focused === null
+        ? (await activeWindow()).window
+        : ((await listWindows()).windows.find((window) => window.id === focused) ?? null);
+    if (!target || !isBrowserProcess(target.process)) continue;
+    return (
+      `BROWSER_TAB_CHORD: ${chord} is refused in browser windows because it can close, open, switch or retarget a ChatGPT tab. ` +
+      'Open the page under test in a separate browser window and navigate it through explicit UI controls or set_value, not browser tab/window keyboard shortcuts.'
+    );
+  }
+  return null;
+}
+
 const MAX_WINDOW_RESULTS = 100;
 const MAX_CLIPBOARD_LINE_CHARS = 16_000;
 const MAX_CLIPBOARD_OUTPUT_CHARS = 64_000;
@@ -463,6 +490,8 @@ export function registerDesktopTools(reg: SurfaceRegistrar): void {
                 break;
             }
           }
+          const browserRefusal = await browserChordRefusal(parsed);
+          if (browserRefusal) return fail(browserRefusal);
           logInfo(`tool computer ${parsed.map((a) => a.type).join(', ')}`);
           noteDetail(parsed.map((a) => a.type).join(', '));
           const verifyCapture = verify?.capture === 'always' || verify?.capture === 'on_change';
