@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from 'vitest';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { Capabilities } from '../src/shared/types.js';
 
 const desktop = vi.hoisted(() => {
@@ -49,9 +49,9 @@ function caps(over: Partial<Capabilities>): Capabilities {
   };
 }
 
-function desktopSurface() {
+function desktopSurface(over: Partial<Capabilities> = {}) {
   const registered = new Map<string, { config: any; handler: (input: any) => Promise<any> }>();
-  const liveCaps = caps({ screen: true });
+  const liveCaps = caps({ screen: true, ...over });
   registerDesktopTools({
     ctx: { privacyScreenshots: false },
     caps: liveCaps,
@@ -104,5 +104,51 @@ describe('Desktop observe runtime contract', () => {
     const result = await observe.handler({});
     expect(result.content[0].text).toContain('No foreground window');
     expect(result.content[0].text).toContain('frameId 7');
+  });
+});
+
+
+describe('Desktop browser keyboard safety', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  const nativeResult = () => ({
+    completedCount: 1,
+    routes: ['native'],
+    cursor: null,
+    clipboard: [],
+    verification: null,
+    screenshot: null
+  });
+
+  it('refuses a browser tab-management chord before native dispatch', async () => {
+    desktop.activeWindow.mockResolvedValueOnce({
+      window: { id: 7, process: 'chrome.exe', title: 'ChatGPT', x: 0, y: 0, width: 1000, height: 700, state: 'normal' },
+      screen: { width: 1920, height: 1080 }
+    });
+    desktop.actAndCapture.mockResolvedValueOnce(nativeResult());
+    const computer = desktopSurface({ control: true }).get('computer')!;
+
+    const result = await computer.handler({ actions: [{ type: 'keypress', keys: ['ctrl', 'w'] }] });
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain('BROWSER_TAB_CHORD: ctrl+w');
+    expect(desktop.actAndCapture).not.toHaveBeenCalled();
+  });
+
+  it('leaves the same keypress available to a non-browser target', async () => {
+    desktop.activeWindow.mockResolvedValueOnce({
+      window: { id: 9, process: 'notepad.exe', title: 'Notes', x: 0, y: 0, width: 800, height: 600, state: 'normal' },
+      screen: { width: 1920, height: 1080 }
+    });
+    desktop.actAndCapture.mockResolvedValueOnce(nativeResult());
+    const computer = desktopSurface({ control: true }).get('computer')!;
+
+    const result = await computer.handler({ actions: [{ type: 'keypress', keys: ['ctrl', 'w'] }] });
+
+    expect(result.isError ?? false).toBe(false);
+    expect(result.content[0].text).toContain('Done 1/1');
+    expect(desktop.actAndCapture).toHaveBeenCalledTimes(1);
   });
 });
