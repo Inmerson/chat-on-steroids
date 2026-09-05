@@ -2,11 +2,12 @@ import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { CORE_PROTOCOL_VERSION, type CoreHello } from '../src/shared/core-protocol.js';
+import { CORE_CAPABILITIES, CORE_PROTOCOL_VERSION, type CoreHello } from '../src/shared/core-protocol.js';
 import {
   CoreIpcClient,
   ensureCoreIpcToken,
   startCoreIpcServer,
+  type CoreIpcHandlers,
   type CoreIpcServer
 } from '../src/main/core/ipc.js';
 
@@ -30,7 +31,23 @@ function hello(): CoreHello {
     coreVersion: '2.1.2',
     corePid: process.pid,
     generation: 4,
-    capabilities: ['connection-status', 'connection-control', 'settings-apply', 'execution-probe', 'structured-health']
+    capabilities: CORE_CAPABILITIES
+  };
+}
+
+function handlers(dir: string, token: string, overrides: Partial<CoreIpcHandlers> = {}): CoreIpcHandlers {
+  return {
+    userDataDir: dir,
+    token,
+    hello,
+    status: () => ({ generation: 4, status: { state: 'connected' } }),
+    connect: async () => undefined,
+    disconnect: async () => undefined,
+    applySettings: async () => undefined,
+    secretStatus: async () => ({ hasApiKey: false, hasGoalKey: false }),
+    setSecret: async () => undefined,
+    shutdownCore: async () => undefined,
+    ...overrides
   };
 }
 
@@ -48,16 +65,7 @@ describe('Core local IPC', () => {
     const dir = await root();
     const token = await ensureCoreIpcToken(dir);
     const connect = vi.fn(async () => undefined);
-    const server = await startCoreIpcServer({
-      userDataDir: dir,
-      token,
-      hello,
-      status: () => ({ generation: 4, status: { state: 'connected' } }),
-      connect,
-      disconnect: async () => undefined,
-      applySettings: async () => undefined,
-      shutdownCore: async () => undefined
-    });
+    const server = await startCoreIpcServer(handlers(dir, token, { connect }));
     servers.push(server);
 
     const client = new CoreIpcClient(server.endpoint, token);
@@ -75,21 +83,10 @@ describe('Core local IPC', () => {
     const token = await ensureCoreIpcToken(dir);
     const setSecret = vi.fn(async () => undefined);
     const secretStatus = vi.fn(async () => ({ hasApiKey: false, hasGoalKey: true }));
-    const server = await startCoreIpcServer({
-      userDataDir: dir,
-      token,
-      hello,
-      status: () => ({ generation: 4, status: { state: 'connected' } }),
-      connect: async () => undefined,
-      disconnect: async () => undefined,
-      applySettings: async () => undefined,
-      shutdownCore: async () => undefined,
-      setSecret,
-      secretStatus
-    } as any);
+    const server = await startCoreIpcServer(handlers(dir, token, { setSecret, secretStatus }));
     servers.push(server);
 
-    const client = new CoreIpcClient(server.endpoint, token) as any;
+    const client = new CoreIpcClient(server.endpoint, token);
     await expect(client.secretStatus()).resolves.toEqual({ hasApiKey: false, hasGoalKey: true });
     await expect(client.setSecret('openaiApiKey', 'sk-test-value')).resolves.toBeUndefined();
     expect(setSecret).toHaveBeenCalledWith('openaiApiKey', 'sk-test-value');
@@ -99,16 +96,7 @@ describe('Core local IPC', () => {
   it('uses exclusive endpoint ownership so a second Core cannot bind the same profile', async () => {
     const dir = await root();
     const token = await ensureCoreIpcToken(dir);
-    const options = {
-      userDataDir: dir,
-      token,
-      hello,
-      status: () => ({ generation: 4, status: { state: 'connected' as const } }),
-      connect: async () => undefined,
-      disconnect: async () => undefined,
-      applySettings: async () => undefined,
-      shutdownCore: async () => undefined
-    };
+    const options = handlers(dir, token);
     const first = await startCoreIpcServer(options);
     servers.push(first);
 
