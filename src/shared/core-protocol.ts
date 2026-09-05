@@ -11,6 +11,25 @@ export const CORE_CAPABILITIES = [
 ] as const;
 
 export type CoreCapability = (typeof CORE_CAPABILITIES)[number];
+export type CoreOverallState = 'CONNECTED' | 'DEGRADED' | 'RECONNECTING' | 'OFFLINE' | 'AUTH_REQUIRED';
+
+export interface CoreHealthStatus {
+  overall: CoreOverallState;
+  authHealthy: boolean;
+  remoteTransportHealthy: boolean;
+  remoteSubscriptionHealthy: boolean;
+  coreProcessHealthy: boolean;
+  localMcpHealthy: boolean;
+  toolProbeHealthy: boolean;
+  lastToolSuccessAt: number | null;
+  lastRemoteHeartbeatAt: number | null;
+  lastProbeAt: number | null;
+  reconnectAttempt: number;
+  connectionGeneration: number;
+  corePid: number | null;
+  recovering: boolean;
+  authRequired: boolean;
+}
 
 export interface CoreHello {
   protocolVersion: number;
@@ -30,6 +49,7 @@ export type CoreStatusProjection = Pick<ConnectionStatus, 'state'> & Partial<Omi
 export interface CoreStatusEnvelope {
   generation: number;
   status: CoreStatusProjection;
+  health?: CoreHealthStatus;
 }
 
 export type CoreCommandName = 'hello' | 'status' | 'connect' | 'disconnect' | 'apply-settings' | 'shutdown-core';
