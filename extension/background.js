@@ -1374,13 +1374,10 @@ async function ackCommand(id, status, error, conversationId, agent, client, sour
   // handler rejects and the page is told truthfully that this worker did not take custody.
   await persistLive();
   scheduleRetry();
-  if (status === 'sent' && agent && source && Number.isInteger(source.tab)) {
-    try {
-      void chrome.tabs.remove(source.tab).catch(() => undefined);
-    } catch {
-      // Best effort; lifecycle module also removes durable worker lease
-    }
-  }
+  // A worker's bootstrap ACK proves only that its prompt became durable. The worker page must
+  // remain alive while the model can still issue identity-sensitive MCP calls so the recorder
+  // can join their request ids to this exact conversation. agent-tab-lifecycle.js owns the
+  // later destructive close and requires separate durable sleeping/terminal evidence first.
   return drainCommandAcks(id);
 }
 
