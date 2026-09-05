@@ -5,6 +5,8 @@ import path from 'node:path';
 
 export interface InstallerHandoffRequest {
   parentPid: number;
+  /** Additional installed-app processes that may still hold the executable open. */
+  waitPids?: number[];
   installerPath: string;
   args: string[];
   windowsHide: boolean;
@@ -30,7 +32,6 @@ async function processExistsDefault(pid: number): Promise<boolean> {
     process.kill(pid, 0);
     return true;
   } catch (error) {
-    // EPERM means the process exists but this process cannot signal it. ESRCH means it is gone.
     return (error as NodeJS.ErrnoException).code === 'EPERM';
   }
 }
@@ -51,17 +52,20 @@ async function launchDefault(file: string, args: string[], options: { windowsHid
   });
 }
 
-/**
- * The behavior contract used by both tests and any future native handoff helper. Nothing may
- * launch the installer before the old application PID is actually gone.
- */
+function waitSet(request: InstallerHandoffRequest): number[] {
+  const values = [request.parentPid, ...(request.waitPids ?? [])];
+  if (values.some((pid) => !Number.isSafeInteger(pid) || pid <= 0)) {
+    throw new Error('Invalid PID for installer handoff');
+  }
+  return [...new Set(values)];
+}
+
+/** Nothing may launch NSIS while any process from the installation still owns its executable. */
 export async function runInstallerHandoff(
   request: InstallerHandoffRequest,
   dependencies: InstallerHandoffDependencies = {}
 ): Promise<void> {
-  if (!Number.isSafeInteger(request.parentPid) || request.parentPid <= 0) {
-    throw new Error('Invalid parent PID for installer handoff');
-  }
+  const waitPids = waitSet(request);
   if (!request.installerPath) throw new Error('Missing installer path for handoff');
 
   const processExists = dependencies.processExists ?? processExistsDefault;
@@ -72,9 +76,13 @@ export async function runInstallerHandoff(
   const maxWaitMs = request.maxWaitMs ?? 5 * 60_000;
   const startedAt = now();
 
-  while (await processExists(request.parentPid)) {
+  for (;;) {
+    const alive = (await Promise.all(waitPids.map(async (pid) => ({ pid, alive: await processExists(pid) })))).filter(
+      (entry) => entry.alive
+    );
+    if (alive.length === 0) break;
     if (now() - startedAt >= maxWaitMs) {
-      throw new Error(`Old application PID ${request.parentPid} did not exit before installer handoff deadline`);
+      throw new Error(`Processes ${alive.map((entry) => entry.pid).join(', ')} did not exit before installer handoff deadline`);
     }
     await sleep(pollIntervalMs);
   }
@@ -88,7 +96,30 @@ const POWERSHELL_HANDOFF = String.raw`param(
 $ErrorActionPreference = 'Stop'
 $request = Get-Content -LiteralPath $RequestPath -Raw | ConvertFrom-Json
 try {
-  Wait-Process -Id ([int]$request.parentPid) -ErrorAction SilentlyContinue
+  $waitIds = New-Object System.Collections.Generic.List[int]
+  $waitIds.Add([int]$request.parentPid)
+  if ($null -ne $request.waitPids) {
+    foreach ($processId in @($request.waitPids)) {
+      $value = [int]$processId
+      if (-not $waitIds.Contains($value)) { $waitIds.Add($value) }
+    }
+  }
+  $pollMs = if ($null -ne $request.pollIntervalMs) { [int]$request.pollIntervalMs } else { 250 }
+  $maxWaitMs = if ($null -ne $request.maxWaitMs) { [int]$request.maxWaitMs } else { 300000 }
+  $deadline = [DateTime]::UtcNow.AddMilliseconds($maxWaitMs)
+  while ($true) {
+    $alive = $false
+    foreach ($processId in $waitIds) {
+      if ($null -ne (Get-Process -Id $processId -ErrorAction SilentlyContinue)) {
+        $alive = $true
+        break
+      }
+    }
+    if (-not $alive) { break }
+    if ([DateTime]::UtcNow -ge $deadline) { throw 'Old Chat On Steroids processes did not exit before installer handoff deadline.' }
+    Start-Sleep -Milliseconds $pollMs
+  }
+
   $start = @{ FilePath = [string]$request.installerPath }
   if ($null -ne $request.args -and $request.args.Count -gt 0) {
     $start.ArgumentList = @($request.args | ForEach-Object { [string]$_ })
@@ -101,17 +132,12 @@ try {
 `;
 
 /**
- * Starts a helper that is independent of the application executable being replaced.
- *
- * Using the app's own Electron binary as the waiter would keep that executable open and merely
- * move the NSIS file-lock race into the helper. Windows PowerShell is used as the first production
- * helper because it is outside the installation directory. The script is static; installer path,
- * args and PID live in a JSON request file and are never interpolated into shell source. A small
- * native helper can replace this later without changing the request protocol or tests.
+ * Starts a helper outside the installation directory. The helper is hidden; the explicit NSIS
+ * installer is not. Paths/arguments/PIDs are data in a JSON request, never shell interpolation.
  */
 export async function startWindowsInstallerHandoff(input: StartWindowsInstallerHandoffInput): Promise<void> {
   if (process.platform !== 'win32') throw new Error('Windows installer handoff requested on a non-Windows host');
-  if (!Number.isSafeInteger(input.parentPid) || input.parentPid <= 0) throw new Error('Invalid parent PID for installer handoff');
+  waitSet(input);
   if (!input.installerPath) throw new Error('Missing installer path for handoff');
 
   const directory = path.join(input.userDataDir, 'updates', 'handoff');
@@ -121,6 +147,7 @@ export async function startWindowsInstallerHandoff(input: StartWindowsInstallerH
   const scriptPath = path.join(directory, `${id}.ps1`);
   const request: InstallerHandoffRequest = {
     parentPid: input.parentPid,
+    waitPids: input.waitPids ? [...input.waitPids] : undefined,
     installerPath: input.installerPath,
     args: [...input.args],
     windowsHide: input.windowsHide,
