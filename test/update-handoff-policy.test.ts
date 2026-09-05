@@ -7,7 +7,8 @@ import { runInstallerHandoff } from '../src/main/update/handoff.js';
 describe('Windows installation ownership', () => {
   it('recognizes an installed NSIS app by its adjacent electron-builder uninstaller', () => {
     const execPath = 'C:\\Users\\ibrahim\\AppData\\Local\\Programs\\Chat On Steroids\\Chat On Steroids.exe';
-    const exists = vi.fn((candidate: string) => candidate === path.join(path.dirname(execPath), 'Uninstall Chat On Steroids.exe'));
+    const uninstaller = path.win32.join(path.win32.dirname(execPath), 'Uninstall Chat On Steroids.exe');
+    const exists = vi.fn((candidate: string) => candidate === uninstaller);
 
     expect(ownsWindowsInstallation(execPath, exists)).toBe(true);
   });
