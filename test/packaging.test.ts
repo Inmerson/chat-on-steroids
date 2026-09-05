@@ -35,6 +35,9 @@ const {
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const requireFromTest = createRequire(import.meta.url);
+const { generateAppRunScript } = requireFromTest(
+  path.join(root, 'node_modules', 'app-builder-lib', 'out', 'targets', 'appimage', 'appImageUtil.js')
+) as { generateAppRunScript: (config: Record<string, string>) => string };
 
 function yamlFile(relative: string): any {
   return loadYaml(readFileSync(path.join(root, ...relative.split('/')), 'utf8'));
@@ -409,9 +412,6 @@ describe('cross-platform packaging targets', () => {
   });
 
   it('keeps the static AppImage sandbox fallback conditional and duplicate-safe', () => {
-    const { generateAppRunScript } = requireFromTest(
-      path.join(root, 'node_modules', 'app-builder-lib', 'out', 'targets', 'appimage', 'appImageUtil.js')
-    ) as { generateAppRunScript: (config: Record<string, string>) => string };
     const script = generateAppRunScript({
       ExecutableName: 'chat-on-steroids',
       DesktopFileName: 'com.chatonsteroids.app.desktop',
