@@ -8,8 +8,9 @@
  */
 
 import type { ConnectionStatus } from '../shared/types.js';
-import type { CoreHealthStatus } from '../shared/core-protocol.js';
+import type { CoreHealthStatus, CoreSecretKey, CoreSecretStatus } from '../shared/core-protocol.js';
 import * as local from './connection-local.js';
+import { hasSecret, setSecret } from './secrets.js';
 import { uiConnectionFacade } from './core/ui-connection.js';
 
 const UI_CLIENT_MODE = process.env.COS_CORE_UI_CLIENT === '1';
@@ -44,6 +45,19 @@ export function disconnect(): Promise<void> {
 
 export function applySettings(): Promise<void> {
   return UI_CLIENT_MODE ? ui().applySettings() : local.applySettings();
+}
+
+/** Secret plaintext is write-only across the UI/Core boundary. */
+export async function getCoreSecretStatus(): Promise<CoreSecretStatus> {
+  if (UI_CLIENT_MODE) return ui().secretStatus();
+  return {
+    hasApiKey: await hasSecret('openaiApiKey'),
+    hasGoalKey: await hasSecret('openRouterApiKey')
+  };
+}
+
+export function setCoreSecret(key: CoreSecretKey, value: string): Promise<void> {
+  return UI_CLIENT_MODE ? ui().setSecret(key, value) : setSecret(key, value);
 }
 
 /**
