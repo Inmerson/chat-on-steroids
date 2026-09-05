@@ -2,6 +2,7 @@ import { spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { mkdir, writeFile } from 'node:fs/promises';
 import path from 'node:path';
+import { prepareInstalledCoreUpdateHandoff } from '../core/update-quiesce.js';
 
 export interface InstallerHandoffRequest {
   parentPid: number;
@@ -132,13 +133,22 @@ try {
 `;
 
 /**
- * Starts a helper outside the installation directory. The helper is hidden; the explicit NSIS
- * installer is not. Paths/arguments/PIDs are data in a JSON request, never shell interpolation.
+ * Starts a helper outside the installation directory. `--updated` is emitted only by the owned
+ * NSIS-install policy, so that case first quiesces the installed Core/supervisor and adds their
+ * PIDs to the helper wait set. A win-unpacked fresh-install wizard has no `--updated` and leaves
+ * its compatible Core running because the installer targets a different installation directory.
  */
 export async function startWindowsInstallerHandoff(input: StartWindowsInstallerHandoffInput): Promise<void> {
   if (process.platform !== 'win32') throw new Error('Windows installer handoff requested on a non-Windows host');
-  waitSet(input);
   if (!input.installerPath) throw new Error('Missing installer path for handoff');
+
+  let waitPids = input.waitPids ? [...input.waitPids] : [];
+  if (input.args.includes('--updated')) {
+    const prepared = await prepareInstalledCoreUpdateHandoff(input.userDataDir);
+    waitPids = [...new Set([...waitPids, ...prepared.waitPids])];
+  }
+  const effective: InstallerHandoffRequest = { ...input, waitPids };
+  waitSet(effective);
 
   const directory = path.join(input.userDataDir, 'updates', 'handoff');
   await mkdir(directory, { recursive: true });
@@ -147,7 +157,7 @@ export async function startWindowsInstallerHandoff(input: StartWindowsInstallerH
   const scriptPath = path.join(directory, `${id}.ps1`);
   const request: InstallerHandoffRequest = {
     parentPid: input.parentPid,
-    waitPids: input.waitPids ? [...input.waitPids] : undefined,
+    waitPids,
     installerPath: input.installerPath,
     args: [...input.args],
     windowsHide: input.windowsHide,
