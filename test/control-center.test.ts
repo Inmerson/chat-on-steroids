@@ -3,6 +3,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { OrchestrationState } from '../src/main/orchestration/reducer.js';
 import type { RunWorkflowState } from '../src/main/orchestration/workflow.js';
 import type { TaskRecord } from '../src/main/orchestration/types.js';
+import type { AgentHealthEvidence } from '../src/shared/agent-health.js';
 import type { AgentInfo, SwarmState } from '../src/shared/session.js';
 
 const loaders = vi.hoisted(() => ({
@@ -11,17 +12,25 @@ const loaders = vi.hoisted(() => ({
   runtime: vi.fn(),
   swarmForCaller: vi.fn(),
   browserPresent: vi.fn(),
-  browserTelemetry: vi.fn()
+  browserTelemetry: vi.fn(),
+  bridgeHealth: vi.fn(),
+  runningToolCalls: vi.fn(),
+  transferHealth: vi.fn()
 }));
 
 vi.mock('../src/main/orchestration/recovery.js', () => ({ recoverOrchestrationState: loaders.recover }));
 vi.mock('../src/main/orchestration/workflow.js', () => ({ workflowStateForRun: loaders.workflow }));
 vi.mock('../src/main/orchestration/manager-authority.js', () => ({ managerRuntimeForRun: loaders.runtime }));
-vi.mock('../src/main/agents.js', () => ({ swarmStateForCaller: loaders.swarmForCaller }));
+vi.mock('../src/main/agents.js', () => ({
+  swarmStateForCaller: loaders.swarmForCaller,
+  primeTransferHealthEvidence: loaders.transferHealth
+}));
 vi.mock('../src/main/bridge.js', () => ({
   browserPresent: loaders.browserPresent,
-  browserAgentTabTelemetry: loaders.browserTelemetry
+  browserAgentTabTelemetry: loaders.browserTelemetry,
+  bridgeHealthEvidenceForAgent: loaders.bridgeHealth
 }));
+vi.mock('../src/main/mcp/call-context.js', () => ({ runningToolCalls: loaders.runningToolCalls }));
 
 import { controlCenterStatus, projectControlCenterStatus } from '../src/main/orchestration/control-center.js';
 
@@ -110,6 +119,19 @@ function swarm(agents: AgentInfo[] = []): SwarmState {
   return { enabled: true, running: agents.some((entry) => entry.role === 'worker' && entry.state !== 'sleeping'), agents };
 }
 
+function healthEvidence(overrides: Partial<AgentHealthEvidence> = {}): AgentHealthEvidence {
+  return {
+    identity: 'exact',
+    browserPresent: true,
+    runningToolCalls: 0,
+    generating: false,
+    activeTurnId: false,
+    workflowBlocked: false,
+    finiteWait: null,
+    ...overrides
+  };
+}
+
 afterEach(() => {
   loaders.recover.mockReset();
   loaders.workflow.mockReset();
@@ -117,6 +139,9 @@ afterEach(() => {
   loaders.swarmForCaller.mockReset();
   loaders.browserPresent.mockReset();
   loaders.browserTelemetry.mockReset();
+  loaders.bridgeHealth.mockReset();
+  loaders.runningToolCalls.mockReset();
+  loaders.transferHealth.mockReset();
   vi.restoreAllMocks();
 });
 
@@ -130,7 +155,8 @@ describe('Control Center projector', () => {
     );
 
     expect(status).toEqual({
-      version: 1,
+      version: 2,
+      recoveryPolicy: 'off',
       observedAt: 1_777_777,
       run: null,
       tasks: [],
@@ -147,6 +173,58 @@ describe('Control Center projector', () => {
       }
     });
     expect(JSON.parse(JSON.stringify(status))).toEqual(status);
+  });
+
+  it('projects exact MCP activity as healthy tool-call work and preserves V2 fields through JSON', () => {
+    const state = orchestration({
+      runId: 'run-health-tool',
+      tasks: { task: task('task', { state: 'ACTIVE', assignedWorkerId: 'worker-1' }) }
+    });
+    const evidence = new Map<string, AgentHealthEvidence>([
+      ['worker-1', healthEvidence({ runningToolCalls: 1 })]
+    ]);
+
+    const status = projectControlCenterStatus(
+      state,
+      workflow('run-health-tool'),
+      swarm([agent('worker-1')]),
+      1_000,
+      null,
+      evidence
+    );
+
+    expect(status).toMatchObject({ version: 2, recoveryPolicy: 'off' });
+    expect(status.agents.find((entry) => entry.id === 'worker-1')).toMatchObject({
+      activity: 'tool_call',
+      health: 'healthy',
+      recommendedAction: 'none'
+    });
+    expect(JSON.parse(JSON.stringify(status))).toEqual(status);
+  });
+
+  it('keeps a generating exact turn healthy despite old liveness and absent browser evidence', () => {
+    const state = orchestration({
+      runId: 'run-health-generation',
+      tasks: { task: task('task', { state: 'ACTIVE', assignedWorkerId: 'worker-1' }) }
+    });
+    const evidence = new Map<string, AgentHealthEvidence>([
+      ['worker-1', healthEvidence({ browserPresent: false, generating: true })]
+    ]);
+
+    const status = projectControlCenterStatus(
+      state,
+      workflow('run-health-generation'),
+      swarm([agent('worker-1', { lastSeenAt: 1 })]),
+      60 * 60_000,
+      null,
+      evidence
+    );
+
+    expect(status.agents.find((entry) => entry.id === 'worker-1')).toMatchObject({
+      activity: 'working',
+      health: 'healthy',
+      recommendedAction: 'none'
+    });
   });
 
   it('projects fresh authenticated browser lease telemetry without inferring user tabs', () => {
@@ -290,6 +368,8 @@ describe('Control Center projector', () => {
       expect(projected).toMatchObject({
         state: 'unknown',
         chatBound: false,
+        health: 'unknown',
+        recommendedAction: 'observe',
         broker: { pending: null, awaitingAck: null, delivered: null }
       });
     }
@@ -351,8 +431,8 @@ describe('Control Center projector', () => {
     const state = orchestration({
       runId: 'run-blocked',
       tasks: {
-        blocked: task('blocked', { state: 'BLOCKED' }),
-        verify: task('verify', { state: 'INTEGRATED' })
+        blocked: task('blocked', { state: 'BLOCKED', assignedWorkerId: 'worker-blocked' }),
+        verify: task('verify', { state: 'INTEGRATED', assignedWorkerId: 'worker-verify' })
       }
     });
     const run = workflow('run-blocked', {
@@ -375,6 +455,18 @@ describe('Control Center projector', () => {
     ]);
     expect(status.needsAttention).toEqual([]);
     expect(status.run?.health).toBe('blocked');
+    expect(status.agents.find((entry) => entry.id === 'worker-blocked')).toMatchObject({
+      health: 'blocked',
+      recommendedAction: 'user_attention'
+    });
+    expect(status.agents.find((entry) => entry.id === 'worker-verify')).toMatchObject({
+      health: 'blocked',
+      recommendedAction: 'user_attention'
+    });
+    expect(status.agents.find((entry) => entry.id === 'reviewer')).toMatchObject({
+      health: 'blocked',
+      recommendedAction: 'user_attention'
+    });
     expect(status.browser).toMatchObject({ budget: 5, used: null, queued: null, status: 'unavailable' });
   });
 
@@ -475,9 +567,71 @@ describe('Control Center loader', () => {
     expect(loaders.browserPresent).toHaveBeenCalledTimes(1);
     expect(loaders.browserTelemetry).toHaveBeenCalledTimes(1);
     expect(status).toMatchObject({
+      version: 2,
+      recoveryPolicy: 'off',
       observedAt: 99_999,
       run: { id: 'run-loader', planId: 'plan-loader' },
       browser: { status: 'available', used: 2, queued: 1 }
+    });
+  });
+
+  it('collects live health evidence only for exact owner-bound broker rows', async () => {
+    const prime = agent('prime', { role: 'prime', conversationId: 'conversation-prime' });
+    const worker = agent('worker-1', { conversationId: 'conversation-worker-1' });
+    const state = orchestration({
+      runId: 'run-health-loader',
+      managerAgentId: 'prime',
+      tasks: {
+        active: task('active', { state: 'ACTIVE', assignedWorkerId: 'worker-1' }),
+        review: task('review', { state: 'REVIEWING', reviewerId: 'reviewer-synthetic' })
+      }
+    });
+    loaders.recover.mockResolvedValue({ lastSeq: 9, state });
+    loaders.workflow.mockResolvedValue(workflow('run-health-loader'));
+    loaders.runtime.mockResolvedValue({
+      runId: 'run-health-loader',
+      agentId: 'prime',
+      ownerPrimeConversationId: 'conversation-prime'
+    });
+    loaders.swarmForCaller.mockReturnValue(swarm([prime, worker]));
+    loaders.browserPresent.mockReturnValue(false);
+    loaders.bridgeHealth.mockImplementation((id: string, conversationId: string | null) => ({
+      agentId: id,
+      conversationId,
+      browserPresent: false,
+      generating: id === 'worker-1',
+      activeTurnId: false,
+      finiteWait: null
+    }));
+    loaders.runningToolCalls.mockImplementation((conversationId: string) =>
+      conversationId === 'conversation-prime' ? 2 : 0
+    );
+    loaders.transferHealth.mockReturnValue(null);
+    vi.spyOn(Date, 'now').mockReturnValue(123_456);
+
+    const status = await controlCenterStatus();
+
+    expect(loaders.bridgeHealth.mock.calls).toEqual([
+      ['prime', 'conversation-prime', 123_456],
+      ['worker-1', 'conversation-worker-1', 123_456]
+    ]);
+    expect(loaders.runningToolCalls.mock.calls).toEqual([
+      ['conversation-prime'],
+      ['conversation-worker-1']
+    ]);
+    expect(loaders.transferHealth).toHaveBeenCalledTimes(1);
+    expect(loaders.transferHealth).toHaveBeenCalledWith('conversation-prime');
+    expect(loaders.bridgeHealth).not.toHaveBeenCalledWith('reviewer-synthetic', expect.anything(), expect.anything());
+    expect(status.agents.find((entry) => entry.id === 'prime')).toMatchObject({
+      activity: 'tool_call',
+      health: 'healthy'
+    });
+    expect(status.agents.find((entry) => entry.id === 'worker-1')).toMatchObject({
+      activity: 'working',
+      health: 'healthy'
+    });
+    expect(status.agents.find((entry) => entry.id === 'reviewer-synthetic')).toMatchObject({
+      health: 'unknown'
     });
   });
 

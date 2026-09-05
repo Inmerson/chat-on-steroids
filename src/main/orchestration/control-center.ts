@@ -1,5 +1,13 @@
-import { swarmStateForCaller } from '../agents.js';
-import { browserAgentTabTelemetry, browserPresent, type BrowserAgentTabTelemetry } from '../bridge.js';
+import { primeTransferHealthEvidence, swarmStateForCaller } from '../agents.js';
+import {
+  bridgeHealthEvidenceForAgent,
+  browserAgentTabTelemetry,
+  browserPresent,
+  type BrowserAgentTabTelemetry
+} from '../bridge.js';
+import { collectAgentHealthEvidence, evaluateAgentHealth } from '../agent-health.js';
+import { runningToolCalls } from '../mcp/call-context.js';
+import type { AgentHealthEvidence } from '../../shared/agent-health.js';
 import type { AgentInfo, SwarmState } from '../../shared/session.js';
 import {
   CONTROL_CENTER_BROWSER_BUDGET,
@@ -258,7 +266,10 @@ function projectAgents(
   state: OrchestrationState,
   workflow: RunWorkflowState | null,
   swarm: SwarmState,
-  projectedTasks: readonly ControlCenterTaskStatus[]
+  projectedTasks: readonly ControlCenterTaskStatus[],
+  observedAt: number,
+  agentEvidence: ReadonlyMap<string, AgentHealthEvidence>,
+  blockedAgentIds: ReadonlySet<string>
 ): ControlCenterAgentStatus[] {
   const accumulators = new Map<string, AgentAccumulator>();
 
@@ -291,10 +302,34 @@ function projectAgents(
   return [...accumulators.entries()]
     .map(([id, accumulated]): ControlCenterAgentStatus => {
       const broker = accumulated.broker;
+      const baseEvidence = agentEvidence.get(id) ?? {
+        identity: broker?.conversationId ? 'exact' : 'missing',
+        browserPresent: null,
+        runningToolCalls: 0,
+        generating: false,
+        activeTurnId: false,
+        workflowBlocked: false,
+        finiteWait: null
+      } satisfies AgentHealthEvidence;
+      const projectedHealth = evaluateAgentHealth(
+        {
+          id,
+          broker,
+          evidence: {
+            ...baseEvidence,
+            workflowBlocked: blockedAgentIds.has(id) || baseEvidence.workflowBlocked
+          }
+        },
+        observedAt
+      );
       return {
         id,
         label: broker?.label ?? id,
         state: broker?.state ?? 'unknown',
+        activity: projectedHealth.activity,
+        health: projectedHealth.health,
+        recommendedAction: projectedHealth.recommendedAction,
+        healthReason: projectedHealth.reason,
         roles: ROLE_ORDER.filter((role) => accumulated.roles.has(role)),
         boundTaskIds: [...accumulated.boundTaskIds].sort((a, b) => a.localeCompare(b)),
         reviewedTaskIds: [...accumulated.reviewedTaskIds].sort((a, b) => a.localeCompare(b)),
@@ -351,6 +386,27 @@ function globalBlockers(workflow: RunWorkflowState | null, taskBlockers: Control
   return blockers.sort((a, b) => a.id.localeCompare(b.id));
 }
 
+function structurallyBlockedAgentIds(
+  state: OrchestrationState,
+  workflow: RunWorkflowState | null,
+  taskRows: readonly {
+    task: ControlCenterTaskStatus;
+    blockers: ControlCenterBlocker[];
+  }[]
+): Set<string> {
+  const ids = new Set<string>();
+  for (const row of taskRows) {
+    if (row.blockers.length === 0) continue;
+    if (row.task.assignedWorkerId) ids.add(row.task.assignedWorkerId);
+    if (row.task.reviewerId) ids.add(row.task.reviewerId);
+  }
+  if (workflow?.status === 'blocked' && state.managerAgentId) ids.add(state.managerAgentId);
+  if (workflow?.systemReview?.verdict === 'BLOCKED' && workflow.systemReview.reviewerId) {
+    ids.add(workflow.systemReview.reviewerId);
+  }
+  return ids;
+}
+
 function isActiveAgent(agent: ControlCenterAgentStatus): boolean {
   return agent.state === 'invited' || agent.state === 'active' || agent.state === 'detached' || agent.state === 'waking';
 }
@@ -360,11 +416,13 @@ export function projectControlCenterStatus(
   workflowState: RunWorkflowState | null,
   swarm: SwarmState,
   observedAt: number,
-  browserTelemetry: BrowserAgentTabTelemetry | null = null
+  browserTelemetry: BrowserAgentTabTelemetry | null = null,
+  agentEvidence: ReadonlyMap<string, AgentHealthEvidence> = new Map()
 ): ControlCenterStatus {
   if (!state.runId) {
     return {
       version: CONTROL_CENTER_VERSION,
+      recoveryPolicy: 'off',
       observedAt,
       run: null,
       tasks: [],
@@ -382,11 +440,13 @@ export function projectControlCenterStatus(
     .map((task) => taskProjection(task, state, workflow));
   const tasks = taskRows.map((row) => row.task);
   const blockers = globalBlockers(workflow, taskRows.flatMap((row) => row.blockers));
-  const agents = projectAgents(state, workflow, swarm, tasks);
+  const blockedAgentIds = structurallyBlockedAgentIds(state, workflow, taskRows);
+  const agents = projectAgents(state, workflow, swarm, tasks, observedAt, agentEvidence, blockedAgentIds);
   const verified = tasks.filter((task) => task.state === 'VERIFIED').length;
 
   const status: ControlCenterStatus = {
     version: CONTROL_CENTER_VERSION,
+    recoveryPolicy: 'off',
     observedAt,
     run: {
       id: state.runId,
@@ -425,5 +485,23 @@ export async function controlCenterStatus(): Promise<ControlCenterStatus> {
     : { enabled: false, running: false, agents: [] };
   const observedAt = Date.now();
   const browserTelemetry = browserPresent() ? browserAgentTabTelemetry() : null;
-  return projectControlCenterStatus(recovered.state, workflow, broker, observedAt, browserTelemetry);
+  const evidenceByAgent = new Map<string, AgentHealthEvidence>();
+  for (const brokerAgent of broker.agents) {
+    const bridge = bridgeHealthEvidenceForAgent(brokerAgent.id, brokerAgent.conversationId, observedAt);
+    evidenceByAgent.set(
+      brokerAgent.id,
+      collectAgentHealthEvidence({
+        id: brokerAgent.id,
+        broker: brokerAgent,
+        browser: bridge,
+        runningToolCalls: brokerAgent.conversationId ? runningToolCalls(brokerAgent.conversationId) : 0,
+        transfer:
+          brokerAgent.role === 'prime' && brokerAgent.conversationId
+            ? primeTransferHealthEvidence(brokerAgent.conversationId)
+            : null,
+        workflowBlocked: false
+      })
+    );
+  }
+  return projectControlCenterStatus(recovered.state, workflow, broker, observedAt, browserTelemetry, evidenceByAgent);
 }

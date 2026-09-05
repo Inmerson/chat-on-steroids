@@ -1,6 +1,7 @@
 import type { AgentState } from './session.js';
+import type { AgentActivity, AgentHealth, AgentHealthRecommendedAction } from './agent-health.js';
 
-export const CONTROL_CENTER_VERSION = 1 as const;
+export const CONTROL_CENTER_VERSION = 2 as const;
 export const CONTROL_CENTER_BROWSER_BUDGET = 5 as const;
 
 export type ControlCenterRunHealth = 'running' | 'blocked' | 'failed' | 'verified';
@@ -77,6 +78,10 @@ export interface ControlCenterAgentStatus {
   id: string;
   label: string;
   state: ControlCenterAgentState;
+  activity: AgentActivity;
+  health: AgentHealth;
+  recommendedAction: AgentHealthRecommendedAction;
+  healthReason: string;
   roles: ControlCenterAgentRole[];
   boundTaskIds: string[];
   reviewedTaskIds: string[];
@@ -121,6 +126,7 @@ export interface ControlCenterBrowserStatus {
 
 export interface ControlCenterStatus {
   version: typeof CONTROL_CENTER_VERSION;
+  recoveryPolicy: 'off';
   observedAt: number;
   run: ControlCenterRunStatus | null;
   tasks: ControlCenterTaskStatus[];
