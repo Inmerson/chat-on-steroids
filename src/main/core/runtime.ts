@@ -15,6 +15,7 @@ import { initLogFile, logError, logInfo, logWarn } from '../logger.js';
 import { selfTestHeaders } from '../mcp/server.js';
 import { stopComputerHelper } from '../computer/index.js';
 import { initSecretsPath } from '../secrets.js';
+import { startAgentRuntimeGc } from '../runtime-gc.js';
 import { CONTINUATIONS_STATE, restoreContinuations, setContinuationRecoveryHooks, type ContinuationSnapshot } from '../session/continuation.js';
 import { restoreRequestCorrelations } from '../session/correlation.js';
 import { flushRecorder, onSessionChange, queueDeterministicAttributionRepair, setAgentBinder, setAgentConversationLookup } from '../session/recorder.js';
@@ -108,6 +109,9 @@ async function restoreCoreState(userDataDir: string): Promise<() => void> {
 
 export async function startCoreRuntime(userDataDir: string): Promise<CoreRuntime> {
   const stopRetention = await restoreCoreState(userDataDir);
+  const stopAgentRuntimeGc = startAgentRuntimeGc({
+    onError: (error) => logWarn(`agent runtime GC sweep failed: ${error.message}`)
+  });
   let watchdog: NodeJS.Timeout | null = null;
   let shuttingDown = false;
   let bridgeRevision = 0;
@@ -184,6 +188,7 @@ export async function startCoreRuntime(userDataDir: string): Promise<CoreRuntime
       dropBridgeRevision();
       dropSessionRevision();
       dropSwarmRevision();
+      stopAgentRuntimeGc();
       stopRetention();
       await Promise.allSettled([shutdownConnection(), shutdownBridge()]);
       await Promise.allSettled([unifiedExecManager.terminateAllProcesses(), stopComputerHelper()]);
