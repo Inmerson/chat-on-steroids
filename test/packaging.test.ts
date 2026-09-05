@@ -132,6 +132,17 @@ describe('cross-platform packaging targets', () => {
     expect(smoke).toContain('runtime.electron !== expectedElectronVersion');
   });
 
+  it('pins Node 24 artifact actions across the release handoff', () => {
+    const release = readFileSync(path.join(root, '.github', 'workflows', 'release.yml'), 'utf8');
+    const publish = readFileSync(path.join(root, '.github', 'workflows', 'publish.yml'), 'utf8');
+    const upload = 'actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1';
+    const download = 'actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1';
+
+    expect(release.split(upload)).toHaveLength(3);
+    expect(release.split(download)).toHaveLength(2);
+    expect(publish.split(download)).toHaveLength(2);
+  });
+
   it('repairs only the installed app tree for Windows sandbox startup', () => {
     const config = yamlFile('electron-builder.yml');
     const installer = readFileSync(path.join(root, 'scripts', 'windows-installer-acl.nsh'), 'utf8');
