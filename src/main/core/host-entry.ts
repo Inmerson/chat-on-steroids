@@ -7,6 +7,7 @@ import { hasSecret, setSecret } from '../secrets.js';
 import { APP_VERSION } from '../version.js';
 import { ensureCoreIpcToken, startCoreIpcServer } from './ipc.js';
 import { startCoreRuntime, type CoreRuntime } from './runtime.js';
+import { coreUiDispatcher } from './ui-dispatch.js';
 
 export interface CoreHostEntryOptions {
   userDataDir: string;
@@ -71,6 +72,10 @@ export async function runCoreHost(options: CoreHostEntryOptions): Promise<void> 
       await setSecret(key, value);
       if (key === 'openRouterApiKey') retireGoalDrafts();
       logInfo(`${key === 'openRouterApiKey' ? 'openrouter key' : 'api key'} ${value.trim() === '' ? 'cleared' : 'stored'}`);
+    },
+    uiCall: async (operation, payload) => {
+      requireRuntime();
+      return coreUiDispatcher(operation, payload);
     },
     shutdownCore: async () => {
       // Return the IPC acknowledgement before closing the listener/socket underneath it.
