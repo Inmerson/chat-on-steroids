@@ -24,7 +24,7 @@ interface CoreClient {
   applySettings(): Promise<CoreStatusEnvelope>;
   secretStatus(): Promise<CoreSecretStatus>;
   setSecret(key: CoreSecretKey, value: string): Promise<void>;
-  uiCall<T>(operation: CoreUiOperation, payload: unknown): Promise<T>;
+  uiCall(operation: CoreUiOperation, payload: unknown): Promise<unknown>;
   shutdownCore(): Promise<boolean>;
 }
 
@@ -115,7 +115,7 @@ export function createUiConnectionFacade(options: UiConnectionFacadeOptions): Ui
     status = {
       ...EMPTY_STATUS,
       state: 'connecting-tunnel',
-      detail: 'Core Host is reconnecting…'
+      detail: 'Core Host is reconnectingâ€¦'
     };
     for (const listener of statusListeners) listener({ ...status });
   };
@@ -237,7 +237,7 @@ export function createUiConnectionFacade(options: UiConnectionFacadeOptions): Ui
     applySettings: () => runCommand((client) => client.applySettings()),
     secretStatus: () => runCoreCall((client) => client.secretStatus()),
     setSecret: (key, value) => runCoreCall((client) => client.setSecret(key, value)),
-    uiCall: <T>(operation: CoreUiOperation, payload: unknown) => runCoreCall((client) => client.uiCall<T>(operation, payload)),
+    uiCall: <T>(operation: CoreUiOperation, payload: unknown) => runCoreCall((client) => client.uiCall(operation, payload)) as Promise<T>,
     shutdownConnection: async () => {
       finalShutdown = true;
       if (pollTimer) clearInterval(pollTimer);

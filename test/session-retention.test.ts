@@ -63,7 +63,7 @@ describe('session retention maintenance', () => {
   });
 
   it('is wired unconditionally at app startup instead of living behind the record toggle', async () => {
-    const source = await readFile(path.join(process.cwd(), 'src/main/index.ts'), 'utf8');
+    const source = await readFile(path.join(process.cwd(), 'src/main/core/runtime.ts'), 'utf8');
     expect(source).toContain('startSessionRetentionMaintenance({');
     expect(source).toContain('retainDays: () => getConfig().sessions.retainDays');
     expect(source).not.toContain('if (getConfig().sessions.record) {\n    void pruneSessions');

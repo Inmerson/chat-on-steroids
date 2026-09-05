@@ -46,6 +46,7 @@ function handlers(dir: string, token: string, overrides: Partial<CoreIpcHandlers
     applySettings: async () => undefined,
     secretStatus: async () => ({ hasApiKey: false, hasGoalKey: false }),
     setSecret: async () => undefined,
+    uiCall: async () => null,
     shutdownCore: async () => undefined,
     ...overrides
   };

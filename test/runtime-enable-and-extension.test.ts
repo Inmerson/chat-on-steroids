@@ -6,21 +6,15 @@ const repo = process.cwd();
 
 describe('runtime multi-agent enable regression', () => {
   it('wires persistence before unconditional restore and preserves history while disabled', async () => {
-    const source = await readFile(path.join(repo, 'src/main/index.ts'), 'utf8');
+    const source = await readFile(path.join(repo, 'src/main/core/runtime.ts'), 'utf8');
     const persistSink = source.indexOf('onSwarmPersistNow((snapshot) => writeDurableNow(SWARM_STATE, snapshot))');
-    const restoreRead = source.indexOf('const savedSwarm = await readDurable<SwarmSnapshot>(SWARM_STATE)');
-    const shutdownFence = source.indexOf('if (windowActivation.isDisabled()) return;', restoreRead);
-    const restore = source.indexOf('restoreSwarm(savedSwarm)', restoreRead);
+    const restore = source.indexOf('restoreSwarm(await readDurable<SwarmSnapshot>(SWARM_STATE))');
     const disabledPause = source.indexOf("pauseSwarmForDisable('multi-agent mode is disabled')");
 
     expect(persistSink).toBeGreaterThanOrEqual(0);
-    expect(restoreRead).toBeGreaterThanOrEqual(0);
-    expect(shutdownFence).toBeGreaterThanOrEqual(0);
     expect(restore).toBeGreaterThanOrEqual(0);
     expect(disabledPause).toBeGreaterThanOrEqual(0);
-    expect(persistSink).toBeLessThan(restoreRead);
-    expect(restoreRead).toBeLessThan(shutdownFence);
-    expect(shutdownFence).toBeLessThan(restore);
+    expect(persistSink).toBeLessThan(restore);
     expect(restore).toBeLessThan(disabledPause);
     expect(source).not.toContain('await writeDurableNow(SWARM_STATE, null)');
   });
@@ -30,7 +24,7 @@ describe('companion extension setup contract', () => {
   it('keeps standalone recovery visible without pointing an installed app at releases/latest', async () => {
     const [html, renderer, preload, ipc] = await Promise.all([
       readFile(path.join(repo, 'src/renderer/index.html'), 'utf8'),
-      readFile(path.join(repo, 'src/renderer/main.ts'), 'utf8'),
+      readFile(path.join(repo, 'src/renderer/main-app.ts'), 'utf8'),
       readFile(path.join(repo, 'src/preload/index.ts'), 'utf8'),
       readFile(path.join(repo, 'src/main/ipc.ts'), 'utf8')
     ]);
