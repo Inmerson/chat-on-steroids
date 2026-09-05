@@ -18,13 +18,13 @@
  * the user already thinks in, plus enough schema weight that folding it into Core
  * would meaningfully raise Core's no-query cost.
  *
- * Two surfaces pass that test today.
+ * Three surfaces pass that test today.
  */
 
 import type { Capabilities } from '../../shared/types.js';
 import { desktopAutomationSupported } from '../platform.js';
 
-export const SURFACE_IDS = ['core', 'desktop'] as const;
+export const SURFACE_IDS = ['core', 'desktop', 'steromi'] as const;
 export type SurfaceId = (typeof SURFACE_IDS)[number];
 
 /**
@@ -135,9 +135,31 @@ const DESKTOP: SurfaceDefinition = {
   tools: ['observe', 'computer']
 };
 
-export const SURFACES: Record<SurfaceId, SurfaceDefinition> = { core: CORE, desktop: DESKTOP };
+/**
+ * Steromi — one unified connector for the current Core + Desktop contract.
+ *
+ * It deliberately does not resurrect retired power-tool surfaces. The dashboard and the
+ * ordinary Core/Desktop registrations share the same live permission and ownership guards.
+ */
+const STEROMI: SurfaceDefinition = {
+  id: 'steromi',
+  serverName: 'chat-on-steroids-steromi',
+  connectorName: `${CONNECTOR_BRAND} Steromi (All-in-One)`,
+  description:
+    'Use one unified connector for approved files, patches, terminal commands, recorded sessions, worker agents, screenshots, windows, mouse and keyboard control, and the clipboard. ' +
+    'It also exposes an interactive ChatGPT control panel with Screen, Terminal, Files and Sessions tabs.',
+  cardSummary: 'Core + Desktop in one optional connector, with an inline ChatGPT control panel.',
+  required: false,
+  tools: ['steromi_dashboard', ...CORE.tools, ...DESKTOP.tools]
+};
 
-export const SURFACE_LIST: readonly SurfaceDefinition[] = [CORE, DESKTOP];
+export const SURFACES: Record<SurfaceId, SurfaceDefinition> = {
+  core: CORE,
+  desktop: DESKTOP,
+  steromi: STEROMI
+};
+
+export const SURFACE_LIST: readonly SurfaceDefinition[] = [CORE, DESKTOP, STEROMI];
 
 export function surfaceDefinition(id: SurfaceId): SurfaceDefinition {
   return SURFACES[id];

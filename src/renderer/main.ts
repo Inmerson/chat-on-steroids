@@ -372,6 +372,7 @@ function save(over: { readOnly?: boolean; theme?: 'light' | 'dark' } = {}): Prom
       kind: $<HTMLSelectElement>('tunnelKind').value as 'openai' | 'cloudflared' | 'manual',
       tunnelId: $<HTMLInputElement>('tunnelId').value.trim(),
       desktopTunnelId: $<HTMLInputElement>('desktopTunnelId').value.trim(),
+      steromiTunnelId: $<HTMLInputElement>('steromiTunnelId').value.trim(),
       binaryPath: $<HTMLInputElement>('binaryPath').value.trim()
     },
     ui: {
@@ -831,6 +832,11 @@ function apply(next: AppState): void {
     config.tunnel.desktopTunnelId,
     previousState?.config.tunnel.desktopTunnelId
   );
+  applyValue(
+    $<HTMLInputElement>('steromiTunnelId'),
+    config.tunnel.steromiTunnelId,
+    previousState?.config.tunnel.steromiTunnelId
+  );
   applyValue($<HTMLInputElement>('binaryPath'), config.tunnel.binaryPath, previousState?.config.tunnel.binaryPath);
   applyChecked($<HTMLInputElement>('autoConnect'), config.ui.autoConnect, previousState?.config.ui.autoConnect);
   applyChecked(
@@ -862,7 +868,9 @@ function apply(next: AppState): void {
   // Only this method needs a tunnel per connector. Cloudflare and manual publish the
   // whole address, so both connectors already ride the one tunnel on their own paths.
   const desktopSurface = status.surfaces.find((surface) => surface.id === 'desktop');
+  const steromiSurface = status.surfaces.find((surface) => surface.id === 'steromi');
   $('desktopTunnelField').hidden = !openai || !desktopSurface?.available;
+  $('steromiTunnelField').hidden = !openai || !steromiSurface?.available;
 
   $('wizFolders').textContent =
     config.roots.length === 0 ? 'None yet' : config.roots.map((r) => `/${r.name}`).join('  ');
@@ -1047,7 +1055,8 @@ function connectorCards(next: AppState): HTMLElement[] {
         el(
           'p',
           'hint',
-          surface.id === 'desktop' && !config.tunnel.desktopTunnelId
+          (surface.id === 'desktop' && !config.tunnel.desktopTunnelId) ||
+            (surface.id === 'steromi' && !config.tunnel.steromiTunnelId)
             ? 'Pick this connector’s own tunnel — paste its ID in step 2 first.'
             : 'Choose Tunnel, then pick this connector’s tunnel.'
         )
@@ -1501,7 +1510,8 @@ for (const id of [
   'privacyScreenshots',
   'tunnelKind',
   'tunnelId',
-  'desktopTunnelId'
+  'desktopTunnelId',
+  'steromiTunnelId'
 ]) {
   $(id).addEventListener('change', () => void save());
 }

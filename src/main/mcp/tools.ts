@@ -18,6 +18,7 @@ import { createRegistrar, type ToolContext } from './kernel.js';
 import { decorateCoreRegistrarWithAgentV3 } from './agents-v3.js';
 import { registerCoreTools } from './tools-core.js';
 import { registerDesktopTools } from './tools-desktop.js';
+import { registerSteromiApp } from './steromi-app.js';
 import { surfaceDefinition, type SurfaceId } from './surfaces.js';
 import { serverInstructions } from './instructions.js';
 import { APP_VERSION } from './../version.js';
@@ -32,8 +33,15 @@ export function buildServer(ctx: ToolContext, surface: SurfaceId): McpServer {
   );
 
   const registrar = createRegistrar(server, ctx, surface);
-  if (surface === 'core') registerCoreTools(decorateCoreRegistrarWithAgentV3(registrar));
-  else registerDesktopTools(registrar);
+  if (surface === 'core') {
+    registerCoreTools(decorateCoreRegistrarWithAgentV3(registrar));
+  } else if (surface === 'desktop') {
+    registerDesktopTools(registrar);
+  } else {
+    registerSteromiApp(server, registrar);
+    registerCoreTools(decorateCoreRegistrarWithAgentV3(registrar));
+    registerDesktopTools(registrar);
+  }
 
   // Cheap self-check on a property the tests assert and the design depends on: a surface
   // may register fewer tools than it declares — permissions decide that — but it may never

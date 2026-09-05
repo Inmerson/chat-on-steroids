@@ -157,6 +157,7 @@ async function call(surface: SurfaceId, method: string, params: unknown = {}): P
 
 const core = (method: string, params: unknown = {}): Promise<any> => call('core', method, params);
 const desktop = (method: string, params: unknown = {}): Promise<any> => call('desktop', method, params);
+const steromi = (method: string, params: unknown = {}): Promise<any> => call('steromi', method, params);
 
 const PROTOCOL_2026 = '2026-07-28';
 const META_VERSION = 'io.modelcontextprotocol/protocolVersion';
@@ -669,6 +670,73 @@ describe('surface boundaries', () => {
     expect(names).not.toContain('find');
   });
 
+  it('publishes the Steromi control panel only on the unified surface', async () => {
+    everything();
+    const steromiTools = ((await steromi('tools/list')).body?.result?.tools ?? []) as Array<{
+      name: string;
+      _meta?: { ui?: { resourceUri?: string } };
+    }>;
+    const dashboard = steromiTools.find((tool) => tool.name === 'steromi_dashboard');
+
+    expect(dashboard?._meta?.ui?.resourceUri).toBe('ui://steromi/control-panel.html');
+    expect(toolNames(await core('tools/list'))).not.toContain('steromi_dashboard');
+    expect(toolNames(await desktop('tools/list'))).not.toContain('steromi_dashboard');
+  });
+
+  it('makes only the panel dependencies app-callable on the Steromi surface', async () => {
+    everything();
+    const steromiTools = ((await steromi('tools/list')).body?.result?.tools ?? []) as Array<{
+      name: string;
+      _meta?: Record<string, any>;
+    }>;
+    for (const name of ['observe', 'exec_command', 'write_stdin', 'read', 'session']) {
+      const tool = steromiTools.find((entry) => entry.name === name);
+      expect(tool?._meta?.ui?.visibility, name).toEqual(['model', 'app']);
+      expect(tool?._meta?.['openai/widgetAccessible'], name).toBe(true);
+    }
+
+    const coreRead = (((await core('tools/list')).body?.result?.tools ?? []) as Array<{ name: string; _meta?: unknown }>).find(
+      (entry) => entry.name === 'read'
+    );
+    const desktopObserve = (((await desktop('tools/list')).body?.result?.tools ?? []) as Array<{ name: string; _meta?: unknown }>).find(
+      (entry) => entry.name === 'observe'
+    );
+    expect(coreRead?._meta).toBeUndefined();
+    expect(desktopObserve?._meta).toBeUndefined();
+  });
+
+  it('serves the Steromi control panel as an MCP App resource', async () => {
+    everything();
+    const listed = await steromi('resources/list');
+    const resources = (listed.body?.result?.resources ?? []) as Array<{ uri: string; mimeType?: string }>;
+    expect(resources).toContainEqual(
+      expect.objectContaining({
+        uri: 'ui://steromi/control-panel.html',
+        mimeType: 'text/html;profile=mcp-app'
+      })
+    );
+
+    const read = await steromi('resources/read', { uri: 'ui://steromi/control-panel.html' });
+    const resource = read.body?.result?.contents?.[0] as { uri?: string; mimeType?: string; text?: string } | undefined;
+    expect(resource?.uri).toBe('ui://steromi/control-panel.html');
+    expect(resource?.mimeType).toBe('text/html;profile=mcp-app');
+    expect(resource?.text).toContain('Screen');
+    expect(resource?.text).toContain('Terminal');
+    expect(resource?.text).toContain('Files');
+    expect(resource?.text).toContain('Sessions');
+    expect(resource?.text).toContain('callTool');
+  });
+
+  it('opens the Steromi control panel with structured initial state', async () => {
+    everything();
+    const reply = await steromi('tools/call', { name: 'steromi_dashboard', arguments: {} });
+    expect(reply.body?.result?.structuredContent).toEqual({
+      surface: 'steromi',
+      tabs: ['screen', 'terminal', 'files', 'sessions']
+    });
+    expect(textOf(reply)).toContain('Steromi control panel');
+  });
+
   it('never advertises a tool its surface does not declare', async () => {
     everything();
     for (const surface of SURFACE_LIST) {
@@ -830,6 +898,13 @@ describe('surface boundaries', () => {
       expect(reply.body.result.serverInfo.name, surface.id).toBe(surface.serverName);
       expect(reply.body.result.instructions, surface.id).toBeTruthy();
     }
+    const steromiInstructions = (await steromi('initialize', {
+      protocolVersion: '2025-06-18',
+      capabilities: {},
+      clientInfo: { name: 'test-client', version: '1.0.0' }
+    })).body.result.instructions as string;
+    expect(steromiInstructions).toContain('Steromi all-in-one');
+    expect(steromiInstructions).toContain('observe first, then computer');
   });
 });
 

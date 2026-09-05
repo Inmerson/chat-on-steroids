@@ -53,6 +53,7 @@ import {
   stageQueuedWorkerRevivals
 } from '../agents.js';
 import type { SurfaceId } from './surfaces.js';
+import { STEROMI_APP_CALLABLE_TOOLS, steromiAppCallableMeta } from './steromi-app.js';
 import {
   currentCall,
   emptyEvidence,
@@ -709,6 +710,7 @@ export interface SurfaceRegistrar {
       inputSchema: Schema;
       outputSchema?: z.ZodType;
       annotations?: ToolAnnotations;
+      _meta?: Record<string, unknown>;
     },
     handler: (args: z.output<Schema>) => Promise<ToolResult>
   ): void;
@@ -746,10 +748,14 @@ export function createRegistrar(server: McpServer, ctx: ToolContext, surface: Su
     registered: () => [...names],
     register(name, config, handler) {
       names.push(name);
+      const publishedConfig =
+        surface === 'steromi' && STEROMI_APP_CALLABLE_TOOLS.has(name)
+          ? { ...config, _meta: steromiAppCallableMeta(config._meta) }
+          : config;
       // No identity field is ever added here. Every tool's schema is exactly what its
       // surface declared: who is calling is a fact about the conversation, established from
       // page evidence in `dispatch`, and never something the model is asked to carry.
-      server.registerTool(name, config, ((args: never, mcpCtx?: McpCallContext) =>
+      server.registerTool(name, publishedConfig, ((args: never, mcpCtx?: McpCallContext) =>
         dispatch(name, args, mcpCtx?.sessionId ?? null, requestIdOf(mcpCtx), surface, () =>
           handler(args)
         )) as never);
