@@ -54,6 +54,8 @@ import {
 } from './session/store.js';
 import { activeSessionId, forgetSession, onSessionChange } from './session/recorder.js';
 import {
+  PRIME_ID,
+  agentConversation,
   clearAgent,
   onSwarmChange,
   pauseSwarmForDisable,
@@ -67,6 +69,7 @@ import { hostPlatformInfo } from './platform.js';
 import { syncLoginStartup } from './background-startup.js';
 import { controlCenterStatus } from './orchestration/control-center.js';
 import { markInstallOnQuit, onUpdateChange, updateStatus } from './update.js';
+import { captureAgentRuntimeTargets, releaseCapturedAgentRuntimeTargets } from './runtime-gc.js';
 
 /** The only URLs the renderer may ask the OS to open. */
 const ALLOWED_LINKS = new Set([
@@ -679,10 +682,12 @@ export function registerIpc(getWindow: () => BrowserWindow | null, quitToInstall
 
   handle('swarm:get', async () => swarmState());
   handle('swarm:reset', async () => {
+    const runtimeTargets = captureAgentRuntimeTargets();
     resetSwarm();
     if (!(await persistAgentAuthorityNow())) {
       throw new Error('The cleared run could not be made durable. Retry clearing the swarm.');
     }
+    await releaseCapturedAgentRuntimeTargets(runtimeTargets);
     return swarmState();
   });
   /**
@@ -696,12 +701,18 @@ export function registerIpc(getWindow: () => BrowserWindow | null, quitToInstall
    */
   handle('swarm:clearAgent', async (payload) => {
     const id = agentIdArg.parse(payload);
+    const conversations =
+      id === PRIME_ID
+        ? new Set(swarmState().agents.map((agent) => agent.conversationId).filter((value): value is string => Boolean(value)))
+        : new Set([agentConversation(id)].filter((value): value is string => Boolean(value)));
+    const runtimeTargets = captureAgentRuntimeTargets(conversations);
     const outcome = clearAgent(id);
     if (outcome.cleared !== 'none') {
       if (!(await persistAgentAuthorityNow())) {
         throw new Error('The agent clear could not be made durable. Retry the clear action.');
       }
       if (outcome.cleared === 'worker') cancelWorkerCommands(outcome.reason, id);
+      await releaseCapturedAgentRuntimeTargets(runtimeTargets);
     }
     // The prime's report stays in the main process: the renderer needs the outcome, not
     // the message queued for the prime agent.

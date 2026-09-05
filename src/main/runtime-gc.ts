@@ -16,6 +16,7 @@ export interface RuntimeGcDependencies {
   forgetExecOwner(processId: number): void;
   agentInfoForOwnedConversation(conversationId: string): AgentInfo | null;
   terminateProcessIfUnusedSince(processId: number, cutoff: number): Promise<ConditionalTerminationResult>;
+  terminateProcess(processId: number): Promise<boolean>;
 }
 
 export interface RuntimeGcSummary {
@@ -37,8 +38,21 @@ const defaultDependencies: RuntimeGcDependencies = {
   forgetExecOwner,
   agentInfoForOwnedConversation,
   terminateProcessIfUnusedSince: (processId, cutoff) =>
-    unifiedExecManager.terminateProcessIfUnusedSince(processId, cutoff)
+    unifiedExecManager.terminateProcessIfUnusedSince(processId, cutoff),
+  terminateProcess: (processId) => unifiedExecManager.terminateProcess(processId)
 };
+
+export interface AgentRuntimeReleaseTarget {
+  processId: number;
+  conversationId: string;
+}
+
+export interface RuntimeReleaseSummary {
+  checked: number;
+  terminated: number;
+  missing: number;
+  changed: number;
+}
 
 function emptySummary(): RuntimeGcSummary {
   return {
@@ -117,6 +131,51 @@ export async function sweepAgentRuntimeGc(
     }
   }
 
+  return summary;
+}
+
+/**
+ * Captures exact agent-owned live runtime sessions before a broker mutation destroys the
+ * conversation-to-agent projection needed to select them. This is read-only authority evidence;
+ * the actual process is revalidated again at release time.
+ */
+export function captureAgentRuntimeTargets(
+  conversationIds?: ReadonlySet<string>,
+  dependencies: RuntimeGcDependencies = defaultDependencies
+): AgentRuntimeReleaseTarget[] {
+  const targets: AgentRuntimeReleaseTarget[] = [];
+  for (const runtime of dependencies.listRuntimeProcesses()) {
+    const conversationId = dependencies.execOwner(runtime.processId);
+    if (!conversationId) continue;
+    if (conversationIds && !conversationIds.has(conversationId)) continue;
+    if (!dependencies.agentInfoForOwnedConversation(conversationId)) continue;
+    targets.push({ processId: runtime.processId, conversationId });
+  }
+  return targets;
+}
+
+/** Strong explicit-clear cleanup: owner identity is still fenced, but idle age is irrelevant. */
+export async function releaseCapturedAgentRuntimeTargets(
+  targets: readonly AgentRuntimeReleaseTarget[],
+  dependencies: RuntimeGcDependencies = defaultDependencies
+): Promise<RuntimeReleaseSummary> {
+  const summary: RuntimeReleaseSummary = { checked: 0, terminated: 0, missing: 0, changed: 0 };
+  for (const target of targets) {
+    summary.checked += 1;
+    if (dependencies.execOwner(target.processId) !== target.conversationId) {
+      summary.changed += 1;
+      continue;
+    }
+
+    const terminated = await dependencies.terminateProcess(target.processId);
+    summary[terminated ? 'terminated' : 'missing'] += 1;
+
+    // Process ids are reusable. A replacement session that acquired different ownership while
+    // termination was settling keeps its new attribution.
+    if (dependencies.execOwner(target.processId) === target.conversationId) {
+      dependencies.forgetExecOwner(target.processId);
+    }
+  }
   return summary;
 }
 

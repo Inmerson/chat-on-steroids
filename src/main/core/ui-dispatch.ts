@@ -22,11 +22,14 @@ import {
 } from '../sandbox.js';
 import { TUNNEL_ID_PATTERN } from '../tunnel/index.js';
 import {
+  PRIME_ID,
+  agentConversation,
   clearAgent,
   persistAgentAuthorityNow,
   resetSwarm,
   swarmState
 } from '../agents.js';
+import { captureAgentRuntimeTargets, releaseCapturedAgentRuntimeTargets } from '../runtime-gc.js';
 import { activeSessionId, forgetSession } from '../session/recorder.js';
 import {
   deleteSession,
@@ -55,6 +58,7 @@ const settingsPatch = z.object({
     kind: z.enum(['openai', 'cloudflared', 'manual']),
     tunnelId: z.string().max(128).refine((value) => value === '' || TUNNEL_ID_PATTERN.test(value)),
     desktopTunnelId: z.string().max(128).refine((value) => value === '' || TUNNEL_ID_PATTERN.test(value)),
+    steromiTunnelId: z.string().max(128).refine((value) => value === '' || TUNNEL_ID_PATTERN.test(value)),
     binaryPath: z.string().max(4096)
   }),
   ui: z.object({
@@ -100,6 +104,7 @@ function mergeSettings(current: Config, base: SettingsSnapshot, wanted: Settings
       kind: pick(current.tunnel.kind, base.tunnel.kind, wanted.tunnel.kind),
       tunnelId: pick(current.tunnel.tunnelId, base.tunnel.tunnelId, wanted.tunnel.tunnelId),
       desktopTunnelId: pick(current.tunnel.desktopTunnelId, base.tunnel.desktopTunnelId, wanted.tunnel.desktopTunnelId),
+      steromiTunnelId: pick(current.tunnel.steromiTunnelId, base.tunnel.steromiTunnelId, wanted.tunnel.steromiTunnelId),
       binaryPath: pick(current.tunnel.binaryPath, base.tunnel.binaryPath, wanted.tunnel.binaryPath)
     },
     ui: {
@@ -338,15 +343,23 @@ const defaultDeps: CoreUiDispatcherDeps = {
   },
   swarm: swarmState,
   resetSwarm: async () => {
+    const runtimeTargets = captureAgentRuntimeTargets();
     resetSwarm();
     if (!(await persistAgentAuthorityNow())) throw new Error('The cleared run could not be made durable. Retry clearing the swarm.');
+    await releaseCapturedAgentRuntimeTargets(runtimeTargets);
     return swarmState();
   },
   clearAgent: async (id) => {
+    const conversations =
+      id === PRIME_ID
+        ? new Set(swarmState().agents.map((agent) => agent.conversationId).filter((value): value is string => Boolean(value)))
+        : new Set([agentConversation(id)].filter((value): value is string => Boolean(value)));
+    const runtimeTargets = captureAgentRuntimeTargets(conversations);
     const outcome = clearAgent(id);
     if (outcome.cleared !== 'none') {
       if (!(await persistAgentAuthorityNow())) throw new Error('The agent clear could not be made durable. Retry the clear action.');
       if (outcome.cleared === 'worker') cancelWorkerCommands(outcome.reason, id);
+      await releaseCapturedAgentRuntimeTargets(runtimeTargets);
     }
     return { cleared: outcome.cleared, reason: outcome.reason, swarm: swarmState() };
   },

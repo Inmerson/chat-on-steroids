@@ -33,6 +33,11 @@ vi.mock('electron', () => ({
 // This suite owns IPC behavior, not Electron's packaged-vs-checkout path discovery.
 vi.mock('../src/main/extension-path.js', () => ({ extensionDir: () => process.cwd() }));
 
+vi.mock('../src/main/runtime-gc.js', () => ({
+  captureAgentRuntimeTargets: vi.fn(() => []),
+  releaseCapturedAgentRuntimeTargets: vi.fn(async () => ({ checked: 0, terminated: 0, missing: 0, changed: 0 }))
+}));
+
 const { defaultConfig, getConfig, initConfigPath, saveConfig } = await import('../src/main/config.js');
 const { initSecretsPath, resetSecretsCacheForTests } = await import('../src/main/secrets.js');
 const { appendEvent, createSession, initSessionStore, resetSessionStoreForTests } = await import('../src/main/session/store.js');
@@ -60,6 +65,7 @@ const {
   swarmStateForCaller
 } = await import('../src/main/agents.js');
 const { registerIpc } = await import('../src/main/ipc.js');
+const { captureAgentRuntimeTargets, releaseCapturedAgentRuntimeTargets } = await import('../src/main/runtime-gc.js');
 const { app, dialog, nativeTheme, safeStorage, shell } = await import('electron');
 const { extensionDownloadUrl } = await import('../src/main/version.js');
 const { resetWorkspaces, setWorkspaceFor, workspaceEntries } = await import('../src/main/workspace.js');
@@ -128,6 +134,10 @@ beforeEach(async () => {
   vi.mocked(shell.openPath).mockReset().mockResolvedValue('');
   vi.mocked(shell.openExternal).mockReset().mockResolvedValue(undefined);
   vi.mocked(app.getVersion).mockReset().mockReturnValue('0.0.0');
+  vi.mocked(captureAgentRuntimeTargets).mockReset().mockReturnValue([]);
+  vi.mocked(releaseCapturedAgentRuntimeTargets)
+    .mockReset()
+    .mockResolvedValue({ checked: 0, terminated: 0, missing: 0, changed: 0 });
   resetSwarm();
   resetBridgeForTests();
   resetWorkspaces();
@@ -323,6 +333,105 @@ describe('turning multi-agent mode off', () => {
     expect(await readDurable<any>('ipc-retired-workers')).toMatchObject({
       workers: expect.arrayContaining([expect.objectContaining({ id: 'worker-1', conversationId: worker })])
     });
+  });
+});
+
+describe('durable runtime release after explicit swarm clear', () => {
+  it('captures a worker before mutation, persists its terminal broker state, then releases its runtime', async () => {
+    const prime = '66666666-7777-4888-8999-000000000010';
+    const worker = '11111111-aaaa-4bbb-8ccc-222222222222';
+    spawn({ workers: [{ task: 'clear this exact worker' }], caller: { conversationId: prime } });
+    expect(bindConversation('worker-1', worker)).toBe(true);
+    expect(await persistAgentAuthorityNow()).toBe(true);
+
+    const targets = [{ processId: 101, conversationId: worker }];
+    vi.mocked(captureAgentRuntimeTargets).mockReturnValueOnce(targets);
+    vi.mocked(releaseCapturedAgentRuntimeTargets).mockImplementationOnce(async (received) => {
+      expect(received).toEqual(targets);
+      const durable = await readDurable<any>('ipc-swarm');
+      expect(durable?.agents).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            info: expect.objectContaining({ id: 'worker-1', conversationId: worker, state: 'failed' })
+          })
+        ])
+      );
+      return { checked: 1, terminated: 1, missing: 0, changed: 0 };
+    });
+
+    const reply = (await handlers.get('swarm:clearAgent')!(null, 'worker-1')) as any;
+    expect(reply.ok, reply.error).toBe(true);
+    expect(captureAgentRuntimeTargets).toHaveBeenCalledWith(new Set([worker]));
+    expect(releaseCapturedAgentRuntimeTargets).toHaveBeenCalledOnce();
+  });
+
+  it('captures only the visible current run conversations before clearing Prime', async () => {
+    const prime = '77777777-8888-4999-8aaa-000000000011';
+    const worker = '22222222-bbbb-4ccc-8ddd-333333333333';
+    spawn({ workers: [{ task: 'prime clear coverage' }], caller: { conversationId: prime } });
+    expect(bindConversation('worker-1', worker)).toBe(true);
+    expect(await persistAgentAuthorityNow()).toBe(true);
+
+    const targets = [
+      { processId: 201, conversationId: prime },
+      { processId: 202, conversationId: worker }
+    ];
+    vi.mocked(captureAgentRuntimeTargets).mockReturnValueOnce(targets);
+    vi.mocked(releaseCapturedAgentRuntimeTargets).mockImplementationOnce(async (received) => {
+      expect(received).toEqual(targets);
+      expect(await readDurable('ipc-swarm')).toBeNull();
+      expect(await readDurable<any>('ipc-retired-workers')).toMatchObject({
+        workers: expect.arrayContaining([expect.objectContaining({ conversationId: worker })])
+      });
+      return { checked: 2, terminated: 2, missing: 0, changed: 0 };
+    });
+
+    const reply = (await handlers.get('swarm:clearAgent')!(null, 'prime')) as any;
+    expect(reply.ok, reply.error).toBe(true);
+    expect(captureAgentRuntimeTargets).toHaveBeenCalledWith(new Set([prime, worker]));
+    expect(releaseCapturedAgentRuntimeTargets).toHaveBeenCalledOnce();
+  });
+
+  it('captures all exact agent-owned runtimes before Clear swarm and releases only after durable reset', async () => {
+    const prime = '88888888-9999-4aaa-8bbb-000000000012';
+    const worker = '33333333-cccc-4ddd-8eee-444444444444';
+    spawn({ workers: [{ task: 'reset coverage' }], caller: { conversationId: prime } });
+    expect(bindConversation('worker-1', worker)).toBe(true);
+    expect(await persistAgentAuthorityNow()).toBe(true);
+
+    const targets = [
+      { processId: 301, conversationId: prime },
+      { processId: 302, conversationId: worker }
+    ];
+    vi.mocked(captureAgentRuntimeTargets).mockReturnValueOnce(targets);
+    vi.mocked(releaseCapturedAgentRuntimeTargets).mockImplementationOnce(async (received) => {
+      expect(received).toEqual(targets);
+      expect(await readDurable('ipc-swarm')).toBeNull();
+      return { checked: 2, terminated: 2, missing: 0, changed: 0 };
+    });
+
+    const reply = (await handlers.get('swarm:reset')!(null, undefined)) as any;
+    expect(reply.ok, reply.error).toBe(true);
+    expect(captureAgentRuntimeTargets).toHaveBeenCalledWith();
+    expect(releaseCapturedAgentRuntimeTargets).toHaveBeenCalledOnce();
+  });
+
+  it('attempts no runtime release when the broker clear cannot cross its durability barrier', async () => {
+    const prime = '99999999-aaaa-4bbb-8ccc-000000000013';
+    const worker = '44444444-dddd-4eee-8fff-555555555555';
+    spawn({ workers: [{ task: 'durability failure coverage' }], caller: { conversationId: prime } });
+    expect(bindConversation('worker-1', worker)).toBe(true);
+
+    vi.mocked(captureAgentRuntimeTargets).mockReturnValueOnce([{ processId: 401, conversationId: worker }]);
+    onRetiredWorkersPersistNow(null);
+    try {
+      const reply = (await handlers.get('swarm:clearAgent')!(null, 'worker-1')) as any;
+      expect(reply.ok).toBe(false);
+      expect(reply.error).toMatch(/durable|retry/i);
+      expect(releaseCapturedAgentRuntimeTargets).not.toHaveBeenCalled();
+    } finally {
+      onRetiredWorkersPersistNow((snapshot) => writeDurableNow('ipc-retired-workers', snapshot));
+    }
   });
 });
 

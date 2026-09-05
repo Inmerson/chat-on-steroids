@@ -5,6 +5,8 @@ import type { ManagedProcessRuntimeInfo, ConditionalTerminationResult } from '..
 import {
   AGENT_RUNTIME_RETENTION_MS,
   AGENT_RUNTIME_SWEEP_MS,
+  captureAgentRuntimeTargets,
+  releaseCapturedAgentRuntimeTargets,
   startAgentRuntimeGc,
   sweepAgentRuntimeGc,
   type RuntimeGcDependencies
@@ -56,8 +58,10 @@ function deps(options: {
   owners?: Array<string | null>;
   agents?: Array<AgentInfo | null>;
   termination?: ConditionalTerminationResult;
+  explicitTermination?: boolean;
 } = {}): RuntimeGcDependencies & {
   terminateProcessIfUnusedSince: ReturnType<typeof vi.fn>;
+  terminateProcess: ReturnType<typeof vi.fn>;
   forgetExecOwner: ReturnType<typeof vi.fn>;
 } {
   const owners = [...(options.owners ?? ['chat-worker'])];
@@ -73,13 +77,15 @@ function deps(options: {
     return lastAgent;
   });
   const terminateProcessIfUnusedSince = vi.fn(async () => options.termination ?? 'terminated');
+  const terminateProcess = vi.fn(async () => options.explicitTermination ?? true);
   const forgetExecOwner = vi.fn();
   return {
     listRuntimeProcesses: () => options.processes ?? [runtime()],
     execOwner,
     forgetExecOwner,
     agentInfoForOwnedConversation,
-    terminateProcessIfUnusedSince
+    terminateProcessIfUnusedSince,
+    terminateProcess
   };
 }
 
@@ -222,5 +228,74 @@ describe('agent runtime garbage collection', () => {
     expect(willQuit).toBeGreaterThan(start);
     expect(stop).toBeGreaterThan(willQuit);
     expect(shutdown).toBeGreaterThan(stop);
+  });
+
+  it('captures only live runtimes with exact ownership that still maps to an agent', () => {
+    const fake = deps({
+      processes: [runtime(101), runtime(202), runtime(303)],
+      owners: ['chat-worker', null, 'chat-orphan'],
+      agents: [workerInfo(), null]
+    });
+
+    expect(captureAgentRuntimeTargets(undefined, fake)).toEqual([
+      { processId: 101, conversationId: 'chat-worker' }
+    ]);
+  });
+
+  it('limits captured runtimes to the exact requested conversations, including Prime ownership', () => {
+    const prime = workerInfo('active', { role: 'prime' });
+    prime.conversationId = 'chat-prime';
+    const worker = workerInfo();
+    worker.conversationId = 'chat-worker';
+    const fake = deps({
+      processes: [runtime(101), runtime(202)],
+      owners: ['chat-prime', 'chat-worker'],
+      agents: [prime, worker]
+    });
+
+    expect(captureAgentRuntimeTargets(new Set(['chat-prime']), fake)).toEqual([
+      { processId: 101, conversationId: 'chat-prime' }
+    ]);
+  });
+
+  it('explicit release rechecks ownership and never terminates a process that moved to another conversation', async () => {
+    const fake = deps({ owners: ['chat-other'] });
+
+    const summary = await releaseCapturedAgentRuntimeTargets(
+      [{ processId: 101, conversationId: 'chat-worker' }],
+      fake
+    );
+
+    expect(fake.terminateProcess).not.toHaveBeenCalled();
+    expect(fake.forgetExecOwner).not.toHaveBeenCalled();
+    expect(summary.changed).toBe(1);
+  });
+
+  it.each([
+    [true, 'terminated'],
+    [false, 'missing']
+  ] as const)('explicit release forgets exact ownership when terminateProcess returns %s', async (result, key) => {
+    const fake = deps({ owners: ['chat-worker', 'chat-worker'], explicitTermination: result });
+
+    const summary = await releaseCapturedAgentRuntimeTargets(
+      [{ processId: 101, conversationId: 'chat-worker' }],
+      fake
+    );
+
+    expect(fake.terminateProcess).toHaveBeenCalledWith(101);
+    expect(fake.forgetExecOwner).toHaveBeenCalledWith(101);
+    expect(summary[key]).toBe(1);
+  });
+
+  it('explicit release does not erase a new owner that appears while termination is settling', async () => {
+    const fake = deps({ owners: ['chat-worker', 'chat-reused'], explicitTermination: true });
+
+    await releaseCapturedAgentRuntimeTargets(
+      [{ processId: 101, conversationId: 'chat-worker' }],
+      fake
+    );
+
+    expect(fake.terminateProcess).toHaveBeenCalledOnce();
+    expect(fake.forgetExecOwner).not.toHaveBeenCalled();
   });
 });
