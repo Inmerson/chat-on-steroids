@@ -2125,6 +2125,35 @@ describe('extension observation journal', () => {
     expect(session.data.settled).toEqual(['resume-command']);
   });
 
+  it('keeps a worker command tab open after bootstrap ACK until broker lifecycle releases it', async () => {
+    const local = new FakeStorageArea({ port: 8765, token: 'paired-token' });
+    const session = new FakeStorageArea();
+    const fetch = vi.fn(async (input: string) => {
+      const url = new URL(input);
+      if (url.pathname === '/hello') return response(200, { app: 'chat-on-steroids', paired: true });
+      if (url.pathname === '/commands/ack') return response(200, { ok: true, committed: true });
+      return response(404, {});
+    });
+    const worker = loadWorker({ local, session, fetch });
+    const commandId = 'worker-command-kept-open';
+    const conversationId = '11111111-2222-3333-4444-555555555555';
+    const tab = {
+      id: 82,
+      windowId: 7,
+      url: `https://chatgpt.com/?clf=${commandId}#clf=${commandId}`
+    };
+    const documentId = 'worker-command-document';
+
+    await worker.registerDocument(tab, documentId);
+    await worker.sendFrom(
+      { type: 'ack', id: commandId, status: 'sent', agent: 'worker-1', conversationId },
+      tab,
+      documentId
+    );
+
+    expect(worker.tabsRemove).not.toHaveBeenCalled();
+  });
+
   it('preserves the observation journal on a 426 protocol mismatch', async () => {
     const local = new FakeStorageArea({ port: 8765, token: 'paired-token' });
     const session = new FakeStorageArea();
