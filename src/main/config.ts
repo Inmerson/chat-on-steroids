@@ -30,7 +30,6 @@ import {
 } from '../shared/goal.js';
 import { logError } from './logger.js';
 import { RESERVED_ROOT_NAMES } from './sandbox.js';
-import { capabilitiesForPlatform } from './platform.js';
 
 /**
  * Defaults for the newer sections, in one place so the schema and defaultConfig()
@@ -43,10 +42,9 @@ import { capabilitiesForPlatform } from './platform.js';
  * configs only: an existing config already carries an explicit `record`, and a user who
  * turned it off keeps it off.
  *
- * Existing configs still keep every explicit permission choice. Fresh installs are different:
- * the Home screen is meant to start fully usable, so every tool permission and the agents
- * surface begin enabled. The migration defaults below remain conservative so an upgrade never
- * widens an older config merely because a field did not exist when that config was written.
+ * Existing configs still keep every explicit permission choice. Fresh installs use the same
+ * conservative capability baseline as migrations: first launch is not permission consent, and
+ * the user can deliberately widen it from the Permissions card afterwards.
  */
 /**
  * Where the pressure meter turns amber and red.
@@ -133,11 +131,6 @@ const DEFAULT_GOAL: GoalSettings = {
 // Two workers, not three: three concurrent workers reproducibly trips ChatGPT's rate limit
 // ("too many requests"), which strands the run rather than making it faster.
 const DEFAULT_MULTI_AGENT: MultiAgentSettings = { enabled: false, maxWorkers: 2 };
-/** Fresh-install exposure. Kept separate from migration defaults on purpose. */
-const ALL_FIRST_LAUNCH_CAPABILITIES: Capabilities = Object.fromEntries(
-  CAPABILITIES.map((capability) => [capability, true])
-) as Capabilities;
-const FIRST_LAUNCH_MULTI_AGENT: MultiAgentSettings = { enabled: true, maxWorkers: DEFAULT_MULTI_AGENT.maxWorkers };
 
 const rootSchema = z.object({
   name: z
@@ -322,21 +315,18 @@ const configSchema = z.object({
     .default({ ...DEFAULT_GOAL })
 });
 
-export function defaultConfig(platform: NodeJS.Platform = process.platform): Config {
+export function defaultConfig(_platform: NodeJS.Platform = process.platform): Config {
   return {
     roots: [],
-    // Computer use is intentionally not part of the macOS/Linux port. Fresh installs on those
-    // hosts should therefore never present Windows-only permissions as granted, even though the
-    // stored schema remains cross-platform so one config can still be moved between machines.
-    capabilities: capabilitiesForPlatform({ ...ALL_FIRST_LAUNCH_CAPABILITIES }, platform),
-    readOnly: false,
+    capabilities: { ...DEFAULT_CAPABILITIES },
+    readOnly: true,
     allComputer: false,
     previousRoots: [],
     tunnel: { kind: 'openai', tunnelId: '', desktopTunnelId: '', binaryPath: '' },
     ui: { minimizeToTray: true, autoConnect: false, privacyScreenshots: false, theme: 'dark' },
     sessions: { ...DEFAULT_SESSIONS },
     compaction: { ...DEFAULT_COMPACTION },
-    multiAgent: { ...FIRST_LAUNCH_MULTI_AGENT },
+    multiAgent: { ...DEFAULT_MULTI_AGENT },
     goal: { ...DEFAULT_GOAL }
   };
 }
@@ -344,10 +334,9 @@ export function defaultConfig(platform: NodeJS.Platform = process.platform): Con
 /**
  * Recovery for a config file that exists but cannot be trusted.
  *
- * A missing file is a real first launch and intentionally gets the fully-enabled defaults
- * above. A malformed/corrupt existing file is different: treating damage as consent would
- * widen filesystem/desktop/process access merely because parsing failed. Keep that path on
- * the historical narrow capability set and read-only mode until the user saves settings again.
+ * A missing file and a malformed existing file both start from the conservative authority
+ * baseline. Corruption must never become permission consent; the dedicated recovery function
+ * remains here so future non-authority defaults can still differ without weakening that rule.
  */
 function conservativeRecoveryConfig(): Config {
   return {
