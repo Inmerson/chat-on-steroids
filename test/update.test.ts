@@ -206,7 +206,7 @@ describe('finding a newer release', () => {
 });
 
 describe('staging the new version', () => {
-  it('downloads the artifact, checks it against the published SHA-256, and installs it on quit', async () => {
+  it('downloads, verifies, and hands the Windows installer to supported current-user mode on quit', async () => {
     const { asked, body } = github();
     await asPlatform('win32', undefined, () => checkForUpdates());
 
@@ -220,7 +220,10 @@ describe('staging the new version', () => {
     // The quit half of the restart: the file that was staged is the one handed over, silently,
     // and without starting the app again behind a user who quit for their own reasons.
     await applyStagedUpdate();
-    expect(spawned).toEqual([{ file: staged, args: ['/S', '--updated'] }]);
+    // `/currentuser` is not cosmetic. Without it electron-builder may inherit an old all-users
+    // install and redirect this non-elevated updater to Program Files, where the installer ACL
+    // repair cannot succeed. The updater therefore chooses the per-user mode explicitly.
+    expect(spawned).toEqual([{ file: staged, args: ['/S', '/currentuser', '--updated'] }]);
   });
 
   /**
@@ -353,7 +356,7 @@ describe('a download that survives the process that fetched it', () => {
 
     await applyStagedUpdate();
     expect(spawned).toEqual([
-      { file: path.join(userData, 'updates', NEXT, WINDOWS_ASSET), args: ['/S', '--updated'] }
+      { file: path.join(userData, 'updates', NEXT, WINDOWS_ASSET), args: ['/S', '/currentuser', '--updated'] }
     ]);
   });
 
@@ -401,7 +404,10 @@ describe('installing on request', () => {
     expect(markInstallOnQuit()).toBe(true);
     await applyStagedUpdate();
     expect(spawned).toEqual([
-      { file: path.join(userData, 'updates', NEXT, WINDOWS_ASSET), args: ['/S', '--updated', '--force-run'] }
+      {
+        file: path.join(userData, 'updates', NEXT, WINDOWS_ASSET),
+        args: ['/S', '/currentuser', '--updated', '--force-run']
+      }
     ]);
   });
 
@@ -440,7 +446,7 @@ describe('installing on request', () => {
     await asPlatform('win32', undefined, () => checkForUpdates());
     await applyStagedUpdate();
     expect(spawned).toEqual([
-      { file: path.join(userData, 'updates', NEXT, WINDOWS_ASSET), args: ['/S', '--updated'] }
+      { file: path.join(userData, 'updates', NEXT, WINDOWS_ASSET), args: ['/S', '/currentuser', '--updated'] }
     ]);
   });
 });
