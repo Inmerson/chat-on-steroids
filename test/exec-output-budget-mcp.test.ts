@@ -60,10 +60,11 @@ async function serve(): Promise<McpEndpoint> {
   initSessionStore(dir);
   initDurableStore(dir);
   const cfg = defaultConfig();
-  await saveConfig({ ...cfg, roots: [{ name: 'probe', path: dir }], readOnly: false });
+  const caps = { ...cfg.capabilities, command: true };
+  await saveConfig({ ...cfg, roots: [{ name: 'probe', path: dir }], capabilities: caps, readOnly: false });
   return startMcpServer(() => ({
     roots: [{ name: 'probe', path: dir }],
-    caps: cfg.capabilities,
+    caps,
     readOnly: false,
     sessionTools: false,
     agentTools: false

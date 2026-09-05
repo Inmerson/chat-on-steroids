@@ -2,7 +2,7 @@ import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { defaultConfig, initConfigPath, loadConfig, saveConfig, updateConfig } from '../src/main/config.js';
-import { DESKTOP_CAPABILITIES, type Capability } from '../src/shared/types.js';
+import { DEFAULT_CAPABILITIES } from '../src/shared/types.js';
 import { makeTempDir, removeTempDir } from './helpers.js';
 
 let dir: string;
@@ -298,32 +298,25 @@ describe('settings migration', () => {
 
 /** Fresh-install defaults, while migrations above prove existing choices stay narrow. */
 describe('shipped defaults', () => {
-  const expectedFreshCapability = (capability: Capability, platform: NodeJS.Platform): boolean =>
-    platform === 'win32' || !DESKTOP_CAPABILITIES.includes(capability);
-
   it('records sessions from first launch', () => {
     expect(defaultConfig().sessions.record).toBe(true);
   });
 
-  it('loads a genuinely missing config with every portable Core capability enabled', async () => {
+  it('loads a genuinely missing config in the restricted authority profile', async () => {
     await fs.rm(path.join(dir, 'config.json'), { force: true });
     const loaded = await loadConfig();
-    expect(loaded.readOnly).toBe(false);
-    for (const [capability, enabled] of Object.entries(loaded.capabilities) as Array<[Capability, boolean]>) {
-      expect(enabled, capability).toBe(expectedFreshCapability(capability, process.platform));
-    }
-    expect(loaded.multiAgent.enabled).toBe(true);
+    expect(loaded.readOnly).toBe(true);
+    expect(loaded.capabilities).toEqual(DEFAULT_CAPABILITIES);
+    expect(loaded.multiAgent.enabled).toBe(false);
   });
 
   it.each(['win32', 'darwin', 'linux'] as const)(
-    'starts portable permissions on and only offers Desktop automation where supported on %s',
+    'does not widen restricted first-launch authority on %s',
     (platform) => {
       const config = defaultConfig(platform);
-      expect(config.readOnly).toBe(false);
-      for (const [capability, enabled] of Object.entries(config.capabilities) as Array<[Capability, boolean]>) {
-        expect(enabled, `${platform}:${capability}`).toBe(expectedFreshCapability(capability, platform));
-      }
-      expect(config.multiAgent.enabled).toBe(true);
+      expect(config.readOnly).toBe(true);
+      expect(config.capabilities).toEqual(DEFAULT_CAPABILITIES);
+      expect(config.multiAgent.enabled).toBe(false);
       expect(config.multiAgent.maxWorkers).toBe(2);
     }
   );

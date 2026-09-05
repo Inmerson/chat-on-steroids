@@ -368,7 +368,9 @@ export async function applyStagedUpdate(): Promise<void> {
       // already owns, so it keeps the location and the shortcuts instead of asking about them.
       // `--force-run` is added only when the user pressed Install and is waiting for the app to
       // come back; an update applied on the way out of an ordinary quit must not reopen it.
-      const args = relaunch ? ['/S', '--updated', '--force-run'] : ['/S', '--updated'];
+      const args = relaunch
+        ? ['/S', '/currentuser', '--updated', '--force-run']
+        : ['/S', '/currentuser', '--updated'];
       const installer = spawn(ready.file, args, { detached: true, stdio: 'ignore', windowsHide: true });
       // An installer that cannot start reports it asynchronously, and an unhandled 'error' on a
       // child process would take the quit down with it.
