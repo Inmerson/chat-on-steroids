@@ -1696,7 +1696,6 @@ describe('through the MCP endpoint', () => {
   ): Promise<Record<string, unknown>> => {
     const seq = ++evidenceSeq;
     const requestId = `wfr_agents_${seq}`;
-    const pending = replyWithRequestId(requestId, action, args);
     await recordChatObservations(conversationId, [
       { kind: 'turn_start', time: Date.now(), turnId: `t-${seq}` },
       {
@@ -1706,13 +1705,13 @@ describe('through the MCP endpoint', () => {
         calls: [{ messageId: `m-${seq}`, tool: 'agents', order: 0, answered: false, requestId }]
       }
     ]);
-    return (await pending).result?.structuredContent ?? {};
+    const reply = await replyWithRequestId(requestId, action, args);
+    return reply.result?.structuredContent ?? {};
   };
 
   const asChat = async (conversationId: string, action: string, args: Record<string, unknown> = {}): Promise<string> => {
     const seq = ++evidenceSeq;
     const requestId = `wfr_agents_${seq}`;
-    const pending = agentsWithRequestId(requestId, action, args);
     await recordChatObservations(conversationId, [
       { kind: 'turn_start', time: Date.now(), turnId: `t-${seq}` },
       {
@@ -1722,7 +1721,7 @@ describe('through the MCP endpoint', () => {
         calls: [{ messageId: `m-${seq}`, tool: 'agents', order: 0, answered: false, requestId }]
       }
     ]);
-    return pending;
+    return agentsWithRequestId(requestId, action, args);
   };
 
   beforeEach(async () => {
