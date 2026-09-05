@@ -1,6 +1,6 @@
 import type { ConnectionStatus } from './types.js';
 
-export const CORE_PROTOCOL_VERSION = 4;
+export const CORE_PROTOCOL_VERSION = 5;
 
 export const CORE_CAPABILITIES = [
   'connection-status',
@@ -8,7 +8,8 @@ export const CORE_CAPABILITIES = [
   'settings-apply',
   'execution-probe',
   'structured-health',
-  'secret-storage'
+  'secret-storage',
+  'ui-runtime'
 ] as const;
 
 export type CoreCapability = (typeof CORE_CAPABILITIES)[number];
@@ -59,6 +60,23 @@ export interface CoreStatusEnvelope {
   health?: CoreHealthStatus;
 }
 
+/**
+ * Fixed UI operations whose authoritative state lives in the persistent Core Host.
+ * This is intentionally an enum rather than a method/path string supplied by the renderer.
+ */
+export type CoreUiOperation =
+  | 'bridge-status'
+  | 'bridge-unpair'
+  | 'session-list'
+  | 'session-events'
+  | 'session-delete'
+  | 'handoff-get'
+  | 'swarm-get'
+  | 'swarm-reset'
+  | 'swarm-clear-agent'
+  | 'control-center-status'
+  | 'goal-models';
+
 export type CoreCommandName =
   | 'hello'
   | 'status'
@@ -67,6 +85,7 @@ export type CoreCommandName =
   | 'apply-settings'
   | 'secret-status'
   | 'set-secret'
+  | 'ui-call'
   | 'shutdown-core';
 
 interface CoreRequestBase {
@@ -75,8 +94,11 @@ interface CoreRequestBase {
 }
 
 export type CoreRequest =
-  | (CoreRequestBase & { command: Exclude<CoreCommandName, 'set-secret'> })
-  | (CoreRequestBase & { command: 'set-secret'; key: CoreSecretKey; value: string });
+  | (CoreRequestBase & {
+      command: Exclude<CoreCommandName, 'set-secret' | 'ui-call'>;
+    })
+  | (CoreRequestBase & { command: 'set-secret'; key: CoreSecretKey; value: string })
+  | (CoreRequestBase & { command: 'ui-call'; operation: CoreUiOperation; payload: unknown });
 
 export interface CoreResponse<T = unknown> {
   id: string;
