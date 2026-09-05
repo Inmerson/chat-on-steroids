@@ -1,5 +1,5 @@
 import http from 'node:http';
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it } from 'vitest';
 import { startMcpServer, type McpEndpoint } from '../src/main/mcp/server.js';
 import type { ToolContext } from '../src/main/mcp/tools.js';
 import { DEFAULT_CAPABILITIES } from '../src/shared/types.js';
