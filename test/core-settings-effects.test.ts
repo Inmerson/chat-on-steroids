@@ -10,7 +10,9 @@ function deps() {
     cancelWorkerCommands: vi.fn(() => 2),
     persistAgentAuthorityNow: vi.fn(async () => true),
     retireGoalDrafts: vi.fn(),
-    forgetExposedSurface: vi.fn()
+    forgetExposedSurface: vi.fn(),
+    forgetWorkspaceRoot: vi.fn(),
+    renameWorkspaceRoot: vi.fn()
   };
 }
 
@@ -68,5 +70,34 @@ describe('Core settings side-effect ownership', () => {
     await reconcileCoreSettingsEffects(before, after, effects);
 
     expect(effects.retireGoalDrafts).toHaveBeenCalledTimes(1);
+  });
+
+  it('forgets removed workspace roots inside Core', async () => {
+    const before = defaultConfig();
+    before.roots = [
+      { name: 'project', path: '/work/project' },
+      { name: 'docs', path: '/work/docs' }
+    ];
+    const after = structuredClone(before);
+    after.roots = [{ name: 'project', path: '/work/project' }];
+    const effects = deps();
+
+    await reconcileCoreSettingsEffects(before, after, effects);
+
+    expect(effects.forgetWorkspaceRoot).toHaveBeenCalledWith('docs');
+    expect(effects.renameWorkspaceRoot).not.toHaveBeenCalled();
+  });
+
+  it('renames a Core workspace root when the same approved path receives a new name', async () => {
+    const before = defaultConfig();
+    before.roots = [{ name: 'project', path: '/work/project' }];
+    const after = structuredClone(before);
+    after.roots = [{ name: 'code', path: '/work/project' }];
+    const effects = deps();
+
+    await reconcileCoreSettingsEffects(before, after, effects);
+
+    expect(effects.renameWorkspaceRoot).toHaveBeenCalledWith('project', 'code');
+    expect(effects.forgetWorkspaceRoot).not.toHaveBeenCalled();
   });
 });
