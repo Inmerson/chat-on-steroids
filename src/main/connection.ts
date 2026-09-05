@@ -14,6 +14,7 @@ import { hasSecret, setSecret } from './secrets.js';
 import { uiConnectionFacade } from './core/ui-connection.js';
 
 const UI_CLIENT_MODE = process.env.COS_CORE_UI_CLIENT === '1';
+export type CoreRuntimeChangeKind = 'bridge' | 'session' | 'swarm';
 
 function ui() {
   return uiConnectionFacade();
@@ -37,6 +38,10 @@ export function getCoreHealth(): CoreHealthStatus | null {
 
 export function onCoreHealthChange(listener: (health: CoreHealthStatus | null) => void): () => void {
   return UI_CLIENT_MODE ? ui().onCoreHealthChange(listener) : () => undefined;
+}
+
+export function onCoreRuntimeChange(listener: (kind: CoreRuntimeChangeKind) => void): () => void {
+  return UI_CLIENT_MODE ? ui().onRuntimeChange(listener) : () => undefined;
 }
 
 export function connect(): Promise<void> {
