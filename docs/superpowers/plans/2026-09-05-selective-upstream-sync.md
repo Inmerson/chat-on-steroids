@@ -487,4 +487,3 @@
 - [ ] **Step 5: Final branch review**
 
   Review `origin/main..HEAD` as one branch and reject any change that is not attributable to one of Tasks 1–5. Do not merge or push to a shared branch as part of this task; integration/push is a separate explicit side effect.
-
