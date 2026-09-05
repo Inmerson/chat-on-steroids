@@ -26,7 +26,8 @@ const CORE_UI_OPERATIONS = new Set<CoreUiOperation>([
   'swarm-reset',
   'swarm-clear-agent',
   'control-center-status',
-  'goal-models'
+  'goal-models',
+  'diagnostics-run'
 ]);
 
 /**
