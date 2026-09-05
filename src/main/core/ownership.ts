@@ -48,17 +48,27 @@ async function controlRequest(endpoint: string, command: 'ping' | 'shutdown'): P
   });
 }
 
+function pidFromReply(reply: string | null, prefix: string): number | null {
+  if (!reply?.startsWith(`${prefix}:`)) return null;
+  const pid = Number(reply.slice(prefix.length + 1));
+  return Number.isSafeInteger(pid) && pid > 0 ? pid : null;
+}
+
 async function endpointIsLive(endpoint: string): Promise<boolean> {
-  return (await controlRequest(endpoint, 'ping')) === 'ok';
+  return pidFromReply(await controlRequest(endpoint, 'ping'), 'ok') !== null;
+}
+
+/** Returns the live supervisor PID, or null when this profile has no supervisor. */
+export async function coreSupervisorPid(userDataDir: string): Promise<number | null> {
+  return pidFromReply(await controlRequest(supervisorEndpointForUserData(userDataDir), 'ping'), 'ok');
 }
 
 /**
- * Explicit updater/system-shutdown control. This is deliberately narrow: no PID, executable or
- * arbitrary command crosses the endpoint. Absence is a normal result because a profile may not
- * have started its persistent supervisor yet.
+ * Explicit updater/system-shutdown control. The returned PID is diagnostic/wait metadata only;
+ * the named-pipe/socket response is the authority that this is the supervisor owning the profile.
  */
-export async function requestCoreSupervisorStop(userDataDir: string): Promise<boolean> {
-  return (await controlRequest(supervisorEndpointForUserData(userDataDir), 'shutdown')) === 'stopping';
+export async function requestCoreSupervisorStop(userDataDir: string): Promise<number | null> {
+  return pidFromReply(await controlRequest(supervisorEndpointForUserData(userDataDir), 'shutdown'), 'stopping');
 }
 
 function serveControl(socket: Socket, options: CoreSupervisorLockOptions): void {
@@ -75,11 +85,11 @@ function serveControl(socket: Socket, options: CoreSupervisorLockOptions): void 
     if (newline === -1) return;
     const command = buffer.slice(0, newline).trim();
     if (command === 'ping') {
-      socket.end('ok\n');
+      socket.end(`ok:${process.pid}\n`);
       return;
     }
     if (command === 'shutdown') {
-      socket.end('stopping\n');
+      socket.end(`stopping:${process.pid}\n`);
       setImmediate(() => options.onShutdown?.());
       return;
     }
