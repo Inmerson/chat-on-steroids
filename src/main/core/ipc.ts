@@ -6,11 +6,14 @@ import type {
   CoreHello,
   CoreRequest,
   CoreResponse,
+  CoreSecretKey,
+  CoreSecretStatus,
   CoreStatusEnvelope
 } from '../../shared/core-protocol.js';
 
 const MAX_IPC_MESSAGE_BYTES = 128 * 1024;
 const IPC_TIMEOUT_MS = 2_000;
+const MAX_SECRET_VALUE_CHARS = 500;
 
 /**
  * User-scoped rendezvous endpoint for the persistent Core Host.
@@ -81,6 +84,8 @@ export interface CoreIpcHandlers {
   connect: () => Promise<void>;
   disconnect: () => Promise<void>;
   applySettings: () => Promise<void>;
+  secretStatus: () => CoreSecretStatus | Promise<CoreSecretStatus>;
+  setSecret: (key: CoreSecretKey, value: string) => Promise<void>;
   shutdownCore: () => Promise<void>;
 }
 
@@ -91,6 +96,10 @@ export interface CoreIpcServer {
 
 function response(socket: Socket, value: CoreResponse): void {
   socket.end(`${JSON.stringify(value)}\n`);
+}
+
+function validSecretKey(value: unknown): value is CoreSecretKey {
+  return value === 'openaiApiKey' || value === 'openRouterApiKey';
 }
 
 async function dispatch(request: CoreRequest, handlers: CoreIpcHandlers): Promise<unknown> {
@@ -108,6 +117,14 @@ async function dispatch(request: CoreRequest, handlers: CoreIpcHandlers): Promis
     case 'apply-settings':
       await handlers.applySettings();
       return handlers.status();
+    case 'secret-status':
+      return handlers.secretStatus();
+    case 'set-secret':
+      if (!validSecretKey(request.key) || typeof request.value !== 'string' || request.value.length > MAX_SECRET_VALUE_CHARS) {
+        throw new Error('Invalid Core secret mutation');
+      }
+      await handlers.setSecret(request.key, request.value);
+      return undefined;
     case 'shutdown-core':
       await handlers.shutdownCore();
       return true;
@@ -228,9 +245,9 @@ export class CoreIpcClient {
     private readonly timeoutMs = IPC_TIMEOUT_MS
   ) {}
 
-  private async request<T>(command: CoreRequest['command']): Promise<T> {
+  private async request<T>(command: CoreRequest['command'], extra: Record<string, unknown> = {}): Promise<T> {
     const id = randomUUID();
-    const wire: CoreRequest = { id, token: this.token, command };
+    const wire = { id, token: this.token, command, ...extra } as CoreRequest;
     return new Promise<T>((resolve, reject) => {
       const socket = createConnection(this.endpoint);
       let buffered = '';
@@ -289,6 +306,14 @@ export class CoreIpcClient {
 
   applySettings(): Promise<CoreStatusEnvelope> {
     return this.request('apply-settings');
+  }
+
+  secretStatus(): Promise<CoreSecretStatus> {
+    return this.request('secret-status');
+  }
+
+  setSecret(key: CoreSecretKey, value: string): Promise<void> {
+    return this.request('set-secret', { key, value });
   }
 
   shutdownCore(): Promise<boolean> {
