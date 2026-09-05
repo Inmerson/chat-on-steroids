@@ -4,6 +4,7 @@ import path from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   acquireCoreSupervisorLock,
+  coreSupervisorPid,
   requestCoreSupervisorStop,
   supervisorEndpointForUserData,
   type CoreSupervisorLock
@@ -38,18 +39,20 @@ describe('Core supervisor ownership', () => {
     await expect(acquireCoreSupervisorLock(dir)).rejects.toThrow(/supervisor.*running|already.*owned/i);
   });
 
-  it('accepts one explicit local shutdown command so an installed update can quiesce the watchdog first', async () => {
+  it('accepts one explicit local shutdown command and returns the owning PID for installer wait', async () => {
     const dir = await root();
     const onShutdown = vi.fn();
     const lock = await acquireCoreSupervisorLock(dir, { onShutdown });
     locks.push(lock);
 
-    await expect(requestCoreSupervisorStop(dir)).resolves.toBe(true);
+    await expect(coreSupervisorPid(dir)).resolves.toBe(process.pid);
+    await expect(requestCoreSupervisorStop(dir)).resolves.toBe(process.pid);
     expect(onShutdown).toHaveBeenCalledTimes(1);
   });
 
-  it('returns false when no supervisor owns the profile instead of making update shutdown fail', async () => {
+  it('returns null when no supervisor owns the profile instead of making update shutdown fail', async () => {
     const dir = await root();
-    await expect(requestCoreSupervisorStop(dir)).resolves.toBe(false);
+    await expect(coreSupervisorPid(dir)).resolves.toBeNull();
+    await expect(requestCoreSupervisorStop(dir)).resolves.toBeNull();
   });
 });
