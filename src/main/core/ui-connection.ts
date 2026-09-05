@@ -14,6 +14,8 @@ import {
 import { CoreIpcClient, coreEndpointForUserData, ensureCoreIpcToken, shouldAcceptCoreEnvelope } from './ipc.js';
 import { startCoreSupervisorDetached } from './process.js';
 
+type RuntimeChangeKind = 'bridge' | 'session' | 'swarm';
+
 interface CoreClient {
   hello(): Promise<CoreHello>;
   status(): Promise<CoreStatusEnvelope>;
@@ -58,6 +60,7 @@ export interface UiConnectionFacade {
   getCoreHealth(): CoreHealthStatus | null;
   onStatusChange(listener: (status: ConnectionStatus) => void): () => void;
   onCoreHealthChange(listener: (health: CoreHealthStatus | null) => void): () => void;
+  onRuntimeChange(listener: (kind: RuntimeChangeKind) => void): () => void;
   refresh(): Promise<void>;
   connect(): Promise<void>;
   disconnect(): Promise<void>;
@@ -74,6 +77,9 @@ export function createUiConnectionFacade(options: UiConnectionFacadeOptions): Ui
   let status: ConnectionStatus = { ...EMPTY_STATUS };
   let health: CoreHealthStatus | null = null;
   let generation = -1;
+  let bridgeRevision = -1;
+  let sessionRevision = -1;
+  let swarmRevision = -1;
   let activeClient: CoreClient | null = null;
   let supervisorStarted = false;
   let finalShutdown = false;
@@ -81,11 +87,23 @@ export function createUiConnectionFacade(options: UiConnectionFacadeOptions): Ui
   let refreshInFlight: Promise<void> | null = null;
   const statusListeners = new Set<(value: ConnectionStatus) => void>();
   const healthListeners = new Set<(value: CoreHealthStatus | null) => void>();
+  const runtimeListeners = new Set<(kind: RuntimeChangeKind) => void>();
   const sleep = options.sleep ?? sleepDefault;
+
+  const publishRevision = (kind: RuntimeChangeKind, previous: number, next: number | undefined): number => {
+    if (next === undefined) return previous;
+    if (previous >= 0 && next !== previous) {
+      for (const listener of runtimeListeners) listener(kind);
+    }
+    return next;
+  };
 
   const publish = (envelope: CoreStatusEnvelope): void => {
     if (!shouldAcceptCoreEnvelope(generation, envelope)) return;
     generation = envelope.generation;
+    bridgeRevision = publishRevision('bridge', bridgeRevision, envelope.bridgeRevision);
+    sessionRevision = publishRevision('session', sessionRevision, envelope.sessionRevision);
+    swarmRevision = publishRevision('swarm', swarmRevision, envelope.swarmRevision);
     status = { ...EMPTY_STATUS, ...envelope.status } as ConnectionStatus;
     health = envelope.health ?? health;
     for (const listener of statusListeners) listener({ ...status });
@@ -130,8 +148,6 @@ export function createUiConnectionFacade(options: UiConnectionFacadeOptions): Ui
       try {
         const peer = await candidate.hello();
         if (!compatible(peer)) {
-          // A protocol-incompatible old host cannot share the ownership endpoint with its
-          // replacement. Ask it to quiesce, then let the independent supervisor start this build.
           await candidate.shutdownCore().catch(() => false);
           throw new Error('Core protocol is incompatible');
         }
@@ -210,6 +226,11 @@ export function createUiConnectionFacade(options: UiConnectionFacadeOptions): Ui
       ensurePolling();
       return () => healthListeners.delete(listener);
     },
+    onRuntimeChange: (listener) => {
+      runtimeListeners.add(listener);
+      ensurePolling();
+      return () => runtimeListeners.delete(listener);
+    },
     refresh,
     connect: () => runCommand((client) => client.connect()),
     disconnect: () => runCommand((client) => client.disconnect()),
@@ -218,7 +239,6 @@ export function createUiConnectionFacade(options: UiConnectionFacadeOptions): Ui
     setSecret: (key, value) => runCoreCall((client) => client.setSecret(key, value)),
     uiCall: <T>(operation: CoreUiOperation, payload: unknown) => runCoreCall((client) => client.uiCall<T>(operation, payload)),
     shutdownConnection: async () => {
-      // UI lifecycle is not Core lifecycle. Stop only this process's polling/admission to IPC.
       finalShutdown = true;
       if (pollTimer) clearInterval(pollTimer);
       pollTimer = null;
