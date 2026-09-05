@@ -1653,18 +1653,18 @@ describe('canonical recorder 1.8', () => {
     const recorded = JSON.parse(serialized) as Record<string, any>;
     expect(recorded.path).toBe('/project/src/main.ts');
     expect(recorded.diagnostics).toEqual({ exitCode: 7, label: 'keep this metadata' });
-    expect(recorded.auth.Authorization).toBe('[redacted]');
-    expect(recorded.auth.token).toBe('[redacted]');
-    expect(recorded.auth.access_token).toBe('[redacted]');
-    expect(recorded.auth.Refresh_Token).toBe('[redacted]');
-    expect(recorded.auth.password).toBe('[redacted]');
-    expect(recorded.auth.passwd).toBe('[redacted]');
-    expect(recorded.auth.api_key).toBe('[redacted]');
-    expect(recorded.auth.apiKey).toBe('[redacted]');
-    expect(recorded.auth.nested[0]).toEqual({ secret: '[redacted]', cookie: '[redacted]' });
+    expect(recorded.auth.Authorization).toBe('<removed>');
+    expect(recorded.auth.token).toBe('<removed>');
+    expect(recorded.auth.access_token).toBe('<removed>');
+    expect(recorded.auth.Refresh_Token).toBe('<removed>');
+    expect(recorded.auth.password).toBe('<removed>');
+    expect(recorded.auth.passwd).toBe('<removed>');
+    expect(recorded.auth.api_key).toBe('<removed>');
+    expect(recorded.auth.apiKey).toBe('<removed>');
+    expect(recorded.auth.nested[0]).toEqual({ secret: '<removed>', cookie: '<removed>' });
     expect(recorded.auth.nested[1]).toEqual({
-      'Set-Cookie': '[redacted]',
-      client_secret: '[redacted]',
+      'Set-Cookie': '<removed>',
+      client_secret: '<removed>',
       label: 'keep nested label'
     });
   });

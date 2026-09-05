@@ -14,7 +14,7 @@ const CREDENTIAL_FIELDS = new Set([
   'client_secret'
 ]);
 
-const REDACTED = '[redacted]';
+const REDACTED = '<removed>';
 
 /**
  * Recursively removes credential-valued fields while preserving the surrounding diagnostic
