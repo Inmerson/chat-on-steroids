@@ -1,9 +1,10 @@
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   acquireCoreSupervisorLock,
+  requestCoreSupervisorStop,
   supervisorEndpointForUserData,
   type CoreSupervisorLock
 } from '../src/main/core/ownership.js';
@@ -35,5 +36,20 @@ describe('Core supervisor ownership', () => {
     locks.push(first);
 
     await expect(acquireCoreSupervisorLock(dir)).rejects.toThrow(/supervisor.*running|already.*owned/i);
+  });
+
+  it('accepts one explicit local shutdown command so an installed update can quiesce the watchdog first', async () => {
+    const dir = await root();
+    const onShutdown = vi.fn();
+    const lock = await acquireCoreSupervisorLock(dir, { onShutdown });
+    locks.push(lock);
+
+    await expect(requestCoreSupervisorStop(dir)).resolves.toBe(true);
+    expect(onShutdown).toHaveBeenCalledTimes(1);
+  });
+
+  it('returns false when no supervisor owns the profile instead of making update shutdown fail', async () => {
+    const dir = await root();
+    await expect(requestCoreSupervisorStop(dir)).resolves.toBe(false);
   });
 });
