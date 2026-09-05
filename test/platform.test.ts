@@ -23,18 +23,18 @@ const allCapabilities = (): Capabilities => ({
 });
 
 describe('cross-platform product surface', () => {
-  it.each(['darwin', 'linux'] as const)('keeps Core fully usable while omitting Desktop on %s', (platform) => {
+  it.each(['darwin', 'linux'] as const)('keeps restricted Core useful while omitting Desktop on %s', (platform) => {
     const config = defaultConfig(platform);
     expect(config.capabilities).toMatchObject({
       browse: true,
       search: true,
       read: true,
       metadata: true,
-      create: true,
-      edit: true,
-      move: true,
-      deleteFile: true,
-      command: true,
+      create: false,
+      edit: false,
+      move: false,
+      deleteFile: false,
+      command: false,
       screen: false,
       control: false,
       clipboardRead: false,
@@ -46,7 +46,7 @@ describe('cross-platform product surface', () => {
 
   it('masks stored Windows Desktop grants at runtime without deleting the stored choices', () => {
     const stored = allCapabilities();
-    const config = { ...defaultConfig('linux'), capabilities: stored };
+    const config = { ...defaultConfig('linux'), capabilities: stored, readOnly: false };
     const live = effectiveCapabilities(config, 'linux');
 
     expect(live.screen).toBe(false);

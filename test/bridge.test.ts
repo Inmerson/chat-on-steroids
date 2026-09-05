@@ -3936,6 +3936,7 @@ describe('the goal loop over the bridge', () => {
     await saveConfig({
       ...defaultConfig(),
       sessions: { ...defaultConfig().sessions, record: true },
+      multiAgent: { ...defaultConfig().multiAgent, enabled: true },
       goal: { ...defaultConfig().goal, enabled: true, model: 'deepseek/deepseek-v4-flash', reasoning: 'default' }
     });
     await setSecret('openRouterApiKey', 'sk-or-bridge');
