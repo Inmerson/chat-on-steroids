@@ -43,6 +43,14 @@ the 2.1 autonomous-execution line without replacing the newer orchestration arch
 - Update state is exposed through the existing app-state/IPC path, and the renderer shows install or
   manual-update actions without disrupting the Control Center layout.
 
+### Upstream lineage between 2.0.2 and the fork's 2.1.x line
+
+The original `totec448-spec/chat-on-steroids` project continued through upstream releases
+2.0.3, 2.0.4 and 2.0.5 before and while this fork's 2.1.x architecture was developed. Their
+historical release notes are preserved under `docs/release-notes/` for provenance. These are
+not Inmerson fork release tags. The fork's 2.1.x line selectively incorporates relevant
+upstream hardening while retaining Agent System 3.0, Control Center and autonomous execution.
+
 ## [2.1.0] — 2026-09-05
 
 2.1.0 integrates Agent System 3.0, Control Center, durable autonomous execution, Infinite Loop,
