@@ -58,6 +58,21 @@ export function backgroundExecObligations(conversationId: string | null | undefi
   return unifiedExecManager.backgroundState(processIds);
 }
 
+/** Bounded same-conversation reminders. This projection never drains terminal output. */
+export function backgroundExecRecoveryNotices(conversationId: string | null | undefined): string[] {
+  const exited = backgroundExecObligations(conversationId).exitedUnread;
+  if (exited.length === 0) return [];
+  const notices = exited.slice(0, 3).map(
+    (session) =>
+      `Background session ${session.processId} finished with exit code ${session.exitCode ?? 'unknown'} and has unread output. ` +
+      `Poll it with write_stdin(session_id=${session.processId}, chars="").`
+  );
+  if (exited.length > notices.length) {
+    notices.push(`${exited.length - notices.length} more background session result(s) are waiting to be polled.`);
+  }
+  return notices;
+}
+
 /**
  * Whether `processId` is unknown to the connector. Conversation identity is deliberately not
  * consulted for authorization; all authenticated MCP chats share the enabled Core authority.

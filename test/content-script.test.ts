@@ -2160,6 +2160,38 @@ describe('the app-owned chronological stream', () => {
     expect(disclosure.textContent).not.toContain('private-result-sentinel');
   });
 
+  it('renders canonical process, refusal and internal-error outcomes without exposing payloads', async () => {
+    const withOutcomes = () => {
+      const payload = activity();
+      const process = payload.data.stream.find((entry) => entry.seq === 4)!;
+      const refusal = payload.data.stream.find((entry) => entry.seq === 3)!;
+      Object.assign(process, { outcome: 'process_exit_nonzero', args: 'raw-process-args', result: 'raw-process-result' });
+      Object.assign(refusal, { outcome: 'tool_rejected', args: 'raw-refusal-args', result: 'raw-refusal-result' });
+      return payload;
+    };
+    live = await harness(undefined, { activity: withOutcomes });
+    renderingOn();
+    const section = assistantTurn(live.document, turnId, []);
+    await bindFiberRequest(section, 'wfr-app-stream');
+    live.hook.renderStreams();
+
+    const panels = overwriteRows(section, '.clf-stream-tool-panel');
+    expect(panels.some((node) => node.textContent?.includes('read_file · process exited non-zero'))).toBe(true);
+    expect(panels.some((node) => node.textContent?.includes('read_file · refused'))).toBe(true);
+    expect(section.textContent).not.toContain('raw-process-args');
+    expect(section.textContent).not.toContain('raw-process-result');
+    expect(section.textContent).not.toContain('raw-refusal-args');
+    expect(section.textContent).not.toContain('raw-refusal-result');
+
+    const internal = withOutcomes();
+    Object.assign(internal.data, { resetActivity: true });
+    Object.assign(internal.data.stream.find((entry) => entry.seq === 4)!, { outcome: 'tool_internal_error' });
+    live.reply.set('activity', () => internal);
+    await live.hook.pullActivity();
+    live.hook.renderStreams();
+    expect(overwriteRows(section, '.clf-stream-tool-panel').some((node) => node.textContent?.includes('failed'))).toBe(true);
+  });
+
   it('keeps only the same calls expanded when activity rows are repainted', async () => {
     live = await harness(undefined, { activity });
     renderingOn();
