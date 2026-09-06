@@ -10948,9 +10948,18 @@ describe('the goal loop', () => {
     await new Promise((resolve) => globalThis.setTimeout(resolve, 10));
 
     let scans = 0;
+    let resolveScan!: () => void;
+    const scanRequested = new Promise<void>((resolve, reject) => {
+      const timeout = globalThis.setTimeout(() => reject(new Error('hidden Stop mutation did not request Fiber')), 2_000);
+      resolveScan = () => {
+        globalThis.clearTimeout(timeout);
+        resolve();
+      };
+    });
     const onAsk = (event: any) => {
       if (!event.data || event.data.source !== 'clf-fiber-ask') return;
       scans++;
+      resolveScan();
       const scanToken = event.data.nonce;
       section.setAttribute('data-clf-fiber-turn', `${scanToken}:0`);
       // Goal's own settle loop is not what this regression freezes. Once the terminal Fiber
@@ -10989,7 +10998,7 @@ describe('the goal loop', () => {
     live.window.addEventListener('message', onAsk);
     try {
       stopGenerating(live.document);
-      await new Promise((resolve) => globalThis.setTimeout(resolve, 10));
+      await scanRequested;
       await settle(1200);
     } finally {
       live.window.removeEventListener('message', onAsk);

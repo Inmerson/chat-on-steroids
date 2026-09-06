@@ -7,7 +7,9 @@ export default defineConfig({
     // rather than being inlined by the bundler.
     plugins: [externalizeDepsPlugin()],
     build: {
-      rollupOptions: { input: resolve(__dirname, 'src/main/index.ts') }
+      // Keep the emitted name `out/main/index.js` (package.json's main) while routing the
+      // executable into UI, persistent Core Host, or supervisor mode before UI bootstrap runs.
+      rollupOptions: { input: { index: resolve(__dirname, 'src/main/bootstrap.ts') } }
     }
   },
   preload: {

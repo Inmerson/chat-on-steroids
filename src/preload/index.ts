@@ -8,6 +8,7 @@
 
 import { contextBridge, ipcRenderer } from 'electron';
 import type { AppState, Capabilities, Config, Diagnosis, LogEntry } from '../shared/types.js';
+import type { CoreHealthStatus } from '../shared/core-protocol.js';
 import type { ControlCenterStatus } from '../shared/control-center.js';
 import type {
   Handoff,
@@ -34,7 +35,6 @@ export interface SettingsPatch {
   goal: Config['goal'];
 }
 
-/** One page of the OpenRouter catalogue, as the model picker asks for it. */
 export interface GoalModelPage {
   models: Array<{ id: string; name: string; created: number; contextLength: number }>;
   total: number;
@@ -44,7 +44,6 @@ export interface SessionList {
   sessions: SessionSummary[];
   activeId: string | null;
   pressure: Array<TokenPressure & { id: string }>;
-  /** Total retained sessions, not merely the current IPC page. */
   total: number;
   nextCursor: SessionListCursor | null;
 }
@@ -58,19 +57,18 @@ export interface SessionDetail {
   summary: SessionSummary | null;
   events: SessionEvent[];
   total: number;
-  /** First sequence not represented by this response; pass back as `from` for live deltas. */
   nextFrom: number;
 }
 
 const api = {
   getState: () => call<AppState>('state:get'),
+  getCoreHealth: () => call<CoreHealthStatus | null>('core:health'),
   saveSettings: (patch: SettingsPatch, base: SettingsPatch) => call<AppState>('settings:save', { patch, base }),
   addRoot: () => call<AppState>('roots:add'),
   removeRoot: (name: string) => call<AppState>('roots:remove', { name }),
   renameRoot: (name: string, newName: string) => call<AppState>('roots:rename', { name, newName }),
   toggleAllComputer: () => call<AppState>('roots:allComputer:toggle'),
   setApiKey: (value: string) => call<AppState>('secret:set', { value }),
-  // The goal loop's own credential. Same channel, named slot; the value only ever goes in.
   setGoalKey: (value: string) => call<AppState>('secret:set', { value, key: 'openRouterApiKey' }),
   listGoalModels: (offset: number) => call<GoalModelPage>('goal:models', { offset }),
   pickBinary: () => call<AppState>('binary:pick'),
@@ -84,8 +82,6 @@ const api = {
   openLink: (url: string) => call<boolean>('link:open', { url }),
   installUpdate: () => call<boolean>('update:install'),
 
-  // Sessions, compaction and the browser bridge. Everything here is read-only or a
-  // named action; there is still no channel that takes a path or a command.
   listSessions: (options?: { cursor?: SessionListCursor; limit?: number }) =>
     call<SessionList>('sessions:list', options ?? {}),
   getSession: (id: string, options?: { from?: number; limit?: number }) =>
@@ -95,19 +91,13 @@ const api = {
 
   unpairExtension: () => call<AppState>('bridge:unpair'),
   downloadExtension: () => call<boolean>('bridge:downloadExtension'),
-  // The renderer can ask where the extension is and ask for it to be opened, but the
-  // path it gets back is only ever displayed: the open happens in the main process
-  // against a folder the renderer never chose.
   extensionPath: () => call<string | null>('bridge:extensionPath'),
   openExtensionFolder: () => call<string>('bridge:openExtensionFolder'),
 
-  // One read-only orchestration projection. No generic IPC escape hatch and no renderer input.
   getControlCenter: () => call<ControlCenterStatus>('control-center:get'),
 
   getSwarm: () => call<SwarmState>('swarm:get'),
   resetSwarm: () => call<SwarmState>('swarm:reset'),
-  // Clearing the prime ends the run; clearing a worker frees that slot. Which of the two
-  // happened comes back in the result — the renderer does not decide it.
   clearAgent: (id: string) => call<ClearAgentResult>('swarm:clearAgent', id),
 
   onStateChanged: (listener: (state: AppState) => void): (() => void) => {

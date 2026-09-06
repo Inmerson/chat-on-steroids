@@ -3,7 +3,7 @@
  *
  * Electron safeStorage delegates to the host OS: DPAPI on Windows, Keychain on macOS,
  * and a desktop secret store such as libsecret/KWallet on Linux. The plaintext key exists
- * only inside the main process: it is never sent over IPC, never written to config.json,
+ * only inside the main process: it is never sent over renderer IPC, never written to config.json,
  * and never logged. Linux's `basic_text` fallback is deliberately rejected below because
  * presenting obfuscation as credential encryption would weaken the app on the new port.
  */
@@ -17,6 +17,7 @@ import { logError, logWarn } from './logger.js';
 const FILE_NAME = 'secrets.bin';
 const LINUX_BASIC_TEXT_PREFIX = Buffer.from('v10', 'ascii');
 const LINUX_STORAGE_PROBE = 'chat-on-steroids-safe-storage-probe';
+const UI_CLIENT_MODE = process.env.COS_CORE_UI_CLIENT === '1';
 
 let secretsPath = '';
 let cache: Record<string, string> | null = null;
@@ -62,6 +63,11 @@ function enqueue<T>(operation: () => Promise<T>): Promise<T> {
  * OS-backed encrypted blob as the rest and never leaves the main process.
  */
 export type SecretKey = 'openaiApiKey' | 'bridgeToken' | 'openRouterApiKey';
+type UserApiSecretKey = Exclude<SecretKey, 'bridgeToken'>;
+
+function isUserApiSecretKey(key: SecretKey): key is UserApiSecretKey {
+  return key === 'openaiApiKey' || key === 'openRouterApiKey';
+}
 
 export function initSecretsPath(userDataDir: string): void {
   secretsPath = path.join(userDataDir, FILE_NAME);
@@ -139,28 +145,16 @@ function parseSecretStore(json: string): Record<string, string> {
 
 async function loadAll(): Promise<Record<string, string>> {
   const generation = loadGeneration;
-  // Keychain / Secret Service availability can be transient on macOS/Linux (for example while
-  // the login keychain is locked or no desktop keyring has been unlocked yet). Do not attempt
-  // decryption in that state and, crucially, do not cache an empty object: once secure storage
-  // becomes available later in the same process, the next read must retry the real encrypted
-  // file. Caching `{}` here would make a later setSecret() overwrite the existing blob and erase
-  // credentials that were merely temporarily inaccessible.
   if (!(await isEncryptionAvailable())) return {};
   try {
     const blob = await fs.readFile(secretsPath);
     if (!secureStorageCiphertextIsProtected(blob)) {
-      // Do not turn a historical/insecure Linux v10 blob into authoritative plaintext merely
-      // because a secure keyring became available later. Linux support first ships in 2.0.2, so
-      // there is no supported secure Linux v10 format to migrate here.
       logWarn('Stored Linux credentials use Electron’s insecure hard-coded-key fallback; the file was left untouched');
       rotationPending = false;
       return {};
     }
     const decrypted = await safeStorage.decryptStringAsync(blob);
     const parsed = parseSecretStore(decrypted.result);
-    // `deleteAllSecrets()` is allowed to race a Keychain decrypt without waiting for a prompt or
-    // unavailable provider. Once deletion starts, plaintext from the older generation must never
-    // republish credentials that have just been removed from disk.
     if (generation !== loadGeneration) return cache ?? {};
     cache = parsed;
     rotationPending = decrypted.shouldReEncrypt;
@@ -171,13 +165,6 @@ async function loadAll(): Promise<Record<string, string>> {
       cache = {};
       rotationPending = false;
     } else {
-      // Electron's async API can reject while a key provider is temporarily unavailable, but
-      // Electron 43.4's TypeScript result shape does not expose the `isTemporarilyUnavailable`
-      // marker mentioned by the docs. A copied/corrupt blob is indistinguishable here from a
-      // transient key-provider failure. Treat *neither* as an empty authoritative store: leave
-      // the ciphertext untouched, leave cache unresolved, and make every mutation fail closed.
-      // Reads still degrade to "no credential" so startup/bridge/UI remain usable and a later
-      // call can retry after Keychain/Secret Service becomes available again.
       const available = await isEncryptionAvailable();
       logWarn(
         available
@@ -215,31 +202,15 @@ async function writeAll(values: Record<string, string>): Promise<void> {
   await fs.mkdir(path.dirname(secretsPath), { recursive: true });
   await fs.writeFile(tmp, blob, { mode: 0o600 });
   await fs.rename(tmp, secretsPath);
-  // Published only once the rename succeeded. A failed disk write must leave the
-  // process believing the old state, not a credential it never actually saved.
   cache = values;
   rotationPending = false;
 }
 
-/**
- * Reseals a successfully decrypted blob when Electron reports key rotation.
- *
- * Decryption has already proved the plaintext and JSON are valid. Re-encryption is still
- * best-effort for reads: if the new key is temporarily unavailable, keep both the in-memory
- * plaintext and the old ciphertext intact and try again after the next process restart/read.
- * The mutation queue prevents a rotation rewrite from racing a user/API-key update through
- * the shared `secrets.bin.tmp` path.
- */
 async function rotateIfNeeded(): Promise<void> {
   if (!rotationPending || cache === null) return;
   await enqueue(async () => {
     if (!rotationPending || cache === null) return;
     try {
-      // Chromium sets `should_reencrypt` when this plaintext was successfully decrypted by a
-      // provider other than the one now selected for encryption. Electron forwards that flag and
-      // plaintext verbatim, so migration is encrypting the returned plaintext with the current
-      // provider. Calling decrypt on the old ciphertext again cannot change which provider sealed
-      // those bytes and would never perform the requested rotation.
       await writeAll({ ...cache });
     } catch (err) {
       logWarn(`Stored credentials could not be re-encrypted with the current secure-storage key: ${(err as Error).message}`);
@@ -255,31 +226,38 @@ export async function getSecret(key: SecretKey): Promise<string | null> {
 }
 
 export async function hasSecret(key: SecretKey): Promise<boolean> {
+  if (UI_CLIENT_MODE && isUserApiSecretKey(key)) {
+    const { uiConnectionFacade } = await import('./core/ui-connection.js');
+    const status = await uiConnectionFacade().secretStatus();
+    return key === 'openaiApiKey' ? status.hasApiKey : status.hasGoalKey;
+  }
   return (await getSecret(key)) !== null;
 }
 
 export function setSecret(key: SecretKey, value: string): Promise<void> {
+  if (UI_CLIENT_MODE && isUserApiSecretKey(key)) {
+    return import('./core/ui-connection.js').then(async ({ uiConnectionFacade }) => {
+      await uiConnectionFacade().setSecret(key, value);
+      // UI readers such as the OpenRouter model catalogue still decrypt locally today. Forget any
+      // old snapshot so their next read observes the Core-owned write instead of stale plaintext.
+      loadGeneration += 1;
+      cache = null;
+      rotationPending = false;
+      loadInFlight = null;
+    });
+  }
   return enqueue(async () => {
     if (!(await isEncryptionAvailable())) {
       throw new Error('Secure OS credential storage is unavailable, so the key was not saved');
     }
-    // Read inside the queue, so this composes from the latest committed state rather
-    // than from a snapshot taken before the call ahead of it finished.
     const current = await readAll();
-    // `readAll()` deliberately degrades to an empty *view* for startup/status callers while
-    // Keychain/Secret Service is unavailable. A mutation must never compose from that view:
-    // if the read did not establish an authoritative cache, writing it would replace real
-    // encrypted credentials with a partial/empty blob after a transient unlock race.
     if (cache === null) {
       throw new Error('Secure OS credential storage is unavailable, so the key was not saved');
     }
     const all = { ...current };
     const trimmed = value.trim();
-    if (trimmed === '') {
-      delete all[key];
-    } else {
-      all[key] = trimmed;
-    }
+    if (trimmed === '') delete all[key];
+    else all[key] = trimmed;
     await writeAll(all);
   });
 }
@@ -290,9 +268,6 @@ export function clearSecret(key: SecretKey): Promise<void> {
 
 export function deleteAllSecrets(): Promise<void> {
   return enqueue(async () => {
-    // Invalidate first, before touching disk. A decrypt may already hold the old ciphertext in
-    // memory and can complete after rm(); its generation check above then returns the new empty
-    // view instead of resurrecting the deleted credentials into cache.
     loadGeneration += 1;
     rotationPending = false;
     cache = null;

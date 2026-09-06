@@ -1,5 +1,6 @@
 import { readFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
+import { transform } from 'esbuild';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
@@ -117,6 +118,28 @@ describe('cross-platform packaging targets', () => {
       'dist:mac:x64', 'dist:mac:arm64',
       'dist:linux:x64', 'dist:linux:arm64'
     ]) expect(pkg.scripts[script]).toBeTypeOf('string');
+  });
+
+  it('keeps the Core-aware bootstrap buildable as Electron CommonJS main', async () => {
+    const source = readFileSync(path.join(root, 'src', 'main', 'bootstrap.ts'), 'utf8');
+    await expect(transform(source, { loader: 'ts', format: 'cjs', target: 'node20' })).resolves.toMatchObject({
+      code: expect.any(String)
+    });
+  });
+
+  it('resolves packaged renderer assets from the app root instead of a dynamic main chunk directory', () => {
+    const source = readFileSync(path.join(root, 'src', 'main', 'index.ts'), 'utf8');
+    expect(source).toContain("path.join(app.getAppPath(), 'out', 'preload', 'index.js')");
+    expect(source).toContain("path.join(app.getAppPath(), 'out', 'renderer', 'index.html')");
+    expect(source).not.toContain("path.join(__dirname, '../preload/index.js')");
+    expect(source).not.toContain("path.join(__dirname, '../renderer/index.html')");
+  });
+
+  it('isolates the Windows Core lifecycle smoke with an explicit Electron user-data directory', () => {
+    const smoke = readFileSync(path.join(root, 'scripts', 'smoke-windows-core-lifecycle.mjs'), 'utf8');
+    expect(smoke).toContain("const smokeUserData = path.join(roaming, 'chat-on-steroids-smoke');");
+    expect(smoke).toContain("[`--user-data-dir=${smokeUserData}`]");
+    expect(smoke).toContain("const tokenPath = path.join(smokeUserData, 'core', 'ipc.token');");
   });
 
   it('pins Electron 43.4.1 exactly and proves packaged runners use those runtime bytes', () => {
