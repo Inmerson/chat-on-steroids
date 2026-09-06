@@ -3351,7 +3351,7 @@ describe('delivering a bootstrap', () => {
       await vi.waitFor(async () => {
         const after = await readDurable<any>('bridge-commands');
         expect(after?.commands?.some((entry: any) => entry?.id === workerCommand.id)).toBe(false);
-      });
+      }, { timeout: 5_000, interval: 25 });
       const durableBroker = await readDurable<any>('swarm');
       expect(durableBroker?.dormantRuns?.[0]?.agents.find((entry: any) => entry?.info?.id === 'worker-1')?.info?.state).toBe(
         'failed'

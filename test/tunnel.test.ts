@@ -8,13 +8,15 @@
 import { chmod, mkdir, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { describe, expect, it } from 'vitest';
-import { ago, parseClientStatus, parsePollHealth, readMetric } from '../src/main/tunnel/health.js';
+import { ago, parseClientStatus, parsePollHealth, POLL_FRESH_MS, readMetric } from '../src/main/tunnel/health.js';
 import {
   describeNetworkError,
   isUnreachableError,
   NO_OUTAGE,
+  openAiLivenessDecision,
   outageConfirmed,
-  outageRecovered
+  outageRecovered,
+  retryDelayMs
 } from '../src/main/tunnel/index.js';
 import { describeRoute } from '../src/main/diagnostics.js';
 import { commonBinaryDirsForPlatform, locateBinary, tunnelExecutableName } from '../src/main/tunnel/locate.js';
@@ -262,6 +264,49 @@ describe('outage confirmation', () => {
   it('is inert when no run is open', () => {
     expect(outageConfirmed(NO_OUTAGE, T + 10 * 60_000)).toBe(false);
     expect(outageRecovered(NO_OUTAGE, T)).toBe(false);
+  });
+});
+
+describe('restart backoff', () => {
+  it('backs repeated failures off exponentially and caps the retry delay', () => {
+    expect([1, 2, 3, 4, 5, 6, 7, 20].map(retryDelayMs)).toEqual([
+      2_000,
+      4_000,
+      8_000,
+      16_000,
+      32_000,
+      60_000,
+      60_000,
+      60_000
+    ]);
+  });
+});
+
+describe('OpenAI tunnel liveness authority', () => {
+  const T = 1_000_000_000_000;
+
+  it('never promotes local readiness to connected before this client completes a control-plane handshake', () => {
+    expect(openAiLivenessDecision(null, T, NO_OUTAGE, T + 1_000)).toEqual({
+      state: 'starting',
+      resetBackoff: false
+    });
+    expect(openAiLivenessDecision(null, T, NO_OUTAGE, T + POLL_FRESH_MS + 1)).toEqual({
+      state: 'offline',
+      resetBackoff: false
+    });
+  });
+
+  it('resets restart backoff only after this client has completed a fresh handshake', () => {
+    expect(openAiLivenessDecision(T + 5_000, T, NO_OUTAGE, T + 6_000)).toEqual({
+      state: 'connected',
+      resetBackoff: true
+    });
+    expect(
+      openAiLivenessDecision(T + 5_000, T, NO_OUTAGE, T + 5_000 + POLL_FRESH_MS + 1)
+    ).toEqual({
+      state: 'offline',
+      resetBackoff: true
+    });
   });
 });
 
