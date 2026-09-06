@@ -69,8 +69,14 @@ export class HeadTailBuffer {
   /** Append a later buffer with the same budget, carrying its omission count across. */
   pushBuffer(other: HeadTailBuffer): void {
     this.pushChunk(Buffer.concat(other.head, other.headLength));
+    // `other`'s omitted bytes sit between its stable head and rolling tail. Carry that gap
+    // before appending the tail so UTF-8 boundary trimming cannot leave spare head capacity
+    // that pulls a later tail byte across the omission marker.
+    if (other.omitted > 0) {
+      this.omitted += other.omitted;
+      this.normalizeUtf8OmissionBoundaries();
+    }
     this.pushChunk(Buffer.concat(other.tail, other.tailLength));
-    this.omitted += other.omitted;
   }
 
   private pushToTail(chunk: Buffer): void {

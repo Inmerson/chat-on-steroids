@@ -38,6 +38,19 @@ describe('UTF-8 stream boundaries', () => {
     expect(text).not.toContain('�');
   });
 
+  it('preserves an inherited omission boundary when buffers are drained and merged', () => {
+    const drained = new HeadTailBuffer(8);
+    drained.pushChunk(Buffer.concat([Buffer.from('aaa'), euro, Buffer.from('bbbb')]));
+    expect(drained.omittedBytes()).toBe(3);
+
+    const collected = new HeadTailBuffer(8);
+    collected.pushBuffer(drained);
+
+    const text = collected.toBytesWithOmissionMarker().toString('utf8');
+    expect(text).toMatch(/^aaa\n\.\.\. 3 bytes omitted \.\.\.\nbbbb$/);
+    expect(text).not.toContain('�');
+  });
+
   it('keeps arbitrary child-process stream consumers on the streaming decoder', async () => {
     for (const relative of ['../src/main/tunnel/index.ts', '../src/main/search.ts', '../src/main/computer/index.ts']) {
       const source = await readFile(new URL(relative, import.meta.url), 'utf8');
