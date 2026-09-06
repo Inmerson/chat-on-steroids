@@ -3,30 +3,36 @@ from pathlib import Path
 path = Path('src/main/bridge.ts')
 source = path.read_text(encoding='utf-8')
 
-old_next = '''/**
- * One at a time, whatever kind it is. The browser half can only be opening one tab anyway,
- * and a worker chat is identified by the extension reporting which tab it opened for which
- * slot — so two bootstraps in flight is precisely the state where that report can be made
- * about the wrong tab.
- */
-function nextDeliverable(): Command | null {
-  if (commandLeaseWrites.size > 0) return null;
-  // Revivals never enter the app's browser opener: only the extension can know whether the exact
-  // conversation is already open. They also must not block unrelated fresh worker/resume tabs.
-  if (commands.some((command) => (command.spec.type === 'worker' || command.spec.type === 'resume') && isLeased(command))) return null;
-  return commands.find((command) => command.spec.type === 'worker' || command.spec.type === 'resume') ?? null;
-}
-'''
+
+def function_range(text: str, signature: str) -> tuple[int, int]:
+    function_at = text.index(signature)
+    start = text.rfind('/**', 0, function_at)
+    if start < 0 or function_at - start > 1500:
+        start = function_at
+    brace = text.index('{', function_at)
+    depth = 0
+    for index in range(brace, len(text)):
+        char = text[index]
+        if char == '{':
+            depth += 1
+        elif char == '}':
+            depth -= 1
+            if depth == 0:
+                end = index + 1
+                if end < len(text) and text[end] == '\n':
+                    end += 1
+                return start, end
+    raise SystemExit(f'unclosed function: {signature}')
+
+
 new_next = '''/**
  * Serializes every OS-opened fresh chat and every resume, while allowing exact worker markers
  * already handed to a proven Prime browser to progress independently.
  *
- * The old global lease fence was necessary when a worker was identified only by which fresh tab
- * happened to report next. Fresh worker pages now redeem their own command id from the `clf`
- * marker, and Prime-side placement keeps one offer/timer per command. That makes those browser-
- * placed workers independent without weakening the OS fallback: a worker with no placement
- * offer still blocks the line exactly as before, so cold starts and default-browser opens never
- * stack.
+ * Fresh worker pages redeem their own command id from the `clf` marker, and Prime-side placement
+ * keeps one offer/timer per command. Those browser-placed workers can therefore overlap safely.
+ * A worker with no placement offer still blocks the line exactly as before, so cold starts and
+ * default-browser opens never stack; resumes also remain one-at-a-time.
  */
 function nextDeliverable(): Command | null {
   if (commandLeaseWrites.size > 0) return null;
@@ -43,9 +49,8 @@ function nextDeliverable(): Command | null {
 }
 '''
 
-if old_next not in source:
-    raise SystemExit('nextDeliverable block not found')
-source = source.replace(old_next, new_next, 1)
+start, end = function_range(source, 'function nextDeliverable(): Command | null')
+source = source[:start] + new_next + source[end:]
 
 old_offer = '''  if (offerPlacement(command)) return;
   await openFreshChatInBrowser(command);
@@ -59,8 +64,8 @@ new_offer = '''  if (offerPlacement(command)) {
   }
   await openFreshChatInBrowser(command);
 '''
-if old_offer not in source:
-    raise SystemExit('offerPlacement delivery block not found')
+if source.count(old_offer) != 1:
+    raise SystemExit(f'offerPlacement delivery block matches: {source.count(old_offer)}')
 source = source.replace(old_offer, new_offer, 1)
 
 path.write_text(source, encoding='utf-8')
