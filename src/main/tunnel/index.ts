@@ -172,13 +172,6 @@ const MAX_BACKOFF_MS = 60_000;
 /** How often to look again while the control plane is unreachable. */
 const OFFLINE_RECHECK_MS = 5_000;
 /**
- * How long the client must go without complaining before we believe it is back.
- *
- * It has to exceed the client's own retry gap during an outage — observed at up to
- * ~20s — or the quiet between two failed retries would be mistaken for recovery.
- */
-const RECOVERY_QUIET_MS = 30_000;
-/**
  * How long a run of "cannot reach OpenAI" complaints must go without a completed poll
  * before the user is told the connection is down.
  *
@@ -221,6 +214,40 @@ export function outageConfirmed(run: UnreachableRun, nowMs: number): boolean {
 export function outageRecovered(run: UnreachableRun, lastHandshake: number | null): boolean {
   if (run.since === 0 || lastHandshake === null) return false;
   return run.handshakeBefore === null || lastHandshake > run.handshakeBefore;
+}
+
+export interface OpenAiLivenessDecision {
+  state: 'starting' | 'connected' | 'offline';
+  /** A locally-ready process only earns a fresh retry budget after it proves control-plane reachability. */
+  resetBackoff: boolean;
+}
+
+/**
+ * Decides user-visible liveness from proof completed by the current tunnel-client process.
+ * Local `/readyz` is intentionally absent: it proves only that the child is locally healthy.
+ */
+export function openAiLivenessDecision(
+  currentProcessHandshake: number | null,
+  launchedAt: number,
+  run: UnreachableRun,
+  nowMs: number
+): OpenAiLivenessDecision {
+  const hasCurrentProof = currentProcessHandshake !== null && currentProcessHandshake > 0;
+  if (!hasCurrentProof) {
+    const graceExpired = launchedAt !== 0 && nowMs - launchedAt > POLL_FRESH_MS;
+    return {
+      state: graceExpired || outageConfirmed(run, nowMs) ? 'offline' : 'starting',
+      resetBackoff: false
+    };
+  }
+
+  return {
+    state:
+      nowMs - currentProcessHandshake > POLL_FRESH_MS || outageConfirmed(run, nowMs)
+        ? 'offline'
+        : 'connected',
+    resetBackoff: true
+  };
 }
 
 /**
@@ -278,6 +305,8 @@ async function startOpenAiTunnel(opts: TunnelStartOptions): Promise<TunnelHandle
   let run: UnreachableRun = NO_OUTAGE;
   /** Epoch ms of the last control-plane poll the client completed. The proof. */
   let lastHandshake: number | null = null;
+  /** Proof completed by the currently running client, never inherited across a restart. */
+  let runHandshakeAt: number | null = null;
   /** Poll errors already reported, so only new ones reach the log. */
   let pollErrors = 0;
   /** When the current client process reached ready, for the first-poll grace period. */
@@ -321,6 +350,31 @@ async function startOpenAiTunnel(opts: TunnelStartOptions): Promise<TunnelHandle
       handshakeAt: lastHandshake,
       health
     });
+  };
+
+  const showStarting = (): void => {
+    shown = null;
+    opts.report({
+      state: 'connecting-tunnel',
+      detail: 'Tunnel client is ready. Waiting for a verified handshake with OpenAI…',
+      handshakeAt: lastHandshake,
+      health
+    });
+  };
+
+  const reportLiveness = (nowMs: number): void => {
+    const decision = openAiLivenessDecision(runHandshakeAt, launchedAt, run, nowMs);
+    if (decision.resetBackoff) attempts = 0;
+    if (decision.state === 'connected') {
+      showConnected();
+      return;
+    }
+    if (decision.state === 'offline') {
+      if (!unreachableReason) unreachableReason = 'it stopped answering';
+      showOffline();
+      return;
+    }
+    showStarting();
   };
 
   /**
@@ -412,21 +466,8 @@ async function startOpenAiTunnel(opts: TunnelStartOptions): Promise<TunnelHandle
           }
 
           const read = await refreshHealth(base);
-
-          // A client that has only just started may not have completed its first poll
-          // yet; that is not an outage, so it gets one poll cycle of grace.
-          const since = lastHandshake ?? launchedAt;
-          const stale =
-            read === null
-              ? Date.now() - lastUnreachable < RECOVERY_QUIET_MS
-              : Date.now() - since > POLL_FRESH_MS || outageConfirmed(run, Date.now());
-
-          if (stale) {
-            if (!unreachableReason) unreachableReason = 'it stopped answering';
-            showOffline();
-          } else {
-            showConnected();
-          }
+          if (read !== null && read > 0) runHandshakeAt = read;
+          reportLiveness(Date.now());
           watch(base);
         })();
       },
@@ -438,6 +479,7 @@ async function startOpenAiTunnel(opts: TunnelStartOptions): Promise<TunnelHandle
     if (stopped) return;
     clearTimer();
     lastError = '';
+    runHandshakeAt = null;
     // A stale URL from the previous run would otherwise be read as this run's.
     await fs.rm(healthFile, { force: true }).catch(() => {});
 
@@ -545,15 +587,14 @@ async function startOpenAiTunnel(opts: TunnelStartOptions): Promise<TunnelHandle
       if (base) {
         const ready = await probe(`${base}/readyz`);
         if (ready.ok) {
-          attempts = 0;
           shown = null;
           healthBase = base;
           launchedAt = Date.now();
           pollErrors = 0;
           run = NO_OUTAGE;
-          await refreshHealth(base);
-          if (Date.now() - lastUnreachable < RECOVERY_QUIET_MS) showOffline();
-          else showConnected();
+          const read = await refreshHealth(base);
+          if (read !== null && read > 0) runHandshakeAt = read;
+          reportLiveness(Date.now());
           watch(base);
           return;
         }
