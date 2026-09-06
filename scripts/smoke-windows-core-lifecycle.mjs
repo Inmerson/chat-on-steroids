@@ -182,6 +182,16 @@ function captureChild(child, label) {
   };
 }
 
+function releaseChildHandles(record) {
+  if (!record?.child) return;
+  // Chromium descendants can inherit the Electron browser process' stdout/stderr handles on
+  // Windows. Killing only the browser PID therefore does not guarantee Node's pipe readers will
+  // receive EOF. Explicitly destroy our read ends once diagnostics are no longer needed.
+  record.child.stdout?.destroy();
+  record.child.stderr?.destroy();
+  record.child.unref();
+}
+
 function launchUi(label) {
   const child = spawn(executable, [], {
     cwd: packageRoot,
@@ -195,13 +205,20 @@ function launchUi(label) {
 
 async function terminateChild(record) {
   const pid = record?.child?.pid;
-  if (!pid || !processExists(pid)) return;
-  try {
-    process.kill(pid, 'SIGKILL');
-  } catch {
+  if (!pid) {
+    releaseChildHandles(record);
     return;
   }
-  await waitForExit(pid).catch(() => undefined);
+  if (processExists(pid)) {
+    try {
+      process.kill(pid, 'SIGKILL');
+    } catch {
+      releaseChildHandles(record);
+      return;
+    }
+    await waitForExit(pid).catch(() => undefined);
+  }
+  releaseChildHandles(record);
 }
 
 let ui1 = null;
@@ -239,6 +256,7 @@ try {
   const firstUiPid = ui1.child.pid;
   process.kill(firstUiPid, 'SIGKILL');
   await waitForExit(firstUiPid);
+  releaseChildHandles(ui1);
   const helloAfterUiExit = await waitFor('Core after UI exit', async () => {
     try {
       return await coreRequest(userDataDir, token, 'hello');
