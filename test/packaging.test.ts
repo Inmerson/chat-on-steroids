@@ -1,5 +1,6 @@
 import { readFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
+import { transform } from 'esbuild';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
@@ -119,6 +120,12 @@ describe('cross-platform packaging targets', () => {
     ]) expect(pkg.scripts[script]).toBeTypeOf('string');
   });
 
+  it('keeps the Core-aware bootstrap buildable as Electron CommonJS main', async () => {
+    const source = readFileSync(path.join(root, 'src', 'main', 'bootstrap.ts'), 'utf8');
+    await expect(transform(source, { loader: 'ts', format: 'cjs', target: 'node20' })).resolves.toMatchObject({
+      code: expect.any(String)
+    });
+  });
   it('pins Electron 43.4.1 exactly and proves packaged runners use those runtime bytes', () => {
     const pkg = JSON.parse(readFileSync(path.join(root, 'package.json'), 'utf8'));
     const lock = JSON.parse(readFileSync(path.join(root, 'package-lock.json'), 'utf8'));
