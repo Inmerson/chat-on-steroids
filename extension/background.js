@@ -3150,6 +3150,18 @@ function deferredRevivalUrl(entry) {
  * locally either — when no redeem arrives the app opens it the old way, which is the only
  * recovery that still works if this window is closing.
  */
+async function protectPlacedWorkerTab(created) {
+  if (!Number.isInteger(created?.id)) return;
+  try {
+    await chrome.tabs.update(created.id, { autoDiscardable: false });
+    discardProtectedTabs[String(created.id)] = true;
+    await persistLive();
+  } catch {
+    // The tab already exists. Discard-policy hardening is best effort after creation; treating
+    // this as placement failure would let the app's fallback create a second worker tab.
+  }
+}
+
 async function placeSuccessorChat(raw, tabId) {
   const id = commandMarkerId(raw && raw.id);
   if (id && raw.background === true) {
@@ -3160,11 +3172,7 @@ async function placeSuccessorChat(raw, tabId) {
     if (model) query.push(`model=${encodeURIComponent(model)}`);
     if (effort) query.push(`reasoning_effort=${encodeURIComponent(effort)}`);
     const created = await createChatTab(`https://chatgpt.com/?${query.join('&')}#${marker}`, true);
-    if (Number.isInteger(created?.id)) {
-      await chrome.tabs.update(created.id, { autoDiscardable: false });
-      discardProtectedTabs[String(created.id)] = true;
-      await persistLive();
-    }
+    await protectPlacedWorkerTab(created);
     return;
   }
   if (!id || typeof tabId !== 'number') return;
@@ -3185,12 +3193,18 @@ async function placeSuccessorChat(raw, tabId) {
   const query = [marker];
   if (model) query.push(`model=${encodeURIComponent(model)}`);
   if (reasoningEffort) query.push(`reasoning_effort=${encodeURIComponent(reasoningEffort)}`);
-  const create = { url: `https://chatgpt.com/?${query.join('&')}#${marker}`, windowId: home.windowId, active: true };
+  const create = {
+    url: `https://chatgpt.com/?${query.join('&')}#${marker}`,
+    windowId: home.windowId,
+    // Omitted is the existing Compact & Resume behavior. Only fresh workers carry false.
+    active: raw && raw.active === false ? false : true
+  };
   // Directly after the chat it continues, so a handoff reads as one piece of work instead of a
   // tab appended to the far end of a long strip.
   if (typeof home.index === 'number') create.index = home.index + 1;
   try {
-    await chrome.tabs.create(create);
+    const created = await chrome.tabs.create(create);
+    if (create.active === false) await protectPlacedWorkerTab(created);
   } catch {
     // Window teardown or browser policy rejected the create. The app's placement fallback
     // turns that into an ordinary OS open rather than a lost command.

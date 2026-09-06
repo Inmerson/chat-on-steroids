@@ -1782,6 +1782,7 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
     const since = Number(url.searchParams.get('since') ?? 0);
     const goalClient = (url.searchParams.get('goalClient') ?? '').slice(0, 100);
     if (!id) return json(res, 400, { error: 'bad_conversation_id' }, origin);
+    notePlacementHome(id);
     const retiredWorker = retiredWorkerForConversation(id);
     const superseded = await conversationWasSuperseded(id);
     /**
@@ -4401,6 +4402,7 @@ export function cancelResume(sessionId: string): boolean {
     return false;
   }
   if (queued) {
+    clearPlacementOffer(queued.id);
     commands = commands.filter((command) => command !== queued);
     if (queued.timer) clearTimeout(queued.timer);
     queued.timer = null;
@@ -4432,6 +4434,7 @@ export async function cancelResumeNow(sessionId: string): Promise<boolean> {
   if (!entry && !queued) return false;
 
   if (queued) {
+    clearPlacementOffer(queued.id);
     if (queued.timer) clearTimeout(queued.timer);
     queued.timer = null;
     try {
@@ -4703,68 +4706,145 @@ export const BROWSER_PLACEMENT_MS = 20_000;
  */
 let placementCollector: string | null = null;
 
-/** The one fresh chat currently offered to its home page, and the fallback that outlives it. */
-let placementOffer: { id: string; conversationId: string | null; model: string | null; reasoningEffort: ReasoningEffort | null } | null = null;
-let placementTimer: NodeJS.Timeout | null = null;
-
-/** Drops the standing offer and its fallback. Called by every path that ends a command. */
-function clearPlacementOffer(): void {
-  placementOffer = null;
-  if (placementTimer) clearTimeout(placementTimer);
-  placementTimer = null;
+interface PlacementOffer {
+  id: string;
+  conversationId: string | null;
+  model: string | null;
+  reasoningEffort: ReasoningEffort | null;
+  /** Existing Background chats mode uses the companion-owned managed window. */
+  background: boolean;
+  /** False only for fresh workers placed beside their live prime. */
+  active: boolean;
+  /** One response consumes the offer, while its fallback timer still outlives the handout. */
+  available: boolean;
+  timer: NodeJS.Timeout | null;
 }
 
-/**
- * Offers a leased fresh chat to the page of the chat it succeeds.
- *
- * Returns false whenever this app cannot name a home chat that is asking for this command
- * right now, which is every path except a page-driven compaction. Those open through the OS
- * opener exactly as before, because there is genuinely nothing better to know about them.
- */
-function offerPlacement(command: Command): boolean {
-  const home = commandHomeConversation(command.spec);
-  const backgroundWorker = command.spec.type === 'worker' && getConfig().ui.backgroundChats && browserWakeConnected();
-  if (!backgroundWorker && (!home || home !== placementCollector)) return false;
-  clearPlacementOffer();
-  placementOffer = {
-    id: command.id,
-    conversationId: backgroundWorker ? null : home,
-    model: command.spec.type === 'worker' ? command.spec.model : null,
-    reasoningEffort: command.spec.type === 'worker' ? command.spec.reasoningEffort : null
-  };
-  placementTimer = setTimeout(() => {
-    placementTimer = null;
-    placementOffer = null;
-    // Still queued and still nobody's: the home page did not open it, so ask the OS after all.
-    const stale = commands.find((entry) => entry.id === command.id && entry.owner === null);
-    // A connected companion owns background placement. Falling back through the OS here
-    // raises Chrome even if its tab is merely still loading. The existing command deadline
-    // reports an unredeemed attempt; only an absent browser needs the cold-start opener.
-    if (stale && !(backgroundWorker && browserWakeConnected())) void openFreshChatInBrowser(stale);
-  }, BROWSER_PLACEMENT_MS);
-  placementTimer.unref?.();
-  if (backgroundWorker) wakeBrowserWork();
-  logInfo(`bridge: offering ${specKey(command.spec)} to ${home}'s own browser window`);
+/** One offer per fresh command. Concurrent workers must never evict one another's placement/fallback. */
+const placementOffers = new Map<string, PlacementOffer>();
+/** Recent /activity polls prove exactly which prime conversations still have a page able to place a tab. */
+const placementHomes = new Map<string, number>();
+const MAX_PLACEMENT_HOMES = 128;
+
+function notePlacementHome(conversationId: string): void {
+  placementHomes.delete(conversationId);
+  placementHomes.set(conversationId, Date.now());
+  while (placementHomes.size > MAX_PLACEMENT_HOMES) {
+    const oldest = placementHomes.keys().next().value as string | undefined;
+    if (!oldest) break;
+    placementHomes.delete(oldest);
+  }
+}
+
+function placementHomePolling(conversationId: string): boolean {
+  const seenAt = placementHomes.get(conversationId);
+  if (seenAt === undefined) return false;
+  if (Date.now() - seenAt >= BROWSER_PRESENT_MS) {
+    placementHomes.delete(conversationId);
+    return false;
+  }
   return true;
 }
 
-/**
- * The one fresh chat this conversation's browser is being asked to open next to itself.
- *
- * Spent on handout. The page that collects it is the page that opens the tab, and a second
- * poll - from another tab of the same chat, or the same tab a moment later - must not create
- * a second one. If that page fails to act, the fallback above is what recovers it, not a
- * repeated offer.
- */
-function pendingBrowserPlacement(conversationId: string | null): { id: string; model: string | null; reasoningEffort: ReasoningEffort | null; background?: true } | null {
-  const offer = placementOffer;
-  if (!offer || offer.conversationId !== conversationId) return null;
-  if (!commands.some((entry) => entry.id === offer.id && entry.owner === null)) {
-    placementOffer = null;
-    return null;
+/** Drops one command's offer, or every offer while the bridge itself is resetting. */
+function clearPlacementOffer(id?: string): void {
+  if (id !== undefined) {
+    const offer = placementOffers.get(id);
+    if (offer?.timer) clearTimeout(offer.timer);
+    placementOffers.delete(id);
+    return;
   }
-  placementOffer = null;
-  return { id: offer.id, model: offer.model, reasoningEffort: offer.reasoningEffort, ...(offer.conversationId === null ? { background: true as const } : {}) };
+  for (const offer of placementOffers.values()) {
+    if (offer.timer) clearTimeout(offer.timer);
+  }
+  placementOffers.clear();
+}
+
+/**
+ * Offers a leased fresh chat to the browser that can place it without asking the OS to choose
+ * a Chrome instance/window.
+ *
+ * Compact & Resume keeps its strict in-flight collector: only the page whose capture request
+ * created the command may receive that successor. A fresh worker has different evidence: the
+ * broker already names its prime, and a recent authenticated /activity poll proves that prime's
+ * page is alive now. That memory-only proof deliberately disappears on restart, so a restored
+ * worker keeps the old immediate OS-open recovery rather than waiting for a page that may be gone.
+ */
+function offerPlacement(command: Command): boolean {
+  const home = commandHomeConversation(command.spec);
+  const worker = command.spec.type === 'worker';
+  const backgroundWorker = worker && getConfig().ui.backgroundChats && browserWakeConnected();
+  if (worker) {
+    if (!backgroundWorker && (!home || !placementHomePolling(home))) return false;
+  } else if (!home || home !== placementCollector) {
+    return false;
+  }
+
+  // Re-entry for one command replaces only that command's stale offer. It can never cancel a
+  // sibling worker's fallback, which was the single-global-offer race.
+  clearPlacementOffer(command.id);
+  const offer: PlacementOffer = {
+    id: command.id,
+    conversationId: backgroundWorker ? null : home,
+    model: worker ? command.spec.model : null,
+    reasoningEffort: worker ? command.spec.reasoningEffort : null,
+    background: backgroundWorker,
+    active: !worker,
+    available: true,
+    timer: null
+  };
+  placementOffers.set(command.id, offer);
+  offer.timer = setTimeout(() => {
+    offer.timer = null;
+    if (placementOffers.get(command.id) !== offer) return;
+    placementOffers.delete(command.id);
+    const stale = commands.find((entry) => entry.id === command.id && entry.owner === null);
+    // Resume has no independent redeem retry, so this timer remains its OS fallback. Workers
+    // already own exactly one fallback at WORKER_REDEEM_MS; giving this timer a second opener is
+    // the duplicate-tab race. Their command deadline clears this offer before reopening once.
+    if (stale && !worker) void openFreshChatInBrowser(stale);
+  }, BROWSER_PLACEMENT_MS);
+  offer.timer.unref?.();
+  if (backgroundWorker) wakeBrowserWork();
+  logInfo(
+    backgroundWorker
+      ? `bridge: offering ${specKey(command.spec)} to the browser companion's background window`
+      : `bridge: offering ${specKey(command.spec)} to ${home}'s own browser window`
+  );
+  return true;
+}
+
+type BrowserPlacement = {
+  id: string;
+  model: string | null;
+  reasoningEffort: ReasoningEffort | null;
+  background?: true;
+  active?: false;
+};
+
+/**
+ * The next fresh chat this browser is being asked to place.
+ *
+ * Handout is one-shot per command, but the command's timer deliberately remains alive until the
+ * page redeems or the fallback boundary arrives. Several worker offers may coexist; repeated
+ * polls drain them one at a time without one worker destroying another's timer.
+ */
+function pendingBrowserPlacement(conversationId: string | null): BrowserPlacement | null {
+  for (const offer of placementOffers.values()) {
+    if (!offer.available || offer.conversationId !== conversationId) continue;
+    if (!commands.some((entry) => entry.id === offer.id && entry.owner === null)) {
+      clearPlacementOffer(offer.id);
+      continue;
+    }
+    offer.available = false;
+    return {
+      id: offer.id,
+      model: offer.model,
+      reasoningEffort: offer.reasoningEffort,
+      ...(offer.background ? { background: true as const } : offer.active ? {} : { active: false as const })
+    };
+  }
+  return null;
 }
 
 // -------------------------------------------------------- exact browser recovery
@@ -6852,6 +6932,9 @@ function expire(command: Command): void {
  * its chance to place this one.
  */
 async function reopenWorkerChat(command: Command): Promise<void> {
+  // The worker redeem deadline is the single fallback owner. Cancel any still-live
+  // page-placement timer before the one OS reopen so the two clocks cannot race.
+  clearPlacementOffer(command.id);
   if (!(await persistCommandLease(command, null, Date.now()))) {
     if (commands.includes(command)) {
       drop(command, 'the chat this app opened did not report back in time');
@@ -6871,7 +6954,7 @@ function retire(command: Command, why: string): void {
   // A standing placement offer belongs to this command alone. Handout already re-checks that
   // the command is still queued, so this is not what makes a retired offer inert — it is what
   // stops the fifteen-second fallback outliving the thing it was covering for.
-  if (placementOffer?.id === command.id) clearPlacementOffer();
+  clearPlacementOffer(command.id);
   if (!commands.includes(command)) return;
   commands = commands.filter((entry) => entry !== command);
   logInfo(`bridge: ${specKey(command.spec)} is done — ${why}`);
@@ -7581,6 +7664,7 @@ export function resetBridgeForTests(): void {
   browserLaunchTimer = null;
   lastBrowserLaunchAt = 0;
   clearPlacementOffer();
+  placementHomes.clear();
   lastSeenAt = null;
   extensionVersion = null;
   versionWarned = false;

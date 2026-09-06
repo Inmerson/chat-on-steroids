@@ -1324,6 +1324,45 @@ describe('worker settings authority', () => {
     expect(worker.windowsUpdate).not.toHaveBeenCalled();
   });
 
+
+  it('opens an inactive worker beside the prime and protects it from auto-discard', async () => {
+    const session = new FakeStorageArea();
+    const fetch = vi.fn(async (input: string) => {
+      const url = new URL(input);
+      if (url.pathname === '/hello') return response(200, { app: 'chat-on-steroids', paired: true });
+      if (url.pathname === '/activity') {
+        return response(200, {
+          sessionId: 'prime-session',
+          stream: [],
+          entries: [],
+          nextSince: 0,
+          placement: { id: 'cmd-worker', active: false }
+        });
+      }
+      return response(404, {});
+    });
+    const worker = loadWorker({
+      local: new FakeStorageArea(paired),
+      session,
+      fetch,
+      tabsGet: async () => ({ id: 47, windowId: 9, index: 4 }) as never
+    });
+    await worker.registerTab(47);
+    await worker.send({ type: 'bind', conversationId: CHAT }, 47);
+
+    await worker.send({ type: 'activity', conversationId: CHAT, since: 0 }, 47);
+
+    expect(worker.tabsCreate).toHaveBeenCalledTimes(1);
+    const created = worker.tabsCreate.mock.calls[0]![0] as Record<string, unknown>;
+    expect(created.windowId).toBe(9);
+    expect(created.index).toBe(5);
+    expect(created.active).toBe(false);
+    expect(String(created.url)).toBe('https://chatgpt.com/?clf=cmd-worker#clf=cmd-worker');
+    expect(worker.tabsUpdate).toHaveBeenCalledWith(99, { autoDiscardable: false });
+    expect(session.data.discardProtectedTabs).toEqual({ '99': true });
+    expect(worker.windowsUpdate).not.toHaveBeenCalled();
+  });
+
   it('leaves a compaction reply that places nothing to the app’s own opener', async () => {
     const fetch = vi.fn(async (input: string, init: Record<string, unknown> = {}) => {
       const url = new URL(input);
