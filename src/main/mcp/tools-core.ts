@@ -48,8 +48,10 @@ import { composeCommandBatch, parseCommandBatchSections } from '../codex/command
 import { formatExecOutputForModel, newStreamOutput } from '../codex/exec-output.js';
 import { DEFAULT_TRUNCATION_POLICY, EXEC_OUTPUT_CEILING_POLICY, unifiedExecManager } from '../codex/manager.js';
 import {
+  backgroundExecObligations,
   execOwnershipDenied,
   forgetExecOwner,
+  MAX_UNREAD_EXEC_RESULTS_PER_CONVERSATION,
   noteExecOwner,
   provenConversation
 } from '../codex/ownership.js';
@@ -738,6 +740,17 @@ export function registerCoreTools(reg: SurfaceRegistrar): void {
               }
             }
 
+            const owner = provenConversation(currentCaller().requestId, currentCaller().conversationId);
+            const unread = backgroundExecObligations(owner).exitedUnread;
+            if (unread.length >= MAX_UNREAD_EXEC_RESULTS_PER_CONVERSATION) {
+              unifiedExecManager.releaseProcessId(processId);
+              const sessionIds = unread.map((session) => session.processId).join(', ');
+              return fail(
+                `EXEC_RESULTS_UNREAD: ${unread.length} completed background results are still waiting for this conversation. ` +
+                  `Drain session IDs ${sessionIds} with write_stdin before starting another command. No child was spawned.`
+              );
+            }
+
             const output = await unifiedExecManager.execCommand({
               command,
               shellType: shell.shellType,
@@ -756,7 +769,6 @@ export function registerCoreTools(reg: SurfaceRegistrar): void {
             if (output.processId === null) {
               forgetExecOwner(processId);
             } else {
-              const owner = provenConversation(currentCaller().requestId, currentCaller().conversationId);
               noteExecOwner(output.processId, owner);
             }
             const responseText = execCommandResponseText(output);

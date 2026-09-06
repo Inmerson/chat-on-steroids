@@ -1,6 +1,6 @@
 !macro grantSandboxReadAccess
   ClearErrors
-  ExecWait '\"$SYSDIR\icacls.exe\" \"$INSTDIR\" /grant \"*S-1-15-2-2:(OI)(CI)(RX)\" /Q' $0
+  ExecWait '"$SYSDIR\icacls.exe" "$INSTDIR" /grant "*S-1-15-2-2:(OI)(CI)(RX)" /Q' $0
   ${If} ${Errors}
     StrCpy $0 2
   ${EndIf}

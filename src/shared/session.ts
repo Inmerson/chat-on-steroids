@@ -107,7 +107,10 @@ export interface FileChange {
   approximate: boolean;
 }
 
-export type ToolOutcome = 'ok' | 'error' | 'rejected';
+/** Canonical outcomes written by current versions. Only tool_internal_error is a connector defect. */
+export type ToolOutcome = 'ok' | 'process_exit_nonzero' | 'tool_rejected' | 'tool_internal_error';
+/** Legacy spellings remain readable from durable history, but are never emitted by new calls. */
+export type StoredToolOutcome = ToolOutcome | 'error' | 'rejected';
 
 /**
  * How confident the recorder is that this call belongs to the session it landed in.
@@ -162,12 +165,35 @@ export interface ToolCallRecord {
   /** Exact arguments as JSON. Cut inline past the cap, with the whole text in an asset. */
   args: StoredText;
   result: StoredText;
-  outcome: ToolOutcome;
+  outcome: StoredToolOutcome;
   durationMs: number;
   summary: ActivitySummary;
   /** Files this call demonstrably changed, with line counts where computable. */
   changes?: FileChange[];
   assets?: AssetRef[];
+}
+
+/** Reads current outcomes and only self-proving legacy rows; ambiguous legacy errors abstain. */
+export function normalizedToolOutcome(
+  call: Pick<ToolCallRecord, 'tool' | 'summary'> & { outcome: unknown }
+): ToolOutcome | null {
+  if (
+    call.outcome === 'ok' ||
+    call.outcome === 'process_exit_nonzero' ||
+    call.outcome === 'tool_rejected' ||
+    call.outcome === 'tool_internal_error'
+  ) {
+    return call.outcome;
+  }
+  if (call.outcome === 'rejected') return 'tool_rejected';
+  if (
+    call.outcome === 'error' &&
+    (call.tool === 'exec_command' || call.tool === 'write_stdin') &&
+    /^✕ exit -?\d+$/.test(call.summary.metric ?? '')
+  ) {
+    return 'process_exit_nonzero';
+  }
+  return null;
 }
 
 export type MessageState = 'streaming' | 'final';
@@ -359,6 +385,13 @@ export interface SessionSummary {
   events: number;
   userMessages: number;
   toolCalls: number;
+  /** Child commands that completed non-zero. This is workload status, not connector reliability. */
+  processExitNonzero: number;
+  /** Expected refusals such as permission/sandbox/policy rejection. */
+  toolRejected: number;
+  /** Connector/tool implementation failures; the tool reliability numerator. */
+  toolInternalErrors: number;
+  /** Chat errors plus toolInternalErrors. */
   errors: number;
   /** Rough local estimate for the whole session — never ChatGPT's private counter. */
   estimatedTokens: number;

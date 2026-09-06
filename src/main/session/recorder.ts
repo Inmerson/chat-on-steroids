@@ -62,6 +62,7 @@ import {
   resetCorrelationRegistryForTests,
 } from './correlation.js';
 import { resumeOpeningChat } from './resume-gate.js';
+import { sanitizeRecordedArgs } from './redaction.js';
 import { summarizeToolCall } from './summarize.js';
 
 interface LiveConversation {
@@ -916,50 +917,6 @@ async function storeText(
   };
 }
 
-/**
- * Fields that must never reach disk, whatever tool they arrive on.
- *
- * Nothing in the multi-agent surface carries a credential any more — an agent *is* the
- * conversation it runs in, and that id is recorded on purpose — so this is now a guard
- * against a field named like a secret arriving on some other tool, rather than a rule about
- * agent identity. Writing one into events.jsonl would publish it to session_history, to the
- * Activity feed the extension is sent, and to anything built from the raw log.
- */
-const CREDENTIAL_FIELDS = new Set(['secret']);
-
-/**
- * Removes the argument values that must never be written to disk.
- *
- * Environment overrides can carry credentials, a base64 blob is megabytes of noise,
- * and clipboard text is the one input the user may not have meant to hand over.
- * Everything else is stored verbatim: the point of the record is exact recovery.
- */
-function redactArgs(tool: string, args: unknown): unknown {
-  if (!args || typeof args !== 'object') return args;
-  const copy: Record<string, unknown> = { ...(args as Record<string, unknown>) };
-  if (copy['env'] && typeof copy['env'] === 'object') {
-    copy['env'] = Object.fromEntries(Object.keys(copy['env'] as object).map((key) => [key, '***']));
-  }
-  if (typeof copy['dataBase64'] === 'string') {
-    copy['dataBase64'] = `<${(copy['dataBase64'] as string).length} base64 characters not stored>`;
-  }
-  // Clipboard text arrives inside computer's action list, so the redaction follows the
-  // action rather than the tool name: the text the user copied is theirs, and one of these
-  // steps buried in a batch of clicks must not be the thing that writes it to disk.
-  if (tool === 'computer' && Array.isArray(copy['actions'])) {
-    copy['actions'] = (copy['actions'] as unknown[]).map((action) => {
-      if (!action || typeof action !== 'object') return action;
-      const step = action as Record<string, unknown>;
-      if (step['type'] !== 'write_clipboard' || typeof step['text'] !== 'string') return action;
-      return { ...step, text: `<${(step['text'] as string).length} characters not stored>` };
-    });
-  }
-  for (const field of Object.keys(copy)) {
-    if (CREDENTIAL_FIELDS.has(field)) copy[field] = '<removed>';
-  }
-  return copy;
-}
-
 function redactResult(tool: string, text: string): string {
   // The other half of the clipboard rule: what was read comes back as its own line in
   // computer's reply, and only that line is dropped, so the rest of the result — which
@@ -1146,7 +1103,7 @@ async function fileToolCall(input: ToolCallInput, target: Target): Promise<ToolC
       requestId: input.requestId ?? null,
       conversationId: target.conversationId,
       attributionMethod: target.conversationId && input.requestId ? 'request_id' : 'unattributed',
-      args: await storeText(sessionId, safeJson(redactArgs(input.tool, input.args)), MAX_TOOL_ARGS_CHARS),
+      args: await storeText(sessionId, safeJson(sanitizeRecordedArgs(input.tool, input.args)), MAX_TOOL_ARGS_CHARS),
       result: await storeText(sessionId, resultText, MAX_TOOL_RESULT_CHARS),
       outcome: input.outcome,
       durationMs: input.durationMs,

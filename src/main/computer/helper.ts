@@ -56,6 +56,7 @@ public static class Clf {
   const uint MOUSEEVENTF_RIGHTDOWN = 0x0008, MOUSEEVENTF_RIGHTUP = 0x0010;
   const uint MOUSEEVENTF_MIDDLEDOWN = 0x0020, MOUSEEVENTF_MIDDLEUP = 0x0040;
   const uint MOUSEEVENTF_WHEEL = 0x0800, MOUSEEVENTF_HWHEEL = 0x1000;
+  const int SM_SWAPBUTTON = 23;
   const uint KEYEVENTF_KEYUP = 0x0002, KEYEVENTF_UNICODE = 0x0004;
 
   [DllImport("user32.dll", SetLastError = true)]
@@ -111,10 +112,19 @@ public static class Clf {
   }
 
   static void ButtonFlags(string button, out uint down, out uint up) {
+    // Callers name semantic primary/secondary buttons. SendInput names physical buttons, while
+    // Windows applies SM_SWAPBUTTON afterwards, so cancel that inversion here per call.
+    bool swapped = GetSystemMetrics(SM_SWAPBUTTON) != 0;
     switch (button) {
-      case "right": down = MOUSEEVENTF_RIGHTDOWN; up = MOUSEEVENTF_RIGHTUP; break;
+      case "right":
+        down = swapped ? MOUSEEVENTF_LEFTDOWN : MOUSEEVENTF_RIGHTDOWN;
+        up = swapped ? MOUSEEVENTF_LEFTUP : MOUSEEVENTF_RIGHTUP;
+        break;
       case "middle": case "wheel": down = MOUSEEVENTF_MIDDLEDOWN; up = MOUSEEVENTF_MIDDLEUP; break;
-      default: down = MOUSEEVENTF_LEFTDOWN; up = MOUSEEVENTF_LEFTUP; break;
+      default:
+        down = swapped ? MOUSEEVENTF_RIGHTDOWN : MOUSEEVENTF_LEFTDOWN;
+        up = swapped ? MOUSEEVENTF_RIGHTUP : MOUSEEVENTF_LEFTUP;
+        break;
     }
   }
 

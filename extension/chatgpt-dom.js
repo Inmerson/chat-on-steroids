@@ -257,12 +257,23 @@ var CLF_DOM = (() => {
     return /(?:message delivery timed out|unknown error occurred|there was an error generating (?:a|the) response|error in message stream|network error|something went wrong)/i.test(line);
   }
 
-  /** The conversation this tab is on, or null for a chat that has not been sent yet. */
-  function conversationId() {
+  /**
+   * The conversation a ChatGPT path names, or null when it names none.
+   *
+   * Project conversations use `/g/<project>/c/<id>`; shared snapshots deliberately do not
+   * count as owned conversations. Keep this parser strict because its result feeds attribution,
+   * recovery and agent routing.
+   */
+  function conversationFromPath(pathname) {
     return safe(() => {
-      const match = /^\/c\/([0-9a-f-]{8,64})/i.exec(location.pathname);
+      const match = /^\/(?:g\/[^/]+\/)?c\/([0-9a-f-]{8,64})(?:\/|$)/i.exec(String(pathname || ''));
       return match ? match[1] : null;
     }, null);
+  }
+
+  /** The conversation this tab is on, or null for a chat that has not been sent yet. */
+  function conversationId() {
+    return safe(() => conversationFromPath(location.pathname), null);
   }
 
   /** Human ChatGPT title when one has actually been generated; never conversation identity. */
@@ -1404,6 +1415,7 @@ var CLF_DOM = (() => {
 
   return {
     conversationId,
+    conversationFromPath,
     conversationTitle,
     turns,
     presentationTurns,

@@ -142,7 +142,10 @@ describe('cross-platform packaging targets', () => {
     expect(installer).toContain('${FileExists} "$INSTDIR\\${APP_EXECUTABLE_FILENAME}"');
     expect(installer).toContain('!insertmacro grantSandboxReadAccess');
     expect(installer).toContain('$SYSDIR\\icacls.exe');
-    expect(installer).toContain('\\"$INSTDIR\\"');
+    expect(installer).toContain(
+      `ExecWait '"$SYSDIR\\icacls.exe" "$INSTDIR" /grant "*S-1-15-2-2:(OI)(CI)(RX)" /Q' $0`
+    );
+    expect(installer).not.toContain("ExecWait '\\\"");
     expect(installer).toContain('*S-1-15-2-2:(OI)(CI)(RX)');
     expect(installer).toContain('ExecWait');
     expect(installer).toContain('${If} ${Errors}');
