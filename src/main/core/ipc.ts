@@ -249,6 +249,9 @@ export class CoreIpcClient {
       };
       socket.setTimeout(this.timeoutMs, () => finish(new Error('Core IPC request timed out')));
       socket.once('error', (error) => finish(error));
+      const closedBeforeResponse = (): void => finish(new Error('Core IPC connection closed before a complete response'));
+      socket.once('end', closedBeforeResponse);
+      socket.once('close', closedBeforeResponse);
       socket.once('connect', () => socket.write(`${JSON.stringify(wire)}\n`));
       socket.on('data', (chunk: Buffer) => {
         buffered += chunk.toString('utf8');

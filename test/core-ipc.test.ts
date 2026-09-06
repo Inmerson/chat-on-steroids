@@ -1,3 +1,8 @@
+import { randomUUID } from 'node:crypto';
+import { promises as fs } from 'node:fs';
+import { createServer } from 'node:net';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
 import { describe, expect, it } from 'vitest';
 import {
   CORE_PROTOCOL_VERSION,
@@ -5,7 +10,7 @@ import {
   type CoreHello,
   type CoreStatusEnvelope
 } from '../src/shared/core-protocol.js';
-import { coreEndpointForUserData, shouldAcceptCoreEnvelope } from '../src/main/core/ipc.js';
+import { CoreIpcClient, coreEndpointForUserData, shouldAcceptCoreEnvelope } from '../src/main/core/ipc.js';
 
 function hello(overrides: Partial<CoreHello> = {}): CoreHello {
   return {
@@ -46,6 +51,34 @@ describe('Core IPC endpoint', () => {
 
   it('uses a socket path beneath userData on non-Windows platforms', () => {
     expect(coreEndpointForUserData('/tmp/cos-user', 'linux')).toBe('/tmp/cos-user/core/core.sock');
+  });
+
+  it('rejects promptly when a connected Core closes before returning a response', async () => {
+    const endpoint = process.platform === 'win32'
+      ? `\\\\.\\pipe\\cos-core-ipc-close-${randomUUID()}`
+      : path.join(tmpdir(), `cos-core-ipc-close-${randomUUID()}.sock`);
+    const server = createServer((socket) => {
+      socket.once('data', () => socket.end());
+    });
+    await new Promise<void>((resolve, reject) => {
+      server.once('error', reject);
+      server.listen(endpoint, resolve);
+    });
+
+    try {
+      const client = new CoreIpcClient(endpoint, 'a'.repeat(64), 10_000);
+      const outcome = await Promise.race([
+        client.hello().then(
+          () => 'resolved',
+          (error: unknown) => `rejected:${error instanceof Error ? error.message : String(error)}`
+        ),
+        new Promise<string>((resolve) => setTimeout(() => resolve('hung'), 500))
+      ]);
+      expect(outcome).toMatch(/^rejected:Core IPC connection closed before a complete response$/);
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+      if (process.platform !== 'win32') await fs.rm(endpoint, { force: true }).catch(() => undefined);
+    }
   });
 });
 

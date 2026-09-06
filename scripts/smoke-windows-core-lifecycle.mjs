@@ -28,6 +28,7 @@ const executable = path.join(packageRoot, 'Chat On Steroids.exe');
 if (!existsSync(executable)) throw new Error(`Packaged executable is missing: ${executable}`);
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+const note = (message) => process.stdout.write(`[core-smoke] ${message}\n`);
 
 async function waitFor(label, probe, timeoutMs = 30_000, intervalMs = 200) {
   const deadline = Date.now() + timeoutMs;
@@ -63,25 +64,6 @@ async function waitForExit(pid, timeoutMs = 15_000) {
   throw new Error(`Process ${pid} did not exit within ${timeoutMs}ms`);
 }
 
-async function findTokenFile(root) {
-  const queue = [root];
-  while (queue.length > 0) {
-    const directory = queue.shift();
-    let entries;
-    try {
-      entries = await fs.readdir(directory, { withFileTypes: true });
-    } catch {
-      continue;
-    }
-    for (const entry of entries) {
-      const target = path.join(directory, entry.name);
-      if (entry.isDirectory()) queue.push(target);
-      else if (entry.isFile() && entry.name === 'ipc.token' && path.basename(path.dirname(target)) === 'core') return target;
-    }
-  }
-  return null;
-}
-
 function coreEndpoint(userDataDir) {
   const digest = createHash('sha256').update(path.resolve(userDataDir)).digest('hex').slice(0, 24);
   return `\\\\.\\pipe\\chat-on-steroids-core-${digest}`;
@@ -106,6 +88,9 @@ async function lineRequest(endpoint, line, timeoutMs = 3_000) {
     };
     socket.setTimeout(timeoutMs, () => finish(new Error(`IPC timeout for ${endpoint}`)));
     socket.once('error', (error) => finish(error));
+    const closedBeforeResponse = () => finish(new Error(`IPC closed before a complete response for ${endpoint}`));
+    socket.once('end', closedBeforeResponse);
+    socket.once('close', closedBeforeResponse);
     socket.once('connect', () => socket.write(`${line}\n`));
     socket.on('data', (chunk) => {
       buffer += chunk.toString('utf8');
@@ -161,7 +146,7 @@ function captureChild(child, label) {
 }
 
 function launchUi(env, label) {
-  const child = spawn(executable, [], {
+  const child = spawn(executable, [`--user-data-dir=${smokeUserData}`], {
     cwd: packageRoot,
     env,
     stdio: ['ignore', 'pipe', 'pipe'],
@@ -186,10 +171,12 @@ const smokeRoot = await fs.mkdtemp(path.join(tmpdir(), 'cos-core-lifecycle-'));
 const roaming = path.join(smokeRoot, 'AppData', 'Roaming');
 const local = path.join(smokeRoot, 'AppData', 'Local');
 const home = path.join(smokeRoot, 'Home');
+const smokeUserData = path.join(roaming, 'chat-on-steroids-smoke');
 await Promise.all([
   fs.mkdir(roaming, { recursive: true }),
   fs.mkdir(local, { recursive: true }),
-  fs.mkdir(home, { recursive: true })
+  fs.mkdir(home, { recursive: true }),
+  fs.mkdir(smokeUserData, { recursive: true })
 ]);
 const env = {
   ...process.env,
@@ -208,9 +195,12 @@ let lastCorePid = null;
 let lastSupervisorPid = null;
 
 try {
+  note(`launching first UI with isolated userData ${smokeUserData}`);
   ui1 = launchUi(env, 'first UI');
-  const tokenPath = await waitFor('Core IPC token', async () => findTokenFile(roaming), 35_000);
-  userDataDir = path.dirname(path.dirname(tokenPath));
+  const tokenPath = path.join(smokeUserData, 'core', 'ipc.token');
+  await waitFor('Core IPC token', async () => existsSync(tokenPath), 35_000);
+  note('Core IPC token is ready');
+  userDataDir = smokeUserData;
   token = (await fs.readFile(tokenPath, 'utf8')).trim();
   if (!/^[0-9a-f]{64}$/i.test(token)) throw new Error(`Invalid Core IPC token in ${tokenPath}`);
 
@@ -224,14 +214,18 @@ try {
   if (!Number.isSafeInteger(hello1.corePid) || hello1.corePid <= 0) throw new Error('Initial Core hello has no valid PID');
   if (!Number.isSafeInteger(hello1.protocolVersion) || hello1.protocolVersion < 1) throw new Error('Initial Core hello has no protocol version');
   lastCorePid = hello1.corePid;
+  note(`initial Core is healthy at pid ${lastCorePid}`);
   lastSupervisorPid = await waitFor('Core supervisor', () => supervisorPid(userDataDir), 15_000);
   if (!processExists(lastSupervisorPid)) throw new Error('Core supervisor PID is not alive');
+  note(`supervisor is healthy at pid ${lastSupervisorPid}`);
 
   // Abrupt UI loss is stronger than a graceful quit: the Core and supervisor must remain alive
   // even when Electron gets no teardown callback at all.
   const firstUiPid = ui1.child.pid;
+  note(`terminating first UI pid ${firstUiPid}`);
   process.kill(firstUiPid, 'SIGKILL');
   await waitForExit(firstUiPid);
+  note('first UI exited; checking Core survival');
   const helloAfterUiExit = await waitFor('Core after UI exit', async () => {
     try {
       return await coreRequest(userDataDir, token, 'hello');
@@ -243,11 +237,14 @@ try {
     throw new Error(`UI exit replaced Core ${lastCorePid} with ${helloAfterUiExit.corePid}`);
   }
   if ((await supervisorPid(userDataDir)) !== lastSupervisorPid) throw new Error('UI exit replaced the Core supervisor');
+  note('Core and supervisor survived first UI exit');
 
   // Kill the execution plane itself. The independent supervisor must recreate a fresh Core
   // generation without any Electron UI process being alive.
+  note(`terminating Core pid ${lastCorePid}`);
   process.kill(lastCorePid, 'SIGKILL');
   await waitForExit(lastCorePid);
+  note('Core exited; waiting for supervisor restart');
   const hello2 = await waitFor('Core supervisor restart', async () => {
     try {
       const hello = await coreRequest(userDataDir, token, 'hello');
@@ -259,11 +256,14 @@ try {
   const restartedCorePid = hello2.corePid;
   if (!Number.isSafeInteger(restartedCorePid) || restartedCorePid <= 0) throw new Error('Restarted Core has no valid PID');
   lastCorePid = restartedCorePid;
+  note(`supervisor restarted Core as pid ${restartedCorePid}`);
 
   // Relaunch the UI against the still-running Core. It must attach rather than replace it.
+  note('launching second UI against the surviving Core');
   ui2 = launchUi(env, 'second UI');
   await sleep(2_500);
   if (!processExists(ui2.child.pid)) throw new Error(`Second UI exited early.\n${ui2.output()}`);
+  note(`second UI is alive at pid ${ui2.child.pid}`);
   const hello3 = await coreRequest(userDataDir, token, 'hello');
   if (hello3.corePid !== restartedCorePid) {
     throw new Error(`UI relaunch replaced existing Core ${restartedCorePid} with ${hello3.corePid}`);

@@ -66,7 +66,7 @@ function createWindow(): void {
     backgroundColor: getConfig().ui.theme === 'dark' ? '#0e0e11' : '#ffffff',
     title: 'Chat On Steroids',
     webPreferences: {
-      preload: path.join(__dirname, '../preload/index.js'),
+      preload: path.join(app.getAppPath(), 'out', 'preload', 'index.js'),
       contextIsolation: true,
       nodeIntegration: false,
       sandbox: true,
@@ -132,7 +132,7 @@ function createWindow(): void {
   window.on('closed', () => { window = null; });
 
   if (process.env.ELECTRON_RENDERER_URL) void window.loadURL(process.env.ELECTRON_RENDERER_URL);
-  else void window.loadFile(path.join(__dirname, '../renderer/index.html'));
+  else void window.loadFile(path.join(app.getAppPath(), 'out', 'renderer', 'index.html'));
 }
 
 function showWindow(): void {
