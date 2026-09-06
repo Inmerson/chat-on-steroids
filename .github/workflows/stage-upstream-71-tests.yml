@@ -17,10 +17,10 @@ jobs:
           ref: fix/upstream-worker-placement-71
           fetch-depth: 0
 
-      - name: Stage regression tests
-        run: python scripts/stage-upstream-71-tests.py
+      - name: Apply worker placement implementation
+        run: python scripts/apply-upstream-71-fix.py
 
-      - name: Commit staged tests
+      - name: Commit implementation
         shell: bash
         run: |
           git diff --check
@@ -29,11 +29,11 @@ jobs:
           fi
           git config user.name "Inmerson"
           git config user.email "216765991+Inmerson@users.noreply.github.com"
-          git add test/bridge.test.ts
-          git commit -m "test: cover live-prime worker placement"
+          git add src/main/bridge.ts extension/background.js test/extension.test.ts
+          git commit -m "fix: keep fresh worker tabs behind the prime"
           git push origin HEAD:fix/upstream-worker-placement-71
 
-      - name: Run focused bridge tests
+      - name: Run focused placement tests
         run: |
           npm ci
-          npx vitest run test/bridge.test.ts
+          npx vitest run test/bridge.test.ts test/extension.test.ts
