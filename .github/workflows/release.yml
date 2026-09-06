@@ -2,7 +2,19 @@ name: Release candidate
 
 on:
   workflow_call:
+    inputs:
+      require_windows_signing:
+        description: Refuse Windows packages without a valid Authenticode publisher signature
+        required: false
+        type: boolean
+        default: false
   workflow_dispatch:
+    inputs:
+      require_windows_signing:
+        description: Require valid Authenticode on Windows installers
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -93,8 +105,42 @@ jobs:
       - name: Prove native runner target
         run: node -e "if(process.platform!=='${{ matrix.platform }}'||process.arch!=='${{ matrix.arch }}')throw new Error('Expected ${{ matrix.platform }}-${{ matrix.arch }}, got '+process.platform+'-'+process.arch)"
 
-      - name: Package
+      - name: Require Windows signing credentials
+        if: matrix.platform == 'win32' && inputs.require_windows_signing
+        shell: pwsh
+        env:
+          WIN_CSC_LINK: ${{ secrets.WIN_CSC_LINK }}
+          WIN_CSC_KEY_PASSWORD: ${{ secrets.WIN_CSC_KEY_PASSWORD }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ([string]::IsNullOrWhiteSpace($env:WIN_CSC_LINK)) { throw 'WIN_CSC_LINK is required for an official Windows release' }
+          if ([string]::IsNullOrWhiteSpace($env:WIN_CSC_KEY_PASSWORD)) { throw 'WIN_CSC_KEY_PASSWORD is required for an official Windows release' }
+
+      - name: Package Windows
+        if: matrix.platform == 'win32'
         run: npm run ${{ matrix.script }}
+        env:
+          WIN_CSC_LINK: ${{ secrets.WIN_CSC_LINK }}
+          WIN_CSC_KEY_PASSWORD: ${{ secrets.WIN_CSC_KEY_PASSWORD }}
+
+      - name: Package non-Windows
+        if: matrix.platform != 'win32'
+        run: npm run ${{ matrix.script }}
+
+      - name: Verify Windows Authenticode publisher signature
+        if: matrix.platform == 'win32' && inputs.require_windows_signing
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $installer = (Resolve-Path "release/Chat-On-Steroids-Setup-${{ matrix.arch }}.exe").Path
+          $signature = Get-AuthenticodeSignature -LiteralPath $installer
+          if ($signature.Status -ne 'Valid') {
+            throw "Windows installer Authenticode status is $($signature.Status): $installer"
+          }
+          if ($null -eq $signature.SignerCertificate) {
+            throw "Windows installer has no publisher certificate: $installer"
+          }
+          Write-Host "Authenticode OK: $($signature.SignerCertificate.Subject)"
 
       - name: Smoke packaged runtime natively
         run: node scripts/smoke-packaged-runtime.mjs --platform ${{ matrix.platform }} --arch ${{ matrix.arch }}
