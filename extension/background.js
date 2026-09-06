@@ -1413,7 +1413,15 @@ async function placeBackgroundWorker(raw, tabId) {
   };
   if (Number.isInteger(home.index)) create.index = home.index + 1;
   try {
-    await chrome.tabs.create(create);
+    const created = await chrome.tabs.create(create);
+    if (Number.isInteger(created?.id)) {
+      try {
+        await chrome.tabs.update(created.id, { autoDiscardable: false });
+      } catch {
+        // The tab already exists. Treating this presentation hardening failure as a
+        // placement failure would make the app's bounded OS fallback open a duplicate.
+      }
+    }
     return true;
   } catch {
     // The app keeps a bounded OS-open fallback armed until the marked page actually redeems.
