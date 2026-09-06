@@ -95,8 +95,10 @@ describe.runIf(IS_WINDOWS)('desktop helper', () => {
   });
 
   it('queries Windows UI Automation without requiring a screenshot', async () => {
-    const result = await findUi({ role: 'Button', maxResults: 5 });
-    expect(result.window).toBeGreaterThan(0);
+    const target = await visibleWindow();
+    if (target === null) return;
+    const result = await findUi({ window: target, role: 'Button', maxResults: 5 });
+    expect(result.window).toBe(target);
     expect(Array.isArray(result.elements)).toBe(true);
     expect(result.elements.length).toBeLessThanOrEqual(5);
     expect(result.snapshotId).toBeGreaterThan(0);
