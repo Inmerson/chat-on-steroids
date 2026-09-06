@@ -24,36 +24,26 @@ jobs:
 
           path = Path('extension/background.js')
           source = path.read_text(encoding='utf-8')
-          old = '''  try {
-            await chrome.tabs.create(create);
-            return true;
-          } catch {
-            // The app keeps a bounded OS-open fallback armed until the marked page actually redeems.
-            return false;
-          }
-          '''
-          new = '''  try {
-            const created = await chrome.tabs.create(create);
-            if (Number.isInteger(created?.id)) {
-              try {
-                await chrome.tabs.update(created.id, { autoDiscardable: false });
-              } catch {
-                // The tab already exists. Treating this presentation hardening failure as a
-                // placement failure would make the app's bounded OS fallback open a duplicate.
+          start = source.index('async function placeBackgroundWorker')
+          end = source.index('\n}\n\nasync function rememberDeferredRevival', start)
+          placement = source[start:end + 2]
+          old = '    await chrome.tabs.create(create);\n    return true;'
+          new = '''    const created = await chrome.tabs.create(create);
+              if (Number.isInteger(created?.id)) {
+                try {
+                  await chrome.tabs.update(created.id, { autoDiscardable: false });
+                } catch {
+                  // The tab already exists. Treating this presentation hardening failure as a
+                  // placement failure would make the app's bounded OS fallback open a duplicate.
+                }
               }
-            }
-            return true;
-          } catch {
-            // The app keeps a bounded OS-open fallback armed until the marked page actually redeems.
-            return false;
-          }
-          '''
-          count = source.count(old)
-          if count == 0 and new in source:
-              raise SystemExit(0)
-          if count != 1:
-              raise SystemExit(f'expected one placement block, found {count}')
-          path.write_text(source.replace(old, new, 1), encoding='utf-8')
+              return true;'''
+          if old not in placement:
+              if 'await chrome.tabs.update(created.id, { autoDiscardable: false });' in placement:
+                  raise SystemExit(0)
+              raise SystemExit('background worker create/return pair not found')
+          patched = placement.replace(old, new, 1)
+          path.write_text(source[:start] + patched + source[end + 2:], encoding='utf-8')
           PY
           git diff --check
           if git diff --quiet; then
