@@ -966,7 +966,11 @@ export function bridgeHealthEvidenceForAgent(
   return {
     agentId,
     conversationId,
-    browserPresent: browserPresent(),
+    // Global extension presence is not evidence that this exact agent conversation is open.
+    // A different ChatGPT tab may be polling while this worker's recorded conversation is
+    // absent, and health must degrade that missing exact-session evidence rather than borrowing
+    // liveness from the unrelated tab.
+    browserPresent: Boolean(live) && browserPresent(),
     generating: Boolean(live?.generating),
     activeTurnId: Boolean(live?.activeTurnId),
     finiteWait

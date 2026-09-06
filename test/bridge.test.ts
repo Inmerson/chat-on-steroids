@@ -340,6 +340,7 @@ describe('agent health evidence', () => {
       activeTurnId: true
     });
     expect(bridgeHealthEvidenceForAgent('worker-1', 'health-other-chat', now)).toMatchObject({
+      browserPresent: false,
       generating: false,
       activeTurnId: false
     });
