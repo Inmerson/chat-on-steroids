@@ -80,6 +80,27 @@ describe('readTextFile', () => {
     expect(result.hasMore).toBe(true);
   });
 
+  it.runIf(process.platform === 'win32')('releases a ranged-read handle before an immediate rename', async () => {
+    const source = at('rename-after-range.txt');
+    const target = at('rename-after-range-moved.txt');
+    // More than the line-count budget, so readTextFile stops the stream as soon as it knows a
+    // third line exists instead of scanning to EOF. That is the generator-finally path whose
+    // open handle historically prevents rename/replace on Windows when cleanup is missed.
+    await fs.writeFile(source, 'line\n'.repeat(900_000), 'utf8');
+    try {
+      const result = await readTextFile(source, { startLine: 1, endLine: 2, maxBytes: 1024 });
+      expect(result.text).toBe('line\nline');
+      expect(result.totalLines).toBeNull();
+      expect(result.hasMore).toBe(true);
+
+      await fs.rename(source, target);
+      expect((await fs.readFile(target, 'utf8')).startsWith('line\nline\n')).toBe(true);
+    } finally {
+      await fs.rm(source, { force: true });
+      await fs.rm(target, { force: true });
+    }
+  });
+
   it('reads to the end of the file when only a start is given', async () => {
     const result = await readTextFile(at('big.txt'), { startLine: 198 });
     expect(result.text).toBe('line 198\nline 199\nline 200');
