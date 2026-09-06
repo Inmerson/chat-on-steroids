@@ -36,6 +36,21 @@ jobs:
             exit 1
           fi
 
+      - name: Require Windows publisher signing credentials
+        env:
+          WIN_CSC_LINK: ${{ secrets.WIN_CSC_LINK }}
+          WIN_CSC_KEY_PASSWORD: ${{ secrets.WIN_CSC_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          if [ -z "$WIN_CSC_LINK" ]; then
+            echo "Missing WIN_CSC_LINK — official Windows releases require a publisher code-signing certificate." >&2
+            exit 1
+          fi
+          if [ -z "$WIN_CSC_KEY_PASSWORD" ]; then
+            echo "Missing WIN_CSC_KEY_PASSWORD — official Windows releases require the signing-key password." >&2
+            exit 1
+          fi
+
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
 
       - name: Verify tag matches package version
@@ -116,6 +131,9 @@ jobs:
     name: Build candidate
     needs: preflight
     uses: ./.github/workflows/release.yml
+    with:
+      require_windows_signing: true
+    secrets: inherit
 
   publish:
     name: Publish
