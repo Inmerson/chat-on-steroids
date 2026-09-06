@@ -10,6 +10,7 @@ import { contextBridge, ipcRenderer } from 'electron';
 import type { AppState, Capabilities, Config, Diagnosis, LogEntry } from '../shared/types.js';
 import type { CoreHealthStatus } from '../shared/core-protocol.js';
 import type { ControlCenterStatus } from '../shared/control-center.js';
+import type { WorkspaceDraft } from '../main/workspace-drafts.js';
 import type {
   Handoff,
   SessionEvent,
@@ -88,6 +89,8 @@ const api = {
     call<SessionDetail>('sessions:events', { id, ...options }),
   deleteSession: (id: string) => call<boolean>('sessions:delete', { id }),
   getHandoff: (id: string, handoffId?: string) => call<Handoff | null>('handoff:get', { id, handoffId }),
+  listWorkspaceDrafts: () => call<WorkspaceDraft[]>('workspace:drafts'),
+  saveWorkspaceDraft: (sessionId: string, text: string) => call<WorkspaceDraft | null>('workspace:saveDraft', { sessionId, text }),
 
   unpairExtension: () => call<AppState>('bridge:unpair'),
   downloadExtension: () => call<boolean>('bridge:downloadExtension'),
