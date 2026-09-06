@@ -29,6 +29,7 @@ import type { SwarmState } from '../shared/session.js';
 import { $, ago, el, icon, run, shortAgo, toast } from './dom.js';
 import { chatApply, chatSettingsPatch, chatVisible, initChat } from './chat.js';
 import { controlCenterVisible, initControlCenter } from './control-center.js';
+import { initWorkspaceShell } from './workspace-shell.js';
 
 declare global {
   interface Window {
@@ -1535,6 +1536,7 @@ async function refresh(): Promise<void> {
 buildGroups();
 initChat({ save: () => save(), state: () => state });
 initControlCenter(api);
+initWorkspaceShell(document, { openControl: () => showTab('control') });
 
 void (async () => {
   await refresh();

@@ -1836,8 +1836,41 @@ input[readonly] {
   padding: 12px 14px 14px;
   gap: 12px;
   grid-template-columns: 310px minmax(0, 1fr);
-  grid-template-rows: minmax(0, 1fr);
+  grid-template-rows: auto minmax(0, 1fr);
 }
+
+.workspace-bar {
+  grid-column: 1 / -1;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 18px;
+  padding: 12px 14px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: linear-gradient(120deg, var(--hover), transparent 72%);
+}
+
+.workspace-bar > div { min-width: 0; }
+
+.workspace-eyebrow {
+  display: block;
+  margin-bottom: 3px;
+  color: var(--muted);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: .12em;
+}
+
+.workspace-bar strong { font-size: 13px; }
+
+.workspace-bar p {
+  margin: 4px 0 0;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.workspace-control-link { flex: none; }
 
 /* Header, body, footer. The Sessions card is exactly this shape. */
 [data-panel='chat'] .card {
