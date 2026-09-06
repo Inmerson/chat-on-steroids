@@ -75,7 +75,11 @@ async function paint(): Promise<void> {
 }
 
 if (typeof window !== 'undefined' && window.api && typeof window.api.getCoreHealth === 'function') {
-  window.api.onStateChanged(() => void paint());
+  // Core health is already a dedicated read-only IPC projection. Do not subscribe to the app's
+  // full state stream a second time: the main renderer owns that stream and uses it to protect
+  // focused/dirty form state. A light independent poll keeps health fresh without competing for
+  // renderer state callbacks or rebuilding the much larger AppState snapshot.
   void paint();
-  setTimeout(() => void paint(), 400);
+  window.setTimeout(() => void paint(), 400);
+  window.setInterval(() => void paint(), 1_000);
 }

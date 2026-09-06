@@ -24,7 +24,6 @@ describe('session retention maintenance', () => {
     expect(prune).toHaveBeenCalledTimes(1);
     expect(prune).toHaveBeenLastCalledWith(30);
 
-    // Maintenance is intentionally coarse, not a filesystem poll on the app's hot path.
     await vi.advanceTimersByTimeAsync(SESSION_RETENTION_SWEEP_MS - 1);
     expect(prune).toHaveBeenCalledTimes(1);
 
@@ -62,10 +61,14 @@ describe('session retention maintenance', () => {
     stop();
   });
 
-  it('is wired unconditionally at app startup instead of living behind the record toggle', async () => {
-    const source = await readFile(path.join(process.cwd(), 'src/main/core/runtime.ts'), 'utf8');
-    expect(source).toContain('startSessionRetentionMaintenance({');
-    expect(source).toContain('retainDays: () => getConfig().sessions.retainDays');
-    expect(source).not.toContain('if (getConfig().sessions.record) {\n    void pruneSessions');
+  it('is wired unconditionally in Core runtime instead of living behind the record toggle or UI lifecycle', async () => {
+    const [core, ui] = await Promise.all([
+      readFile(path.join(process.cwd(), 'src/main/core/runtime.ts'), 'utf8'),
+      readFile(path.join(process.cwd(), 'src/main/index.ts'), 'utf8')
+    ]);
+    expect(core).toContain('startSessionRetentionMaintenance({');
+    expect(core).toContain('retainDays: () => getConfig().sessions.retainDays');
+    expect(core).not.toContain('if (getConfig().sessions.record) {\n    void pruneSessions');
+    expect(ui).not.toContain('startSessionRetentionMaintenance({');
   });
 });

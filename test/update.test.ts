@@ -267,7 +267,7 @@ describe('installed Windows versus win-unpacked', () => {
       {
         parentPid: process.pid,
         installerPath: path.join(userData, 'updates', NEXT, WINDOWS_ASSET),
-        args: ['/currentuser'],
+        args: [],
         windowsHide: false,
         userDataDir: userData
       }

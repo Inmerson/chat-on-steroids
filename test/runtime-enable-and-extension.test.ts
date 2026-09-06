@@ -5,18 +5,24 @@ import { describe, expect, it } from 'vitest';
 const repo = process.cwd();
 
 describe('runtime multi-agent enable regression', () => {
-  it('wires persistence before unconditional restore and preserves history while disabled', async () => {
-    const source = await readFile(path.join(repo, 'src/main/core/runtime.ts'), 'utf8');
-    const persistSink = source.indexOf('onSwarmPersistNow((snapshot) => writeDurableNow(SWARM_STATE, snapshot))');
-    const restore = source.indexOf('restoreSwarm(await readDurable<SwarmSnapshot>(SWARM_STATE))');
-    const disabledPause = source.indexOf("pauseSwarmForDisable('multi-agent mode is disabled')");
+  it('keeps persistence/restore authority in Core and preserves history while disabled', async () => {
+    const [core, ui] = await Promise.all([
+      readFile(path.join(repo, 'src/main/core/runtime.ts'), 'utf8'),
+      readFile(path.join(repo, 'src/main/index.ts'), 'utf8')
+    ]);
+    const persistSink = core.indexOf('onSwarmPersistNow((snapshot) => writeDurableNow(SWARM_STATE, snapshot))');
+    const restore = core.indexOf('restoreSwarm(await readDurable<SwarmSnapshot>(SWARM_STATE))');
+    const disabledPause = core.indexOf("pauseSwarmForDisable('multi-agent mode is disabled')");
 
     expect(persistSink).toBeGreaterThanOrEqual(0);
     expect(restore).toBeGreaterThanOrEqual(0);
     expect(disabledPause).toBeGreaterThanOrEqual(0);
     expect(persistSink).toBeLessThan(restore);
     expect(restore).toBeLessThan(disabledPause);
-    expect(source).not.toContain('await writeDurableNow(SWARM_STATE, null)');
+    expect(core).not.toContain('await writeDurableNow(SWARM_STATE, null)');
+    // Presentation UI must not become a second durable/swarm writer after the Core split.
+    expect(ui).not.toContain('onSwarmPersistNow(');
+    expect(ui).not.toContain('restoreSwarm(');
   });
 });
 
@@ -26,7 +32,7 @@ describe('companion extension setup contract', () => {
       readFile(path.join(repo, 'src/renderer/index.html'), 'utf8'),
       readFile(path.join(repo, 'src/renderer/main-app.ts'), 'utf8'),
       readFile(path.join(repo, 'src/preload/index.ts'), 'utf8'),
-      readFile(path.join(repo, 'src/main/ipc.ts'), 'utf8')
+      readFile(path.join(repo, 'src/main/ipc-ui.ts'), 'utf8')
     ]);
 
     expect(html).toMatch(/id="bridgeDownload"[\s\S]*?Download extension ZIP/i);
