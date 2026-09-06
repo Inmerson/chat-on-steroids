@@ -121,7 +121,10 @@ it('does not overwrite a focused dirty settings field on an unsolicited state pu
   });
   if (!(w.HTMLElement.prototype as any).scrollIntoView) (w.HTMLElement.prototype as any).scrollIntoView = () => {};
 
-  let stateListener: (state: any) => void = () => undefined;
+  const stateListeners = new Set<(state: any) => void>();
+  const pushState = (next: any): void => {
+    for (const listener of [...stateListeners]) listener(next);
+  };
   const baseConfig = {
     roots: [{ name: 'repo', path: 'C:\\repo' }],
     readOnly: true,
@@ -156,7 +159,7 @@ it('does not overwrite a focused dirty settings field on an unsolicited state pu
     getState: () => ok(state),
     getLog: () => ok([]),
     getSwarm: () => ok({ running: false, runId: null, agents: [], maxWorkers: 2, pendingReports: 0 }),
-    onStateChanged: (fn: any) => { stateListener = fn; return () => undefined; },
+    onStateChanged: (fn: any) => { stateListeners.add(fn); return () => stateListeners.delete(fn); },
     onLogEntry: () => () => undefined,
     onSwarmChanged: () => () => undefined,
     onSessionChanged: () => () => undefined,
@@ -172,7 +175,7 @@ it('does not overwrite a focused dirty settings field on an unsolicited state pu
   field.focus();
   field.value = 'tunnel_USER_IS_STILL_TYPING';
 
-  stateListener(structuredClone(state));
+  pushState(structuredClone(state));
 
   expect(w.document.activeElement).toBe(field);
   expect(field.value).toBe('tunnel_USER_IS_STILL_TYPING');
@@ -180,7 +183,7 @@ it('does not overwrite a focused dirty settings field on an unsolicited state pu
   const multiAgent = w.document.getElementById('homeMaEnabled') as HTMLInputElement;
   multiAgent.focus();
   multiAgent.checked = true;
-  stateListener(structuredClone(state));
+  pushState(structuredClone(state));
   expect(w.document.activeElement).toBe(multiAgent);
   expect(multiAgent.checked).toBe(true);
 
@@ -189,20 +192,20 @@ it('does not overwrite a focused dirty settings field on an unsolicited state pu
   const compactionThreshold = w.document.getElementById('autoCompactTokens') as HTMLInputElement;
   compactionThreshold.focus();
   compactionThreshold.value = '355000';
-  stateListener(structuredClone(state));
+  pushState(structuredClone(state));
   expect(w.document.activeElement).toBe(compactionThreshold);
   expect(compactionThreshold.value).toBe('355000');
 
   compactionThreshold.blur();
   const updatedThreshold = structuredClone(state) as any;
   updatedThreshold.config.compaction.autoTokens = 320000;
-  stateListener(updatedThreshold);
+  pushState(updatedThreshold);
   expect(compactionThreshold.value).toBe('320000');
 
   const goalPrompt = w.document.getElementById('goalPrompt') as HTMLTextAreaElement;
   goalPrompt.focus();
   goalPrompt.value = 'USER IS STILL EDITING THIS PROMPT';
-  stateListener(structuredClone(state));
+  pushState(structuredClone(state));
   expect(w.document.activeElement).toBe(goalPrompt);
   expect(goalPrompt.value).toBe('USER IS STILL EDITING THIS PROMPT');
 
@@ -222,7 +225,7 @@ it('does not overwrite a focused dirty settings field on an unsolicited state pu
       state: 'off', detail: '', lastRequestAt: null, lastToolCallAt: null
     }
   ];
-  stateListener(withTools);
+  pushState(withTools);
   expect(w.document.getElementById('facts')!.textContent).toContain('3 available');
   expect(w.document.getElementById('facts')!.textContent).not.toContain('of 9');
 });
@@ -421,7 +424,7 @@ async function mountChat(
     bridge: { running: true, port: 8765, paired: false, present: false, lastSeenAt: null },
     ...overrides
   };
-  let listener: (next: any) => void = () => undefined;
+  const listeners = new Set<(next: any) => void>();
   const calls: any[] = [];
   const keys: Array<{ method: string; value: string }> = [];
   const modelPages: any[] = [];
@@ -432,8 +435,8 @@ async function mountChat(
       getLog: () => ok([]),
       getSwarm: () => ok({ running: false, runId: null, agents: [], maxWorkers: 2, pendingReports: 0 }),
       onStateChanged: (fn: any) => {
-        listener = fn;
-        return () => undefined;
+        listeners.add(fn);
+        return () => listeners.delete(fn);
       },
       onLogEntry: () => () => undefined,
       onSwarmChanged: () => () => undefined,
@@ -472,7 +475,10 @@ async function mountChat(
   Object.defineProperty(w, 'api', { value: api, configurable: true });
   await import('../src/renderer/main.js');
   await new Promise((resolve) => setTimeout(resolve, 0));
-  return { window: w, calls, keys, modelPages, state, push: (next) => listener(next) };
+  return {
+    window: w, calls, keys, modelPages, state,
+    push: (next) => { for (const listener of [...listeners]) listener(next); }
+  };
 }
 
 const settle = () => new Promise((resolve) => setTimeout(resolve, 0));
