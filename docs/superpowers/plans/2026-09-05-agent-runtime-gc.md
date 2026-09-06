@@ -341,4 +341,3 @@ Run searches confirming `runtime-gc.ts` contains no process-name matching and no
 - [ ] **Step 5: Commit any verification-only fix, otherwise leave history unchanged**
 
 If no fix was required, do not create an empty commit.
-

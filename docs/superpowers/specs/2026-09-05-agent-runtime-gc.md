@@ -62,4 +62,3 @@ Run a coarse process-lifetime maintenance timer every 30 seconds. It must be `un
 - Killing arbitrary orphan `node.exe`/browser/MCP processes not created by UnifiedExec.
 - Control Center GC buttons or configurable retention UI.
 - Dynamic worker scheduling.
-
