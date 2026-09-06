@@ -122,11 +122,15 @@ async function lineRequest(endpoint, line, timeoutMs = 3_000) {
     const finish = (error, value) => {
       if (settled) return;
       settled = true;
+      clearTimeout(deadline);
       socket.destroy();
       if (error) reject(error);
       else resolve(value);
     };
-    socket.setTimeout(timeoutMs, () => finish(new Error(`IPC timeout for ${endpoint}`)));
+    // A pending Windows named-pipe connect can leave no ref'ed libuv handle even though its
+    // promise has not settled. Keep an explicit JS deadline alive so recovery polling reaches
+    // the intended timeout instead of Node terminating with an unsettled top-level await.
+    const deadline = setTimeout(() => finish(new Error(`IPC timeout for ${endpoint}`)), timeoutMs);
     socket.once('error', (error) => finish(error));
     socket.once('connect', () => socket.write(`${line}\n`));
     socket.on('data', (chunk) => {
