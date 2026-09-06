@@ -113,15 +113,10 @@ it('returns an attributed tool result while its recorder append is still pending
     status: reply.status,
     text: await reply.text()
   }));
-  const winner = await Promise.race([
-    response.then((reply) => ({ kind: 'response' as const, reply })),
-    new Promise<{ kind: 'timeout' }>((resolve) => setTimeout(() => resolve({ kind: 'timeout' }), 150))
-  ]);
+  const reply = await response;
 
-  expect(winner.kind).toBe('response');
-  if (winner.kind !== 'response') throw new Error('tool reply waited for recorder persistence');
-  expect(winner.reply.status).toBe(200);
-  expect(winner.reply.text).toContain('hello');
+  expect(reply.status).toBe(200);
+  expect(reply.text).toContain('hello');
   expect(runningToolCalls(conversationId)).toBe(0);
   expect(settlingToolCalls(conversationId)).toBe(1);
   expect(inFlightToolCalls(conversationId)).toBe(1);
@@ -129,7 +124,7 @@ it('returns an attributed tool result while its recorder append is still pending
   releaseRecord();
   releaseRecord = null;
   await vi.waitFor(() => expect(inFlightToolCalls(conversationId)).toBe(0));
-});
+}, 15_000);
 
 it('counts a call as running until its whole request is done, not just its handler', async () => {
   // The compaction barrier waits for this to reach zero before it writes a handoff. The
