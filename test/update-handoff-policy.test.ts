@@ -19,10 +19,10 @@ describe('Windows installation ownership', () => {
 });
 
 describe('Windows installer policy', () => {
-  it('uses a visible assisted upgrade for explicit install on a true NSIS installation', () => {
+  it('uses a visible assisted current-user upgrade for explicit install on a true NSIS installation', () => {
     expect(windowsInstallPlan({ explicit: true, ownsInstallation: true })).toEqual({
       launch: true,
-      args: ['--updated'],
+      args: ['/currentuser', '--updated'],
       windowsHide: false,
       mode: 'assisted-upgrade'
     });
@@ -37,10 +37,10 @@ describe('Windows installer policy', () => {
     });
   });
 
-  it('retains silent ordinary-quit upgrades only for a true installation', () => {
+  it('retains silent ordinary-quit current-user upgrades only for a true installation', () => {
     expect(windowsInstallPlan({ explicit: false, ownsInstallation: true })).toEqual({
       launch: true,
-      args: ['/S', '--updated'],
+      args: ['/S', '/currentuser', '--updated'],
       windowsHide: true,
       mode: 'silent-upgrade'
     });
