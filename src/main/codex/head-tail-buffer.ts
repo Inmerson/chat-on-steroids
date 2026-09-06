@@ -16,6 +16,8 @@ export class HeadTailBuffer {
   private tail: Buffer[] = [];
   private tailLength = 0;
   private omitted = 0;
+  /** Once bytes are omitted, the stable head must never refill after UTF-8 boundary trimming. */
+  private headSealed = false;
 
   constructor(maxBytes: number = UNIFIED_EXEC_OUTPUT_MAX_BYTES) {
     this.maxBytes = maxBytes;
@@ -44,7 +46,7 @@ export class HeadTailBuffer {
       this.omitted += chunk.length;
       return;
     }
-    const remainingHead = Math.max(0, this.headBudget - this.headLength);
+    const remainingHead = this.headSealed ? 0 : Math.max(0, this.headBudget - this.headLength);
     const headLength = Math.min(remainingHead, chunk.length);
     if (headLength > 0) {
       this.head.push(chunk.subarray(0, headLength));
@@ -84,11 +86,13 @@ export class HeadTailBuffer {
       this.omitted += this.tailLength + (chunk.length - kept.length);
       this.tail = [kept];
       this.tailLength = kept.length;
+      this.normalizeUtf8OmissionBoundaries();
       return;
     }
     this.tail.push(chunk);
     this.tailLength += chunk.length;
     this.trimTailToBudget();
+    this.normalizeUtf8OmissionBoundaries();
   }
 
   private trimTailToBudget(): void {
@@ -108,4 +112,58 @@ export class HeadTailBuffer {
       excess = 0;
     }
   }
+
+  /**
+   * An omission marker separates head and tail, so both sides must independently end/start on a
+   * UTF-8 code-point boundary. Any boundary bytes discarded here become part of the omission count,
+   * preserving `retained + omitted === total input` rather than hiding corrective trimming.
+   */
+  private normalizeUtf8OmissionBoundaries(): void {
+    if (this.omitted === 0) return;
+    this.headSealed = true;
+
+    const head = Buffer.concat(this.head, this.headLength);
+    const headTrim = incompleteUtf8SuffixLength(head);
+    if (headTrim > 0) {
+      const kept = head.subarray(0, head.length - headTrim);
+      this.head = kept.length === 0 ? [] : [kept];
+      this.headLength = kept.length;
+      this.omitted += headTrim;
+    }
+
+    const tail = Buffer.concat(this.tail, this.tailLength);
+    const tailTrim = leadingUtf8ContinuationBytes(tail);
+    if (tailTrim > 0) {
+      const kept = tail.subarray(tailTrim);
+      this.tail = kept.length === 0 ? [] : [kept];
+      this.tailLength = kept.length;
+      this.omitted += tailTrim;
+    }
+  }
+}
+
+function leadingUtf8ContinuationBytes(bytes: Buffer): number {
+  let index = 0;
+  while (index < bytes.length && index < 3 && (bytes[index]! & 0xc0) === 0x80) index++;
+  return index;
+}
+
+function incompleteUtf8SuffixLength(bytes: Buffer): number {
+  if (bytes.length === 0) return 0;
+  let lead = bytes.length - 1;
+  let continuations = 0;
+  while (lead >= 0 && continuations < 3 && (bytes[lead]! & 0xc0) === 0x80) {
+    continuations++;
+    lead--;
+  }
+  if (lead < 0) return continuations;
+
+  const first = bytes[lead]!;
+  const expected =
+    (first & 0x80) === 0 ? 1 :
+      (first & 0xe0) === 0xc0 ? 2 :
+        (first & 0xf0) === 0xe0 ? 3 :
+          (first & 0xf8) === 0xf0 ? 4 : 1;
+  const available = bytes.length - lead;
+  return expected > available ? available : 0;
 }

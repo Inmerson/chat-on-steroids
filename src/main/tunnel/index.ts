@@ -19,6 +19,7 @@ import path from 'node:path';
 import type { ConnectionState, TunnelHealth, TunnelSettings } from '../../shared/types.js';
 import { childEnv, terminateProcessTree } from '../exec.js';
 import { logError, logInfo, logWarn } from '../logger.js';
+import { Utf8ChunkDecoder } from '../utf8-stream.js';
 import { ago, POLL_FRESH_MS, readClientStatus, readPollHealth } from './health.js';
 import { locateBinary } from './locate.js';
 
@@ -99,8 +100,9 @@ async function stopTree(child: ChildProcess | null, timeoutMs = 3_000): Promise<
 
 function lineReader(onLine: (line: string) => void): (chunk: Buffer) => void {
   let carry = '';
+  const decoder = new Utf8ChunkDecoder();
   return (chunk: Buffer) => {
-    carry += chunk.toString('utf8');
+    carry += decoder.write(chunk);
     let at = carry.indexOf('\n');
     while (at !== -1) {
       const line = carry.slice(0, at).trimEnd();

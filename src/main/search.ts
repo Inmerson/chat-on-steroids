@@ -12,6 +12,7 @@ import { spawn } from 'node:child_process';
 import path from 'node:path';
 import { locateRipgrep } from './ripgrep.js';
 import { isExcludedFolderName, sniffBinaryBytes, type TextEncoding } from './fsops.js';
+import { Utf8ChunkDecoder } from './utf8-stream.js';
 
 /**
  * Skipped by default because they are large and rarely what anyone means. The model
@@ -289,8 +290,10 @@ async function searchWithRipgrep(
       }
     };
 
+    const stdoutDecoder = new Utf8ChunkDecoder();
+    const stderrDecoder = new Utf8ChunkDecoder();
     child.stdout.on('data', (chunk: Buffer) => {
-      stdout += chunk.toString('utf8');
+      stdout += stdoutDecoder.write(chunk);
       let consumed = 0;
       for (;;) {
         const newline = stdout.indexOf('\n', consumed);
@@ -301,13 +304,15 @@ async function searchWithRipgrep(
       if (consumed > 0) stdout = stdout.slice(consumed);
     });
     child.stderr.on('data', (chunk: Buffer) => {
-      stderr = `${stderr}${chunk.toString('utf8')}`.slice(-8000);
+      stderr = `${stderr}${stderrDecoder.write(chunk)}`.slice(-8000);
     });
     child.once('error', (error) => {
       const code = (error as NodeJS.ErrnoException).code;
       finish(new Error(`ripgrep could not start${code ? ` (${code})` : ''}`));
     });
     child.once('close', (code) => {
+      stdout += stdoutDecoder.end();
+      stderr = `${stderr}${stderrDecoder.end()}`.slice(-8000);
       if (stdout.trim()) consider(stdout.trim());
       // rg uses 1 for "no matches". A deliberate limit/time kill can return any code.
       if (stoppedBecause !== null || code === 0 || code === 1) finish();
