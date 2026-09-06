@@ -4210,6 +4210,9 @@ describe('a worker chat that never opens', () => {
   it('offers concurrent fresh workers to their live prime page without asking the OS to foreground Chrome', async () => {
     const home = 'c0c0c0c0-1111-4222-8333-000000000b71';
     await pair();
+    await request('POST', '/events', {
+      body: { conversationId: home, events: [{ kind: 'user_message', time: Date.now(), messageId: 'prime-placement-71', text: 'prime is live' }] }
+    });
     expect((await request('GET', `/activity?conversationId=${home}`)).status).toBe(200);
 
     spawn({
@@ -4236,6 +4239,9 @@ describe('a worker chat that never opens', () => {
     try {
       const home = 'c0c0c0c0-1111-4222-8333-000000000b72';
       await pair();
+      await request('POST', '/events', {
+        body: { conversationId: home, events: [{ kind: 'user_message', time: Date.now(), messageId: 'prime-placement-72', text: 'prime is live' }] }
+      });
       expect((await request('GET', `/activity?conversationId=${home}`)).status).toBe(200);
       spawn({ workers: [{ task: 'fallback worker' }], caller: { conversationId: home } });
 
