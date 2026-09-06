@@ -214,20 +214,24 @@ describe('agent runtime garbage collection', () => {
   });
 
   it('wires GC after swarm restore/canonicalization and stops it before shutdown phases', async () => {
-    const indexSource = await readFile(new URL('../src/main/index.ts', import.meta.url), 'utf8');
-    const restore = indexSource.indexOf('restoreSwarm(savedSwarm);');
-    const canonicalize = indexSource.indexOf("pauseSwarmForDisable('multi-agent mode is disabled');", restore);
-    const start = indexSource.indexOf('stopAgentRuntimeGc = startAgentRuntimeGc(', canonicalize);
-    const willQuit = indexSource.indexOf("app.on('will-quit'", start);
-    const stop = indexSource.indexOf('stopAgentRuntimeGc?.();', willQuit);
-    const shutdown = indexSource.indexOf('void runShutdownSequence(', willQuit);
+    const runtimeSource = await readFile(new URL('../src/main/core/runtime.ts', import.meta.url), 'utf8');
+    const restore = runtimeSource.indexOf('restoreSwarm(await readDurable<SwarmSnapshot>(SWARM_STATE));');
+    const canonicalize = runtimeSource.indexOf("pauseSwarmForDisable('multi-agent mode is disabled');", restore);
+    const runtimeStart = runtimeSource.indexOf('export async function startCoreRuntime', canonicalize);
+    const restored = runtimeSource.indexOf('const stopRetention = await restoreCoreState(userDataDir);', runtimeStart);
+    const start = runtimeSource.indexOf('const stopAgentRuntimeGc = startAgentRuntimeGc(', restored);
+    const shutdown = runtimeSource.indexOf('shutdown: async () => {', start);
+    const stop = runtimeSource.indexOf('stopAgentRuntimeGc();', shutdown);
+    const retentionStop = runtimeSource.indexOf('stopRetention();', stop);
 
     expect(restore).toBeGreaterThanOrEqual(0);
     expect(canonicalize).toBeGreaterThan(restore);
-    expect(start).toBeGreaterThan(canonicalize);
-    expect(willQuit).toBeGreaterThan(start);
-    expect(stop).toBeGreaterThan(willQuit);
-    expect(shutdown).toBeGreaterThan(stop);
+    expect(runtimeStart).toBeGreaterThan(canonicalize);
+    expect(restored).toBeGreaterThan(runtimeStart);
+    expect(start).toBeGreaterThan(restored);
+    expect(shutdown).toBeGreaterThan(start);
+    expect(stop).toBeGreaterThan(shutdown);
+    expect(retentionStop).toBeGreaterThan(stop);
   });
 
   it('captures only live runtimes with exact ownership that still maps to an agent', () => {
