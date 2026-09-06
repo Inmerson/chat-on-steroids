@@ -2,7 +2,6 @@ import { randomUUID, createHash } from 'node:crypto';
 import { spawn } from 'node:child_process';
 import { promises as fs, existsSync } from 'node:fs';
 import { createConnection } from 'node:net';
-import { tmpdir } from 'node:os';
 import path from 'node:path';
 import process from 'node:process';
 
@@ -26,6 +25,17 @@ const packageRoot = explicitRoot
 if (!packageRoot) throw new Error('Could not find packaged Windows x64 application root');
 const executable = path.join(packageRoot, 'Chat On Steroids.exe');
 if (!existsSync(executable)) throw new Error(`Packaged executable is missing: ${executable}`);
+
+// Electron resolves the packaged Windows appData folder through the Windows known-folder API.
+// Replacing APPDATA in a child environment is not a reliable way to relocate app.getPath('userData')
+// on the hosted runner. The smoke therefore observes the real per-runner profile. Refuse to do that
+// on a developer machine unless explicitly opted in so this test can never kill a person's live Core.
+const allowRealProfile = String(process.env.CI).toLowerCase() === 'true' || process.argv.includes('--allow-real-profile');
+if (!allowRealProfile) {
+  throw new Error('This smoke uses the real Windows app-data profile. Run under CI or pass --allow-real-profile explicitly.');
+}
+const appDataRoot = process.env.APPDATA ? path.resolve(process.env.APPDATA) : null;
+if (!appDataRoot) throw new Error('APPDATA is not available');
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -63,20 +73,32 @@ async function waitForExit(pid, timeoutMs = 15_000) {
   throw new Error(`Process ${pid} did not exit within ${timeoutMs}ms`);
 }
 
-async function findTokenFile(root) {
-  const queue = [root];
-  while (queue.length > 0) {
-    const directory = queue.shift();
-    let entries;
+async function findPackagedTokenFile(root) {
+  // userData is one directory below appData and the token is userData/core/ipc.token. Check
+  // likely product/package spellings first, then enumerate only the immediate appData children.
+  const likelyNames = ['Chat On Steroids', 'chat-on-steroids'];
+  const candidates = likelyNames.map((name) => path.join(root, name, 'core', 'ipc.token'));
+  for (const candidate of candidates) {
     try {
-      entries = await fs.readdir(directory, { withFileTypes: true });
+      if ((await fs.stat(candidate)).isFile()) return candidate;
     } catch {
-      continue;
+      // Keep probing while the UI/Core bootstrap creates the profile.
     }
-    for (const entry of entries) {
-      const target = path.join(directory, entry.name);
-      if (entry.isDirectory()) queue.push(target);
-      else if (entry.isFile() && entry.name === 'ipc.token' && path.basename(path.dirname(target)) === 'core') return target;
+  }
+
+  let entries;
+  try {
+    entries = await fs.readdir(root, { withFileTypes: true });
+  } catch {
+    return null;
+  }
+  for (const entry of entries) {
+    if (!entry.isDirectory()) continue;
+    const candidate = path.join(root, entry.name, 'core', 'ipc.token');
+    try {
+      if ((await fs.stat(candidate)).isFile()) return candidate;
+    } catch {
+      // Not this application profile.
     }
   }
   return null;
@@ -160,10 +182,10 @@ function captureChild(child, label) {
   };
 }
 
-function launchUi(env, label) {
+function launchUi(label) {
   const child = spawn(executable, [], {
     cwd: packageRoot,
-    env,
+    env: { ...process.env, ELECTRON_ENABLE_LOGGING: '1' },
     stdio: ['ignore', 'pipe', 'pipe'],
     windowsHide: true
   });
@@ -182,24 +204,6 @@ async function terminateChild(record) {
   await waitForExit(pid).catch(() => undefined);
 }
 
-const smokeRoot = await fs.mkdtemp(path.join(tmpdir(), 'cos-core-lifecycle-'));
-const roaming = path.join(smokeRoot, 'AppData', 'Roaming');
-const local = path.join(smokeRoot, 'AppData', 'Local');
-const home = path.join(smokeRoot, 'Home');
-await Promise.all([
-  fs.mkdir(roaming, { recursive: true }),
-  fs.mkdir(local, { recursive: true }),
-  fs.mkdir(home, { recursive: true })
-]);
-const env = {
-  ...process.env,
-  APPDATA: roaming,
-  LOCALAPPDATA: local,
-  USERPROFILE: home,
-  HOME: home,
-  ELECTRON_ENABLE_LOGGING: '1'
-};
-
 let ui1 = null;
 let ui2 = null;
 let userDataDir = null;
@@ -208,8 +212,11 @@ let lastCorePid = null;
 let lastSupervisorPid = null;
 
 try {
-  ui1 = launchUi(env, 'first UI');
-  const tokenPath = await waitFor('Core IPC token', async () => findTokenFile(roaming), 35_000);
+  ui1 = launchUi('first UI');
+  const tokenPath = await waitFor('Core IPC token', async () => {
+    if (!processExists(ui1.child.pid)) throw new Error(`First UI exited before Core startup.\n${ui1.output()}`);
+    return findPackagedTokenFile(appDataRoot);
+  }, 35_000);
   userDataDir = path.dirname(path.dirname(tokenPath));
   token = (await fs.readFile(tokenPath, 'utf8')).trim();
   if (!/^[0-9a-f]{64}$/i.test(token)) throw new Error(`Invalid Core IPC token in ${tokenPath}`);
@@ -261,7 +268,7 @@ try {
   lastCorePid = restartedCorePid;
 
   // Relaunch the UI against the still-running Core. It must attach rather than replace it.
-  ui2 = launchUi(env, 'second UI');
+  ui2 = launchUi('second UI');
   await sleep(2_500);
   if (!processExists(ui2.child.pid)) throw new Error(`Second UI exited early.\n${ui2.output()}`);
   const hello3 = await coreRequest(userDataDir, token, 'hello');
@@ -304,5 +311,4 @@ try {
   if (lastCorePid && processExists(lastCorePid)) {
     try { process.kill(lastCorePid, 'SIGKILL'); } catch { /* already gone */ }
   }
-  await fs.rm(smokeRoot, { recursive: true, force: true }).catch(() => undefined);
 }
