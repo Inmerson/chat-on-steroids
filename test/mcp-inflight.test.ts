@@ -5,6 +5,7 @@ import { afterEach, expect, it, vi } from 'vitest';
 import { defaultConfig, initConfigPath, saveConfig } from '../src/main/config.js';
 import { validateNewRoot } from '../src/main/sandbox.js';
 import { initDurableStore, resetDurableForTests } from '../src/main/durable.js';
+import { observeRequestCorrelation } from '../src/main/session/correlation.js';
 import {
   inFlightToolCalls,
   runningToolCalls,
@@ -76,10 +77,14 @@ async function serve(): Promise<McpEndpoint> {
   }));
 }
 
-const readNote = (url: string): Promise<Response> =>
+const readNote = (url: string, requestId: string | null = null): Promise<Response> =>
   fetch(url, {
     method: 'POST',
-    headers: { 'content-type': 'application/json', accept: 'application/json, text/event-stream' },
+    headers: {
+      'content-type': 'application/json',
+      accept: 'application/json, text/event-stream',
+      ...(requestId ? { 'x-request-id': `${requestId}/att1` } : {})
+    },
     body: JSON.stringify({
       jsonrpc: '2.0',
       id: 1,
@@ -87,6 +92,44 @@ const readNote = (url: string): Promise<Response> =>
       params: { name: 'read', arguments: { paths: ['/probe/note.txt'] } }
     })
   });
+
+it('returns an attributed tool result while its recorder append is still pending', async () => {
+  releaseRecord = () => {};
+  endpoint = await serve();
+  const requestId = 'wfr_inflight_recorder_latency';
+  const conversationId = 'conv-inflight-recorder-latency';
+  expect(
+    observeRequestCorrelation({
+      requestId,
+      conversationId,
+      sessionId: '2026-09-06-recorder-latency',
+      messageId: 'msg-recorder-latency',
+      tool: 'read',
+      observedAt: Date.now()
+    })
+  ).toBe('stored');
+
+  const response = readNote(endpoint.url, requestId).then(async (reply) => ({
+    status: reply.status,
+    text: await reply.text()
+  }));
+  const winner = await Promise.race([
+    response.then((reply) => ({ kind: 'response' as const, reply })),
+    new Promise<{ kind: 'timeout' }>((resolve) => setTimeout(() => resolve({ kind: 'timeout' }), 150))
+  ]);
+
+  expect(winner.kind).toBe('response');
+  if (winner.kind !== 'response') throw new Error('tool reply waited for recorder persistence');
+  expect(winner.reply.status).toBe(200);
+  expect(winner.reply.text).toContain('hello');
+  expect(runningToolCalls(conversationId)).toBe(0);
+  expect(settlingToolCalls(conversationId)).toBe(1);
+  expect(inFlightToolCalls(conversationId)).toBe(1);
+
+  releaseRecord();
+  releaseRecord = null;
+  await vi.waitFor(() => expect(inFlightToolCalls(conversationId)).toBe(0));
+});
 
 it('counts a call as running until its whole request is done, not just its handler', async () => {
   // The compaction barrier waits for this to reach zero before it writes a handoff. The
