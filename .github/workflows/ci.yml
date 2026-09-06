@@ -64,3 +64,80 @@ jobs:
           path: verify.log
           if-no-files-found: ignore
           retention-days: 3
+
+  package-windows-core:
+    name: Package + persistent Core smoke Windows x64
+    needs: verify
+    runs-on: windows-2025
+    timeout-minutes: 50
+
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
+        with:
+          node-version: 22
+          architecture: x64
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Reject whitespace errors in the PR diff
+        if: github.event_name == 'pull_request'
+        shell: pwsh
+        run: git diff --check "origin/${{ github.base_ref }}...HEAD"
+
+      - name: Build Windows x64 installer
+        run: npm run dist:x64
+
+      - name: Smoke packaged native runtime
+        run: node scripts/smoke-packaged-runtime.mjs --platform win32 --arch x64
+
+      - name: Smoke persistent Core lifecycle from win-unpacked
+        run: node scripts/smoke-windows-core-lifecycle.mjs
+
+      - name: Install generated NSIS package as current user
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $installer = (Resolve-Path 'release/Chat-On-Steroids-Setup-x64.exe').Path
+          $installDir = Join-Path $env:RUNNER_TEMP 'cos-installed-smoke'
+          Remove-Item -LiteralPath $installDir -Recurse -Force -ErrorAction SilentlyContinue
+          $arguments = @('/S', '/currentuser', "/D=$installDir")
+          $process = Start-Process -FilePath $installer -ArgumentList $arguments -Wait -PassThru
+          if ($process.ExitCode -ne 0) { throw "NSIS installer exited $($process.ExitCode)" }
+          $exe = Join-Path $installDir 'Chat On Steroids.exe'
+          $uninstaller = Join-Path $installDir 'Uninstall Chat On Steroids.exe'
+          if (-not (Test-Path -LiteralPath $exe -PathType Leaf)) { throw "Installed executable is missing: $exe" }
+          if (-not (Test-Path -LiteralPath $uninstaller -PathType Leaf)) { throw "Adjacent NSIS uninstaller is missing: $uninstaller" }
+          "COS_INSTALLED_ROOT=$installDir" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "COS_UNINSTALLER=$uninstaller" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Smoke installed native runtime
+        run: node scripts/smoke-packaged-runtime.mjs --platform win32 --arch x64 --root "$env:COS_INSTALLED_ROOT"
+        shell: pwsh
+
+      - name: Smoke persistent Core lifecycle from installed NSIS app
+        run: node scripts/smoke-windows-core-lifecycle.mjs --root "$env:COS_INSTALLED_ROOT"
+        shell: pwsh
+
+      - name: Uninstall smoke package
+        if: always() && env.COS_UNINSTALLER != ''
+        shell: pwsh
+        run: |
+          if (Test-Path -LiteralPath $env:COS_UNINSTALLER -PathType Leaf) {
+            $process = Start-Process -FilePath $env:COS_UNINSTALLER -ArgumentList @('/S') -Wait -PassThru
+            if ($process.ExitCode -ne 0) { Write-Warning "NSIS uninstaller exited $($process.ExitCode)" }
+          }
+
+      - name: Upload Windows package
+        if: success()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: core-reliability-windows-x64
+          path: release/Chat-On-Steroids-Setup-x64.exe
+          if-no-files-found: error
+          retention-days: 7
