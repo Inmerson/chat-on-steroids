@@ -9,79 +9,20 @@ permissions:
   contents: write
 
 jobs:
-  patch-tests:
-    runs-on: ubuntu-latest
+  stage:
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
         with:
-          ref: ${{ github.ref_name }}
+          ref: fix/upstream-worker-placement-71
           fetch-depth: 0
-      - name: Add worker placement regressions
+
+      - name: Stage regression tests
+        run: python scripts/stage-upstream-71-tests.py
+
+      - name: Commit staged tests
         shell: bash
         run: |
-          python - <<'PY'
-          from pathlib import Path
-
-          path = Path('test/bridge.test.ts')
-          source = path.read_text(encoding='utf-8')
-          marker = "describe('a worker chat that never opens', () => {\n"
-          sentinel = "offers concurrent fresh workers to their live prime page without asking the OS to foreground Chrome"
-          if sentinel not in source:
-              tests = r'''
-  it('offers concurrent fresh workers to their live prime page without asking the OS to foreground Chrome', async () => {
-    const home = 'c0c0c0c0-1111-4222-8333-000000000b71';
-    await pair();
-    expect((await request('GET', `/activity?conversationId=${home}`)).status).toBe(200);
-
-    spawn({
-      workers: [{ task: 'first background worker' }, { task: 'second background worker' }],
-      caller: { conversationId: home }
-    });
-
-    const placements: Array<{ id: string; background?: true }> = [];
-    await vi.waitFor(async () => {
-      const feed = await request('GET', `/activity?conversationId=${home}`);
-      const placement = feed.body.placement as { id: string; background?: true } | null;
-      if (placement && !placements.some((entry) => entry.id === placement.id)) placements.push(placement);
-      expect(placements).toHaveLength(2);
-    });
-
-    expect(new Set(placements.map((entry) => entry.id)).size).toBe(2);
-    expect(placements.every((entry) => entry.background === true)).toBe(true);
-    expect(opened).toEqual([]);
-  });
-
-  it('uses the worker redeem deadline as the single OS fallback when prime-side placement never redeems', async () => {
-    vi.useFakeTimers();
-    try {
-      const home = 'c0c0c0c0-1111-4222-8333-000000000b72';
-      await pair();
-      expect((await request('GET', `/activity?conversationId=${home}`)).status).toBe(200);
-      spawn({ workers: [{ task: 'fallback worker' }], caller: { conversationId: home } });
-
-      let placement: { id: string; background?: true } | null = null;
-      await vi.waitFor(async () => {
-        const feed = await request('GET', `/activity?conversationId=${home}`);
-        placement = feed.body.placement ?? null;
-        expect(placement).not.toBeNull();
-      });
-      expect(placement!.background).toBe(true);
-      expect(opened).toEqual([]);
-
-      await vi.advanceTimersByTimeAsync(WORKER_REDEEM_MS + 1_000);
-      await flushDurable();
-      await vi.waitFor(() => expect(opened).toHaveLength(1));
-      expect(new URL(opened[0]!).searchParams.get('clf')).toBe(placement!.id);
-    } finally {
-      vi.useRealTimers();
-    }
-  });
-'''
-              if marker not in source:
-                  raise SystemExit('worker bootstrap describe marker not found')
-              source = source.replace(marker, marker + tests, 1)
-              path.write_text(source, encoding='utf-8')
-          PY
           git diff --check
           if git diff --quiet; then
             exit 0
@@ -90,10 +31,9 @@ jobs:
           git config user.email "216765991+Inmerson@users.noreply.github.com"
           git add test/bridge.test.ts
           git commit -m "test: cover live-prime worker placement"
-          git push origin "HEAD:${GITHUB_REF_NAME}"
+          git push origin HEAD:fix/upstream-worker-placement-71
 
       - name: Run focused bridge tests
-        if: ${{ always() }}
         run: |
           npm ci
           npx vitest run test/bridge.test.ts
