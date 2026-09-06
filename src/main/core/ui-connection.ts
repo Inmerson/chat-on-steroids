@@ -115,7 +115,7 @@ export function createUiConnectionFacade(options: UiConnectionFacadeOptions): Ui
     status = {
       ...EMPTY_STATUS,
       state: 'connecting-tunnel',
-      detail: 'Core Host is reconnectingâ€¦'
+      detail: 'Core Host is reconnecting…'
     };
     for (const listener of statusListeners) listener({ ...status });
   };
