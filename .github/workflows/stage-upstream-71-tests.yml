@@ -17,21 +17,20 @@ jobs:
           ref: fix/upstream-worker-placement-71
           fetch-depth: 0
 
-      - name: Apply worker placement implementation
-        run: python scripts/apply-upstream-71-fix.py
+      - name: Refine live-prime regression fixture
+        run: python scripts/refine-upstream-71-tests.py
 
-      - name: Commit implementation
+      - name: Commit regression refinement
         shell: bash
         run: |
           git diff --check
-          if git diff --quiet; then
-            exit 0
+          if ! git diff --quiet; then
+            git config user.name "Inmerson"
+            git config user.email "216765991+Inmerson@users.noreply.github.com"
+            git add test/bridge.test.ts
+            git commit -m "test: model a recorded live prime for placement"
+            git push origin HEAD:fix/upstream-worker-placement-71
           fi
-          git config user.name "Inmerson"
-          git config user.email "216765991+Inmerson@users.noreply.github.com"
-          git add src/main/bridge.ts extension/background.js test/extension.test.ts
-          git commit -m "fix: keep fresh worker tabs behind the prime"
-          git push origin HEAD:fix/upstream-worker-placement-71
 
       - name: Run focused placement tests
         run: |
