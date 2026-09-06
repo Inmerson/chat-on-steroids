@@ -24,6 +24,77 @@ function deferred() {
 }
 
 describe('CoreHealthController', () => {
+  it('allows a ready tunnel to complete its first long poll before default recovery', async () => {
+    let now = 10_000;
+    let current = status({ state: 'connecting-tunnel', handshakeAt: null });
+    const recover = vi.fn(async () => undefined);
+    const controller = new CoreHealthController({
+      getStatus: () => current,
+      isServerRunning: () => true,
+      probe: async () => ({ healthy: true, toolCount: 5, latencyMs: 1, detail: 'ok' }),
+      recover,
+      now: () => now
+    });
+    await controller.tick();
+    now = 55_000;
+    await controller.tick();
+    expect(recover).not.toHaveBeenCalled();
+    current = status({ handshakeAt: now });
+    await controller.tick();
+    expect(controller.snapshot().overall).toBe('CONNECTED');
+  });
+
+  it('gives each recreated transport a fresh joining budget', async () => {
+    let now = 10_000;
+    const recover = vi.fn(async () => undefined);
+    const controller = new CoreHealthController({
+      getStatus: () => status({ state: 'connecting-tunnel', handshakeAt: null }),
+      isServerRunning: () => true,
+      probe: async () => ({ healthy: true, toolCount: 5, latencyMs: 1, detail: 'ok' }),
+      recover,
+      now: () => now,
+      joiningStaleMs: 25_000
+    });
+    await controller.tick();
+    now = 36_000;
+    await controller.tick();
+    await controller.recoveryPromise();
+    now = 46_000;
+    await controller.tick();
+    expect(recover).toHaveBeenCalledTimes(1);
+    now = 72_000;
+    await controller.tick();
+    expect(recover).toHaveBeenCalledTimes(2);
+  });
+
+  it('does not replace a transport that connected while its local probe was pending', async () => {
+    let now = 10_000;
+    let current = status({ state: 'connecting-tunnel', handshakeAt: null });
+    const pending = deferred();
+    let pause = false;
+    const recover = vi.fn(async () => undefined);
+    const controller = new CoreHealthController({
+      getStatus: () => current,
+      isServerRunning: () => true,
+      probe: async () => {
+        if (pause) await pending.promise;
+        return { healthy: true, toolCount: 5, latencyMs: 1, detail: 'ok' };
+      },
+      recover,
+      now: () => now,
+      joiningStaleMs: 25_000
+    });
+    await controller.tick();
+    now = 36_000;
+    pause = true;
+    const tick = controller.tick();
+    current = status({ handshakeAt: now });
+    pending.resolve();
+    await tick;
+    expect(recover).not.toHaveBeenCalled();
+    expect(controller.snapshot().overall).toBe('CONNECTED');
+  });
+
   it('does not call transport-only connected healthy when the real MCP probe fails', async () => {
     const recovery = deferred();
     const recover = vi.fn(() => recovery.promise);
