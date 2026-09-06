@@ -59,7 +59,7 @@ function client(overrides: Record<string, unknown> = {}) {
     applySettings: vi.fn(async () => envelope()),
     secretStatus: vi.fn(async () => ({ hasApiKey: true, hasGoalKey: false })),
     setSecret: vi.fn(async () => undefined),
-    uiCall: vi.fn(async () => null),
+    uiCall: async <T>(): Promise<T> => null as T,
     shutdownCore: vi.fn(async () => true),
     ...overrides
   };
@@ -183,7 +183,8 @@ describe('UI persistent-Core connection facade', () => {
   });
 
   it('routes fixed UI runtime calls through the attached Core client', async () => {
-    const peer = client({ uiCall: vi.fn(async () => ({ running: true })) });
+    const uiCall = vi.fn(async () => ({ running: true }));
+    const peer = client({ uiCall });
     const facade = createUiConnectionFacade({
       userDataDir: () => 'profile',
       token: async () => 'a'.repeat(64),
@@ -193,6 +194,6 @@ describe('UI persistent-Core connection facade', () => {
     });
 
     await expect(facade.uiCall('bridge-status', null)).resolves.toEqual({ running: true });
-    expect(peer.uiCall).toHaveBeenCalledWith('bridge-status', null);
+    expect(uiCall).toHaveBeenCalledWith('bridge-status', null);
   });
 });
