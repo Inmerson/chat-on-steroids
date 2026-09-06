@@ -19,6 +19,7 @@ import { defaultConfig, initConfigPath, saveConfig } from '../src/main/config.js
 import { initDurableStore, resetDurableForTests } from '../src/main/durable.js';
 import { startMcpServer, type McpEndpoint } from '../src/main/mcp/server.js';
 import { validateNewRoot } from '../src/main/sandbox.js';
+import { flushRecorder } from '../src/main/session/recorder.js';
 import { initSessionStore, resetSessionStoreForTests, unsetSessionRootForTests } from '../src/main/session/store.js';
 
 /** Bytes the probe command writes to stdout. Comfortably past both budgets under test. */
@@ -41,6 +42,7 @@ let endpoint: McpEndpoint | null = null;
 afterEach(async () => {
   if (endpoint) await endpoint.stop().catch(() => undefined);
   endpoint = null;
+  await flushRecorder();
   resetSessionStoreForTests();
   unsetSessionRootForTests();
   resetDurableForTests();
