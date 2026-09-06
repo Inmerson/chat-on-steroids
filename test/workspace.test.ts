@@ -406,8 +406,10 @@ describe('the sandbox is still the boundary', () => {
       resolveIn(roots, path.join(approved, 'project', 'escape', 'new', 'deep', 'file.txt'), { allowMissing: true })
     );
 
-    await expect(shorthand).rejects.toBeInstanceOf(SandboxError);
-    await expect(native).rejects.toBeInstanceOf(SandboxError);
+    await Promise.all([
+      expect(shorthand).rejects.toBeInstanceOf(SandboxError),
+      expect(native).rejects.toBeInstanceOf(SandboxError)
+    ]);
     await expect(fs.stat(path.join(outside, 'new', 'deep', 'file.txt'))).rejects.toMatchObject({ code: 'ENOENT' });
   });
 
