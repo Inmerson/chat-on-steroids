@@ -18,7 +18,9 @@ export interface CoreHealthControllerOptions {
 }
 
 const DEFAULT_HEARTBEAT_STALE_MS = 75_000;
-const DEFAULT_JOINING_STALE_MS = 30_000;
+// tunnel-client can take up to three 30s long-poll cycles to produce its first remote
+// proof. Recovering earlier kills a healthy client before that proof can arrive.
+const DEFAULT_JOINING_STALE_MS = 95_000;
 
 /**
  * Converts several independent health planes into the one answer the UI and Core IPC consume.
@@ -64,6 +66,9 @@ export class CoreHealthController {
 
   private beginRecovery(reason: string): void {
     if (this.recovery || this.health.authRequired) return;
+    // The recovery replaces the transport. Its successor must receive a fresh joining
+    // budget instead of inheriting the failed transport's elapsed time.
+    this.joiningSince = null;
     this.recoveryAttempt += 1;
     this.apply({ type: 'RECOVERY_STARTED', attempt: this.recoveryAttempt });
     this.apply({ type: 'REMOTE_RECREATED' });
@@ -166,9 +171,13 @@ export class CoreHealthController {
       if (status.state === 'connected') this.beginRecovery('remote transport is connected but the local MCP endpoint is unavailable');
     }
 
-    if (!this.health.authRequired && this.heartbeatIsStale(status, now)) {
+    // A local probe is asynchronous. Re-read the transport before deciding to tear it
+    // down so a successful handshake that arrived during that probe wins the race.
+    const currentStatus = this.options.getStatus();
+    this.updateTransport(currentStatus, now);
+    if (!this.health.authRequired && this.heartbeatIsStale(currentStatus, now)) {
       this.beginRecovery('remote heartbeat is stale; replacing the half-open transport');
-    } else if (!this.health.authRequired && this.joiningIsStale(status, now)) {
+    } else if (!this.health.authRequired && this.joiningIsStale(currentStatus, now)) {
       this.beginRecovery('remote transport is stuck connecting; recreating it');
     }
 

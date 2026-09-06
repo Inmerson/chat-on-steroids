@@ -4,6 +4,10 @@ export default defineConfig({
   test: {
     include: ['test/**/*.test.ts'],
     environment: 'node',
+    // A full host-core fan-out makes JSDOM and child-process suites starve each other on
+    // Windows. Four workers keep those timing-sensitive integration checks reproducible
+    // without serializing the whole suite.
+    maxWorkers: 4,
     // Real filesystem, real child processes and a real HTTP server, so the
     // defaults are too tight.
     testTimeout: 30_000,
