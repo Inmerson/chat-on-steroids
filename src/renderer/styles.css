@@ -1870,6 +1870,15 @@ input[readonly] {
   font-size: 12px;
 }
 
+.workspace-pulse-label {
+  color: var(--ink);
+  font-weight: 650;
+}
+
+.workspace-pulse-label.is-good { color: var(--good); }
+.workspace-pulse-label.is-active { color: var(--accent); }
+.workspace-pulse-label.is-bad { color: var(--bad); }
+
 .workspace-control-link { flex: none; }
 
 /* Header, body, footer. The Sessions card is exactly this shape. */
