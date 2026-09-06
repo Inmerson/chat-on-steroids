@@ -6719,7 +6719,13 @@ async function deliverOne(): Promise<void> {
   // Beside the chat it succeeds, when this app can name that chat and its browser is still
   // polling. Only that browser can put the new tab in the window the old one is in, and only
   // a tab it creates itself is guaranteed to be in a browser this extension is loaded in.
-  if (offerPlacement(command)) return;
+  if (offerPlacement(command)) {
+    // Prime-side worker placement is command-id isolated. Advance the queue now so a single
+    // agents spawn may hand every fresh worker to the same live Prime without waiting for the
+    // first tab to redeem. Resumes remain serialized by nextDeliverable().
+    if (command.spec.type === 'worker') void deliver();
+    return;
+  }
   await openFreshChatInBrowser(command);
 }
 
@@ -7187,19 +7193,26 @@ const isLeased = (command: Command): boolean => {
 };
 
 /**
- * The one command that may go to the browser right now, or null.
+ * Serializes every OS-opened fresh chat and every resume, while allowing exact worker markers
+ * already handed to a proven Prime browser to progress independently.
  *
- * One at a time, whatever kind it is. The browser half can only be opening one tab anyway,
- * and a worker chat is identified by the extension reporting which tab it opened for which
- * slot — so two bootstraps in flight is precisely the state where that report can be made
- * about the wrong tab.
+ * Fresh worker pages redeem their own command id from the `clf` marker, and Prime-side placement
+ * keeps one offer/timer per command. Those browser-placed workers can therefore overlap safely.
+ * A worker with no placement offer still blocks the line exactly as before, so cold starts and
+ * default-browser opens never stack; resumes also remain one-at-a-time.
  */
 function nextDeliverable(): Command | null {
   if (commandLeaseWrites.size > 0) return null;
-  // Revivals never enter the app's browser opener: only the extension can know whether the exact
-  // conversation is already open. They also must not block unrelated fresh worker/resume tabs.
-  if (commands.some((command) => (command.spec.type === 'worker' || command.spec.type === 'resume') && isLeased(command))) return null;
-  return commands.find((command) => command.spec.type === 'worker' || command.spec.type === 'resume') ?? null;
+  const blocked = commands.some((command) => {
+    if (command.spec.type !== 'worker' && command.spec.type !== 'resume') return false;
+    if (!isLeased(command)) return false;
+    return command.spec.type === 'resume' || !placementOffers.has(command.id);
+  });
+  if (blocked) return null;
+  return commands.find(
+    (command) =>
+      (command.spec.type === 'worker' || command.spec.type === 'resume') && !isLeased(command)
+  ) ?? null;
 }
 
 /**
