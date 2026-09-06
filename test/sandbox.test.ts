@@ -250,6 +250,12 @@ describe('resolvePath — links and reparse points', () => {
     await expectRefused('/project/escape/planted.txt', true);
   });
 
+  it('rejects a nonexistent deep descendant below an escaping junction before creation', async () => {
+    const outsideDeep = path.join(outside, 'new', 'deep', 'file.txt');
+    await expectRefused('/project/escape/new/deep/file.txt', true);
+    await expect(fs.stat(outsideDeep)).rejects.toMatchObject({ code: 'ENOENT' });
+  });
+
   it('still rejects an escaping link when the caller used a native path', async () => {
     const err = await expectRefused(path.join(escapeLink, 'secret.txt'));
     expect(err.message).toMatch(/escapes its approved folder/);
@@ -260,6 +266,12 @@ describe('resolvePath — links and reparse points', () => {
     expect(resolved.real).toBe(path.join(approved, 'sub', 'nested.txt'));
     // The virtual path reflects where the file really is, not how it was reached.
     expect(resolved.virtual).toBe('/project/sub/nested.txt');
+  });
+
+  it('allows a missing child below an internal junction and canonicalizes the create target', async () => {
+    const resolved = await resolvePath(roots, '/project/inner/new-child.txt', { allowMissing: true });
+    expect(resolved.real).toBe(path.join(approved, 'sub', 'new-child.txt'));
+    expect(resolved.virtual).toBe('/project/sub/new-child.txt');
   });
 
   it('canonicalizes an internal link reached through a native path', async () => {
@@ -290,6 +302,9 @@ describe('resolvePath — links and reparse points', () => {
       // Sanity: Windows itself follows the replacement junction to the unapproved target.
       await expect(fs.readFile(path.join(original, 'secret.txt'), 'utf8')).resolves.toBe('SECRET OUTSIDE THE APPROVED ROOT');
       await expect(resolvePath(swapRoots, '/swap/secret.txt')).rejects.toThrow(/root.*(?:changed|available)|approve again/i);
+      await expect(resolvePath(swapRoots, '/swap/new-child.txt', { allowMissing: true })).rejects.toThrow(
+        /root.*(?:changed|available)|approve again/i
+      );
     } finally {
       await fs.rm(original, { recursive: true, force: true });
       await fs.rename(moved, original);

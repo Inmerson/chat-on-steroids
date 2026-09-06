@@ -247,12 +247,25 @@ describe('connection surface state', () => {
     const connection = await import('../src/main/connection.js');
     await connection.connect();
     expect(mocks.starts).toBe(1);
+    const staleReport = mocks.report;
 
     mocks.config.tunnel.kind = 'manual';
     await connection.applySettings();
 
     expect(mocks.starts).toBe(2);
+    expect(mocks.tunnelStop).toHaveBeenCalledTimes(1);
     expect(connection.getStatus().state).toBe('connected');
+
+    // A callback retained by the tunnel from the previous generation is no longer authority
+    // after reconnect. Half-open transports must not be able to repaint a healthy replacement.
+    staleReport?.({
+      state: 'tunnel-unavailable',
+      detail: 'stale transport failed after replacement',
+      publicUrl: 'https://stale.invalid/mcp/core/old-token'
+    });
+    expect(connection.getStatus().state).toBe('connected');
+    expect(connection.getStatus().publicUrl).not.toContain('stale.invalid');
+    expect(mocks.tunnelStop).toHaveBeenCalledTimes(1);
   });
 
   it('prewarms the helper only when a native Desktop capability is published', async () => {

@@ -557,14 +557,16 @@ async function dispatchTracked(
     requestId: context.caller.requestId,
     conversationId: context.caller.conversationId
   });
-  // Exact request-id identity needs no browser wait, so make its durable session append part
-  // of completing the MCP call. The recorder catches storage failures and returns null, so a
-  // broken history never breaks the tool itself. Only the degraded/unidentified path remains
-  // fire-and-forget because it may still spend a grace window waiting for page evidence.
+  // Recording is observability, not tool authority. Even exact request-id attribution must not
+  // turn a slow disk/session append into MCP response latency once the handler result is ready.
+  // Keep the promise in settling accounting so shutdown/diagnostics can still see it, while
+  // flushRecorder() remains the durability barrier for process exit.
   if (context.caller.conversationId) {
-    await recording;
+    holdWhileSettling(context, recording);
     if (name === 'observe' || name === 'computer') {
-      logInfo(`desktop timing recorder_wait_ms=${Date.now() - recorderStartedAt} attributed=true`);
+      void recording.then(() =>
+        logInfo(`desktop timing recorder_wait_ms=0 recorder_async_ms=${Date.now() - recorderStartedAt} attributed=true`)
+      );
     }
   } else {
     if (name === 'observe' || name === 'computer') {
