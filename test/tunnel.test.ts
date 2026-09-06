@@ -14,7 +14,8 @@ import {
   isUnreachableError,
   NO_OUTAGE,
   outageConfirmed,
-  outageRecovered
+  outageRecovered,
+  retryDelayMs
 } from '../src/main/tunnel/index.js';
 import { describeRoute } from '../src/main/diagnostics.js';
 import { commonBinaryDirsForPlatform, locateBinary, tunnelExecutableName } from '../src/main/tunnel/locate.js';
@@ -262,6 +263,21 @@ describe('outage confirmation', () => {
   it('is inert when no run is open', () => {
     expect(outageConfirmed(NO_OUTAGE, T + 10 * 60_000)).toBe(false);
     expect(outageRecovered(NO_OUTAGE, T)).toBe(false);
+  });
+});
+
+describe('restart backoff', () => {
+  it('backs repeated failures off exponentially and caps the retry delay', () => {
+    expect([1, 2, 3, 4, 5, 6, 7, 20].map(retryDelayMs)).toEqual([
+      2_000,
+      4_000,
+      8_000,
+      16_000,
+      32_000,
+      60_000,
+      60_000,
+      60_000
+    ]);
   });
 });
 

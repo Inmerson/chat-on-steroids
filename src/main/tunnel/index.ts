@@ -201,6 +201,12 @@ export interface UnreachableRun {
 
 export const NO_OUTAGE: UnreachableRun = { since: 0, handshakeBefore: null };
 
+/** Exponential restart delay for consecutive tunnel-process failures, capped at one minute. */
+export function retryDelayMs(attempt: number): number {
+  const normalized = Math.max(1, Math.floor(attempt));
+  return Math.min(MAX_BACKOFF_MS, 2000 * 2 ** (normalized - 1));
+}
+
 /** True once a run has gone unanswered long enough to be an outage, not a retry. */
 export function outageConfirmed(run: UnreachableRun, nowMs: number): boolean {
   return run.since !== 0 && nowMs - run.since >= UNREACHABLE_CONFIRM_MS;
@@ -368,7 +374,7 @@ async function startOpenAiTunnel(opts: TunnelStartOptions): Promise<TunnelHandle
     if (stopped) return;
     attempts += 1;
     shown = null;
-    const wait = Math.min(MAX_BACKOFF_MS, 2000 * 2 ** (attempts - 1));
+    const wait = retryDelayMs(attempts);
     opts.report({
       state: 'connecting-tunnel',
       detail: `${detail} Reconnecting in ${Math.round(wait / 1000)}s…`
