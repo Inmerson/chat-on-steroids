@@ -21,6 +21,7 @@ import path from 'node:path';
 import { ensureUsablePath, normalizeEnvironment, setEnvValue } from '../env.js';
 import { findWindowsPowerShell, terminateProcessTree } from '../exec.js';
 import { logInfo, logWarn } from '../logger.js';
+import { Utf8ChunkDecoder } from '../utf8-stream.js';
 import { HELPER_SCRIPT } from './helper.js';
 
 /** Width the screenshot is scaled down to, matching computer-use convention. */
@@ -288,9 +289,11 @@ async function startHelper(): Promise<HelperRuntime> {
       ready: false
     };
     let started = false;
+    const stdoutDecoder = new Utf8ChunkDecoder();
+    const stderrDecoder = new Utf8ChunkDecoder();
 
     child.stdout.on('data', (chunk: Buffer) => {
-      runtime.stdoutBuffer += chunk.toString('utf8');
+      runtime.stdoutBuffer += stdoutDecoder.write(chunk);
       for (;;) {
         const newline = runtime.stdoutBuffer.indexOf('\n');
         if (newline === -1) break;
@@ -347,7 +350,7 @@ async function startHelper(): Promise<HelperRuntime> {
       }
     });
     child.stderr.on('data', (chunk: Buffer) => {
-      runtime.stderrTail = `${runtime.stderrTail}${chunk.toString('utf8')}`.slice(-8000);
+      runtime.stderrTail = `${runtime.stderrTail}${stderrDecoder.write(chunk)}`.slice(-8000);
     });
     child.once('spawn', () => {
       started = true;
@@ -373,6 +376,8 @@ async function startHelper(): Promise<HelperRuntime> {
       }
     });
     child.once('close', () => {
+      runtime.stdoutBuffer += stdoutDecoder.end();
+      runtime.stderrTail = `${runtime.stderrTail}${stderrDecoder.end()}`.slice(-8000);
       if (helperRuntime === runtime) helperRuntime = null;
       const pending = runtime.pending;
       if (pending) {

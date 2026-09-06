@@ -400,6 +400,19 @@ describe('the sandbox is still the boundary', () => {
     await expect(run('worker-1', () => resolveIn(roots, 'escape/secret.txt'))).rejects.toThrow(SandboxError);
   });
 
+  it('makes the same sandbox decision for shorthand and native paths through an escaping link', async () => {
+    const shorthand = run('worker-1', () => resolveIn(roots, 'escape/new/deep/file.txt', { allowMissing: true }));
+    const native = run('worker-1', () =>
+      resolveIn(roots, path.join(approved, 'project', 'escape', 'new', 'deep', 'file.txt'), { allowMissing: true })
+    );
+
+    await Promise.all([
+      expect(shorthand).rejects.toBeInstanceOf(SandboxError),
+      expect(native).rejects.toBeInstanceOf(SandboxError)
+    ]);
+    await expect(fs.stat(path.join(outside, 'new', 'deep', 'file.txt'))).rejects.toMatchObject({ code: 'ENOENT' });
+  });
+
   it('refuses a native drive path even with a workspace set', async () => {
     await expect(run('worker-1', () => resolveIn(roots, path.join(outside, 'secret.txt')))).rejects.toThrow(
       SandboxError
