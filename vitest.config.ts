@@ -4,6 +4,7 @@ export default defineConfig({
   test: {
     include: ['test/**/*.test.ts'],
     environment: 'node',
+    setupFiles: ['test/setup-wait-for.ts'],
     // A full host-core fan-out makes JSDOM and child-process suites starve each other on
     // Windows. Four workers keep those timing-sensitive integration checks reproducible
     // without serializing the whole suite.
