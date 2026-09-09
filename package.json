@@ -45,8 +45,11 @@
     "test:kill": "node scripts/kill-stray-vitest.mjs"
   },
   "dependencies": {
+    "@anthropic-ai/mcpb": "^2.1.2",
+    "@modelcontextprotocol/client": "^2.0.0",
     "@modelcontextprotocol/node": "^2.0.0",
     "@modelcontextprotocol/server": "^2.0.0",
+    "fflate": "^0.8.3",
     "node-pty": "1.2.0-beta.15",
     "sharp": "0.35.3",
     "tree-sitter": "0.25.1",

@@ -49,6 +49,20 @@ afterEach(async () => {
 });
 
 describe('secret store', () => {
+  it('stores plugin namespace credentials through the OS-backed secret store', async () => {
+    const key = 'plugin:fixture-plugin:api-token' as const;
+    await setSecret(key, 'plugin-secret-value');
+
+    expect(await getSecret(key)).toBe('plugin-secret-value');
+    resetSecretsCacheForTests();
+    expect(await getSecret(key)).toBe('plugin-secret-value');
+
+    const sealedWrites = vi.mocked(safeStorage.encryptStringAsync).mock.calls
+      .map(([value]) => value)
+      .filter((value) => value !== 'chat-on-steroids-safe-storage-probe');
+    expect(sealedWrites.some((value) => value.includes('plugin:fixture-plugin:api-token'))).toBe(true);
+  });
+
   it('refuses Linux v10 hard-coded-key ciphertext instead of trusting the legacy backend label', async () => {
     vi.mocked(safeStorage.getSelectedStorageBackend).mockReturnValue('basic_text');
     vi.mocked(safeStorage.encryptStringAsync).mockResolvedValueOnce(Buffer.from('v10fallback-ciphertext', 'ascii'));
