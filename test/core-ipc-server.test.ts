@@ -79,6 +79,20 @@ describe('Core local IPC', () => {
     await expect(intruder.status()).rejects.toThrow(/unauthorized/i);
   });
 
+  it('gives lifecycle commands enough time to finish beyond the fast status deadline', async () => {
+    const dir = await root();
+    const token = await ensureCoreIpcToken(dir);
+    const connect = vi.fn(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 2_200));
+    });
+    const server = await startCoreIpcServer(handlers(dir, token, { connect }));
+    servers.push(server);
+
+    const client = new CoreIpcClient(server.endpoint, token);
+    await expect(client.connect()).resolves.toMatchObject({ generation: 4, status: { state: 'connected' } });
+    expect(connect).toHaveBeenCalledTimes(1);
+  }, 10_000);
+
   it('keeps secret values write-only while making Core the mutation authority', async () => {
     const dir = await root();
     const token = await ensureCoreIpcToken(dir);

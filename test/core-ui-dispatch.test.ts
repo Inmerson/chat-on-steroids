@@ -13,7 +13,8 @@ function deps() {
     resetSwarm: vi.fn(async () => ({ running: false, agents: [] })),
     clearAgent: vi.fn(async () => ({ cleared: 'none', reason: 'not found', swarm: { running: false, agents: [] } })),
     controlCenter: vi.fn(async () => ({ state: 'idle' })),
-    goalModels: vi.fn(async () => ({ models: [], total: 0 }))
+    goalModels: vi.fn(async () => ({ models: [], total: 0 })),
+    revokeDevice: vi.fn(async () => true)
   };
 }
 
@@ -50,5 +51,15 @@ describe('Core-owned UI runtime dispatch', () => {
     await expect(dispatch('session-delete', { id: '../escape' })).rejects.toThrow();
     await expect(dispatch('swarm-clear-agent', { id: '' })).rejects.toThrow();
     await expect(dispatch('goal-models', { offset: -1 })).rejects.toThrow();
+  });
+
+  it('preserves the 2.1.3 device revoke operation at the Core trust boundary', async () => {
+    const d = deps();
+    const dispatch = createCoreUiDispatcher(d as never);
+    const deviceId = 'dev_0123456789abcdef0123456789abcdef';
+
+    await expect((dispatch as any)('devices-revoke', { deviceId })).resolves.toBe(true);
+    expect(d.revokeDevice).toHaveBeenCalledWith(deviceId);
+    await expect((dispatch as any)('devices-revoke', { deviceId: '../escape' })).rejects.toThrow();
   });
 });

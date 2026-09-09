@@ -182,6 +182,52 @@ describe('UI persistent-Core connection facade', () => {
     expect(changed).toEqual(['bridge', 'swarm']);
   });
 
+  it('does not republish an unchanged status and health snapshot on every poll', async () => {
+    const snapshot = envelope(3, 'connected', { bridgeRevision: 1, sessionRevision: 5, swarmRevision: 2 });
+    const peer = client({ status: vi.fn(async () => structuredClone(snapshot)) });
+    const facade = createUiConnectionFacade({
+      userDataDir: () => 'profile',
+      token: async () => 'a'.repeat(64),
+      client: () => peer,
+      startSupervisor: vi.fn(),
+      sleep: async () => undefined
+    });
+    const statuses: string[] = [];
+    const healthGenerations: number[] = [];
+    facade.onStatusChange((status) => statuses.push(status.state));
+    facade.onCoreHealthChange((health) => healthGenerations.push(health?.connectionGeneration ?? -1));
+
+    await facade.refresh();
+    await facade.refresh();
+
+    expect(statuses).toEqual(['connected']);
+    expect(healthGenerations).toEqual([3]);
+    await facade.shutdownConnection();
+  });
+
+  it('republishes the combined snapshot once when only structured health changes', async () => {
+    const first = envelope(3, 'connected', { bridgeRevision: 1, sessionRevision: 5, swarmRevision: 2 });
+    const second = structuredClone(first);
+    second.health!.lastProbeAt = 20;
+    const peer = client({ status: vi.fn().mockResolvedValueOnce(first).mockResolvedValueOnce(second) });
+    const facade = createUiConnectionFacade({
+      userDataDir: () => 'profile',
+      token: async () => 'a'.repeat(64),
+      client: () => peer,
+      startSupervisor: vi.fn(),
+      sleep: async () => undefined
+    });
+    const snapshots: string[] = [];
+    facade.onStatusChange((status) => snapshots.push(status.state));
+
+    await facade.refresh();
+    await facade.refresh();
+
+    expect(snapshots).toEqual(['connected', 'connected']);
+    expect(facade.getCoreHealth()?.lastProbeAt).toBe(20);
+    await facade.shutdownConnection();
+  });
+
   it('routes fixed UI runtime calls through the attached Core client', async () => {
     const uiCall = vi.fn(async () => ({ running: true }));
     const peer = client({ uiCall });

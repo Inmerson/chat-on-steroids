@@ -1,11 +1,4 @@
-import type { AppApi } from '../preload/index.js';
 import type { CoreHealthStatus } from '../shared/core-protocol.js';
-
-declare global {
-  interface Window {
-    api: AppApi;
-  }
-}
 
 export interface CoreHealthFact {
   label: string;
@@ -48,38 +41,4 @@ export function coreHealthFacts(health: CoreHealthStatus, now = Date.now()): Cor
       ? [{ label: 'Recovery attempt', value: String(health.reconnectAttempt), bad: false }]
       : [])
   ];
-}
-
-function factNode(fact: CoreHealthFact): HTMLElement {
-  const row = document.createElement('div');
-  row.className = 'fact core-health-fact';
-  const name = document.createElement('span');
-  name.textContent = fact.label;
-  const code = document.createElement('code');
-  if (fact.bad) code.className = 'is-bad';
-  code.textContent = fact.value;
-  code.title = fact.value;
-  row.append(name, code);
-  return row;
-}
-
-async function paint(): Promise<void> {
-  const api = window.api;
-  if (!api || typeof api.getCoreHealth !== 'function') return;
-  const container = document.getElementById('facts');
-  if (!container) return;
-  const reply = await api.getCoreHealth();
-  for (const node of container.querySelectorAll('.core-health-fact')) node.remove();
-  if (!reply.ok || !reply.data) return;
-  container.prepend(...coreHealthFacts(reply.data).map(factNode));
-}
-
-if (typeof window !== 'undefined' && window.api && typeof window.api.getCoreHealth === 'function') {
-  // Core health is already a dedicated read-only IPC projection. Do not subscribe to the app's
-  // full state stream a second time: the main renderer owns that stream and uses it to protect
-  // focused/dirty form state. A light independent poll keeps health fresh without competing for
-  // renderer state callbacks or rebuilding the much larger AppState snapshot.
-  void paint();
-  window.setTimeout(() => void paint(), 400);
-  window.setInterval(() => void paint(), 1_000);
 }

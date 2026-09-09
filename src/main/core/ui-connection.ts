@@ -90,6 +90,8 @@ export function createUiConnectionFacade(options: UiConnectionFacadeOptions): Ui
   const runtimeListeners = new Set<(kind: RuntimeChangeKind) => void>();
   const sleep = options.sleep ?? sleepDefault;
 
+  const sameValue = (left: unknown, right: unknown): boolean => JSON.stringify(left) === JSON.stringify(right);
+
   const publishRevision = (kind: RuntimeChangeKind, previous: number, next: number | undefined): number => {
     if (next === undefined) return previous;
     if (previous >= 0 && next !== previous) {
@@ -100,14 +102,18 @@ export function createUiConnectionFacade(options: UiConnectionFacadeOptions): Ui
 
   const publish = (envelope: CoreStatusEnvelope): void => {
     if (!shouldAcceptCoreEnvelope(generation, envelope)) return;
+    const nextStatus = { ...EMPTY_STATUS, ...envelope.status } as ConnectionStatus;
+    const nextHealth = envelope.health ?? health;
+    const statusChanged = !sameValue(status, nextStatus);
+    const healthChanged = !sameValue(health, nextHealth);
     generation = envelope.generation;
     bridgeRevision = publishRevision('bridge', bridgeRevision, envelope.bridgeRevision);
     sessionRevision = publishRevision('session', sessionRevision, envelope.sessionRevision);
     swarmRevision = publishRevision('swarm', swarmRevision, envelope.swarmRevision);
-    status = { ...EMPTY_STATUS, ...envelope.status } as ConnectionStatus;
-    health = envelope.health ?? health;
-    for (const listener of statusListeners) listener({ ...status });
-    for (const listener of healthListeners) listener(health ? { ...health } : null);
+    status = nextStatus;
+    health = nextHealth;
+    if (statusChanged || healthChanged) for (const listener of statusListeners) listener({ ...status });
+    if (healthChanged) for (const listener of healthListeners) listener(health ? { ...health } : null);
   };
 
   const publishUnavailable = (): void => {

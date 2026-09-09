@@ -215,6 +215,12 @@ export interface MultiAgentSettings {
   maxWorkers: number;
 }
 
+export interface DeviceSettings {
+  role: 'coordinator' | 'node' | 'independent';
+  coordinatorHost: string;
+  coordinatorPort: number;
+}
+
 export interface Config {
   roots: Root[];
   capabilities: Capabilities;
@@ -224,6 +230,7 @@ export interface Config {
   sessions: SessionSettings;
   compaction: CompactionSettings;
   multiAgent: MultiAgentSettings;
+  device: DeviceSettings;
   goal: GoalSettings;
   allComputer?: boolean;
   previousRoots?: Root[];
@@ -411,6 +418,21 @@ export interface UpdateStatus {
 /** Where this fork publishes the builds its updater is allowed to install. */
 export const RELEASES_PAGE = 'https://github.com/Inmerson/chat-on-steroids/releases/latest';
 
+/** Safe-to-display coordinator inventory. Pairing secrets never travel in AppState. */
+export interface ManagedDeviceSummary {
+  deviceId: string;
+  friendlyName: string;
+  provider: 'local' | 'remote';
+  status: 'UNENROLLED' | 'CONNECTING' | 'ONLINE' | 'DEGRADED' | 'OFFLINE' | 'REVOKED';
+  capabilities: string[];
+  lastSeenAt: string | null;
+}
+
+export interface DeviceOverview {
+  local: ManagedDeviceSummary;
+  remotes: ManagedDeviceSummary[];
+}
+
 export interface AppState {
   config: Config;
   status: ConnectionStatus;
@@ -426,6 +448,9 @@ export interface AppState {
   bundledTunnelVersion: string | null;
   bridge: BridgeStatus;
   update: UpdateStatus;
+  devices?: DeviceOverview;
+  /** Structured execution health projected by the persistent Core Host. */
+  coreHealth?: import('./core-protocol.js').CoreHealthStatus | null;
 }
 
 export const DEFAULT_CAPABILITIES: Capabilities = {

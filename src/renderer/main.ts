@@ -1,3 +1,2 @@
-/** Renderer composition entry. Keep the mature UI module intact and layer Core health beside it. */
+/** Renderer composition entry. The main renderer owns all AppState-driven DOM updates. */
 import './main-app.js';
-import './core-health-widget.js';

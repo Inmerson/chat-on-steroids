@@ -1,3 +1,5 @@
+import { promises as fs } from 'node:fs';
+import path from 'node:path';
 import { describe, expect, it } from 'vitest';
 import type { CoreHealthStatus } from '../src/shared/core-protocol.js';
 import { coreHealthFacts } from '../src/renderer/core-health-widget.js';
@@ -49,5 +51,21 @@ describe('layered Core health UI projection', () => {
 
     const auth = coreHealthFacts(health({ overall: 'AUTH_REQUIRED', authHealthy: false, authRequired: true }));
     expect(auth).toContainEqual({ label: 'Authentication', value: 'Required', bad: true });
+  });
+
+  it('is a pure projection and does not run a second renderer IPC polling loop', async () => {
+    const source = await fs.readFile(path.join(process.cwd(), 'src', 'renderer', 'core-health-widget.ts'), 'utf8');
+    expect(source).not.toContain('window.setInterval');
+    expect(source).not.toContain('getCoreHealth()');
+  });
+
+  it('paints structured Core health through the normal AppState render path', async () => {
+    const [renderer, ipc] = await Promise.all([
+      fs.readFile(path.join(process.cwd(), 'src', 'renderer', 'main-app.ts'), 'utf8'),
+      fs.readFile(path.join(process.cwd(), 'src', 'main', 'ipc-ui.ts'), 'utf8')
+    ]);
+    expect(ipc).toContain('coreHealth: getCoreHealth()');
+    expect(renderer).toContain("import { coreHealthFacts }");
+    expect(renderer).toContain('next.coreHealth');
   });
 });

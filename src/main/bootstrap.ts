@@ -15,6 +15,10 @@ async function bootstrap(): Promise<void> {
   // Detached children inherit the UI environment. Clear the facade selector before importing
   // any Core module or the helper would recursively behave as another UI IPC client.
   delete process.env.COS_CORE_UI_CLIENT;
+  // Core Host and Supervisor never create a BrowserWindow. Avoid paying for Chromium's GPU
+  // acceleration stack in backend-only Electron processes; the UI process keeps its normal
+  // hardware-accelerated rendering path.
+  app.disableHardwareAcceleration();
   // Helper processes must share the exact installed profile with the UI. Set it before any
   // config/secrets/session module is initialized.
   app.setPath('userData', mode.userDataDir);

@@ -106,6 +106,26 @@
       <main>
         <!-- ============================================================ Home -->
         <section class="panel is-active" data-panel="home">
+          <section class="overview-deck" aria-label="Computer control overview">
+            <div class="overview-intro">
+              <span class="overview-eyebrow">Coordinator workspace</span>
+              <h1>One control plane.<br /><em>Your computers in view.</em></h1>
+              <p>Keep this computer in command, then add other approved computers when the device registry is ready.</p>
+            </div>
+            <section class="coordinator-card" id="coordinatorCard">
+              <div class="coordinator-card-head"><span class="coordinator-mark"><svg class="ico" viewBox="0 0 24 24"><use href="#i-monitor" /></svg></span><span><small>Coordinator</small><strong id="coordinatorName">This computer</strong></span><span class="coordinator-state" id="coordinatorState">Checking</span></div>
+              <p class="coordinator-detail" id="coordinatorDetail">Reading local control status…</p>
+              <div class="coordinator-facts"><span id="coordinatorScope">Local permissions</span><span id="coordinatorFolders">No approved folders</span></div>
+              <div class="coordinator-work-context" aria-label="Current work context"><small>Current work</small><strong id="coordinatorActiveFile">No active file reported</strong><code id="coordinatorLocation">No approved workspace</code></div>
+              <button class="coordinator-connect" id="coordinatorConnect" type="button"><svg class="ico" viewBox="0 0 24 24"><use href="#i-power" /></svg><span id="coordinatorConnectLabel">Connect coordinator</span></button>
+            </section>
+            <section class="fleet-card" aria-label="Managed computers">
+              <div class="fleet-head"><span><small>Managed computers</small><strong id="fleetCount">1 local computer</strong></span><span class="fleet-live"><i></i>Live view</span></div>
+              <div class="fleet-local"><span class="fleet-node-mark"><svg class="ico" viewBox="0 0 24 24"><use href="#i-monitor" /></svg></span><span><b>This computer</b><em id="fleetLocalDetail">Local coordinator</em></span><span class="fleet-role">PRIMARY</span></div>
+              <div id="fleetRemoteList"></div>
+              <p class="fleet-empty" id="fleetEmpty">No remote computers are paired yet. Add one from Setup; each computer will appear here with its exact online state and permitted surface.</p>
+            </section>
+          </section>
           <div class="top">
             <!-- ------------------------------------------------- permissions -->
             <section class="card">
@@ -191,6 +211,10 @@
         <!-- =========================================================== Setup -->
         <section class="panel scroll" data-panel="setup">
           <div class="sheet">
+            <section class="pairing-setup" aria-labelledby="pairingSetupTitle">
+              <div><span class="overview-eyebrow">Multi-computer</span><h2 id="pairingSetupTitle">Add a computer</h2><p>Install the Node Agent package on the other Windows computer, then enter a one-time pairing code. The code expires after 10 minutes and can be used once.</p></div>
+              <div class="pairing-actions"><button class="btn btn-solid" id="createPairingTicket" type="button"><svg class="ico" viewBox="0 0 24 24"><use href="#i-plus" /></svg>Create pairing code</button><div id="pairingTicket" hidden><code id="pairingCode"></code><span id="pairingExpiry"></span></div></div>
+            </section>
             <div class="lede">
               <p>
                 Six steps, once. Custom MCP apps need ChatGPT <strong>Developer mode</strong> on the
@@ -696,8 +720,8 @@
           <div class="control-summary" id="controlSummary" aria-label="Run summary"></div>
           <div class="control-body">
             <section class="card control-canvas-card">
-              <h2>
-                <span>Agent system</span>
+              <h2 class="control-canvas-heading">
+                <span class="canvas-heading-copy"><small>Live workspace map</small><strong>Agent canvas</strong></span>
                 <span class="acts">
                   <input
                     id="controlSearch"
@@ -716,6 +740,7 @@
                 </span>
               </h2>
               <div class="control-canvas-scroll" id="controlGraph">
+                <div class="canvas-corner-note"><span>ORCHESTRATION</span><b>Click a node to trace its work</b></div>
                 <div class="control-legend" id="controlLegend" aria-label="Task state legend">
                   <button type="button" class="is-good" data-control-filter="verified" aria-pressed="false">
                     Verified <b class="control-filter-count">0</b>
@@ -772,23 +797,43 @@
       </main>
 
       <!-- --------------------------------------------------------------- nav -->
-      <nav id="tabs">
+      <nav id="tabs" aria-label="Workspace navigation">
+        <div class="rail-brand" aria-label="Chat On Steroids">
+          <span class="mark"><svg class="ico" viewBox="0 0 24 24"><use href="#i-mark" /></svg></span>
+          <span><strong>Chat On Steroids</strong><small>LOCAL AGENT WORKSPACE</small></span>
+        </div>
+        <p class="rail-label">Workspace</p>
         <button class="is-sel" data-tab="home" type="button">
-          <svg class="ico" viewBox="0 0 24 24"><use href="#i-home" /></svg>Home
-        </button>
-        <button data-tab="setup" type="button">
-          <svg class="ico" viewBox="0 0 24 24"><use href="#i-steps" /></svg>Setup
-          <span class="badge" id="setupBadge" hidden></span>
-        </button>
-        <button data-tab="chat" type="button">
-          <svg class="ico" viewBox="0 0 24 24"><use href="#i-chat" /></svg>Chat
+          <svg class="ico" viewBox="0 0 24 24"><use href="#i-home" /></svg><span>Overview</span>
         </button>
         <button data-tab="control" type="button">
-          <svg class="ico" viewBox="0 0 24 24"><use href="#i-control" /></svg>Control
+          <svg class="ico" viewBox="0 0 24 24"><use href="#i-control" /></svg><span>Control canvas</span>
+        </button>
+        <button data-tab="chat" type="button">
+          <svg class="ico" viewBox="0 0 24 24"><use href="#i-chat" /></svg><span>Conversations</span>
+        </button>
+        <p class="rail-label rail-label-secondary">System</p>
+        <button data-tab="setup" type="button">
+          <svg class="ico" viewBox="0 0 24 24"><use href="#i-steps" /></svg><span>Connection</span>
+          <span class="badge" id="setupBadge" hidden></span>
         </button>
         <button data-tab="activity" type="button">
-          <svg class="ico" viewBox="0 0 24 24"><use href="#i-pulse" /></svg>Activity
+          <svg class="ico" viewBox="0 0 24 24"><use href="#i-pulse" /></svg><span>Activity log</span>
         </button>
+        <section class="rail-pulse" id="railPulse" aria-live="polite">
+          <span class="rail-status-dot" id="railStatusDot"></span>
+          <span class="rail-pulse-copy"><small>Connection</small><strong id="railConnectionState">Checking status</strong></span>
+          <span class="rail-connection-detail" id="railConnectionDetail">Local-first control</span>
+        </section>
+        <div class="rail-actions" aria-label="Workspace actions">
+          <button class="rail-action rail-connect" id="railConnect" type="button">
+            <svg class="ico" viewBox="0 0 24 24"><use href="#i-power" /></svg><span id="railConnectLabel">Connect</span>
+          </button>
+          <button class="rail-action" id="railRunChecks" type="button">
+            <svg class="ico" viewBox="0 0 24 24"><use href="#i-pulse" /></svg><span>System check</span>
+          </button>
+        </div>
+        <div class="rail-footer"><span>Permissions stay local</span></div>
       </nav>
     </div>
 

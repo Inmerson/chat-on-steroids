@@ -40,6 +40,8 @@ import {
   readRecentEvents
 } from '../session/store.js';
 import { applyCoreSettingsTransition } from './settings-runtime.js';
+import { createPairingTicket, deviceOverview, revokeRemote } from '../multidevice/registry.js';
+import { disconnectRemote } from '../multidevice/transport.js';
 
 const idSchema = z.string().min(8).max(64).regex(/^[0-9a-z-]+$/i);
 const agentIdSchema = z.string().min(1).max(64).regex(/^[0-9a-z-]+$/i);
@@ -78,6 +80,11 @@ const settingsPatch = z.object({
     autoTokens: z.number().int().min(10_000).max(4_000_000)
   }),
   multiAgent: z.object({ enabled: z.boolean(), maxWorkers: z.number().int().min(1).max(8) }),
+  device: z.object({
+    role: z.enum(['coordinator', 'node', 'independent']),
+    coordinatorHost: z.string().trim().max(255),
+    coordinatorPort: z.number().int().min(1024).max(65535)
+  }),
   goal: z.object({
     enabled: z.boolean(),
     model: z.string().min(1).max(160).regex(/^~?[a-z0-9._\-]+\/[a-z0-9._\-]+(:[a-z0-9._\-]+)?$/i),
@@ -127,6 +134,11 @@ function mergeSettings(current: Config, base: SettingsSnapshot, wanted: Settings
       enabled: pick(current.multiAgent.enabled, base.multiAgent.enabled, wanted.multiAgent.enabled),
       maxWorkers: pick(current.multiAgent.maxWorkers, base.multiAgent.maxWorkers, wanted.multiAgent.maxWorkers)
     },
+    device: {
+      role: pick(current.device.role, base.device.role, wanted.device.role),
+      coordinatorHost: pick(current.device.coordinatorHost, base.device.coordinatorHost, wanted.device.coordinatorHost),
+      coordinatorPort: pick(current.device.coordinatorPort, base.device.coordinatorPort, wanted.device.coordinatorPort)
+    },
     goal: {
       enabled: pick(current.goal.enabled, base.goal.enabled, wanted.goal.enabled),
       model: pick(current.goal.model, base.goal.model, wanted.goal.model),
@@ -164,6 +176,9 @@ export interface CoreUiDispatcherDeps {
   controlCenter: () => Promise<unknown> | unknown;
   goalModels: (offset: number) => Promise<unknown>;
   diagnostics: () => Promise<unknown>;
+  devicesOverview: () => Promise<unknown>;
+  createPairingTicket: () => Promise<unknown>;
+  revokeDevice: (deviceId: string) => Promise<boolean>;
 }
 
 export type CoreUiDispatcher = (operation: CoreUiOperation, payload: unknown) => Promise<unknown>;
@@ -249,6 +264,16 @@ export function createCoreUiDispatcher(deps: CoreUiDispatcherDeps): CoreUiDispat
       case 'diagnostics-run':
         z.null().parse(payload);
         return deps.diagnostics();
+      case 'devices-overview':
+        z.null().parse(payload);
+        return deps.devicesOverview();
+      case 'devices-pairing-create':
+        z.null().parse(payload);
+        return deps.createPairingTicket();
+      case 'devices-revoke': {
+        const { deviceId } = z.object({ deviceId: z.string().regex(/^dev_[0-9a-f]{32}$/i) }).parse(payload);
+        return deps.revokeDevice(deviceId);
+      }
     }
   };
 }
@@ -365,7 +390,14 @@ const defaultDeps: CoreUiDispatcherDeps = {
   },
   controlCenter: controlCenterStatus,
   goalModels: (offset) => listGoalModels(offset, MODEL_PAGE_SIZE),
-  diagnostics: runDiagnostics
+  diagnostics: runDiagnostics,
+  devicesOverview: deviceOverview,
+  createPairingTicket,
+  revokeDevice: async (deviceId) => {
+    const revoked = await revokeRemote(deviceId);
+    if (revoked) disconnectRemote(deviceId);
+    return revoked;
+  }
 };
 
 export const coreUiDispatcher = createCoreUiDispatcher(defaultDeps);

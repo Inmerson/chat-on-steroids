@@ -598,6 +598,33 @@ describe('surface boundaries', () => {
     for (const name of surfaceDefinition('desktop').tools) expect(names, name).not.toContain(name);
   });
 
+  it('routes explicit managed device ids through the multi-device executor', async () => {
+    everything();
+    const execute = vi.fn(async (deviceId: string, operation: string, payload: unknown) => ({ deviceId, operation, payload }));
+    (ctx as any).multiDevice = { execute };
+
+    const read = await core('tools/call', {
+      name: 'read',
+      arguments: { paths: ['/remote/file.txt'], device_id: 'dev_12345678' }
+    });
+    expect(failed(read)).toBe(false);
+    expect(execute).toHaveBeenCalledWith('dev_12345678', 'filesystem.read', { path: '/remote/file.txt' });
+
+    const patch = await core('tools/call', {
+      name: 'apply_patch',
+      arguments: { patch: 'not parsed locally', workdir: '/remote', device_id: 'dev_12345678' }
+    });
+    expect(failed(patch)).toBe(false);
+    expect(execute).toHaveBeenCalledWith('dev_12345678', 'filesystem.apply_patch', { patch: 'not parsed locally', cwd: '/remote' });
+
+    const exec = await core('tools/call', {
+      name: 'exec_command',
+      arguments: { cmd: 'whoami', workdir: '/remote', device_id: 'dev_12345678' }
+    });
+    expect(failed(exec), JSON.stringify(exec)).toBe(false);
+    expect(execute).toHaveBeenCalledWith('dev_12345678', 'terminal.exec', { command: 'whoami', cwd: '/remote', tty: false });
+  });
+
   /**
    * The multi-agent field that no longer exists, everywhere it used to appear.
    *
@@ -761,7 +788,9 @@ describe('surface boundaries', () => {
 
     // Not just the names: the action vocabulary of the other surface must be absent too,
     // because a schema fragment is what a discovery pull actually costs.
-    for (const marker of ['computer', 'observe', 'click_ref', 'captureAfter', 'write_clipboard']) {
+    // A Core-side managed-device field may legitimately say "this computer". Match the
+    // Desktop tool names themselves rather than the generic English noun.
+    for (const marker of ['"name":"computer"', '"name":"observe"', 'click_ref', 'captureAfter', 'write_clipboard']) {
       expect(coreBody, marker).not.toContain(marker);
     }
     for (const marker of ['apply_patch', 'exec_command', 'write_stdin', 'save_handoff', 'Begin Patch']) {
@@ -1993,13 +2022,14 @@ describe('sandbox enforcement through the tool layer', () => {
     await expect(fs.stat(path.join(outside, 'planted.txt'))).rejects.toThrow();
   });
 
-  it('does not advertise the retired apply_patch cwd argument', async () => {
+  it('does not advertise the retired local apply_patch cwd argument while preserving 2.1.3 remote routing fields', async () => {
     ctx.readOnly = false;
     ctx.caps = withCaps({ create: true });
     const tool = toolList(await core('tools/list')).find((entry) => entry.name === 'apply_patch')!;
-    expect(Object.keys(tool.inputSchema.properties)).toEqual(['patch']);
+    expect(Object.keys(tool.inputSchema.properties)).toEqual(['patch', 'device_id', 'workdir']);
     expect(tool.inputSchema.required).toEqual(['patch']);
     expect(tool.inputSchema.additionalProperties).toBe(false);
+    expect(tool.inputSchema.properties).not.toHaveProperty('cwd');
   });
 
   it('does not let a retired cwd field silently rebase relative patch paths', async () => {
@@ -3114,7 +3144,8 @@ describe('exec_command and write_stdin', () => {
       'yield_time_ms',
       'max_output_tokens',
       'shell',
-      'login'
+      'login',
+      'device_id'
     ]);
     expect(exec.inputSchema.required ?? []).toEqual([]);
     expect(exec.inputSchema.additionalProperties).toBe(false);
@@ -3394,7 +3425,7 @@ describe('exec session attribution and authenticated continuation', () => {
     const stranger = await asChat('wfr_execown_stranger', 'write_stdin', {
       session_id: sessionId,
       chars: 'cross-chat\r',
-      yield_time_ms: 1_000
+      yield_time_ms: 5_000
     });
     expect(stranger.body.result?.isError, textOf(stranger)).not.toBe(true);
     expect(textOf(stranger)).toContain('echo=cross-chat');
@@ -3404,7 +3435,7 @@ describe('exec session attribution and authenticated continuation', () => {
     const unproven = await asChat(null, 'write_stdin', {
       session_id: sessionId,
       chars: 'anon\r',
-      yield_time_ms: 1_000
+      yield_time_ms: 5_000
     });
     expect(unproven.body.result?.isError, textOf(unproven)).not.toBe(true);
     expect(textOf(unproven)).toContain('echo=anon');

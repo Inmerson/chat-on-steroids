@@ -17,6 +17,17 @@ afterAll(async () => {
 });
 
 describe('settings migration', () => {
+  it('adds the 2.1.3 device coordinator defaults to old configs without widening authority', async () => {
+    const defaults = defaultConfig() as any;
+    expect(defaults.device).toEqual({ role: 'independent', coordinatorHost: '', coordinatorPort: 8788 });
+
+    const legacy = { ...defaults };
+    delete legacy.device;
+    await fs.writeFile(path.join(dir, 'config.json'), JSON.stringify(legacy), 'utf8');
+    const loaded = await loadConfig() as any;
+    expect(loaded.device).toEqual({ role: 'independent', coordinatorHost: '', coordinatorPort: 8788 });
+  });
+
   it('never leaves Goal enabled while session recording is off', async () => {
     const impossible = {
       ...defaultConfig(),

@@ -14,6 +14,7 @@ import { SURFACE_LIST, surfaceIsUseful, type SurfaceId } from './mcp/surfaces.js
 import { getSecret } from './secrets.js';
 import { startTunnel, TunnelError, type TunnelHandle } from './tunnel/index.js';
 import { desktopAutomationSupported } from './platform.js';
+import { executeRemote } from './multidevice/transport.js';
 
 let endpoint: McpEndpoint | null = null;
 let tunnel: TunnelHandle | null = null;
@@ -181,7 +182,8 @@ async function connectImpl(): Promise<void> {
         roots: live.roots,
         caps: effectiveCapabilities(live),
         readOnly: live.readOnly,
-        privacyScreenshots: live.ui.privacyScreenshots
+        privacyScreenshots: live.ui.privacyScreenshots,
+        multiDevice: { execute: executeRemote }
       };
     });
     if (shutdownRequested || generation !== connectionGeneration) {

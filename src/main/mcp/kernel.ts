@@ -73,6 +73,7 @@ import {
 import { readOverflowText } from '../session/store.js';
 import { backgroundExecRecoveryNotices } from '../codex/ownership.js';
 import type { StoredText, ToolOutcome } from '../../shared/session.js';
+import type { ProtocolOperation } from '../../shared/multidevice/types.js';
 
 export interface ToolContext {
   roots: Root[];
@@ -111,6 +112,10 @@ export interface ToolContext {
    * ever added to. Defaults to the live answer when the caller does not track it.
    */
   exposedFind?: boolean;
+  /** Explicit remote-device execution path. Omit to keep all tools local to this computer. */
+  multiDevice?: {
+    execute(deviceId: string, operation: ProtocolOperation, payload: unknown): Promise<unknown>;
+  };
 }
 
 export type ToolContent =

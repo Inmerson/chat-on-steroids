@@ -8,7 +8,7 @@
 
 import { app, BrowserWindow, clipboard, dialog, ipcMain, nativeTheme, shell } from 'electron';
 import { z } from 'zod';
-import type { AppState, BridgeStatus, Config, Diagnosis } from '../shared/types.js';
+import type { AppState, BridgeStatus, Config, Diagnosis, DeviceOverview } from '../shared/types.js';
 import type { Handoff, SwarmState } from '../shared/session.js';
 import type { ControlCenterStatus } from '../shared/control-center.js';
 import {
@@ -18,7 +18,6 @@ import {
   getCoreHealth,
   getCoreSecretStatus,
   getStatus,
-  onCoreHealthChange,
   onCoreRuntimeChange,
   onStatusChange,
   setCoreSecret
@@ -52,10 +51,11 @@ function resolvedBinary(config: Config): string | null {
 }
 
 async function buildState(): Promise<AppState> {
-  const [config, bridge, secrets] = await Promise.all([
+  const [config, bridge, secrets, devices] = await Promise.all([
     callCoreUi<Config>('config-get'),
     callCoreUi<BridgeStatus>('bridge-status'),
-    getCoreSecretStatus()
+    getCoreSecretStatus(),
+    callCoreUi<DeviceOverview>('devices-overview')
   ]);
   return {
     config,
@@ -67,7 +67,9 @@ async function buildState(): Promise<AppState> {
     resolvedBinary: resolvedBinary(config),
     bundledTunnelVersion: bundledVersion(),
     bridge,
-    update: updateStatus()
+    update: updateStatus(),
+    devices,
+    coreHealth: getCoreHealth()
   };
 }
 
@@ -178,6 +180,11 @@ export function registerUiIpc(getWindow: () => BrowserWindow | null, quitToInsta
   handle('connection:connect', async () => { await connect(); return buildState(); });
   handle('connection:disconnect', async () => { await disconnect(); return buildState(); });
   handle('diagnostics:run', async () => callCoreUi<Diagnosis>('diagnostics-run'));
+  handle('devices:pairing:create', async () => callCoreUi<{ pairingId: string; code: string; expiresAt: number }>('devices-pairing-create'));
+  handle('devices:revoke', async (payload) => {
+    const { deviceId } = z.object({ deviceId: z.string().regex(/^dev_[0-9a-f]{32}$/i) }).parse(payload);
+    return callCoreUi<boolean>('devices-revoke', { deviceId });
+  });
 
   handle('log:get', async () => getLog());
   handle('log:text', async () => formatLogForClipboard());
@@ -264,7 +271,6 @@ export function registerUiIpc(getWindow: () => BrowserWindow | null, quitToInsta
   };
 
   onStatusChange(pushState);
-  onCoreHealthChange(pushState);
   onCoreRuntimeChange((kind) => {
     if (kind === 'bridge') pushState();
     if (kind === 'session') push('session:changed');

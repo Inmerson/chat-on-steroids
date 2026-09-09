@@ -8,6 +8,8 @@ import { APP_VERSION } from '../version.js';
 import { ensureCoreIpcToken, startCoreIpcServer } from './ipc.js';
 import { startCoreRuntime, type CoreRuntime } from './runtime.js';
 import { coreUiDispatcher } from './ui-dispatch.js';
+import { getConfig } from '../config.js';
+import { startCoordinatorTransport, type CoordinatorTransport } from '../multidevice/transport.js';
 
 export interface CoreHostEntryOptions {
   userDataDir: string;
@@ -27,6 +29,7 @@ export async function runCoreHost(options: CoreHostEntryOptions): Promise<void> 
   const token = await ensureCoreIpcToken(options.userDataDir);
   const abort = new AbortController();
   let runtime: CoreRuntime | null = null;
+  let coordinatorTransport: CoordinatorTransport | null = null;
   let stopping = false;
 
   const requestStop = (): void => {
@@ -91,6 +94,14 @@ export async function runCoreHost(options: CoreHostEntryOptions): Promise<void> 
   try {
     logInfo(`core host started pid=${process.pid} protocol=${CORE_PROTOCOL_VERSION}`);
     runtime = await startCoreRuntime(options.userDataDir);
+    const device = getConfig().device;
+    coordinatorTransport = device.role === 'coordinator'
+      ? await startCoordinatorTransport({ host: device.coordinatorHost, port: device.coordinatorPort })
+      : null;
+    if (coordinatorTransport) {
+      const address = coordinatorTransport.address();
+      logInfo(`coordinator transport listening on ${address.host}:${address.port}`);
+    }
     await new Promise<void>((resolve) => {
       if (abort.signal.aborted) resolve();
       else abort.signal.addEventListener('abort', () => resolve(), { once: true });
@@ -99,6 +110,7 @@ export async function runCoreHost(options: CoreHostEntryOptions): Promise<void> 
     logError(`core host failed: ${(error as Error).message}`);
   } finally {
     if (runtime) await runtime.shutdown().catch((error) => logError(`core runtime shutdown failed: ${(error as Error).message}`));
+    await coordinatorTransport?.close().catch(() => undefined);
     await ipc.close().catch(() => undefined);
     process.removeListener('SIGTERM', stopSignal);
     process.removeListener('SIGINT', stopSignal);

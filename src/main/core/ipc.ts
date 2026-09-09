@@ -15,6 +15,7 @@ import type {
 const MAX_IPC_REQUEST_BYTES = 128 * 1024;
 const MAX_IPC_RESPONSE_BYTES = 4 * 1024 * 1024;
 const IPC_TIMEOUT_MS = 2_000;
+const IPC_OPERATION_TIMEOUT_MS = 15_000;
 const MAX_SECRET_VALUE_CHARS = 500;
 const CORE_UI_OPERATIONS = new Set<CoreUiOperation>([
   'config-get',
@@ -231,7 +232,14 @@ export async function startCoreIpcServer(handlers: CoreIpcHandlers): Promise<Cor
 }
 
 export class CoreIpcClient {
-  constructor(private readonly endpoint: string, private readonly token: string, private readonly timeoutMs = IPC_TIMEOUT_MS) {}
+  constructor(private readonly endpoint: string, private readonly token: string, private readonly timeoutMs?: number) {}
+
+  private timeoutFor(command: CoreRequest['command']): number {
+    if (this.timeoutMs !== undefined) return this.timeoutMs;
+    return command === 'hello' || command === 'status' || command === 'secret-status' || command === 'shutdown-core'
+      ? IPC_TIMEOUT_MS
+      : IPC_OPERATION_TIMEOUT_MS;
+  }
 
   private async request<T>(command: CoreRequest['command'], extra: Record<string, unknown> = {}): Promise<T> {
     const id = randomUUID();
@@ -247,7 +255,7 @@ export class CoreIpcClient {
         if (error) reject(error);
         else resolve(value as T);
       };
-      socket.setTimeout(this.timeoutMs, () => finish(new Error('Core IPC request timed out')));
+      socket.setTimeout(this.timeoutFor(command), () => finish(new Error('Core IPC request timed out')));
       socket.once('error', (error) => finish(error));
       const closedBeforeResponse = (): void => finish(new Error('Core IPC connection closed before a complete response'));
       socket.once('end', closedBeforeResponse);

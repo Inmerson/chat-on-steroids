@@ -132,6 +132,7 @@ const DEFAULT_GOAL: GoalSettings = {
 // Two workers, not three: three concurrent workers reproducibly trips ChatGPT's rate limit
 // ("too many requests"), which strands the run rather than making it faster.
 const DEFAULT_MULTI_AGENT: MultiAgentSettings = { enabled: false, maxWorkers: 2 };
+const DEFAULT_DEVICE: Config['device'] = { role: 'independent', coordinatorHost: '', coordinatorPort: 8788 };
 
 const rootSchema = z.object({
   name: z
@@ -270,6 +271,14 @@ const configSchema = z.object({
     })
     .optional()
     .default({ ...DEFAULT_MULTI_AGENT }),
+  device: z
+    .object({
+      role: z.enum(['coordinator', 'node', 'independent']).optional().default(DEFAULT_DEVICE.role),
+      coordinatorHost: z.string().trim().max(255).optional().default(DEFAULT_DEVICE.coordinatorHost),
+      coordinatorPort: z.number().int().min(1024).max(65535).optional().default(DEFAULT_DEVICE.coordinatorPort)
+    })
+    .optional()
+    .default({ ...DEFAULT_DEVICE }),
   // An empty model id is repaired rather than rejected: the id is free text from a
   // provider listing that changes weekly, and a config that lost it must still load with
   // every root and permission in it intact.
@@ -330,6 +339,7 @@ export function defaultConfig(_platform: NodeJS.Platform = process.platform): Co
     sessions: { ...DEFAULT_SESSIONS },
     compaction: { ...DEFAULT_COMPACTION },
     multiAgent: { ...DEFAULT_MULTI_AGENT },
+    device: { ...DEFAULT_DEVICE },
     goal: { ...DEFAULT_GOAL }
   };
 }

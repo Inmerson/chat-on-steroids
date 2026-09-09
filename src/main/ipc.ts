@@ -70,6 +70,7 @@ import { syncLoginStartup } from './background-startup.js';
 import { controlCenterStatus } from './orchestration/control-center.js';
 import { markInstallOnQuit, onUpdateChange, updateStatus } from './update.js';
 import { captureAgentRuntimeTargets, releaseCapturedAgentRuntimeTargets } from './runtime-gc.js';
+import { createPairingTicket, deviceOverview } from './multidevice/registry.js';
 
 /** The only URLs the renderer may ask the OS to open. */
 const ALLOWED_LINKS = new Set([
@@ -270,7 +271,8 @@ async function buildState(): Promise<AppState> {
     resolvedBinary: resolvedBinary(config),
     bundledTunnelVersion: bundledVersion(),
     bridge: await bridgeStatus(),
-    update: updateStatus()
+    update: updateStatus(),
+    devices: await deviceOverview()
   };
 }
 
@@ -528,6 +530,7 @@ export function registerIpc(getWindow: () => BrowserWindow | null, quitToInstall
   });
 
   handle('diagnostics:run', async () => runDiagnostics());
+  handle('devices:pairing:create', async () => createPairingTicket());
 
   handle('log:get', async () => getLog());
   handle('log:text', async () => formatLogForClipboard());

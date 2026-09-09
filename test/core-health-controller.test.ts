@@ -136,6 +136,25 @@ describe('CoreHealthController', () => {
     });
   });
 
+  it('does not emit duplicate change callbacks for reducer events that leave health unchanged', async () => {
+    const changes: string[] = [];
+    const controller = new CoreHealthController({
+      getStatus: () => status(),
+      isServerRunning: () => true,
+      probe: async () => ({ healthy: true, toolCount: 5, latencyMs: 1, detail: 'ok' }),
+      recover: async () => undefined,
+      now: () => 100_500,
+      requiresRemoteHeartbeat: () => true,
+      onChange: (next) => changes.push(JSON.stringify(next))
+    });
+
+    await controller.tick();
+    changes.length = 0;
+    await controller.tick();
+
+    expect(changes).toEqual([]);
+  });
+
   it('treats OPEN-looking transport with a stale heartbeat as half-open and recreates once', async () => {
     const recovery = deferred();
     const recover = vi.fn(() => recovery.promise);

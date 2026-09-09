@@ -32,6 +32,7 @@ export interface SettingsPatch {
   sessions: Config['sessions'];
   compaction: Config['compaction'];
   multiAgent: Config['multiAgent'];
+  device: Config['device'];
   goal: Config['goal'];
 }
 
@@ -75,6 +76,8 @@ const api = {
   connect: () => call<AppState>('connection:connect'),
   disconnect: () => call<AppState>('connection:disconnect'),
   runDiagnostics: () => call<Diagnosis>('diagnostics:run'),
+  createPairingTicket: () => call<{ pairingId: string; code: string; expiresAt: number }>('devices:pairing:create'),
+  revokeDevice: (deviceId: string) => call<boolean>('devices:revoke', { deviceId }),
   getLog: () => call<LogEntry[]>('log:get'),
   getLogText: () => call<string>('log:text'),
   getLogJson: () => call<string>('log:json'),

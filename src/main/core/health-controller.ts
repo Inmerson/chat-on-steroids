@@ -56,7 +56,9 @@ export class CoreHealthController {
   }
 
   private apply(event: Parameters<typeof reduceCoreHealth>[1]): void {
-    this.health = reduceCoreHealth(this.health, event);
+    const next = reduceCoreHealth(this.health, event);
+    if (JSON.stringify(next) === JSON.stringify(this.health)) return;
+    this.health = next;
     this.options.onChange?.(this.snapshot());
   }
 

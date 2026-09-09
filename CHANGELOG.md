@@ -13,6 +13,39 @@ the app refuses the extension and asks you to reload the matching copy.
 
 No changes yet.
 
+## [2.1.4] — 2026-09-09
+
+2.1.4 adds the first release-ready multi-computer control plane while preserving Chat On Steroids'
+local-first permission model. It also refreshes the desktop workspace so coordinator, device,
+connection, and orchestration state are visible from one surface.
+
+### Added
+- **Managed-device registry and coordinator transport.** Core can keep a durable local/remote device
+  inventory, issue single-use 10-minute pairing codes, authenticate returning nodes with stored
+  resume credentials, track online/offline presence, and revoke enrolled devices.
+- **Explicit remote tool routing.** `read`, `apply_patch`, and `exec_command` accept an explicit
+  managed `device_id` and route supported operations through the coordinator transport without
+  changing the default local-computer behavior.
+- **Coordinator/device UI.** The desktop overview now shows the coordinator, managed computers,
+  pairing controls, connection state, approved workspace context, and a compact system-check path.
+
+### Changed
+- The desktop shell uses a persistent left workspace rail and a denser Control canvas while keeping
+  the existing local permissions, connection lifecycle, activity, chat, and orchestration sources
+  authoritative.
+- Core health facts are projected into the normal renderer state instead of being maintained as a
+  separate presentation-only widget state.
+- Release metadata, desktop app version, lockfile version, and companion extension version are
+  aligned at 2.1.4.
+
+### Reliability and safety
+- Pairing codes are stored only as SHA-256 digests and are single-use; device resume tokens are also
+  stored as digests rather than plaintext credentials.
+- Coordinator mode refuses wildcard and loopback listen hosts, requires an explicit valid port,
+  and remote command routing remains non-interactive and capability-scoped.
+- New registry, transport, Core IPC, UI dispatch, renderer, and MCP routing coverage is included in
+  the verification suite.
+
 ## [2.1.2] — 2026-09-05
 
 2.1.2 is a selective upstream-synchronization and reliability patch for the 2.1 autonomous-

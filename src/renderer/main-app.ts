@@ -29,6 +29,7 @@ import type { SwarmState } from '../shared/session.js';
 import { $, ago, el, icon, run, shortAgo, toast } from './dom.js';
 import { chatApply, chatSettingsPatch, chatVisible, initChat } from './chat.js';
 import { controlCenterVisible, initControlCenter } from './control-center.js';
+import { coreHealthFacts } from './core-health-widget.js';
 
 declare global {
   interface Window {
@@ -381,6 +382,7 @@ function save(over: { readOnly?: boolean; theme?: 'light' | 'dark' } = {}): Prom
       privacyScreenshots: $<HTMLInputElement>('privacyScreenshots').checked,
       theme: over.theme ?? previous.ui.theme
     },
+    device: previous.device,
     ...chatPatch
   };
   requestedSettings = patch;
@@ -413,6 +415,7 @@ async function saveSnapshot(patch: SettingsPatch, previous: AppState['config']):
     sessions: previous.sessions,
     compaction: previous.compaction,
     multiAgent: previous.multiAgent,
+    device: previous.device,
     goal: previous.goal
   };
   const next = await run(api.saveSettings(patch, base));
@@ -772,6 +775,64 @@ function apply(next: AppState): void {
   connectBtn.disabled = !running && missing !== null;
   connectBtn.title = !running && missing ? missing.text : '';
 
+  // The rail is a second, deliberately small control surface for the same live state.
+  // It never owns a connection transition: its button delegates to toggleConnection below
+  // and its copy is painted from the authoritative AppState used by the header.
+  const railPulse = $('railPulse');
+  railPulse.className = `rail-pulse${
+    connected ? ' is-connected' : offline ? ' is-offline' : busy ? ' is-busy' : failed ? ' is-error' : ''
+  }`;
+  $('railConnectionState').textContent = STATUS_TEXT[status.state];
+  $('railConnectionDetail').textContent = status.detail || (missing ? missing.text : 'Local-first control');
+  const railConnect = $<HTMLButtonElement>('railConnect');
+  railConnect.classList.toggle('is-running', running);
+  railConnect.disabled = connectBtn.disabled;
+  railConnect.title = connectBtn.title;
+  $('railConnectLabel').textContent = running ? 'Disconnect' : 'Connect';
+
+  // Overview is the future coordinator surface. Until the device registry is connected,
+  // it names only this local computer and makes the absence of remote inventory explicit.
+  // That prevents a presentation layer from inventing peer health or remote authority.
+  $('coordinatorName').textContent = `${next.platform?.name ?? 'This computer'} coordinator`;
+  $('coordinatorState').textContent = STATUS_TEXT[status.state];
+  $('coordinatorCard').className = `coordinator-card${
+    connected ? ' is-connected' : offline ? ' is-offline' : busy ? ' is-busy' : failed ? ' is-error' : ''
+  }`;
+  $('coordinatorDetail').textContent = status.detail || 'Local control plane is ready to configure.';
+  const enabledWriteCapabilities = WRITE_CAPABILITIES.filter((capability) => config.capabilities[capability]).length;
+  $('coordinatorScope').textContent = config.readOnly
+    ? 'Read-only access'
+    : enabledWriteCapabilities ? `${enabledWriteCapabilities} write permissions enabled` : 'Read access only';
+  $('coordinatorFolders').textContent = config.roots.length === 1
+    ? '1 approved folder'
+    : `${config.roots.length} approved folders`;
+  // The coordinator has an approved workspace list, but Core does not yet project an
+  // operation's active file. Keep that boundary visible instead of guessing from UI focus.
+  $('coordinatorActiveFile').textContent = 'No active file reported';
+  $('coordinatorLocation').textContent = config.roots[0]?.path ?? 'No approved workspace';
+  const coordinatorConnect = $<HTMLButtonElement>('coordinatorConnect');
+  coordinatorConnect.classList.toggle('is-running', running);
+  coordinatorConnect.disabled = connectBtn.disabled;
+  coordinatorConnect.title = connectBtn.title;
+  $('coordinatorConnectLabel').textContent = running ? 'Disconnect coordinator' : 'Connect coordinator';
+  $('fleetLocalDetail').textContent = `${STATUS_TEXT[status.state]} · local control plane`;
+  const devices = next.devices;
+  if (devices) {
+    $('coordinatorName').textContent = `${devices.local.friendlyName} coordinator`;
+    $('fleetCount').textContent = `${devices.remotes.length + 1} managed computer${devices.remotes.length ? 's' : ''}`;
+    $('fleetLocalDetail').textContent = `${devices.local.status.toLowerCase()} · local control plane`;
+    const remotes = $('fleetRemoteList');
+    remotes.replaceChildren(...devices.remotes.map((device) => {
+      const row = el('div', 'fleet-local fleet-remote');
+      row.append(el('span', 'fleet-node-mark', device.friendlyName.slice(0, 1).toUpperCase()));
+      const copy = el('span');
+      copy.append(el('b', '', device.friendlyName), el('em', '', `${device.status.toLowerCase()} · ${device.capabilities.length} capabilities`));
+      row.append(copy, el('span', 'fleet-role', device.status));
+      return row;
+    }));
+    $('fleetEmpty').hidden = devices.remotes.length > 0;
+  }
+
   paintUpdate(next);
 
   // ---- health numbers and facts
@@ -1098,6 +1159,10 @@ function facts(next: AppState): HTMLElement[] {
   const { status, config } = next;
   const rows: [string, string, boolean?][] = [];
   const health = status.health;
+
+  if (next.coreHealth) {
+    for (const fact of coreHealthFacts(next.coreHealth)) rows.push([fact.label, fact.value, fact.bad]);
+  }
 
   if (isRunning(status.state)) {
     rows.push(['Route to OpenAI', health?.route ?? 'starting…']);
@@ -1458,6 +1523,19 @@ $('updateInstall').addEventListener('click', installUpdate);
 $('installUpdate').addEventListener('click', installUpdate);
 $('connectBtn').addEventListener('click', () => void toggleConnection());
 $('wizConnect').addEventListener('click', () => void toggleConnection());
+$('railConnect').addEventListener('click', () => void toggleConnection());
+$('coordinatorConnect').addEventListener('click', () => void toggleConnection());
+$('createPairingTicket').addEventListener('click', async () => {
+  const ticket = await run(api.createPairingTicket());
+  if (!ticket) return;
+  $('pairingCode').textContent = ticket.code;
+  $('pairingExpiry').textContent = `Expires ${new Date(ticket.expiresAt).toLocaleTimeString()}`;
+  $('pairingTicket').hidden = false;
+});
+$('railRunChecks').addEventListener('click', () => {
+  showTab('home');
+  $<HTMLButtonElement>('runChecks').click();
+});
 
 $('pickBinary').addEventListener('click', async () => {
   const next = await run(api.pickBinary());
