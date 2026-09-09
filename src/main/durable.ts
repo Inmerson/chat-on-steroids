@@ -20,6 +20,7 @@ import { initOrchestrationStore } from './orchestration/store.js';
 
 const WRITE_DELAY_MS = 300;
 const RETRY_MAX_MS = 5_000;
+const WINDOWS_REPLACE_RETRY_DELAYS_MS = [10, 20, 40, 80, 160] as const;
 
 let root = '';
 interface PendingWrite {
@@ -65,6 +66,21 @@ function nextWrite(value: unknown): PendingWrite {
   return { generation: nextGeneration++, value };
 }
 
+async function replaceAtomic(source: string, target: string): Promise<void> {
+  for (let retry = 0; ; retry += 1) {
+    try {
+      await fs.rename(source, target);
+      return;
+    } catch (error) {
+      const delay = WINDOWS_REPLACE_RETRY_DELAYS_MS[retry];
+      if (process.platform !== 'win32' || (error as NodeJS.ErrnoException).code !== 'EPERM' || delay === undefined) {
+        throw error;
+      }
+      await new Promise<void>((resolve) => setTimeout(resolve, delay));
+    }
+  }
+}
+
 function enqueue(write: () => Promise<void>): Promise<void> {
   const queued = inFlight.then(write);
   // One failed state file must not poison the serialization chain for every later write.
@@ -102,7 +118,7 @@ async function flushOne(name: string, slot: PendingWrite): Promise<void> {
       await fs.rm(target, { force: true });
     } else {
       await fs.writeFile(tmp, JSON.stringify(slot.value), 'utf8');
-      await fs.rename(tmp, target);
+      await replaceAtomic(tmp, target);
     }
   } catch (err) {
     logWarn(`could not save ${name} state: ${(err as Error).message}`);

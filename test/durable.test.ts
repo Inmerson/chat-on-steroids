@@ -28,6 +28,37 @@ async function tempStore(): Promise<string> {
 }
 
 describe('durable state commit boundary', () => {
+  it.runIf(process.platform === 'win32')(
+    'retries transient Windows EPERM while atomically replacing an existing snapshot',
+    async () => {
+      await tempStore();
+      await writeDurableNow('probe', { generation: 1 });
+      const busy = Object.assign(new Error('injected Windows reader contention'), { code: 'EPERM' });
+      const realRename = fs.rename.bind(fs);
+      const rename = vi
+        .spyOn(fs, 'rename')
+        .mockRejectedValueOnce(busy)
+        .mockImplementation((from, to) => realRename(from, to));
+
+      await expect(writeDurableNow('probe', { generation: 2 })).resolves.toBeUndefined();
+      expect(rename).toHaveBeenCalledTimes(2);
+      await expect(readDurable('probe')).resolves.toEqual({ generation: 2 });
+    }
+  );
+
+  it.runIf(process.platform === 'win32')(
+    'bounds Windows EPERM replacement retries and still surfaces a permanent failure',
+    async () => {
+      await tempStore();
+      await writeDurableNow('probe', { generation: 1 });
+      const blocked = Object.assign(new Error('injected permanent Windows contention'), { code: 'EPERM' });
+      const rename = vi.spyOn(fs, 'rename').mockRejectedValue(blocked);
+
+      await expect(writeDurableNow('probe', { generation: 2 })).rejects.toMatchObject({ code: 'EPERM' });
+      expect(rename).toHaveBeenCalledTimes(6);
+    }
+  );
+
   it('rejects a failed immediate atomic rename and preserves the snapshot for retry', async () => {
     await tempStore();
     const busy = Object.assign(new Error('injected rename contention'), { code: 'EBUSY' });
