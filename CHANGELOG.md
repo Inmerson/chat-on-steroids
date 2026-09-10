@@ -45,6 +45,9 @@ permission boundaries.
   explicitly releases that chat.
 - Session operations whose contract says "every session" use the uncapped durable summary catalog
   rather than the UI-oriented bounded list.
+- Selected-file staging binds the opened file to kernel `dev`/`ino`/`ctime` identity so a
+  same-size, same-mtime pathname replacement is rejected even when a POSIX filesystem immediately
+  reuses the deleted inode.
 - OpenAI tunnel restarts are single-owner: a replacement waits for the process tree it replaces,
   stale process output cannot control the new generation, and health/handshake state is not
   inherited across restart. A single missed `/readyz` probe is confirmed on a second pass before

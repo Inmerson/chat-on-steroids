@@ -55,7 +55,7 @@ it('rejects a pathname swap even when replacement size and mtime appear unchange
   const replacement = path.join(directory, 'replacement.txt');
   await fs.writeFile(source, 'AAAA');
   await fs.writeFile(replacement, 'BBBB');
-  const initial = await fs.stat(source);
+  const initial = await fs.stat(source, { bigint: true });
   const realOpen = fs.open.bind(fs);
   let swapped = false;
   vi.spyOn(fs, 'open').mockImplementation((async (file: any, flags: any, mode?: any) => {
@@ -64,14 +64,19 @@ it('rejects a pathname swap even when replacement size and mtime appear unchange
       await fs.rm(source);
       await fs.copyFile(replacement, source);
       const handle = await realOpen(file, flags, mode);
-      const actual = await handle.stat();
+      const actual = await handle.stat({ bigint: true });
       const realHandleStat = handle.stat.bind(handle);
-      handle.stat = (async () => Object.assign(await realHandleStat(), {
-        size: initial.size,
-        mtimeMs: initial.mtimeMs,
-        dev: actual.dev,
-        ino: actual.ino
-      })) as typeof handle.stat;
+      handle.stat = (async (options?: any) => {
+        const current = await realHandleStat(options);
+        return options?.bigint
+          ? Object.assign(current, { size: initial.size, mtimeNs: initial.mtimeNs, dev: actual.dev, ino: actual.ino })
+          : Object.assign(current, {
+              size: Number(initial.size),
+              mtimeMs: Number(initial.mtimeNs) / 1_000_000,
+              dev: Number(actual.dev),
+              ino: Number(actual.ino)
+            });
+      }) as typeof handle.stat;
       return handle;
     }
     return realOpen(file, flags, mode);

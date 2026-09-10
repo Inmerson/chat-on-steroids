@@ -36,9 +36,9 @@ async function stage(source: AttachmentSource, retained: Set<string>): Promise<I
       await fs.unlink(file); await fs.unlink(file + '.json').catch(() => undefined);
     } else used += stat.size;
   }
-  const stat = typeof source === 'string' ? await fs.lstat(source) : null;
+  const stat = typeof source === 'string' ? await fs.lstat(source, { bigint: true }) : null;
   if (stat?.isSymbolicLink()) throw new Error('Symbolic-link attachments are not accepted; attach the file itself');
-  const size = typeof source === 'string' ? stat!.size : 'text' in source ? Buffer.byteLength(source.text) : source.bytes.byteLength;
+  const size = typeof source === 'string' ? Number(stat!.size) : 'text' in source ? Buffer.byteLength(source.text) : source.bytes.byteLength;
   if (stat && !stat.isFile()) throw new Error('Attach files individually; folders cannot be uploaded');
   if (size > MAX_ATTACHMENT_BYTES) throw new Error('Each attachment must be 512 MB or smaller');
   if (used + size > 2 * 1024 * 1024 * 1024) throw new Error('Attachment storage is full; finish or remove pending messages first');
@@ -51,8 +51,13 @@ async function stage(source: AttachmentSource, retained: Set<string>): Promise<I
       // Stream a fixed snapshot with an explicit byte ceiling even if the source grows.
       const input = await fs.open(source, 'r'), output = await fs.open(destination, 'wx');
       try {
-        const opened = await input.stat();
-        if (opened.dev !== stat!.dev || opened.ino !== stat!.ino) throw new Error('The attachment changed while being read; attach it again');
+        const opened = await input.stat({ bigint: true });
+        // dev+ino alone is insufficient on POSIX because a filesystem may immediately reuse a
+        // deleted inode after a pathname swap. ctime is kernel-owned change metadata, so binding
+        // it to the selected path closes that reuse window even when size and mtime are restored.
+        if (opened.dev !== stat!.dev || opened.ino !== stat!.ino || opened.ctimeNs !== stat!.ctimeNs) {
+          throw new Error('The attachment changed while being read; attach it again');
+        }
         const buffer = Buffer.alloc(ATTACHMENT_CHUNK_BYTES);
         let offset = 0;
         while (offset < size) {
@@ -62,8 +67,10 @@ async function stage(source: AttachmentSource, retained: Set<string>): Promise<I
           while (written < bytesRead) written += (await output.write(buffer, written, bytesRead - written, offset + written)).bytesWritten;
           offset += bytesRead;
         }
-        const after = await input.stat();
-        if (after.size !== size || after.mtimeMs !== stat!.mtimeMs) throw new Error('The attachment changed while being read; attach it again');
+        const after = await input.stat({ bigint: true });
+        if (after.size !== stat!.size || after.mtimeNs !== stat!.mtimeNs || after.ctimeNs !== opened.ctimeNs) {
+          throw new Error('The attachment changed while being read; attach it again');
+        }
       } finally { await input.close(); await output.close(); }
     } else await fs.writeFile(destination, 'text' in source ? source.text : source.bytes, { flag: 'wx' });
     if (attachment.mimeType.startsWith('image/') && size <= 12 * 1024 * 1024) {
