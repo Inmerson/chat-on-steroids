@@ -26,6 +26,8 @@ files:
 extraResources:
   - from: LICENSE
     to: LICENSE
+  - from: THIRD-PARTY-NOTICES.txt
+    to: THIRD-PARTY-NOTICES.txt
   - from: extension
     to: extension
     filter:

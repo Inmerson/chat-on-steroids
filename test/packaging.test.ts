@@ -700,3 +700,15 @@ Load command 11
     }
   });
 });
+
+
+describe('plugin notice packaging', () => {
+  it('ships the generated notices and verifies them before the main test suite', () => {
+    const config = yamlFile('electron-builder.yml');
+    const pkg = JSON.parse(readFileSync(path.join(root, 'package.json'), 'utf8'));
+    const common = config.extraResources as Array<{ from?: string; to?: string }>;
+    expect(common).toContainEqual(expect.objectContaining({ from: 'THIRD-PARTY-NOTICES.txt', to: 'THIRD-PARTY-NOTICES.txt' }));
+    expect(pkg.scripts['verify:notices']).toBe('node scripts/generate-third-party-notices.mjs --check');
+    expect(pkg.scripts['verify:ci']).toContain('npm run verify:notices');
+  });
+});

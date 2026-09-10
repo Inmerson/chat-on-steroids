@@ -208,6 +208,29 @@
           </section>
         </section>
 
+        <!-- ========================================================= Plugins -->
+        <section class="panel plugins-panel" data-panel="plugins">
+          <div class="plugins-content">
+            <header class="plugin-page-head">
+              <div><h1>Plugins</h1><p>Bring external MCP tools into the workspace without widening Core permissions.</p></div>
+              <div class="plugin-search-actions">
+                <label class="plugin-search"><svg class="ico" viewBox="0 0 24 24" aria-hidden="true"><use href="#i-search" /></svg><input id="pluginsSearch" type="search" placeholder="Search plugins" aria-label="Search plugins" /></label>
+                <button class="btn plugin-add" id="pluginsAdd" type="button" aria-label="Add a plugin" title="Add a plugin"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14" /></svg></button>
+              </div>
+            </header>
+            <section class="plugin-connection" aria-labelledby="pluginsSetupTitle">
+              <div><h2 id="pluginsSetupTitle">Set up plugins before your first use</h2><p id="pluginsSetupHint">Add the Chat On Steroids Plugins connector in ChatGPT once so it can use your installed plugins.</p><span id="pluginsConnectionStatus" role="status">Setup required ? connect your plugins</span></div>
+              <button class="btn btn-solid" id="pluginsSetupLink" type="button">Set up plugins</button>
+            </section>
+            <div class="plugin-refresh-guide"><p>After installing, updating or changing enabled plugins, refresh <strong>Chat On Steroids Plugins</strong> in ChatGPT to make its tools available.</p><button class="btn" id="pluginsOpenChatGPT" type="button">Open ChatGPT Apps</button></div>
+            <div class="plugin-section-head"><h2>Installed <span id="pluginsCount" class="plugin-count">Loading?</span></h2><button class="btn" id="pluginsRefresh" type="button">Check local status</button></div>
+            <div id="pluginsInstalled" aria-live="polite"></div>
+            <div class="plugin-section-head"><h2>Explore plugins</h2><span class="muted">Independent integrations</span></div>
+            <div id="pluginsExplore" class="plugin-directory"></div>
+            <details class="plugin-legal"><summary>Legal Notices / Third-party Licenses</summary><p>Catalog illustrations are original Chat On Steroids artwork under the app MIT license. Product names identify independent integrations and do not imply endorsement.</p><p>Installed plugins retain their own licenses. Bundled dependency notices and reviewed catalog license/service references are included in THIRD-PARTY-NOTICES.txt.</p><button class="btn" id="pluginsLegalOpen" type="button">Open full third-party license texts</button></details>
+          </div>
+        </section>
+
         <!-- =========================================================== Setup -->
         <section class="panel scroll" data-panel="setup">
           <div class="sheet">
@@ -811,6 +834,9 @@
         </button>
         <button data-tab="chat" type="button">
           <svg class="ico" viewBox="0 0 24 24"><use href="#i-chat" /></svg><span>Conversations</span>
+        </button>
+        <button data-tab="plugins" type="button">
+          <svg class="ico" viewBox="0 0 24 24"><use href="#i-plus" /></svg><span>Plugins</span>
         </button>
         <p class="rail-label rail-label-secondary">System</p>
         <button data-tab="setup" type="button">

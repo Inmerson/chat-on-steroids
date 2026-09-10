@@ -30,6 +30,7 @@ import { $, ago, el, icon, run, shortAgo, toast } from './dom.js';
 import { chatApply, chatSettingsPatch, chatVisible, initChat } from './chat.js';
 import { controlCenterVisible, initControlCenter } from './control-center.js';
 import { coreHealthFacts } from './core-health-widget.js';
+import { applyPluginsState, initPlugins, refreshPlugins } from './plugins.js';
 
 declare global {
   interface Window {
@@ -121,6 +122,7 @@ function showTab(name: string): void {
   // stale-result guards; the tab switcher owns visibility only.
   chatVisible(name === 'chat');
   controlCenterVisible(name === 'control');
+  if (name === 'plugins') void refreshPlugins();
   // A feed that was appended to while its panel was hidden could not be scrolled then —
   // a hidden element has no scroll height. Pin it now that it has one, so a panel always
   // opens on the newest line rather than on whatever was oldest in the buffer.
@@ -737,6 +739,7 @@ function paintUpdate(next: AppState): void {
 }
 
 function apply(next: AppState): void {
+  applyPluginsState(next);
   const previousState = state;
   state = next;
   applying = true;
@@ -1612,6 +1615,7 @@ async function refresh(): Promise<void> {
 }
 
 buildGroups();
+initPlugins(apply);
 initChat({ save: () => save(), state: () => state });
 initControlCenter(api);
 

@@ -385,6 +385,16 @@ describe('the window as a whole', () => {
     expect(app).toContain("$<HTMLButtonElement>('runChecks').click()");
   });
 
+  it('adds Plugins as a normal workspace destination without removing existing destinations', () => {
+    const names = [...document.querySelectorAll<HTMLButtonElement>('nav button[data-tab]')].map((button) => button.dataset.tab);
+    for (const required of ['home', 'control', 'chat', 'plugins', 'setup', 'activity']) expect(names).toContain(required);
+    expect(document.querySelectorAll('nav button[data-tab="plugins"]')).toHaveLength(1);
+    expect(document.querySelectorAll('.panel[data-panel="plugins"]')).toHaveLength(1);
+    expect(document.getElementById('pluginsInstalled')).not.toBeNull();
+    expect(document.getElementById('pluginsExplore')).not.toBeNull();
+    expect(document.getElementById('pluginsSetupLink')).not.toBeNull();
+  });
+
   it('exposes Control as a normal fifth destination with one bounded canvas panel', () => {
     const controlTab = document.querySelector<HTMLButtonElement>('nav button[data-tab="control"]');
     const controlPanel = document.querySelector<HTMLElement>('.panel[data-panel="control"]');
