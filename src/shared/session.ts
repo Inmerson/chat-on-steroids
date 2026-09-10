@@ -216,6 +216,16 @@ export type SessionEvent =
       kind: 'user_message';
       message: StoredText;
       messageId?: string;
+      /** App outbox identity; present only after a proven handout or native receipt. */
+      inputId?: string;
+      /** A tool handout is offered until a later exact call proves receipt. */
+      inputDelivery?: 'offered' | 'confirmed';
+      /** User-authored text before transport-only wrapping. */
+      authoredText?: string;
+      /** Safe metadata only; staged Core paths and attachment ids are never recorded here. */
+      attachments?: Array<{ name: string; size: number; mimeType: string }>;
+      /** Normalized image bytes are stored as session assets, never inline in history. */
+      assets?: AssetRef[];
       /** First sequence assigned to this stable website message; revisions keep this anchor. */
       origin?: number;
     })
@@ -497,6 +507,16 @@ export type AgentState =
   | 'sleeping'
   | 'finished'
   | 'failed';
+
+/**
+ * Canonical reasoning levels observed from ChatGPT's native model picker.
+ * `none` is a real value; null/absence means no verified picker evidence.
+ */
+export const REASONING_EFFORTS = ['pro', 'none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra'] as const;
+export type ReasoningEffort = (typeof REASONING_EFFORTS)[number];
+export function isReasoningEffort(value: unknown): value is ReasoningEffort {
+  return typeof value === 'string' && (REASONING_EFFORTS as readonly string[]).includes(value);
+}
 
 export interface AgentInfo {
   id: string;

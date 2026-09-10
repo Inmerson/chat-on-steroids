@@ -11,6 +11,8 @@ import { z } from 'zod';
 import type { AppState, BridgeStatus, Config, Diagnosis, DeviceOverview } from '../shared/types.js';
 import type { Handoff, SwarmState } from '../shared/session.js';
 import type { ControlCenterStatus } from '../shared/control-center.js';
+import type { BrowserPreferences } from '../shared/browser-preferences.js';
+import type { ChatModelCatalog } from '../shared/chat-models.js';
 import {
   callCoreUi,
   connect,
@@ -164,6 +166,13 @@ export function registerUiIpc(getWindow: () => BrowserWindow | null, quitToInsta
     return callCoreUi('goal-models', { offset });
   });
 
+  handle('chatModels:get', async () => callCoreUi<ChatModelCatalog>('chat-models-get'));
+  handle('chatModels:request', async () => callCoreUi<ChatModelCatalog>('chat-models-request'));
+  handle('browser:preferences', async (payload) => {
+    const value = z.object({ overwrite: z.boolean().optional(), durations: z.boolean().optional() }).strict().parse(payload ?? {});
+    return callCoreUi<BrowserPreferences>('browser-preferences', value);
+  });
+
   handle('binary:pick', async () => {
     const window = getWindow();
     if (!window) throw new Error('No window');
@@ -274,7 +283,12 @@ export function registerUiIpc(getWindow: () => BrowserWindow | null, quitToInsta
 
   onStatusChange(pushState);
   onCoreRuntimeChange((kind) => {
-    if (kind === 'bridge') pushState();
+    if (kind === 'bridge') {
+      pushState();
+      void callCoreUi<ChatModelCatalog>('chat-models-get')
+        .then((catalog) => push('chatModels:changed', catalog))
+        .catch(() => undefined);
+    }
     if (kind === 'session') push('session:changed');
     if (kind === 'swarm') {
       void callCoreUi<SwarmState>('swarm-get').then((state) => push('swarm:changed', state)).catch(() => undefined);

@@ -594,7 +594,7 @@ describe('surface boundaries', () => {
     everything();
     const names = toolNames(await core('tools/list'));
     // find is absent because exec_command is present — they are mutually exclusive.
-    expect(names).toEqual(['agents', 'apply_patch', 'exec_command', 'read', 'session', 'view_image', 'write_stdin']);
+    expect(names).toEqual(['agents', 'apply_patch', 'download_artifact', 'exec_command', 'read', 'session', 'view_image', 'write_stdin']);
     for (const name of surfaceDefinition('desktop').tools) expect(names, name).not.toContain(name);
   });
 
@@ -867,9 +867,9 @@ describe('surface boundaries', () => {
     const coreTools = toolList(await core('tools/list'));
     const desktopTools = toolList(await desktop('tools/list'));
 
-    // Counts are the design: Core is capped at seven live schemas because find and the exec
+    // Counts are the design: Core is capped at eight live schemas because find and the exec
     // pair cannot both exist, and Desktop is two.
-    expect(coreTools).toHaveLength(7);
+    expect(coreTools).toHaveLength(8);
     expect(desktopTools).toHaveLength(2);
 
     // And the size, which is what a discovery pull actually costs the model on every

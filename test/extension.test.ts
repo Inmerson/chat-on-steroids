@@ -1540,6 +1540,424 @@ describe('extension command delivery', () => {
     expect(backgroundSource).not.toContain("call('/commands'");
   });
 
+  it('status maintenance opens at most one marked fresh-input tab for one UUID', async () => {
+    const local = new FakeStorageArea(paired);
+    const session = new FakeStorageArea();
+    const inputId = '11111111-2222-4333-8444-555555555555';
+    const fetch = vi.fn(async (input: string) => {
+      const url = new URL(input);
+      if (url.pathname === '/hello') return response(200, { app: 'chat-on-steroids', paired: true });
+      if (url.pathname === '/status') return response(200, { ok: true, inputs: [{ id: inputId, conversationId: null }] });
+      return response(404, {});
+    });
+    const worker = loadWorker({ local, session, fetch, tabsQuery: async () => [] });
+    worker.tabsCreate.mockResolvedValue({ id: 211, url: `https://chatgpt.com/?cos-input=${inputId}` });
+
+    await worker.send({ type: 'status' });
+    await worker.send({ type: 'status' });
+
+    expect(fetch.mock.calls.some(([input]) => new URL(String(input)).pathname === '/status')).toBe(true);
+    expect(worker.tabsCreate).toHaveBeenCalledTimes(1);
+    const opened = new URL(String(worker.tabsCreate.mock.calls[0]![0]?.url));
+    expect(opened.origin + opened.pathname).toBe('https://chatgpt.com/');
+    expect(opened.searchParams.get('cos-input')).toBe(inputId);
+  });
+
+  it('re-elects one fresh-input tab after browser restart only while Core still proves the input is queued', async () => {
+    const local = new FakeStorageArea(paired);
+    const inputId = '22222222-3333-4444-8555-666666666666';
+    const fetch = vi.fn(async (input: string) => {
+      const url = new URL(input);
+      if (url.pathname === '/hello') return response(200, { app: 'chat-on-steroids', paired: true });
+      if (url.pathname === '/status') {
+        return response(200, { ok: true, inputs: [{ id: inputId, conversationId: null, state: 'queued', owner: null, sendStarted: false }] });
+      }
+      return response(404, {});
+    });
+
+    const first = loadWorker({ local, session: new FakeStorageArea(), fetch, tabsQuery: async () => [] });
+    first.tabsCreate.mockResolvedValue({ id: 311, url: `https://chatgpt.com/?cos-input=${inputId}` });
+    await first.send({ type: 'status' });
+    expect(first.tabsCreate).toHaveBeenCalledTimes(1);
+
+    // A browser restart destroys the old numeric tab. Core still says `queued`, which is
+    // positive proof that no browser claim committed, so one replacement election is safe.
+    const restarted = loadWorker({ local, session: new FakeStorageArea(), fetch, tabsQuery: async () => [] });
+    restarted.tabsCreate.mockResolvedValue({ id: 1, url: `https://chatgpt.com/?cos-input=${inputId}` });
+    await restarted.send({ type: 'status' });
+
+    expect(restarted.tabsCreate).toHaveBeenCalledTimes(1);
+    expect(new URL(String(restarted.tabsCreate.mock.calls[0]![0]?.url)).searchParams.get('cos-input')).toBe(inputId);
+  });
+
+  it('never opens a replacement tab when Core already records a browser-owned fresh-input claim', async () => {
+    const local = new FakeStorageArea(paired);
+    const inputId = '23232323-4545-4676-8898-a1a1a1a1a1a1';
+    const owner = 'tab-311:document-311-0';
+    const fetch = vi.fn(async (input: string) => {
+      const url = new URL(input);
+      if (url.pathname === '/hello') return response(200, { app: 'chat-on-steroids', paired: true });
+      if (url.pathname === '/status') {
+        return response(200, { ok: true, inputs: [{ id: inputId, conversationId: null, state: 'browser', owner, sendStarted: false }] });
+      }
+      return response(404, {});
+    });
+    const worker = loadWorker({ local, session: new FakeStorageArea(), fetch, tabsQuery: async () => [] });
+    worker.tabsCreate.mockResolvedValue({ id: 1, url: `https://chatgpt.com/?cos-input=${inputId}` });
+
+    await worker.send({ type: 'status' });
+
+    expect(worker.tabsCreate).not.toHaveBeenCalled();
+  });
+
+  it('rebinds an unclaimed queued fresh-input election to the replacement document after same-tab reload', async () => {
+    const local = new FakeStorageArea(paired);
+    const session = new FakeStorageArea();
+    const inputId = '24242424-5656-4787-8909-b2b2b2b2b2b2';
+    const markedUrl = `https://chatgpt.com/?cos-input=${inputId}`;
+    const tab = { id: 251, url: markedUrl, status: 'complete', windowId: 7 };
+    const fetch = vi.fn(async (input: string) => {
+      const url = new URL(input);
+      if (url.pathname === '/hello') return response(200, { app: 'chat-on-steroids', paired: true });
+      if (url.pathname === '/status') {
+        return response(200, { ok: true, inputs: [{ id: inputId, conversationId: null, state: 'queued', owner: null, sendStarted: false }] });
+      }
+      return response(404, {});
+    });
+    const worker = loadWorker({ local, session, fetch, tabsQuery: async () => [tab] });
+    await worker.registerDocument(tab, 'input-document-old');
+    await worker.send({ type: 'status' });
+    expect(worker.tabsSendMessage).toHaveBeenCalledWith(
+      251,
+      { type: 'clf-run-input', id: inputId },
+      { documentId: 'input-document-old' }
+    );
+
+    worker.tabsSendMessage.mockClear();
+    await worker.navigateTab(251, markedUrl);
+    await worker.send({ type: 'status' });
+
+    expect(worker.tabsSendMessage).toHaveBeenCalledWith(
+      251,
+      { type: 'clf-run-input', id: inputId },
+      { documentId: 'document-251-1' }
+    );
+  });
+
+  it('reoffers a claimed pre-send input to the same exact document after service-worker restart', async () => {
+    const local = new FakeStorageArea(paired);
+    const session = new FakeStorageArea();
+    const inputId = '25252525-6767-4898-8010-c3c3c3c3c3c3';
+    const markedUrl = `https://chatgpt.com/?cos-input=${inputId}`;
+    const tab = { id: 261, url: markedUrl, status: 'complete', windowId: 7 };
+    const owner = 'tab-261:input-document-261';
+    let claimed = false;
+    const fetch = vi.fn(async (input: string, init: Record<string, unknown> = {}) => {
+      const url = new URL(input);
+      if (url.pathname === '/hello') return response(200, { app: 'chat-on-steroids', paired: true });
+      if (url.pathname === '/status') {
+        return response(200, {
+          ok: true,
+          inputs: [{
+            id: inputId,
+            conversationId: null,
+            state: claimed ? 'browser' : 'queued',
+            owner: claimed ? owner : null,
+            sendStarted: false
+          }]
+        });
+      }
+      if (url.pathname === '/input/claim') {
+        const body = JSON.parse(String(init.body ?? '{}')) as Record<string, unknown>;
+        expect(body.owner).toBe(owner);
+        claimed = true;
+        return response(200, {
+          input: {
+            id: inputId,
+            sessionId: null,
+            text: 'Resume the exact claim',
+            attachments: [],
+            images: [],
+            state: 'browser',
+            owner,
+            createdAt: 1,
+            conversationId: null
+          }
+        });
+      }
+      return response(404, {});
+    });
+    const first = loadWorker({ local, session, fetch, tabsQuery: async () => [tab] });
+    await first.registerDocument(tab, 'input-document-261');
+    await first.send({ type: 'status' });
+    expect(await first.sendFrom({ type: 'input_claim', id: inputId }, tab, 'input-document-261')).toMatchObject({
+      ok: true,
+      input: { id: inputId }
+    });
+
+    const restarted = loadWorker({ local, session, fetch, tabsQuery: async () => [tab] });
+    restarted.tabsSendMessage.mockClear();
+    await restarted.send({ type: 'status' });
+
+    expect(restarted.tabsSendMessage).toHaveBeenCalledWith(
+      261,
+      { type: 'clf-run-input', id: inputId },
+      { documentId: 'input-document-261' }
+    );
+  });
+
+  it('trusts Core queued state over a stale local pre-send claim after a lost release response', async () => {
+    const inputId = '26262626-7878-4909-8121-d4d4d4d4d4d4';
+    const local = new FakeStorageArea({
+      ...paired,
+      freshInputAssignments: {
+        [inputId]: {
+          tabId: 271,
+          documentId: 'input-document-271',
+          navigationEpoch: 0,
+          claimed: true,
+          sendStarted: false,
+          attachmentIds: []
+        }
+      }
+    });
+    const fetch = vi.fn(async (input: string) => {
+      const url = new URL(input);
+      if (url.pathname === '/hello') return response(200, { app: 'chat-on-steroids', paired: true });
+      if (url.pathname === '/status') {
+        return response(200, { ok: true, inputs: [{ id: inputId, conversationId: null, state: 'queued', owner: null, sendStarted: false }] });
+      }
+      return response(404, {});
+    });
+    const restarted = loadWorker({ local, session: new FakeStorageArea(), fetch, tabsQuery: async () => [] });
+    restarted.tabsCreate.mockResolvedValue({ id: 1, url: `https://chatgpt.com/?cos-input=${inputId}` });
+
+    await restarted.send({ type: 'status' });
+
+    expect(restarted.tabsCreate).toHaveBeenCalledTimes(1);
+  });
+
+  it('binds fresh-input claim, attachment and ACK to the elected browser document only', async () => {
+    const local = new FakeStorageArea(paired);
+    const session = new FakeStorageArea();
+    const inputId = 'aaaaaaaa-2222-4333-8444-bbbbbbbbbbbb';
+    const attachmentId = 'cccccccc-2222-4333-8444-dddddddddddd';
+    const foreignAttachmentId = 'eeeeeeee-2222-4333-8444-ffffffffffff';
+    const conversationId = '01234567-89ab-4cde-8f01-23456789abcd';
+    const markedUrl = `https://chatgpt.com/?cos-input=${inputId}`;
+    const elected = { id: 221, url: markedUrl, status: 'complete', windowId: 7 };
+    const other = { id: 222, url: markedUrl, status: 'complete', windowId: 7 };
+    let exposeTabs = false;
+    const bridgeCalls: Array<{ path: string; body: Record<string, any> }> = [];
+    const fetch = vi.fn(async (input: string, init: Record<string, unknown> = {}) => {
+      const url = new URL(input);
+      if (url.pathname === '/hello') return response(200, { app: 'chat-on-steroids', paired: true });
+      if (url.pathname === '/status') return response(200, { ok: true, inputs: [{ id: inputId, conversationId: null }] });
+      if (['/input/claim', '/input/attachment', '/input/send-started', '/input/ack'].includes(url.pathname)) {
+        const body = JSON.parse(String(init.body ?? '{}')) as Record<string, any>;
+        bridgeCalls.push({ path: url.pathname, body });
+        if (url.pathname === '/input/claim') {
+          return response(200, {
+            input: {
+              id: inputId,
+              sessionId: null,
+              text: 'Deliver exact input',
+              attachments: [{ id: attachmentId, name: 'note.txt', size: 3, mimeType: 'text/plain' }],
+              images: [],
+              state: 'browser',
+              owner: body.owner,
+              createdAt: 1,
+              conversationId: null
+            }
+          });
+        }
+        if (url.pathname === '/input/attachment') return response(200, { chunk: 'YWJj', size: 3 });
+        return response(200, { ok: true });
+      }
+      return response(404, {});
+    });
+    const worker = loadWorker({
+      local,
+      session,
+      fetch,
+      tabsQuery: async () => (exposeTabs ? [other, elected] : [])
+    });
+    exposeTabs = true;
+    await worker.registerDocument(elected, 'input-document-221');
+    await worker.registerDocument(other, 'input-document-222');
+    worker.tabsSendMessage.mockClear();
+
+    await worker.send({ type: 'status' });
+    expect(worker.tabsSendMessage).toHaveBeenCalledWith(
+      221,
+      { type: 'clf-run-input', id: inputId },
+      { documentId: 'input-document-221' }
+    );
+    expect(worker.tabsSendMessage.mock.calls.some(([tab]) => tab === 222)).toBe(false);
+
+    const foreignClaim = await worker.sendFrom(
+      { type: 'input_claim', id: inputId, owner: 'forged-page-owner' },
+      other,
+      'input-document-222'
+    );
+    expect(foreignClaim).toMatchObject({ ok: false });
+    expect(bridgeCalls).toHaveLength(0);
+
+    const claim = await worker.sendFrom(
+      { type: 'input_claim', id: inputId, owner: 'forged-page-owner' },
+      elected,
+      'input-document-221'
+    );
+    expect(claim?.input?.text).toBe('Deliver exact input');
+    expect(bridgeCalls[0]).toMatchObject({
+      path: '/input/claim',
+      body: { id: inputId, owner: 'tab-221:input-document-221', conversationId: null }
+    });
+
+    const beforeForeignAttachment = bridgeCalls.length;
+    expect(await worker.sendFrom(
+      { type: 'input_attachment', id: inputId, attachmentId: foreignAttachmentId, offset: 0 },
+      elected,
+      'input-document-221'
+    )).toMatchObject({ ok: false });
+    expect(bridgeCalls).toHaveLength(beforeForeignAttachment);
+
+    const attachment = await worker.sendFrom(
+      { type: 'input_attachment', id: inputId, attachmentId, offset: 0 },
+      elected,
+      'input-document-221'
+    );
+    expect(attachment).toMatchObject({ ok: true, data: { chunk: 'YWJj', size: 3 } });
+    expect(bridgeCalls.at(-1)).toMatchObject({
+      path: '/input/attachment',
+      body: { id: inputId, owner: 'tab-221:input-document-221', conversationId: null, attachmentId, offset: 0 }
+    });
+
+    expect(await worker.sendFrom(
+      { type: 'input_send_started', id: inputId },
+      elected,
+      'input-document-221'
+    )).toMatchObject({ ok: true });
+    expect(bridgeCalls.at(-1)).toMatchObject({
+      path: '/input/send-started',
+      body: { id: inputId, owner: 'tab-221:input-document-221' }
+    });
+    const beforeRepeatedFence = bridgeCalls.length;
+    expect(await worker.sendFrom(
+      { type: 'input_send_started', id: inputId },
+      elected,
+      'input-document-221'
+    )).toMatchObject({ ok: true });
+    expect(bridgeCalls).toHaveLength(beforeRepeatedFence);
+    const beforeReclaim = bridgeCalls.length;
+    expect(await worker.sendFrom(
+      { type: 'input_claim', id: inputId },
+      elected,
+      'input-document-221'
+    )).toMatchObject({ ok: false, error: 'input_send_already_started' });
+    expect(bridgeCalls).toHaveLength(beforeReclaim);
+
+    const liveSender = { ...elected, url: `https://chatgpt.com/c/${conversationId}?cos-input=${inputId}` };
+    const ackAttempt = await worker.sendFrom(
+      { type: 'input_ack', id: inputId, conversationId, messageId: 'native-user-message' },
+      liveSender,
+      'input-document-221'
+    );
+    expect(ackAttempt).toMatchObject({ ok: true });
+    expect(bridgeCalls.at(-1)).toMatchObject({
+      path: '/input/ack',
+      body: { id: inputId, owner: 'tab-221:input-document-221', conversationId, messageId: 'native-user-message' }
+    });
+
+    await worker.startTabNavigation(221, `https://chatgpt.com/c/${conversationId}`);
+    const beforeStaleAck = bridgeCalls.length;
+    expect(await worker.sendFrom(
+      { type: 'input_ack', id: inputId, conversationId, messageId: 'native-user-message' },
+      elected,
+      'input-document-221'
+    )).toMatchObject({ ok: false });
+    expect(bridgeCalls).toHaveLength(beforeStaleAck);
+  });
+
+  it('durably retries a fresh-input ACK across a full browser restart without reopening or resending', async () => {
+    const local = new FakeStorageArea(paired);
+    const inputId = 'abababab-2323-4343-8454-cdcdcdcdcdcd';
+    const conversationId = '12121212-3434-4565-8787-909090909090';
+    const markedUrl = `https://chatgpt.com/?cos-input=${inputId}`;
+    const elected = { id: 241, url: markedUrl, status: 'complete', windowId: 7 };
+    const owner = 'tab-241:input-document-241';
+    let firstAckCalls = 0;
+    const firstFetch = vi.fn(async (input: string, init: Record<string, unknown> = {}) => {
+      const url = new URL(input);
+      if (url.pathname === '/hello') return response(200, { app: 'chat-on-steroids', paired: true });
+      if (url.pathname === '/status') {
+        return response(200, { ok: true, inputs: [{ id: inputId, conversationId: null, state: 'queued', owner: null, sendStarted: false }] });
+      }
+      const body = JSON.parse(String(init.body ?? '{}')) as Record<string, any>;
+      if (url.pathname === '/input/claim') {
+        return response(200, {
+          input: {
+            id: inputId,
+            sessionId: null,
+            text: 'Durable input ACK',
+            attachments: [],
+            images: [],
+            state: 'browser',
+            owner: body.owner,
+            createdAt: 1,
+            conversationId: null
+          }
+        });
+      }
+      if (url.pathname === '/input/send-started') return response(200, { ok: true });
+      if (url.pathname === '/input/ack') {
+        firstAckCalls += 1;
+        return response(503, { error: 'temporary_ack_failure' });
+      }
+      return response(404, {});
+    });
+    const first = loadWorker({ local, session: new FakeStorageArea(), fetch: firstFetch, tabsQuery: async () => [elected] });
+    await first.registerDocument(elected, 'input-document-241');
+    await first.send({ type: 'status' });
+    await first.sendFrom({ type: 'input_claim', id: inputId }, elected, 'input-document-241');
+    await first.sendFrom({ type: 'input_send_started', id: inputId }, elected, 'input-document-241');
+    const liveSender = { ...elected, url: `https://chatgpt.com/c/${conversationId}?cos-input=${inputId}` };
+    const accepted = await first.sendFrom(
+      { type: 'input_ack', id: inputId, conversationId, messageId: 'native-input-message' },
+      liveSender,
+      'input-document-241'
+    );
+    expect(accepted).toMatchObject({ ok: true, durable: true });
+    expect(firstAckCalls).toBe(1);
+    expect(local.data.inputAckOutbox).toMatchObject([
+      { id: inputId, owner, conversationId, messageId: 'native-input-message' }
+    ]);
+
+    const replayBodies: Array<Record<string, unknown>> = [];
+    const secondFetch = vi.fn(async (input: string, init: Record<string, unknown> = {}) => {
+      const url = new URL(input);
+      if (url.pathname === '/hello') return response(200, { app: 'chat-on-steroids', paired: true });
+      if (url.pathname === '/status') {
+        return response(200, { ok: true, inputs: [{ id: inputId, conversationId: null, state: 'browser', owner, sendStarted: true }] });
+      }
+      if (url.pathname === '/input/ack') {
+        replayBodies.push(JSON.parse(String(init.body ?? '{}')));
+        return response(200, { ok: true });
+      }
+      return response(404, {});
+    });
+    const restarted = loadWorker({ local, session: new FakeStorageArea(), fetch: secondFetch, tabsQuery: async () => [] });
+    restarted.tabsCreate.mockResolvedValue({ id: 1, url: markedUrl });
+    await restarted.send({ type: 'status' });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(replayBodies).toEqual([{ id: inputId, owner, conversationId, messageId: 'native-input-message' }]);
+    expect(local.data.inputAckOutbox).toEqual([]);
+    expect((local.data.freshInputAssignments as Record<string, unknown> | undefined)?.[inputId]).toBeUndefined();
+    expect(restarted.tabsCreate).not.toHaveBeenCalled();
+  });
+
   it('re-injects the recorder into already-open ChatGPT tabs after an extension reload', async () => {
     const local = new FakeStorageArea(paired);
     const session = new FakeStorageArea();

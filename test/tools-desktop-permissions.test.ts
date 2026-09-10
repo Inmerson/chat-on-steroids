@@ -43,6 +43,7 @@ function caps(over: Partial<Capabilities>): Capabilities {
     edit: false,
     move: false,
     deleteFile: false,
+    saveArtifact: false,
     command: false,
     screen: false,
     control: false,

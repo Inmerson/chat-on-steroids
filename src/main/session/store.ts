@@ -948,7 +948,22 @@ export function upsertMessageEvent(
                 ? { renderedHtml: previous.renderedHtml }
                 : {})
             }
-          : event;
+          : previous?.kind === 'user_message' && event.kind === 'user_message'
+            ? {
+                ...event,
+                // App delivery metadata is stronger than a later sparse page echo. Undefined
+                // means "not observed by this producer", never "erase prior proof". Explicit
+                // values such as offered -> confirmed still form a real canonical revision.
+                ...(event.inputId === undefined && previous.inputId !== undefined ? { inputId: previous.inputId } : {}),
+                ...(event.inputDelivery === undefined && previous.inputDelivery !== undefined
+                  ? { inputDelivery: previous.inputDelivery } : {}),
+                ...(event.authoredText === undefined && previous.authoredText !== undefined
+                  ? { authoredText: previous.authoredText } : {}),
+                ...(event.attachments === undefined && previous.attachments !== undefined
+                  ? { attachments: previous.attachments } : {}),
+                ...(event.assets === undefined && previous.assets !== undefined ? { assets: previous.assets } : {})
+              }
+            : event;
       // A canonical assistant message belongs to exactly one generation permanently. Ownership
       // may still be *promoted* from "not known yet" to a durable generation id when the
       // recorder learns it late, but a settled assistant answer may never move to another turn.
@@ -968,6 +983,14 @@ export function upsertMessageEvent(
         previous?.kind === 'assistant_message' && nextEvent.kind === 'assistant_message'
           ? previous.turnId ?? nextEvent.turnId ?? undefined
           : nextEvent.turnId ?? undefined;
+      const sameUserInputMetadata =
+        previous?.kind !== 'user_message' || nextEvent.kind !== 'user_message' || (
+          previous.inputId === nextEvent.inputId &&
+          previous.inputDelivery === nextEvent.inputDelivery &&
+          previous.authoredText === nextEvent.authoredText &&
+          JSON.stringify(previous.attachments ?? null) === JSON.stringify(nextEvent.attachments ?? null) &&
+          JSON.stringify(previous.assets ?? null) === JSON.stringify(nextEvent.assets ?? null)
+        );
       if (
         previous &&
         previous.kind === nextEvent.kind &&
@@ -977,6 +1000,7 @@ export function upsertMessageEvent(
             storedTextEqual(previous.renderedHtml, nextEvent.renderedHtml) &&
             previous.state === nextEvent.state &&
             previous.final === nextEvent.final)) &&
+        sameUserInputMetadata &&
         (previous.turnId ?? undefined) === settledTurnId &&
         (nextEvent.agent === undefined || previous.agent === nextEvent.agent) &&
         (!options.preferTime || previous.time === nextEvent.time)

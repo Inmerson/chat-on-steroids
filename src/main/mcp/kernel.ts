@@ -74,6 +74,8 @@ import { readOverflowText } from '../session/store.js';
 import { backgroundExecRecoveryNotices } from '../codex/ownership.js';
 import type { StoredText, ToolOutcome } from '../../shared/session.js';
 import type { ProtocolOperation } from '../../shared/multidevice/types.js';
+import { requestCorrelation } from '../session/correlation.js';
+import { acknowledgeToolInput, offerToolInput } from '../session/input.js';
 
 export interface ToolContext {
   roots: Root[];
@@ -509,6 +511,19 @@ async function dispatchTracked(
       context.caller.conversationId = transportKey ? bound : resolved;
     }
   }
+  const inputCorrelation = requestCorrelation(context.caller.requestId);
+  const exactInputCaller = inputCorrelation && context.caller.conversationId === inputCorrelation.conversationId
+    ? inputCorrelation
+    : null;
+  if (exactInputCaller) {
+    await acknowledgeToolInput(
+      exactInputCaller.sessionId,
+      exactInputCaller.conversationId,
+      exactInputCaller.requestId,
+      startedAt
+    ).catch(() => logWarn('Prior user input receipt could not be saved; its durable claim is preserved'));
+  }
+
   // Never erase an identity a handler proved more strongly (agents::callerNow). The old
   // post-handler pass could fail to rediscover evidence that callerNow had already reserved
   // and then set agent back to null, which is the live WORKER_IDENTITY_LOST / missing-inbox
@@ -544,10 +559,35 @@ async function dispatchTracked(
   // Inbox messages are part of the MCP result ChatGPT actually receives. Build the delivered
   // result before recording so session(action=read, tool_call=T…) is genuine wire forensics rather than a
   // subtly earlier internal value that omits the worker report most likely to matter later.
-  const delivered = withBackgroundExecRecovery(
+  let delivered = withBackgroundExecRecovery(
     context.caller.conversationId,
     withInbox(context.caller.conversationId, context.agent, result, isFinish)
   );
+  if (exactInputCaller) {
+    const userInput = await offerToolInput(
+      exactInputCaller.sessionId,
+      exactInputCaller.conversationId,
+      exactInputCaller.requestId,
+      Date.now()
+    ).catch(() => {
+      logWarn('Queued user input could not be attached; the completed tool result is preserved');
+      return [];
+    });
+    if (userInput.length) {
+      const content: ToolResult['content'] = [];
+      for (const entry of userInput) {
+        content.push({ type: 'text', text: `\n--- New instruction from the user ---\n${entry.text}` });
+        for (const image of entry.images) {
+          content.push({
+            type: 'image',
+            mimeType: 'image/webp',
+            data: image.dataUrl.slice(image.dataUrl.indexOf(',') + 1)
+          });
+        }
+      }
+      delivered = { ...delivered, content: [...delivered.content, ...content] };
+    }
+  }
   const recorderStartedAt = Date.now();
   const recording = recordToolCall({
     tool: name,

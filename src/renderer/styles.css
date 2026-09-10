@@ -2686,7 +2686,7 @@ nav button.is-sel::after {
 
 .app {
   display: grid;
-  grid-template-columns: 224px minmax(0, 1fr);
+  grid-template-columns: var(--sidebar-width, 224px) minmax(0, 1fr);
   grid-template-rows: auto auto minmax(0, 1fr);
   background: var(--page);
 }
@@ -2696,6 +2696,7 @@ nav button.is-sel::after {
 .app > main { grid-column: 2; grid-row: 3; min-width: 0; }
 
 #tabs {
+  position: relative;
   grid-column: 1;
   grid-row: 1 / -1;
   display: flex;
@@ -2731,6 +2732,28 @@ nav button.is-sel::after {
 .rail-brand small { display: block; }
 .rail-brand strong { font-size: 13px; font-weight: 650; letter-spacing: -0.02em; }
 .rail-brand small { margin-top: 2px; color: var(--faint); font-size: 8.5px; font-weight: 700; letter-spacing: 0.1em; }
+
+#tabs .sidebar-toggle {
+  width: 25px; min-height: 25px; margin-left: auto; justify-content: center; padding: 0;
+  border: 1px solid var(--line); border-radius: 7px; background: var(--card); color: var(--soft);
+  font-size: 18px; line-height: 1;
+}
+.sidebar-resize {
+  position: absolute; z-index: 8; top: 0; right: -4px; bottom: 0; width: 8px; cursor: ew-resize; touch-action: none;
+}
+.sidebar-resize:focus-visible { outline: 2px solid var(--accent); outline-offset: -3px; }
+.app.is-resizing-sidebar { cursor: ew-resize; user-select: none; }
+.app.is-sidebar-collapsed { --sidebar-width: 64px !important; }
+.app.is-sidebar-collapsed .rail-brand { justify-content: center; padding: 2px 0 16px; }
+.app.is-sidebar-collapsed .rail-brand > span:last-of-type,
+.app.is-sidebar-collapsed .rail-label,
+.app.is-sidebar-collapsed .rail-pulse,
+.app.is-sidebar-collapsed .rail-actions,
+.app.is-sidebar-collapsed .rail-footer { display: none; }
+.app.is-sidebar-collapsed #tabs > button[data-tab] { justify-content: center; padding: 8px; }
+.app.is-sidebar-collapsed #tabs > button[data-tab] span:not(.badge) { display: none; }
+.app.is-sidebar-collapsed #tabs .sidebar-toggle { position: absolute; right: 7px; bottom: 8px; margin: 0; }
+.app.is-sidebar-collapsed .sidebar-resize { display: none; }
 
 .rail-label {
   margin: 9px 8px 4px;

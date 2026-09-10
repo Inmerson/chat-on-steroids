@@ -1,8 +1,8 @@
 import type { ConnectionStatus } from './types.js';
 
-// v7 adds fixed plugin-authority UI operations. A v6 Core must be replaced rather than
-// silently accepted by a v7 UI, because plugin lifecycle/secrets belong to the persistent Core.
-export const CORE_PROTOCOL_VERSION = 7;
+// v8 adds browser/model-discovery UI operations. An older Core must be replaced rather than
+// silently accepted because discovery requests and their browser wake authority are Core-owned.
+export const CORE_PROTOCOL_VERSION = 8;
 
 export const CORE_CAPABILITIES = [
   'connection-status',
@@ -13,7 +13,8 @@ export const CORE_CAPABILITIES = [
   'secret-storage',
   'ui-runtime',
   'config-authority',
-  'plugin-authority'
+  'plugin-authority',
+  'browser-model-discovery'
 ] as const;
 
 export type CoreCapability = (typeof CORE_CAPABILITIES)[number];
@@ -100,7 +101,10 @@ export type CoreUiOperation =
   | 'plugins-set-enabled'
   | 'plugins-set-tool-enabled'
   | 'plugins-auth-start'
-  | 'plugins-auth-cancel';
+  | 'plugins-auth-cancel'
+  | 'chat-models-get'
+  | 'chat-models-request'
+  | 'browser-preferences';
 
 export type CoreCommandName =
   | 'hello'

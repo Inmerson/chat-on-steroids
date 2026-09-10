@@ -1,12 +1,48 @@
-import { accessSync, constants, existsSync, statSync } from 'node:fs';
+﻿import { accessSync, constants, existsSync, statSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { launchCommand } from './exec.js';
+import { launchCommand, runCommand, runPowerShell } from './exec.js';
+import { getConfig } from './config.js';
+import type { ChatBrowser } from '../shared/types.js';
+import { browserWindowBounds } from './browser-window-layout.js';
 
 type Exists = (candidate: string) => boolean;
 type Launch = typeof launchCommand;
 
+/** A successful OS handoff is not a live browser. Unknown probes never grant opening authority. */
+export async function isPreferredBrowserRunning(
+  platform: NodeJS.Platform = process.platform,
+  powershell: typeof runPowerShell = runPowerShell,
+  browser: ChatBrowser = getConfig().ui.chatBrowser ?? 'chrome',
+  command: typeof runCommand = runCommand
+): Promise<boolean | null> {
+  try {
+    if (platform !== 'win32') {
+      if (platform !== 'darwin' && platform !== 'linux') return null;
+      // comm contains executable names, never arguments or browsing/profile data.
+      const result = await command('ps', ['-A', '-o', 'comm='], os.tmpdir(), 5000);
+      if (result.timedOut || result.truncated || result.exitCode !== 0 || !result.stdout.trim()) return null;
+      const family = browser === 'edge'
+        ? /^(?:msedge|microsoft-edge(?:-(?:stable|beta|dev))?|Microsoft Edge(?: Beta| Dev| Canary)?(?: Helper.*)?)$/i
+        : browser === 'brave'
+          ? /^(?:brave|brave-browser(?:-(?:stable|beta|dev|nightly))?|Brave Browser(?: Beta| Dev| Nightly)?(?: Helper.*)?)$/i
+        : /^(?:chrome|google-chrome(?:-(?:stable|beta|unstable))?|chromium(?:-browser)?|Google Chrome(?: Beta| Dev| Canary)?(?: Helper.*)?|Chromium(?: Helper.*)?)$/i;
+      return result.stdout.split('\n').some(name => family.test(path.posix.basename(name.trim())));
+    }
+    // Probe only the selected family; another browser cannot prove its presence or absence.
+    // Enumerate names only, never user command lines or profile data. Both names are constants.
+    const processName = browser === 'edge' ? 'msedge' : browser === 'brave' ? 'brave' : 'chrome';
+    const result = await powershell(`$ErrorActionPreference='Stop'; if (@(Get-Process | Where-Object ProcessName -eq '${processName}').Count) { 'running' } else { 'absent' }`, os.tmpdir(), 5000);
+    if (result.timedOut || result.truncated || result.exitCode !== 0) return null;
+    return result.stdout.trim() === 'absent' ? false : result.stdout.trim() === 'running' ? true : null;
+  } catch { return null; }
+}
+
 export interface PreferredBrowserOpenOptions {
+  /** Defaults to the saved ChatGPT browser choice. */
+  browser?: ChatBrowser;
+  /** Start the owned helper without activating its Windows startup window. */
+  backgroundStartup?: boolean;
   platform?: NodeJS.Platform;
   env?: NodeJS.ProcessEnv;
   home?: string;
@@ -14,6 +50,8 @@ export interface PreferredBrowserOpenOptions {
   usable?: Exists;
   /** Test seam for launch failure/retry ordering. */
   launch?: Launch;
+  /** Test seam for the Windows minimized startup wrapper. */
+  powershell?: typeof runPowerShell;
 }
 
 function isExecutableBrowser(candidate: string, platform: NodeJS.Platform): boolean {
@@ -27,41 +65,56 @@ function isExecutableBrowser(candidate: string, platform: NodeJS.Platform): bool
 }
 
 /**
- * Browsers which can run the unpacked companion extension, in preference order.
+ * Installations of the selected companion browser, in preference order.
  *
- * Worker/resume URLs are not ordinary links: the extension must redeem the command marker
- * embedded in them. Sending those URLs to Safari/Firefox merely opens a dead ChatGPT tab, so
- * browser-backed orchestration deliberately prefers the Chrome installation the setup guide
- * tells the user to load the extension into.
+ * Nothing here can choose *which running instance* of that browser the URL reaches: the
+ * platform resolves it to the one that last had focus. A chat that must be opened beside
+ * another chat is therefore not opened from this module at all — the browser holding the
+ * source chat opens it. See `bridge.ts::offerPlacement`.
+ *
+ * Worker/resume URLs require the companion and the user's ChatGPT account. Browser family
+ * is a saved user choice, not inferred from executable availability or the OS URL handler.
+ * Never cross that choice just because another installed browser is easier to launch.
  */
 export function preferredBrowserCandidates(
   platform: NodeJS.Platform = process.platform,
   env: NodeJS.ProcessEnv = process.env,
-  home = env.HOME ?? env.USERPROFILE ?? os.homedir()
+  home = env.HOME ?? env.USERPROFILE ?? os.homedir(),
+  browser: ChatBrowser = 'chrome'
 ): string[] {
   if (platform === 'win32') {
     const p = path.win32;
-    return [
-      env.LOCALAPPDATA && p.join(env.LOCALAPPDATA, 'Google', 'Chrome', 'Application', 'chrome.exe'),
-      env.ProgramFiles && p.join(env.ProgramFiles, 'Google', 'Chrome', 'Application', 'chrome.exe'),
-      env['ProgramFiles(x86)'] && p.join(env['ProgramFiles(x86)'], 'Google', 'Chrome', 'Application', 'chrome.exe')
-    ].filter((candidate): candidate is string => Boolean(candidate));
+    const parts = browser === 'edge'
+      ? ['Microsoft', 'Edge', 'Application', 'msedge.exe']
+      : browser === 'brave'
+        ? ['BraveSoftware', 'Brave-Browser', 'Application', 'brave.exe']
+        : ['Google', 'Chrome', 'Application', 'chrome.exe'];
+    return [env.LOCALAPPDATA, env.ProgramFiles, env['ProgramFiles(x86)']]
+      .filter((root): root is string => Boolean(root))
+      .map(root => p.join(root, ...parts));
   }
 
   if (platform === 'darwin') {
-    // Chrome's release channels are separate .app bundles on macOS. A Beta/Dev/Canary-only
-    // install is still a perfectly valid place to load this unpacked Chrome extension, and the
-    // setup UI never requires Stable specifically. If orchestration only knows the Stable bundle,
-    // a worker/resume command falls through to the system default browser (commonly Safari) even
-    // though the compatible Chrome instance is sitting right there with the extension loaded.
-    const chromeChannels = [
+    // Release channels have separate bundles. Keep Beta/Dev/Canary-only installs usable
+    // without crossing the user's chosen browser family.
+    const channels = browser === 'edge' ? [
+      ['Microsoft Edge.app', 'Microsoft Edge'],
+      ['Microsoft Edge Beta.app', 'Microsoft Edge Beta'],
+      ['Microsoft Edge Dev.app', 'Microsoft Edge Dev'],
+      ['Microsoft Edge Canary.app', 'Microsoft Edge Canary']
+    ] : browser === 'brave' ? [
+      ['Brave Browser.app', 'Brave Browser'],
+      ['Brave Browser Beta.app', 'Brave Browser Beta'],
+      ['Brave Browser Dev.app', 'Brave Browser Dev'],
+      ['Brave Browser Nightly.app', 'Brave Browser Nightly']
+    ] : [
       ['Google Chrome.app', 'Google Chrome'],
       ['Google Chrome Beta.app', 'Google Chrome Beta'],
       ['Google Chrome Dev.app', 'Google Chrome Dev'],
       ['Google Chrome Canary.app', 'Google Chrome Canary'],
       ['Chromium.app', 'Chromium']
     ] as const;
-    return chromeChannels.flatMap(([bundle, executable]) => [
+    return channels.flatMap(([bundle, executable]) => [
       path.posix.join('/Applications', bundle, 'Contents', 'MacOS', executable),
       ...(home ? [path.posix.join(home, 'Applications', bundle, 'Contents', 'MacOS', executable)] : [])
     ]);
@@ -69,11 +122,14 @@ export function preferredBrowserCandidates(
 
   if (platform === 'linux') {
     const pathValue = env.PATH ?? '';
-    // Google ships Beta and Dev as separate Linux packages/binaries, just as it ships
-    // separate .app bundles on macOS. A user can legitimately have the companion loaded in
-    // one of those channels with Stable absent, so keep all Chrome channels ahead of the
-    // Chromium fallbacks rather than handing an orchestration marker to the default browser.
-    const names = [
+    // Search release-channel launchers too: the companion need not be installed in Stable.
+    const names = browser === 'edge' ? ['microsoft-edge', 'microsoft-edge-stable', 'microsoft-edge-beta', 'microsoft-edge-dev'] : browser === 'brave' ? [
+      'brave-browser',
+      'brave-browser-beta',
+      'brave-browser-dev',
+      'brave-browser-nightly',
+      'brave'
+    ] : [
       'google-chrome',
       'google-chrome-stable',
       'google-chrome-beta',
@@ -85,6 +141,23 @@ export function preferredBrowserCandidates(
       .split(':')
       .filter(Boolean)
       .flatMap((dir) => names.map((name) => path.posix.join(dir, name)));
+    if (browser === 'edge') return [...new Set([
+      ...fromPath,
+      ...names.map(name => path.posix.join('/usr/bin', name)),
+      '/opt/microsoft/msedge/msedge', '/opt/microsoft/msedge-beta/msedge', '/opt/microsoft/msedge-dev/msedge'
+    ])];
+    if (browser === 'brave') return [...new Set([
+      ...fromPath,
+      ...names.map(name => path.posix.join('/usr/bin', name)),
+      '/opt/brave.com/brave/brave-browser',
+      '/opt/brave.com/brave-beta/brave-browser-beta',
+      '/opt/brave.com/brave-dev/brave-browser-dev',
+      '/opt/brave.com/brave-nightly/brave-browser-nightly',
+      '/snap/bin/brave',
+      '/usr/lib/brave-browser/brave-browser',
+      home ? path.posix.join(home, '.local', 'share', 'flatpak', 'exports', 'bin', 'com.brave.Browser') : '',
+      '/var/lib/flatpak/exports/bin/com.brave.Browser'
+    ].filter(Boolean))];
     // Chrome and Chromium are both widely installed through Flatpak on immutable Linux
     // desktops. Flatpak exports host launchers for installed applications under these
     // `exports/bin` directories (the exported Chrome desktop file uses the same path as
@@ -128,42 +201,60 @@ export function findPreferredBrowser(
 }
 
 /**
- * Opens an orchestration URL in the first Chromium browser that can actually be launched.
+ * Opens an orchestration URL in the saved browser family.
  *
  * Existence/executable checks are intentionally not the arbitration cut. A stale wrapper or a
  * damaged first Chrome install can pass those checks and still fail at spawn time; worker/resume
- * URLs must then try the next compatible Chromium candidate rather than falling straight through
- * to Safari/Firefox via the system default browser.
+ * URLs may try another installation of that family, never the system default or another family.
  */
 export async function openInPreferredBrowser(
   url: string,
   options: PreferredBrowserOpenOptions = {}
-): Promise<string | null> {
+): Promise<string> {
   const platform = options.platform ?? process.platform;
   const env = options.env ?? process.env;
   const usable = options.usable ?? ((candidate: string) => isExecutableBrowser(candidate, platform));
   const launch = options.launch ?? launchCommand;
+  const selected = options.browser ?? getConfig().ui.chatBrowser ?? 'chrome';
+  const label = selected === 'edge' ? 'Microsoft Edge' : selected === 'brave' ? 'Brave Browser' : 'Google Chrome / Chromium';
+  const bounds = browserWindowBounds();
+  // These switches only affect a newly started Chrome process; handing a URL to an
+  // existing instance cannot change its policy. Memory Saver exclusions alone do not
+  // prevent background timer/renderer throttling of long-running orchestration tabs.
+  const args = [
+    ...(platform === 'win32' ? ['--disable-renderer-backgrounding', '--disable-background-timer-throttling'] : []),
+    ...(options.backgroundStartup ? [`--window-size=${bounds.width},${bounds.height}`] : []),
+    url
+  ];
   let lastError: unknown = null;
 
-  for (const browser of preferredBrowserCandidates(platform, env, options.home)) {
+  for (const browser of new Set(preferredBrowserCandidates(platform, env, options.home, selected))) {
     if (!usable(browser)) continue;
     try {
-      const browserPath = platform === 'win32' ? path.win32 : path.posix;
-      const args =
-        platform === 'win32'
-          ? [
-              '--disable-renderer-backgrounding',
-              '--disable-background-timer-throttling',
-              url
-            ]
-          : [url];
-      await launch(browser, args, browserPath.dirname(browser));
+      // A windowless Chrome exits once extensions load unless the profile has a
+      // persistent background app. Launch the marked helper itself so its tab
+      // owns browser lifetime; the extension adopts that same tab, never a second.
+      const cwd = (platform === 'win32' ? path.win32 : path.posix).dirname(browser);
+      if (options.backgroundStartup && platform === 'win32') {
+        // Start-Process joins ArgumentList; supply one correctly quoted Windows
+        // command line. PowerShell literals are a separate escaping boundary.
+        const literal = (value: string): string => `'${value.replace(/'/g, "''")}'`;
+        const argument = (value: string): string => `"${value.replace(/(\\*)"/g, '$1$1\\"').replace(/(\\*)$/, '$1$1')}"`;
+        if ([browser, ...args].some(value => value.includes('\0'))) throw new Error('Browser launch contains a null byte');
+        const script = `$ErrorActionPreference='Stop'; Start-Process -FilePath ${literal(browser)} -ArgumentList ${literal(args.map(argument).join(' '))} -WorkingDirectory ${literal(cwd)} -WindowStyle Minimized`;
+        // runPowerShell hides its own console. The child gets a real minimized
+        // startup request, not Node's console-only windowsHide flag. No -Wait:
+        // the owned helper tab, not this wrapper, keeps the browser alive.
+        const result = await (options.powershell ?? runPowerShell)(script, cwd, 10_000);
+        if (result.timedOut || result.exitCode !== 0) throw new Error(`Background browser launch failed: ${result.stderr.slice(0, 300) || 'PowerShell did not complete'}`);
+      }
+      else await launch(browser, args, cwd);
       return browser;
     } catch (error) {
       lastError = error;
     }
   }
 
-  if (lastError) throw lastError;
-  return null;
+  if (lastError) throw new Error(`${label} could not start: ${(lastError as Error).message}. Check Settings > Browser & history > ChatGPT browser.`);
+  throw new Error(`${label} was not found. Install it or change Settings > Browser & history > ChatGPT browser.`);
 }

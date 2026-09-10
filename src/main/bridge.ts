@@ -38,6 +38,7 @@ import {
   startGoalDraft
 } from './goal.js';
 import { logInfo, logWarn } from './logger.js';
+import { attachBrowserWake, wakeBrowserWork } from './browser-wake.js';
 import {
   closeConversation,
   liveConversations,
@@ -121,6 +122,17 @@ import { APP_VERSION, BRIDGE_PROTOCOL } from './version.js';
 import { requestCorrelation } from './session/correlation.js';
 import { bindAgentWorkspace } from './workspace.js';
 import { MAX_GOAL_OBJECTIVE_CHARS } from '../shared/goal.js';
+import { pendingChatModelRequest, observeChatModels } from './chat-models.js';
+import { acknowledgeBrowserPreferences, pendingBrowserPreferenceRequest } from './browser-preferences.js';
+import {
+  acknowledgeBrowserInput,
+  claimBrowserInput,
+  listInputs,
+  markBrowserInputSendStarted,
+  pendingBrowserInputs,
+  releaseBrowserInput
+} from './session/input.js';
+import { readInputAttachmentChunk } from './session/input-attachments.js';
 
 /** Fixed candidates so the extension can find the app without being told a port. */
 export const DEFAULT_PORTS = [8765, 8766, 8767, 8768, 8769];
@@ -396,6 +408,7 @@ export interface BridgeCommand {
 }
 
 let server: http.Server | null = null;
+let browserWake: ReturnType<typeof attachBrowserWake> | null = null;
 let port: number | null = null;
 let lastSeenAt: number | null = null;
 let agentTabTelemetry: BrowserAgentTabTelemetry | null = null;
@@ -425,6 +438,11 @@ export function onBridgeChange(listener: () => void): () => void {
   return () => listeners.delete(listener);
 }
 
+/** Browser-owned auxiliary workflows reuse the bridge revision as their UI invalidation signal. */
+export function notifyBridgeWorkflowChange(): void {
+  changed();
+}
+
 function changed(): void {
   for (const listener of listeners) listener();
 }
@@ -439,6 +457,11 @@ export async function bridgeStatus(): Promise<BridgeStatus> {
     lastSeenAt,
     extensionVersion
   };
+}
+
+/** Recent HTTP presence is not proof that a desktop-initiated send can wake the extension now. */
+export function browserWakeConnected(): boolean {
+  return browserWake?.connected() === true;
 }
 
 export function browserAgentTabTelemetry(): BrowserAgentTabTelemetry | null {
@@ -506,6 +529,7 @@ export async function unpair(): Promise<void> {
   // This impossible-as-a-token sentinel preserves the user's explicit intent across both
   // the extension's next poll and an app restart.
   await setSecret('bridgeToken', BROWSER_DISCONNECTED);
+  browserWake?.revoke();
   logInfo('bridge: browser disconnected');
   changed();
 }
@@ -1089,7 +1113,127 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
 
   if (route === '/status') {
     const live = liveConversations();
-    return json(res, 200, { ok: true, conversations: live, commands: commands.length }, origin);
+    return json(res, 200, {
+      ok: true,
+      conversations: live,
+      commands: commands.length,
+      modelCatalogRequest: pendingChatModelRequest(),
+      browserPreferenceRequest: pendingBrowserPreferenceRequest(),
+      inputs: await pendingBrowserInputs()
+    }, origin);
+  }
+
+  if (route === '/models' && req.method === 'POST') {
+    let body: unknown;
+    try { body = await readBody(req); }
+    catch (err) {
+      if ((err as Error).message === 'body_too_large') return tooLarge(res, origin);
+      return json(res, 400, { error: 'bad_request' }, origin);
+    }
+    const accepted = observeChatModels(body);
+    if (accepted) changed();
+    return json(res, accepted ? 200 : 409, { ok: accepted }, origin);
+  }
+
+  if (route === '/browser/preferences' && req.method === 'POST') {
+    let body: unknown;
+    try { body = await readBody(req); }
+    catch (err) {
+      if ((err as Error).message === 'body_too_large') return tooLarge(res, origin);
+      return json(res, 400, { error: 'bad_request' }, origin);
+    }
+    const accepted = acknowledgeBrowserPreferences(body);
+    return json(res, accepted ? 200 : 409, { ok: accepted }, origin);
+  }
+
+  if (route === '/input/claim' && req.method === 'POST') {
+    let body: Record<string, unknown>;
+    try { body = (await readBody(req)) as Record<string, unknown>; }
+    catch (err) {
+      if ((err as Error).message === 'body_too_large') return tooLarge(res, origin);
+      return json(res, 400, { error: 'bad_request' }, origin);
+    }
+    const id = typeof body?.id === 'string' ? body.id : '';
+    const owner = typeof body?.owner === 'string' && body.owner.length <= 200 ? body.owner : '';
+    if (!/^[a-f0-9-]{36}$/i.test(id) || !owner || body?.conversationId !== null) {
+      return json(res, 400, { error: 'invalid_input_claim' }, origin);
+    }
+    const input = await claimBrowserInput(id, owner, null);
+    return json(res, 200, { input }, origin);
+  }
+
+  if (route === '/input/release' && req.method === 'POST') {
+    let body: Record<string, unknown>;
+    try { body = (await readBody(req)) as Record<string, unknown>; }
+    catch (err) {
+      if ((err as Error).message === 'body_too_large') return tooLarge(res, origin);
+      return json(res, 400, { error: 'bad_request' }, origin);
+    }
+    const id = typeof body?.id === 'string' ? body.id : '';
+    const owner = typeof body?.owner === 'string' && body.owner.length <= 200 ? body.owner : '';
+    if (!/^[a-f0-9-]{36}$/i.test(id) || !owner) {
+      return json(res, 400, { error: 'invalid_input_release' }, origin);
+    }
+    const ok = await releaseBrowserInput(id, owner);
+    return json(res, ok ? 200 : 409, ok ? { ok: true } : { error: 'input_not_owned' }, origin);
+  }
+
+  if (route === '/input/send-started' && req.method === 'POST') {
+    let body: Record<string, unknown>;
+    try { body = (await readBody(req)) as Record<string, unknown>; }
+    catch (err) {
+      if ((err as Error).message === 'body_too_large') return tooLarge(res, origin);
+      return json(res, 400, { error: 'bad_request' }, origin);
+    }
+    const id = typeof body?.id === 'string' ? body.id : '';
+    const owner = typeof body?.owner === 'string' && body.owner.length <= 200 ? body.owner : '';
+    if (!/^[a-f0-9-]{36}$/i.test(id) || !owner) {
+      return json(res, 400, { error: 'invalid_input_send' }, origin);
+    }
+    const ok = await markBrowserInputSendStarted(id, owner);
+    return json(res, ok ? 200 : 409, ok ? { ok: true } : { error: 'input_not_owned' }, origin);
+  }
+
+  if (route === '/input/ack' && req.method === 'POST') {
+    let body: Record<string, unknown>;
+    try { body = (await readBody(req)) as Record<string, unknown>; }
+    catch (err) {
+      if ((err as Error).message === 'body_too_large') return tooLarge(res, origin);
+      return json(res, 400, { error: 'bad_request' }, origin);
+    }
+    const id = typeof body?.id === 'string' ? body.id : '';
+    const owner = typeof body?.owner === 'string' && body.owner.length <= 200 ? body.owner : '';
+    const target = conversationId(body?.conversationId);
+    const messageId = typeof body?.messageId === 'string' && body.messageId.length <= 256 ? body.messageId : undefined;
+    if (!/^[a-f0-9-]{36}$/i.test(id) || !owner || !target) {
+      return json(res, 400, { error: 'invalid_input_ack' }, origin);
+    }
+    const ok = await acknowledgeBrowserInput(id, owner, target, messageId);
+    return json(res, ok ? 200 : 409, ok ? { ok: true } : { error: 'input_not_owned' }, origin);
+  }
+
+  if (route === '/input/attachment' && req.method === 'POST') {
+    let body: Record<string, unknown>;
+    try { body = (await readBody(req)) as Record<string, unknown>; }
+    catch (err) {
+      if ((err as Error).message === 'body_too_large') return tooLarge(res, origin);
+      return json(res, 400, { error: 'bad_request' }, origin);
+    }
+    const id = typeof body?.id === 'string' ? body.id : '';
+    const owner = typeof body?.owner === 'string' && body.owner.length <= 200 ? body.owner : '';
+    const attachmentId = typeof body?.attachmentId === 'string' ? body.attachmentId : '';
+    const offset = typeof body?.offset === 'number' ? body.offset : NaN;
+    if (!/^[a-f0-9-]{36}$/i.test(id) || !owner || !/^[a-f0-9-]{36}$/i.test(attachmentId) || !Number.isSafeInteger(offset)) {
+      return json(res, 400, { error: 'invalid_attachment_request' }, origin);
+    }
+    const entry = (await listInputs()).find((row) => row.id === id && row.state === 'browser' && row.owner === owner && row.conversationId === null);
+    const attachment = entry?.attachments.find((file) => file.id === attachmentId);
+    if (!entry || !attachment) return json(res, 409, { error: 'input_not_owned' }, origin);
+    try {
+      return json(res, 200, { chunk: await readInputAttachmentChunk(attachment, offset), size: attachment.size }, origin);
+    } catch {
+      return json(res, 409, { error: 'attachment_unavailable' }, origin);
+    }
   }
 
   if (route === '/correlations' && req.method === 'POST') {
@@ -3021,9 +3165,19 @@ async function startBridgeOnce(epoch: number): Promise<number | null> {
       }, STALE_SWARM_SWEEP_MS);
       staleSwarmTimer.unref?.();
       bridgeRecovering = false;
+      browserWake?.dispose();
+      browserWake = attachBrowserWake(
+        instance,
+        (req) => !bridgeRecovering && server === instance && originOf(req).ok,
+        async (candidate) => {
+          const stored = await getSecret('bridgeToken');
+          return !!stored && stored !== BROWSER_DISCONNECTED && safeEqual(candidate, stored);
+        }
+      );
       // Anything restored from the previous run goes out now rather than waiting for a
       // browser to come and ask.
       deliver();
+      wakeBrowserWork();
       logInfo(`bridge listening on 127.0.0.1:${actual}`);
       changed();
       return actual;
@@ -3048,6 +3202,8 @@ export async function stopBridge(): Promise<void> {
     if (bridgeDesiredRunning || epoch !== bridgeLifecycleEpoch) return;
     const instance = server;
     if (!instance) return;
+    browserWake?.dispose();
+    browserWake = null;
     if (browserPresenceTimer) clearTimeout(browserPresenceTimer);
     browserPresenceTimer = null;
     clearWorkerPlacement();

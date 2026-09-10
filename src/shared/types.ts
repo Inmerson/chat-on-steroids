@@ -29,6 +29,7 @@ export const CAPABILITIES = [
   'edit',
   'move',
   'deleteFile',
+  'saveArtifact',
   'command',
   'screen',
   'control',
@@ -58,6 +59,7 @@ export const WRITE_CAPABILITIES: readonly Capability[] = [
   'edit',
   'move',
   'deleteFile',
+  'saveArtifact',
   'command',
   'control',
   'clipboardWrite'
@@ -120,6 +122,8 @@ export interface TunnelSettings {
 }
 
 export interface UiPrefs {
+  /** Browser family that owns the unpacked ChatGPT companion extension. */
+  chatBrowser?: ChatBrowser;
   minimizeToTray: boolean;
   autoConnect: boolean;
   /** Default screenshots to the active window instead of the whole primary monitor. */
@@ -127,6 +131,10 @@ export interface UiPrefs {
   /** Explicit choice, never inherited from the OS: the window looks how you left it. */
   theme: 'light' | 'dark';
 }
+
+/** Supported Chromium-family browsers for the companion extension. */
+export const CHAT_BROWSERS = ['chrome', 'edge', 'brave'] as const;
+export type ChatBrowser = (typeof CHAT_BROWSERS)[number];
 
 /**
  * Session recording. On by default: unlike the diagnostics log this one writes what
@@ -464,6 +472,7 @@ export const DEFAULT_CAPABILITIES: Capabilities = {
   edit: false,
   move: false,
   deleteFile: false,
+  saveArtifact: false,
   command: false,
   screen: false,
   control: false,
@@ -480,6 +489,7 @@ export const CAPABILITY_LABELS: Record<Capability, string> = {
   edit: 'Edit files',
   move: 'Move / rename',
   deleteFile: 'Delete files',
+  saveArtifact: 'Save ChatGPT files',
   command: 'Run commands',
   screen: 'See the screen',
   control: 'Control mouse and keyboard',
@@ -504,6 +514,7 @@ export const CAPABILITY_DETAILS: Record<Capability, string> = {
   edit: 'Exact edits, applied atomically across files.',
   move: 'Move or rename, both ends inside approved folders.',
   deleteFile: 'Permanent — there is no Recycle Bin.',
+  saveArtifact: 'Save images and files ChatGPT generates into an approved folder.',
   command: 'Run anything as you. NOT limited to approved folders.',
   screen: 'Screenshots, open windows, and the controls on them.',
   control: 'Moves the pointer, clicks, types and presses keys, as you.',
@@ -528,6 +539,7 @@ export const CAPABILITY_TOOLS: Record<Capability, readonly string[]> = {
   edit: ['apply_patch'],
   move: ['apply_patch'],
   deleteFile: ['apply_patch'],
+  saveArtifact: ['download_artifact'],
   command: ['exec_command', 'write_stdin'],
   screen: ['observe'],
   control: ['computer'],

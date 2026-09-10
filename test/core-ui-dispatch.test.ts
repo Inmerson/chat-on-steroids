@@ -24,7 +24,10 @@ function deps() {
     pluginsSetEnabled: vi.fn(async () => ({ plugins: [], catalog: [], schemaRevision: 7 })),
     pluginsSetToolEnabled: vi.fn(async () => ({ plugins: [], catalog: [], schemaRevision: 8 })),
     pluginsAuthStart: vi.fn(async () => ({ plugins: [], catalog: [], schemaRevision: 9 })),
-    pluginsAuthCancel: vi.fn(async () => ({ plugins: [], catalog: [], schemaRevision: 10 }))
+    pluginsAuthCancel: vi.fn(async () => ({ plugins: [], catalog: [], schemaRevision: 10 })),
+    chatModels: vi.fn(() => ({ state: 'ready', requestedAt: 1, observedAt: 2, models: [] })),
+    requestChatModels: vi.fn(async () => ({ state: 'pending', requestedAt: 3, observedAt: null, models: [] })),
+    browserPreferences: vi.fn(async (patch: unknown) => ({ overwrite: false, durations: true, ...(patch as object) }))
   };
 }
 
@@ -86,5 +89,16 @@ describe('Core-owned UI runtime dispatch', () => {
 
     await expect((dispatch as any)('plugins-remove', { id: '../escape' })).rejects.toThrow();
     await expect((dispatch as any)('plugins-set-tool-enabled', { id: pluginId, name: '', enabled: true })).rejects.toThrow();
+  });
+
+  it('keeps browser preferences and model discovery behind fixed Core-owned operations', async () => {
+    const d = deps();
+    const dispatch = createCoreUiDispatcher(d as never);
+
+    await expect((dispatch as any)('chat-models-get', null)).resolves.toMatchObject({ state: 'ready' });
+    await expect((dispatch as any)('chat-models-request', null)).resolves.toMatchObject({ state: 'pending' });
+    await expect((dispatch as any)('browser-preferences', { overwrite: true })).resolves.toMatchObject({ overwrite: true });
+    expect(d.browserPreferences).toHaveBeenCalledWith({ overwrite: true });
+    await expect((dispatch as any)('browser-preferences', { overwrite: 'yes' })).rejects.toThrow();
   });
 });

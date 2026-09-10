@@ -6,11 +6,13 @@
  * ipcRenderer itself is never exposed.
  */
 
-import { contextBridge, ipcRenderer } from 'electron';
+import { contextBridge, ipcRenderer, webUtils } from 'electron';
 import type { AppState, Capabilities, Config, Diagnosis, LogEntry } from '../shared/types.js';
 import type { CoreHealthStatus } from '../shared/core-protocol.js';
 import type { ControlCenterStatus } from '../shared/control-center.js';
 import type { PluginConfigPatch, PluginInstallRequest, PluginSnapshot } from '../shared/plugins.js';
+import type { BrowserPreferences } from '../shared/browser-preferences.js';
+import type { ChatModelCatalog } from '../shared/chat-models.js';
 import type {
   Handoff,
   SessionEvent,
@@ -19,6 +21,8 @@ import type {
   SwarmState,
   TokenPressure
 } from '../shared/session.js';
+import type { InputAttachment } from '../shared/input.js';
+import type { InputArgs, InputEntry } from '../main/session/input.js';
 
 type Reply<T> = { ok: true; data: T } | { ok: false; error: string };
 
@@ -63,6 +67,28 @@ export interface SessionDetail {
 }
 
 const api = {
+  chooseFiles: () => call<InputAttachment[]>('sessions:files'),
+  dropFiles: async (files: File[]): Promise<Reply<InputAttachment[]>> => {
+    if (!files.length || files.length > 20) return { ok: false, error: 'Attach up to 20 files per message' };
+    try {
+      const sources: Array<string | { name: string; bytes: Uint8Array }> = [];
+      for (const file of files) {
+        const hostPath = webUtils.getPathForFile(file);
+        if (!hostPath && file.size > 12 * 1024 * 1024) {
+          return { ok: false, error: 'Pasted files must be 12 MB or smaller' };
+        }
+        sources.push(hostPath || { name: file.name, bytes: new Uint8Array(await file.arrayBuffer()) });
+      }
+      return await call<InputAttachment[]>('sessions:dropFiles', { files: sources });
+    } catch {
+      return { ok: false, error: 'Could not read the attachment' };
+    }
+  },
+  attachText: (text: string) => call<InputAttachment>('sessions:attachText', { text }),
+  sendInput: (input: InputArgs) => call<InputEntry>('sessions:send', input),
+  listInputs: () => call<InputEntry[]>('sessions:outbox'),
+  cancelInput: (id: string) => call<boolean>('sessions:cancelInput', { id }),
+  getSessionImage: (id: string, assetId: string) => call<string | null>('sessions:image', { id, assetId }),
   getState: () => call<AppState>('state:get'),
   getCoreHealth: () => call<CoreHealthStatus | null>('core:health'),
   saveSettings: (patch: SettingsPatch, base: SettingsPatch) => call<AppState>('settings:save', { patch, base }),
@@ -73,6 +99,9 @@ const api = {
   setApiKey: (value: string) => call<AppState>('secret:set', { value }),
   setGoalKey: (value: string) => call<AppState>('secret:set', { value, key: 'openRouterApiKey' }),
   listGoalModels: (offset: number) => call<GoalModelPage>('goal:models', { offset }),
+  getChatModels: () => call<ChatModelCatalog>('chatModels:get'),
+  requestChatModels: () => call<ChatModelCatalog>('chatModels:request'),
+  browserPreferences: (patch: Partial<BrowserPreferences> = {}) => call<BrowserPreferences>('browser:preferences', patch),
   pickBinary: () => call<AppState>('binary:pick'),
   connect: () => call<AppState>('connection:connect'),
   disconnect: () => call<AppState>('connection:disconnect'),
@@ -130,6 +159,11 @@ const api = {
     const wrapped = (): void => listener();
     ipcRenderer.on('session:changed', wrapped);
     return () => ipcRenderer.removeListener('session:changed', wrapped);
+  },
+  onChatModelsChanged: (listener: (catalog: ChatModelCatalog) => void): (() => void) => {
+    const wrapped = (_event: unknown, catalog: ChatModelCatalog): void => listener(catalog);
+    ipcRenderer.on('chatModels:changed', wrapped);
+    return () => ipcRenderer.removeListener('chatModels:changed', wrapped);
   },
   onSwarmChanged: (listener: (state: SwarmState) => void): (() => void) => {
     const wrapped = (_event: unknown, state: SwarmState): void => listener(state);

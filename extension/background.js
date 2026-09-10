@@ -141,6 +141,9 @@ let closing = false;
  */
 let commandAckOutbox = [];
 let ackingCommands = false;
+/** Native fresh-input delivery receipts survive service-worker and browser restarts. */
+let inputAckOutbox = [];
+let ackingInputs = false;
 /** Bounded worker-lifetime terminal ACK receipts, covering ACK-before-source-map rollover races. */
 const recentTerminalCommandAcks = new Map();
 /** Exact browser-session lease snapshot published by agent-tab-lifecycle.js. */
@@ -209,6 +212,19 @@ const deferredRevivalOffers = new Map();
  * conversation. Browser-session only because numeric tab ids do not survive a browser restart.
  */
 let revivalPreferences = {};
+/**
+ * Fresh desktop input custody, one browser tab/document per input UUID.
+ *
+ * `documentId:null` is only a pending browser placement. Once a registered document is
+ * elected its exact Chrome-owned identity never transfers to another document. That is
+ * intentional even when the page disappears after an ambiguous native send: Core remains
+ * the durable owner of the input and a later page must not guess that it may send it again.
+ */
+let freshInputAssignments = {};
+/** Elections created or re-proven during this service-worker lifetime. */
+const freshInputRuntimeAssignments = new Set();
+let freshInputMaintenance = null;
+let freshInputMaintenanceAgain = false;
 
 function load() {
   if (loaded) return Promise.resolve();
@@ -230,7 +246,9 @@ async function loadOnce() {
     'disconnected',
     'deferredRevivals',
     'commandAckOutbox',
-    'loopRecoveryCounters'
+    'inputAckOutbox',
+    'loopRecoveryCounters',
+    'freshInputAssignments'
   ]);
   port = typeof stored.port === 'number' ? stored.port : null;
   token = typeof stored.token === 'string' ? stored.token : null;
@@ -255,7 +273,8 @@ async function loadOnce() {
     'loopTransfers',
     'completedLoopTransfers',
     'managedWindows',
-    'executionRolloverSources'
+    'executionRolloverSources',
+    'freshInputAssignments'
   ]);
   settled = Array.isArray(live.settled) ? live.settled : [];
   journal = Array.isArray(live.journal) ? live.journal : [];
@@ -278,6 +297,17 @@ async function loadOnce() {
     : Array.isArray(live.commandAckOutbox)
       ? live.commandAckOutbox.slice(-200)
       : [];
+  inputAckOutbox = Array.isArray(stored.inputAckOutbox)
+    ? stored.inputAckOutbox.filter((entry) =>
+        entry &&
+        validInputUuid(entry.id) &&
+        typeof entry.owner === 'string' &&
+        entry.owner.length > 0 &&
+        entry.owner.length <= 200 &&
+        !!cleanConversationId(entry.conversationId) &&
+        (entry.messageId === undefined || (typeof entry.messageId === 'string' && entry.messageId.length > 0 && entry.messageId.length <= 256))
+      ).slice(-200)
+    : [];
   revivalPreferences =
     live.revivalPreferences && typeof live.revivalPreferences === 'object' && !Array.isArray(live.revivalPreferences)
       ? { ...live.revivalPreferences }
@@ -289,6 +319,11 @@ async function loadOnce() {
   completedLoopTransfers = parseCompletedLoopTransfers(live.completedLoopTransfers);
   managedWindows = parseManagedWindows(live.managedWindows);
   executionRolloverSources = parseExecutionRolloverSources(live.executionRolloverSources);
+  // Opening/send custody must survive a full browser restart. Numeric tab/document ids may
+  // become stale, but the persisted election is still the fence that prevents a second
+  // native-send opportunity for the same durable Core input. Accept the session copy only
+  // as an in-development migration fallback.
+  freshInputAssignments = parseFreshInputAssignments(stored.freshInputAssignments ?? live.freshInputAssignments);
   agentTabLeaseTelemetry = parseAgentTabLeaseTelemetry(live.agentTabLeaseTelemetry);
   await cleanupLoopTransferState({ checkTabs: true });
   loaded = true;
@@ -344,6 +379,33 @@ function parseExecutionRolloverSources(value) {
   return out;
 }
 
+function validInputUuid(value) {
+  return typeof value === 'string' && /^[a-f0-9-]{36}$/i.test(value);
+}
+
+function parseFreshInputAssignments(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return {};
+  const out = {};
+  for (const [id, raw] of Object.entries(value)) {
+    if (!validInputUuid(id) || !raw || typeof raw !== 'object' || Array.isArray(raw)) continue;
+    if (!Number.isInteger(raw.tabId) || raw.tabId < 0) continue;
+    const documentId = typeof raw.documentId === 'string' && raw.documentId ? raw.documentId : null;
+    const navigationEpoch = Number.isSafeInteger(raw.navigationEpoch) && raw.navigationEpoch >= 0 ? raw.navigationEpoch : null;
+    const attachmentIds = Array.isArray(raw.attachmentIds)
+      ? raw.attachmentIds.filter((attachmentId) => validInputUuid(attachmentId)).slice(0, 20)
+      : [];
+    out[id] = {
+      tabId: raw.tabId,
+      documentId,
+      navigationEpoch,
+      claimed: raw.claimed === true,
+      sendStarted: raw.sendStarted === true,
+      attachmentIds
+    };
+  }
+  return out;
+}
+
 function agentTabTelemetryHeaders() {
   const telemetry = agentTabLeaseTelemetry;
   if (!telemetry) return {};
@@ -387,7 +449,9 @@ function persistLive() {
       // revival text is duplicated into extension storage.
       chrome.storage.local.set({
         commandAckOutbox: commandAckOutbox.slice(-200),
-        deferredRevivals: deferredRevivals.slice(-100)
+        inputAckOutbox: inputAckOutbox.slice(-200),
+        deferredRevivals: deferredRevivals.slice(-100),
+        freshInputAssignments
       })
     ])
   );
@@ -913,7 +977,7 @@ async function fetchBounded(url, init = {}, timeoutMs = REQUEST_TIMEOUT_MS) {
 }
 
 function scheduleRetry() {
-  if (journal.length === 0 && closeOutbox.length === 0 && commandAckOutbox.length === 0) return;
+  if (journal.length === 0 && closeOutbox.length === 0 && commandAckOutbox.length === 0 && inputAckOutbox.length === 0) return;
   if (retryAlarmScheduled) return;
   try {
     if (chrome.alarms && typeof chrome.alarms.create === 'function') {
@@ -926,7 +990,7 @@ function scheduleRetry() {
 }
 
 function clearRetryIfIdle() {
-  if (journal.length > 0 || closeOutbox.length > 0 || commandAckOutbox.length > 0) return;
+  if (journal.length > 0 || closeOutbox.length > 0 || commandAckOutbox.length > 0 || inputAckOutbox.length > 0) return;
   try {
     if (chrome.alarms && typeof chrome.alarms.clear === 'function') void chrome.alarms.clear(RETRY_ALARM);
     retryAlarmScheduled = false;
@@ -1355,6 +1419,57 @@ async function drainCommandAcks(targetId = null) {
     return { ok: true, pending: commandAckOutbox.length, queued: commandAckOutbox.length > 0 };
   } finally {
     ackingCommands = false;
+  }
+}
+
+async function drainInputAcks(targetId = null) {
+  await load();
+  if (ackingInputs || inputAckOutbox.length === 0 || !token) {
+    return { ok: true, pending: inputAckOutbox.length, queued: inputAckOutbox.length > 0 };
+  }
+  ackingInputs = true;
+  let targetResult = null;
+  let changed = false;
+  try {
+    for (const entry of [...inputAckOutbox]) {
+      if (!entry || !validInputUuid(entry.id) || !cleanConversationId(entry.conversationId) || !entry.owner) {
+        inputAckOutbox = inputAckOutbox.filter((candidate) => candidate !== entry);
+        changed = true;
+        continue;
+      }
+      const payload = {
+        id: entry.id,
+        owner: entry.owner,
+        conversationId: entry.conversationId,
+        ...(entry.messageId ? { messageId: entry.messageId } : {})
+      };
+      const result = await call('/input/ack', { method: 'POST', body: JSON.stringify(payload) });
+      if (entry.id === targetId) targetResult = result;
+      if (result.ok && result.data?.ok === true) {
+        inputAckOutbox = inputAckOutbox.filter((candidate) => candidate !== entry);
+        const assignment = freshInputAssignments[entry.id];
+        if (assignment && freshInputOwner(assignment) === entry.owner) {
+          delete freshInputAssignments[entry.id];
+          freshInputRuntimeAssignments.delete(entry.id);
+        }
+        changed = true;
+        continue;
+      }
+      if (result.status >= 400 && result.status < 500 && ![401, 408, 426, 429].includes(result.status)) {
+        inputAckOutbox = inputAckOutbox.filter((candidate) => candidate !== entry);
+        changed = true;
+        continue;
+      }
+      scheduleRetry();
+      break;
+    }
+    if (changed) await persistLive();
+    if (inputAckOutbox.length > 0) scheduleRetry();
+    else clearRetryIfIdle();
+    if (targetResult) return { ...targetResult, pending: inputAckOutbox.length };
+    return { ok: true, pending: inputAckOutbox.length, queued: inputAckOutbox.length > 0 };
+  } finally {
+    ackingInputs = false;
   }
 }
 
@@ -2183,11 +2298,385 @@ function serializeTab(tab, operation) {
   return tracked;
 }
 
+function freshInputOwner(assignment) {
+  if (!assignment || !Number.isInteger(assignment.tabId) || !assignment.documentId) return null;
+  return `tab-${assignment.tabId}:${assignment.documentId}`;
+}
+
+function freshInputSource(assignment) {
+  if (!assignment || !assignment.documentId) return null;
+  return {
+    ok: true,
+    tab: assignment.tabId,
+    documentId: assignment.documentId,
+    navigationEpoch: assignment.navigationEpoch
+  };
+}
+
+function assignmentOwnsSource(assignment, source) {
+  if (!assignment || !source || !assignment.documentId) return false;
+  return (
+    assignment.tabId === source.tab &&
+    assignment.documentId === source.documentId &&
+    assignment.navigationEpoch === source.navigationEpoch &&
+    ownsDocument(source)
+  );
+}
+
+function inputMarkerForTab(tab) {
+  const values = [tab && tab.url, tab && tab.pendingUrl];
+  for (const value of values) {
+    const marker = inputMarkerFromUrl(value);
+    if (marker) return marker;
+  }
+  return null;
+}
+
+function registeredInputSource(tabIdValue) {
+  const key = String(tabIdValue);
+  const documentId = typeof tabDocuments[key] === 'string' ? tabDocuments[key] : null;
+  if (!documentId) return null;
+  const source = {
+    ok: true,
+    tab: tabIdValue,
+    documentId,
+    navigationEpoch: Number.isSafeInteger(tabEpochs[key]) ? tabEpochs[key] : 0
+  };
+  return ownsDocument(source) ? source : null;
+}
+
+async function persistFreshInputAssignments() {
+  await persistLive();
+}
+
+async function offerFreshInputToAssignment(id, assignment) {
+  if (!assignment || assignment.sendStarted || !assignment.documentId) return;
+  const source = freshInputSource(assignment);
+  if (!source || !ownsDocument(source)) return;
+  try {
+    void chrome.tabs.sendMessage(
+      assignment.tabId,
+      { type: 'clf-run-input', id },
+      { documentId: assignment.documentId }
+    ).catch(() => undefined);
+  } catch {
+    // A registered document can disappear between ownership validation and delivery. Its
+    // assignment remains fenced rather than being transferred to a different page.
+  }
+}
+
+let modelCatalogFlight = null;
+let modelCatalogTarget = null;
+
+function catalogTabNonce(tab) {
+  for (const raw of [tab?.url, tab?.pendingUrl]) {
+    if (typeof raw !== 'string' || !raw) continue;
+    try {
+      const url = new URL(raw);
+      if (url.origin !== 'https://chatgpt.com' && url.origin !== 'https://chat.openai.com') continue;
+      const nonce = url.searchParams.get('cos-model-catalog');
+      if (nonce && /^[a-f0-9-]{36}$/i.test(nonce)) return nonce;
+    } catch { /* Ignore transient browser URLs. */ }
+  }
+  return null;
+}
+
+async function catalogProbe(tabId) {
+  try {
+    const reply = await chrome.tabs.sendMessage(tabId, { type: 'clf-model-catalog-state' });
+    return reply && reply.ready === true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Elect one exact ChatGPT document to inspect the provider-owned model picker.
+ *
+ * Core owns browser process startup. The extension may create one inactive helper only when an
+ * explicit request permits opening and no ChatGPT tab exists at all. A hydrating/busy existing
+ * ChatGPT page is retained rather than accumulating helpers. The session reservation is written
+ * before chrome.tabs.create so a lost create response cannot authorize a duplicate opening.
+ */
+function inspectRequestedModels(request) {
+  if (modelCatalogFlight) return modelCatalogFlight;
+  const wanted = request && /^[a-f0-9-]{36}$/i.test(String(request.nonce || '')) &&
+    Number.isFinite(request.expiresAt) && Date.now() < request.expiresAt ? request : null;
+  if (!wanted) return null;
+
+  modelCatalogFlight = (async () => {
+    let tabs = [];
+    try { tabs = await chrome.tabs.query({ url: CHATGPT_TAB_URLS }); } catch { tabs = []; }
+
+    const ordered = [...tabs].sort((a, b) =>
+      Number(catalogTabNonce(b) === wanted.nonce) - Number(catalogTabNonce(a) === wanted.nonce) ||
+      Number(Boolean(catalogTabNonce(b))) - Number(Boolean(catalogTabNonce(a))) ||
+      (a.id ?? Number.MAX_SAFE_INTEGER) - (b.id ?? Number.MAX_SAFE_INTEGER));
+    let tab = null;
+    for (const candidate of ordered) {
+      if (!Number.isInteger(candidate?.id)) continue;
+      if (await catalogProbe(candidate.id)) { tab = candidate; break; }
+    }
+
+    // Existing ChatGPT documents may still be hydrating or may contain a user-owned draft.
+    // Neither condition grants permission to open a second document.
+    if (!tab && ordered.length > 0) return;
+
+    if (!tab && wanted.allowOpen === true) {
+      const key = 'modelCatalogOwner';
+      const stored = await chrome.storage.session.get(key);
+      const owner = stored?.[key];
+      if (owner && owner.nonce === wanted.nonce && (owner.opening === true || Number.isInteger(owner.tab))) return;
+      await chrome.storage.session.set({ [key]: { nonce: wanted.nonce, opening: true } });
+      try {
+        const created = await chrome.tabs.create({
+          url: `https://chatgpt.com/?cos-model-catalog=${encodeURIComponent(wanted.nonce)}`,
+          active: false
+        });
+        if (!created || !Number.isInteger(created.id)) return;
+        tab = created;
+        await chrome.storage.session.set({ [key]: { nonce: wanted.nonce, tab: created.id } });
+      } catch {
+        // Keep the opening reservation. Chrome may have created the tab before losing the reply.
+        return;
+      }
+    }
+
+    if (!tab || !Number.isInteger(tab.id) || Date.now() >= wanted.expiresAt) return;
+    const url = tab.url || tab.pendingUrl || '';
+    modelCatalogTarget = { tab: tab.id, nonce: wanted.nonce, url };
+    try {
+      await chrome.tabs.sendMessage(tab.id, {
+        type: 'clf-model-catalog',
+        nonce: wanted.nonce,
+        expiresAt: wanted.expiresAt
+      });
+    } catch {
+      // Registration or hydration will trigger another maintenance pass for the same request.
+    } finally {
+      modelCatalogTarget = null;
+    }
+  })().finally(() => { modelCatalogFlight = null; });
+  return modelCatalogFlight;
+}
+
+async function applyRequestedBrowserPreferences(request) {
+  if (!request || !/^[a-f0-9-]{36}$/i.test(String(request.nonce || '')) ||
+      !Number.isFinite(request.expiresAt) || request.expiresAt <= Date.now() ||
+      request.expiresAt > Date.now() + 70000 || !request.patch ||
+      Object.keys(request.patch).some(key => !['overwrite', 'durations'].includes(key) || typeof request.patch[key] !== 'boolean')) return;
+  const key = 'browserPreferenceReceipt';
+  const stored = await chrome.storage.session.get(key);
+  let receipt = stored[key];
+  if (!receipt || receipt.nonce !== request.nonce) {
+    receipt = {
+      nonce: request.nonce,
+      values: null,
+      error: 'The previous preference write was not confirmed. Refresh before changing it again.'
+    };
+    await chrome.storage.session.set({ [key]: receipt });
+    try {
+      const patch = {};
+      if (typeof request.patch.overwrite === 'boolean') patch.renderStreamEnabled = request.patch.overwrite;
+      if (typeof request.patch.durations === 'boolean') patch.showStreamTimes = request.patch.durations;
+      if (Object.keys(patch).length) await chrome.storage.local.set(patch);
+      const actual = await chrome.storage.local.get(['renderStreamEnabled', 'showStreamTimes']);
+      receipt = {
+        nonce: request.nonce,
+        values: {
+          overwrite: actual.renderStreamEnabled !== false,
+          durations: actual.showStreamTimes === true
+        }
+      };
+      await chrome.storage.session.set({ [key]: receipt });
+      if (request.patch.overwrite === true) await HANDLERS.overwriteNow();
+    } catch {
+      receipt = {
+        nonce: request.nonce,
+        values: null,
+        error: 'The extension could not confirm its saved preferences. Refresh before retrying.'
+      };
+      await chrome.storage.session.set({ [key]: receipt });
+    }
+  }
+  await call('/browser/preferences', { method: 'POST', body: JSON.stringify(receipt) });
+}
+
+async function maintainFreshInputDelivery() {
+  if (freshInputMaintenance) {
+    // Registration/status can arrive while the current pass is already beyond the point
+    // where that newly-proven document could be elected. Joining that stale pass alone loses
+    // the wake. Keep one coalesced rerun inside the same flight so callers that await this
+    // maintenance observe the newest browser ownership without creating a second scheduler.
+    freshInputMaintenanceAgain = true;
+    return freshInputMaintenance;
+  }
+  const runOnce = async () => {
+    await load();
+    const result = await call('/status');
+    if (!result.ok || !result.data) return result;
+    await applyRequestedBrowserPreferences(result.data.browserPreferenceRequest);
+    void inspectRequestedModels(result.data.modelCatalogRequest);
+    const publishedInputs = Array.isArray(result.data.inputs) ? result.data.inputs : [];
+    const pending = new Set(
+      publishedInputs
+        .map((entry) => (entry && validInputUuid(entry.id) && entry.conversationId === null ? entry.id : null))
+        .filter(Boolean)
+    );
+    const inputState = new Map(
+      publishedInputs
+        .filter((entry) => entry && validInputUuid(entry.id) && entry.conversationId === null)
+        .map((entry) => [entry.id, entry])
+    );
+
+    let tabs = [];
+    try {
+      tabs = await chrome.tabs.query({ url: CHATGPT_TAB_URLS });
+    } catch {
+      tabs = [];
+    }
+
+    let changed = false;
+    for (const [id, assignment] of Object.entries(freshInputAssignments)) {
+      const state = inputState.get(id);
+      if (!state) {
+        if (assignment?.claimed !== true) {
+          delete freshInputAssignments[id];
+          freshInputRuntimeAssignments.delete(id);
+          changed = true;
+        }
+        continue;
+      }
+      const coreState = state.state === 'browser' ? 'browser' : 'queued';
+      if (coreState !== 'queued' || assignment?.sendStarted === true) continue;
+      if (assignment?.claimed === true) {
+        assignment.claimed = false;
+        assignment.attachmentIds = [];
+        changed = true;
+      }
+      const tabAlive = tabs.some((candidate) =>
+        candidate && candidate.id === assignment.tabId && inputMarkerForTab(candidate) === id
+      );
+      if (!tabAlive && !freshInputRuntimeAssignments.has(id)) {
+        delete freshInputAssignments[id];
+        freshInputRuntimeAssignments.delete(id);
+        changed = true;
+      }
+    }
+
+    for (const id of pending) {
+      let assignment = freshInputAssignments[id] || null;
+      const state = inputState.get(id);
+      const coreState = state?.state === 'browser' ? 'browser' : 'queued';
+      if (assignment) {
+        const tab = tabs.find((candidate) => candidate && candidate.id === assignment.tabId && inputMarkerForTab(candidate) === id);
+        const source = tab ? registeredInputSource(assignment.tabId) : null;
+        if (
+          source &&
+          coreState === 'queued' &&
+          assignment.claimed !== true &&
+          assignment.sendStarted !== true &&
+          (assignment.documentId !== source.documentId || assignment.navigationEpoch !== source.navigationEpoch)
+        ) {
+          assignment = {
+            ...assignment,
+            documentId: source.documentId,
+            navigationEpoch: source.navigationEpoch
+          };
+          freshInputAssignments[id] = assignment;
+          freshInputRuntimeAssignments.add(id);
+          changed = true;
+        } else if (!assignment.documentId && source) {
+          assignment = {
+            ...assignment,
+            documentId: source.documentId,
+            navigationEpoch: source.navigationEpoch
+          };
+          freshInputAssignments[id] = assignment;
+          freshInputRuntimeAssignments.add(id);
+          changed = true;
+        }
+        await offerFreshInputToAssignment(id, assignment);
+        continue;
+      }
+
+      // A Core-owned browser claim is already durable. Losing this worker's local election
+      // is not permission to mint another browser sender; only `queued` can be re-elected.
+      if (coreState === 'browser') continue;
+
+      const marked = tabs
+        .filter((candidate) => candidate && Number.isInteger(candidate.id) && inputMarkerForTab(candidate) === id)
+        .sort((a, b) => a.id - b.id);
+      const registered = marked
+        .map((candidate) => ({ tab: candidate, source: registeredInputSource(candidate.id) }))
+        .find((candidate) => candidate.source);
+      const chosen = registered?.tab || marked[0] || null;
+      if (chosen) {
+        const source = registeredInputSource(chosen.id);
+        assignment = {
+          tabId: chosen.id,
+          documentId: source?.documentId || null,
+          navigationEpoch: source?.navigationEpoch ?? null,
+          claimed: false,
+          sendStarted: false,
+          attachmentIds: []
+        };
+        freshInputAssignments[id] = assignment;
+        freshInputRuntimeAssignments.add(id);
+        changed = true;
+        await offerFreshInputToAssignment(id, assignment);
+        continue;
+      }
+
+      try {
+        const created = await chrome.tabs.create({ url: `https://chatgpt.com/?cos-input=${encodeURIComponent(id)}` });
+        if (created && Number.isInteger(created.id)) {
+          freshInputAssignments[id] = {
+            tabId: created.id,
+            documentId: null,
+            navigationEpoch: null,
+            claimed: false,
+            sendStarted: false,
+            attachmentIds: []
+          };
+          freshInputRuntimeAssignments.add(id);
+          changed = true;
+        }
+      } catch {
+        // Browser policy/window teardown can reject a fresh placement. Core still owns the
+        // queued input, so a later status maintenance pass may try the first placement again.
+      }
+    }
+
+    if (changed) await persistFreshInputAssignments();
+    return result;
+  };
+  const work = (async () => {
+    let result = null;
+    do {
+      freshInputMaintenanceAgain = false;
+      result = await runOnce();
+    } while (freshInputMaintenanceAgain);
+    return result;
+  })();
+  freshInputMaintenance = work.finally(() => {
+    if (freshInputMaintenance === tracked) freshInputMaintenance = null;
+  });
+  const tracked = freshInputMaintenance;
+  return tracked;
+}
+
+// Compatibility name used by the selective upstream maintenance regressions. There is still
+// exactly one fork-native maintenance owner: fresh input, model discovery and preferences share
+// this serialized status pass rather than installing parallel schedulers.
+const maintain = maintainFreshInputDelivery;
+
 const HANDLERS = {
   async register_document(_message, sender) {
     const result = await registerDocument(sender, _message);
     if (result && result.ok === true) {
       const recovery = await transferForRegisteredDocument(result);
+      void maintainFreshInputDelivery().catch(() => undefined);
       void recoverDeferredRevivals().catch(() => undefined);
       return recovery ? { ...result, recovery } : result;
     }
@@ -2202,7 +2691,9 @@ const HANDLERS = {
     // undo the thing the popup was opened to check.
     if (found && !token && !disconnected) await provision();
     if (found && token) {
-      void drainCommandAcks()
+      await maintainFreshInputDelivery().catch(() => undefined);
+      void drainInputAcks()
+        .then(() => drainCommandAcks())
         .then(() => drain())
         .then(() => drainCloses())
         .catch(() => undefined);
@@ -2214,12 +2705,154 @@ const HANDLERS = {
       disconnected,
       pending: journal.length,
       pendingCommandAcks: commandAckOutbox.length,
+      pendingInputAcks: inputAckOutbox.length,
       compatible: found ? found.compatible !== false : null,
       appVersion: found ? found.version : null,
       appProtocol: found ? found.bridge : null,
       extensionVersion: chrome.runtime.getManifest().version,
       extensionProtocol: BRIDGE_PROTOCOL,
       ...(pairingError ? { pairError: pairingError } : {})
+    };
+  },
+  async input_claim(message, sender, source) {
+    await load();
+    const id = validInputUuid(message?.id) ? message.id : null;
+    if (!id || !ownsDocument(source)) return { ok: false, error: 'invalid_input_claim' };
+    if (inputMarkerForTab(sender?.tab) !== id) return { ok: false, error: 'input_marker_mismatch' };
+    await maintainFreshInputDelivery();
+    const assignment = freshInputAssignments[id];
+    if (!assignmentOwnsSource(assignment, source)) return { ok: false, error: 'input_not_elected' };
+    if (assignment.sendStarted === true) return { ok: false, error: 'input_send_already_started' };
+    const owner = freshInputOwner(assignment);
+    if (!owner) return { ok: false, error: 'input_not_elected' };
+    const result = await call('/input/claim', {
+      method: 'POST',
+      body: JSON.stringify({ id, owner, conversationId: null })
+    });
+    const input = result.ok && result.data && result.data.input && result.data.input.id === id ? result.data.input : null;
+    if (!input) return result.ok ? { ok: true, input: null } : result;
+    assignment.claimed = true;
+    assignment.attachmentIds = Array.isArray(input.attachments)
+      ? input.attachments.map((attachment) => attachment?.id).filter((attachmentId) => validInputUuid(attachmentId)).slice(0, 20)
+      : [];
+    await persistFreshInputAssignments();
+    if (!assignmentOwnsSource(assignment, source)) return { ok: false, error: 'stale_document' };
+    return { ok: true, input };
+  },
+  async model_catalog(message, _sender, source) {
+    await load();
+    if (!ownsDocument(source) || typeof message?.nonce !== 'string' || !/^[a-f0-9-]{36}$/i.test(message.nonce)) {
+      return { ok: false, error: 'invalid_model_catalog' };
+    }
+    let tab = null;
+    try { tab = await chrome.tabs.get(source.tab); } catch { return { ok: false, error: 'stale_document' }; }
+    const currentUrl = tab?.url || tab?.pendingUrl || '';
+    if (!ownsDocument(source) || !modelCatalogTarget || modelCatalogTarget.tab !== source.tab ||
+        modelCatalogTarget.nonce !== message.nonce || modelCatalogTarget.url !== currentUrl) {
+      return { ok: false, error: 'model_catalog_not_elected' };
+    }
+    const body = JSON.stringify({ nonce: message.nonce, models: message.models, error: message.error });
+    if (body.length > 12000) return { ok: false, error: 'model_catalog_too_large' };
+    const result = await call('/models', { method: 'POST', body });
+    return ownsDocument(source) ? result : { ok: false, error: 'stale_document' };
+  },
+  async input_release(message, _sender, source) {
+    await load();
+    const id = validInputUuid(message?.id) ? message.id : null;
+    if (!id) return { ok: false, error: 'invalid_input_release' };
+    const assignment = freshInputAssignments[id];
+    if (!assignmentOwnsSource(assignment, source) || assignment.claimed !== true || assignment.sendStarted === true) {
+      return { ok: false, error: 'input_not_owned' };
+    }
+    const owner = freshInputOwner(assignment);
+    const result = await call('/input/release', {
+      method: 'POST',
+      body: JSON.stringify({ id, owner })
+    });
+    if (result.ok && result.data?.ok === true && assignmentOwnsSource(assignment, source)) {
+      assignment.claimed = false;
+      assignment.sendStarted = false;
+      assignment.attachmentIds = [];
+      await persistFreshInputAssignments();
+    }
+    return result;
+  },
+  async input_send_started(message, _sender, source) {
+    await load();
+    const id = validInputUuid(message?.id) ? message.id : null;
+    if (!id) return { ok: false, error: 'invalid_input_send' };
+    const assignment = freshInputAssignments[id];
+    if (!assignmentOwnsSource(assignment, source) || assignment.claimed !== true) {
+      return { ok: false, error: 'input_not_owned' };
+    }
+    if (assignment.sendStarted === true) return { ok: true };
+    const owner = freshInputOwner(assignment);
+    const result = await call('/input/send-started', {
+      method: 'POST',
+      body: JSON.stringify({ id, owner })
+    });
+    if (!result.ok || result.data?.ok !== true) return result;
+    assignment.sendStarted = true;
+    await persistFreshInputAssignments();
+    return assignmentOwnsSource(assignment, source)
+      ? { ok: true }
+      : { ok: false, error: 'stale_document' };
+  },
+  async input_attachment(message, _sender, source) {
+    await load();
+    const id = validInputUuid(message?.id) ? message.id : null;
+    const attachmentId = validInputUuid(message?.attachmentId) ? message.attachmentId : null;
+    const offset = Number(message?.offset);
+    if (!id || !attachmentId || !Number.isSafeInteger(offset) || offset < 0) {
+      return { ok: false, error: 'invalid_attachment_request' };
+    }
+    const assignment = freshInputAssignments[id];
+    if (
+      !assignmentOwnsSource(assignment, source) ||
+      assignment.claimed !== true ||
+      assignment.sendStarted === true ||
+      !assignment.attachmentIds.includes(attachmentId)
+    ) {
+      return { ok: false, error: 'input_not_owned' };
+    }
+    const owner = freshInputOwner(assignment);
+    const result = await call('/input/attachment', {
+      method: 'POST',
+      body: JSON.stringify({ id, owner, conversationId: null, attachmentId, offset })
+    });
+    return assignmentOwnsSource(assignment, source) ? result : { ok: false, error: 'stale_document' };
+  },
+  async input_ack(message, _sender, source) {
+    await load();
+    const id = validInputUuid(message?.id) ? message.id : null;
+    const conversationId = cleanConversationId(message?.conversationId);
+    if (!id || !conversationId) return { ok: false, error: 'invalid_input_ack' };
+    const assignment = freshInputAssignments[id];
+    if (!assignmentOwnsSource(assignment, source) || assignment.claimed !== true || assignment.sendStarted !== true) {
+      return { ok: false, error: 'input_not_owned' };
+    }
+    const senderUrl = typeof _sender?.tab?.url === 'string' ? _sender.tab.url : '';
+    if (conversationFromUrl(senderUrl) !== conversationId) return { ok: false, error: 'stale_conversation' };
+    const owner = freshInputOwner(assignment);
+    const messageId = typeof message?.messageId === 'string' && message.messageId.length > 0 && message.messageId.length <= 256
+      ? message.messageId
+      : undefined;
+    inputAckOutbox = [
+      ...inputAckOutbox.filter((entry) => entry?.id !== id),
+      { id, owner, conversationId, ...(messageId ? { messageId } : {}) }
+    ].slice(-200);
+    await persistLive();
+    scheduleRetry();
+    // Once this receipt is in storage.local the irreversible native send has durable
+    // browser custody. Core delivery may still be temporarily unavailable, but the page
+    // must not interpret that transport failure as permission to submit the same message
+    // again. Try the Core ACK now, then report the stronger local durability fact.
+    const deliveryResult = await drainInputAcks(id);
+    return {
+      ok: true,
+      durable: true,
+      pending: inputAckOutbox.length,
+      ...(deliveryResult?.ok === true ? {} : { deliveryPending: true })
     };
   },
   async pair() {
@@ -2230,7 +2863,8 @@ const HANDLERS = {
     connectionEpoch++;
     const result = await provision(true);
     if (result && result.ok) {
-      void drainCommandAcks()
+      void drainInputAcks()
+        .then(() => drainCommandAcks())
         .then(() => drain())
         .then(() => drainCloses())
         .catch(() => undefined);
@@ -2349,6 +2983,7 @@ const HANDLERS = {
       pendingAll: journal.length,
       pendingCloses: closeOutbox.length,
       pendingCommandAcks: commandAckOutbox.length,
+      pendingInputAcks: inputAckOutbox.length,
       delivery
     };
   },
@@ -3008,6 +3643,11 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     'settings_set',
     'settings_get',
     'repair_fiber',
+    'input_claim',
+    'input_release',
+    'input_send_started',
+    'input_attachment',
+    'input_ack',
     'redeem',
     'defer_revival',
     'forget_revival',
@@ -3041,6 +3681,21 @@ function markerFromUrl(value) {
     if (fromQuery) return fromQuery;
     const hash = url.hash.startsWith('#') ? url.hash.slice(1) : url.hash;
     return new URLSearchParams(hash).get('clf');
+  } catch {
+    return null;
+  }
+}
+
+/** Fresh desktop-input marker. It is correlation only; the worker-owned bearer token and
+ * elected Chrome document remain the authority boundary. */
+function inputMarkerFromUrl(value) {
+  try {
+    const url = new URL(String(value || ''));
+    const fromQuery = url.searchParams.get('cos-input');
+    if (validInputUuid(fromQuery)) return fromQuery;
+    const hash = url.hash.startsWith('#') ? url.hash.slice(1) : url.hash;
+    const fromHash = new URLSearchParams(hash).get('cos-input');
+    return validInputUuid(fromHash) ? fromHash : null;
   } catch {
     return null;
   }
@@ -3502,13 +4157,14 @@ if (chrome.windows && chrome.windows.onRemoved && typeof chrome.windows.onRemove
 chrome.runtime.onInstalled.addListener(() => {
   void restoreOpenChatgptTabs().then(() => recoverDeferredRevivals()).catch(() => undefined);
   void load().then(() => {
-    if (journal.length > 0 || closeOutbox.length > 0 || commandAckOutbox.length > 0) scheduleRetry();
+    if (journal.length > 0 || closeOutbox.length > 0 || commandAckOutbox.length > 0 || inputAckOutbox.length > 0) scheduleRetry();
   });
 });
 
 if (chrome.runtime.onStartup && typeof chrome.runtime.onStartup.addListener === 'function') {
   chrome.runtime.onStartup.addListener(() => {
     void load()
+      .then(() => drainInputAcks())
       .then(() => drainCommandAcks())
       .then(() => drain())
       .then(() => drainCloses())
@@ -3520,7 +4176,8 @@ if (chrome.runtime.onStartup && typeof chrome.runtime.onStartup.addListener === 
 if (chrome.alarms && chrome.alarms.onAlarm && typeof chrome.alarms.onAlarm.addListener === 'function') {
   chrome.alarms.onAlarm.addListener((alarm) => {
     if (!alarm || alarm.name !== RETRY_ALARM) return;
-    void drainCommandAcks()
+    void drainInputAcks()
+      .then(() => drainCommandAcks())
       .then(() => drain())
       .then(() => drainCloses())
       .catch(() => undefined);
@@ -3533,5 +4190,5 @@ if (chrome.alarms && chrome.alarms.onAlarm && typeof chrome.alarms.onAlarm.addLi
 // dead or stale recorder pays the scripting cost.
 void restoreOpenChatgptTabs().then(() => recoverDeferredRevivals()).catch(() => undefined);
 void load().then(() => {
-  if (journal.length > 0 || closeOutbox.length > 0 || commandAckOutbox.length > 0) scheduleRetry();
+  if (journal.length > 0 || closeOutbox.length > 0 || commandAckOutbox.length > 0 || inputAckOutbox.length > 0) scheduleRetry();
 });

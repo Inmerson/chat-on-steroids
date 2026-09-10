@@ -62,6 +62,23 @@ export async function readDurable<T>(name: string): Promise<T | null> {
   }
 }
 
+/**
+ * Safety-critical durable readers use this variant when malformed or unreadable state must
+ * not be mistaken for a genuinely absent file. ENOENT remains the only null case.
+ */
+export async function readDurableStrict<T>(name: string): Promise<T | null> {
+  if (!root) return null;
+  try {
+    const raw = await fs.readFile(fileFor(name), 'utf8');
+    return JSON.parse(raw) as T;
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code === 'ENOENT') return null;
+    logWarn(`could not read ${name} state safely: ${(err as Error).message}`);
+    throw err;
+  }
+}
+
 function nextWrite(value: unknown): PendingWrite {
   return { generation: nextGeneration++, value };
 }

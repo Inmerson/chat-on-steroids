@@ -491,6 +491,25 @@
               </div>
 
               <div class="field">
+                <label for="chatBrowser">ChatGPT browser</label>
+                <select id="chatBrowser">
+                  <option value="chrome">Google Chrome / Chromium</option>
+                  <option value="edge">Microsoft Edge</option>
+                  <option value="brave">Brave Browser</option>
+                </select>
+                <p class="hint">Used only when Chat On Steroids needs to open ChatGPT. Existing managed tabs keep their exact browser and conversation ownership.</p>
+              </div>
+
+              <div class="field">
+                <label class="inline"><input type="checkbox" id="browserOverwrite" disabled /> Overwrite ChatGPT tool rows with recorded local activity</label>
+                <label class="inline"><input type="checkbox" id="browserDurations" disabled /> Show tool durations in ChatGPT</label>
+                <div class="row-inline">
+                  <button class="btn" id="browserPreferencesRefresh" type="button">Refresh browser preferences</button>
+                  <span class="chosen" id="browserPreferencesStatus" role="status">Refresh to read the browser's current preferences.</span>
+                </div>
+              </div>
+
+              <div class="field">
                 <label class="inline"><input type="checkbox" id="autoConnect" /> Connect automatically at startup</label>
                 <label class="inline"><input type="checkbox" id="minimizeToTray" /> <span id="minimizeToTrayCopy">Keep running when closed</span></label>
                 <label class="inline" id="privacyScreenshotsSetting"><input type="checkbox" id="privacyScreenshots" /> Privacy screenshots: default to the active window instead of the whole monitor</label>
@@ -720,6 +739,15 @@
 
                   <div class="setting">
                     <span class="setting-text">
+                      <b>Available ChatGPT models</b>
+                      <em id="chatModelStatus" role="status">Connect the browser extension to inspect your account's current model picker.</em>
+                    </span>
+                    <button class="btn" id="refreshChatModels" type="button">Reload models</button>
+                  </div>
+                  <div id="chatModelList" class="goal-models" hidden></div>
+
+                  <div class="setting">
+                    <span class="setting-text">
                       <b>Sub-agent workers</b>
                       <em>Requires the Chrome extension to be loaded and connected. This sets the most worker chats one run may open.</em>
                     </span>
@@ -824,7 +852,9 @@
         <div class="rail-brand" aria-label="Chat On Steroids">
           <span class="mark"><svg class="ico" viewBox="0 0 24 24"><use href="#i-mark" /></svg></span>
           <span><strong>Chat On Steroids</strong><small>LOCAL AGENT WORKSPACE</small></span>
+          <button class="sidebar-toggle" id="sidebarToggle" type="button" aria-expanded="true" aria-label="Collapse workspace sidebar" title="Collapse sidebar (Ctrl+B)">?</button>
         </div>
+        <div id="sidebarResize" class="sidebar-resize" role="separator" aria-label="Resize workspace sidebar" aria-orientation="vertical" tabindex="0"></div>
         <p class="rail-label">Workspace</p>
         <button class="is-sel" data-tab="home" type="button">
           <svg class="ico" viewBox="0 0 24 24"><use href="#i-home" /></svg><span>Overview</span>

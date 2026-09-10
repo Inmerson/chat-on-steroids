@@ -11,6 +11,7 @@ import path from 'node:path';
 import { z } from 'zod';
 import {
   CAPABILITIES,
+  CHAT_BROWSERS,
   DEFAULT_CAPABILITIES,
   GOAL_REASONING_LEVELS,
   WRITE_CAPABILITIES,
@@ -225,6 +226,7 @@ const configSchema = z.object({
     binaryPath: z.string().max(4096)
   }),
   ui: z.object({
+    chatBrowser: z.enum(CHAT_BROWSERS).optional().default('chrome'),
     minimizeToTray: z.boolean(),
     autoConnect: z.boolean(),
     privacyScreenshots: z.boolean().optional().default(false),
@@ -337,7 +339,7 @@ export function defaultConfig(_platform: NodeJS.Platform = process.platform): Co
     allComputer: false,
     previousRoots: [],
     tunnel: { kind: 'openai', tunnelId: '', desktopTunnelId: '', steromiTunnelId: '', pluginsTunnelId: '', binaryPath: '' },
-    ui: { minimizeToTray: true, autoConnect: false, privacyScreenshots: false, theme: 'dark' },
+    ui: { chatBrowser: 'chrome', minimizeToTray: true, autoConnect: false, privacyScreenshots: false, theme: 'dark' },
     sessions: { ...DEFAULT_SESSIONS },
     compaction: { ...DEFAULT_COMPACTION },
     multiAgent: { ...DEFAULT_MULTI_AGENT },

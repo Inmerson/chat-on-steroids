@@ -1112,6 +1112,59 @@ var CLF_DOM = (() => {
     }, null);
   }
 
+  /** A mounted editor behind Settings is not an available model-discovery surface. */
+  function composerVisible() {
+    const box = composer();
+    return !!box && !box.closest('[hidden],[aria-hidden="true"],[inert]') && box.getClientRects().length > 0;
+  }
+
+  /**
+   * ChatGPT's native file chooser for this composer.
+   *
+   * Selector ownership stays in this adapter: content.js may supply browser File objects,
+   * but it does not learn page structure. Some builds mount the hidden input directly under
+   * the form and others portal it nearby, so prefer the exact composer form and fall back to
+   * the page's one native file input.
+   */
+  function attachmentInput() {
+    return safe(() => {
+      const box = composerBox();
+      const local = box ? box.querySelector('input[type="file"]') : null;
+      return local || document.querySelector('input[type="file"]');
+    }, null);
+  }
+
+  function composerFileName(button) {
+    const group = button.closest('[role="group"][aria-label]');
+    if (group?.querySelector('[data-default-action="true"] button')) {
+      const actions = [...group.querySelectorAll('button')].filter((node) => !node.closest('[data-default-action="true"]'));
+      return actions.length === 1 && actions[0] === button ? group.getAttribute('aria-label') : undefined;
+    }
+    return /^Remove file(?: \d+)?: (.+)$/.exec(button.getAttribute('aria-label') || '')?.[1];
+  }
+
+  function hasComposerAttachments() {
+    const host = composerBox();
+    return !!host && (
+      !!host.querySelector('[data-inline-file-uploading], [role="progressbar"]') ||
+      [...host.querySelectorAll('button[aria-label]')].some((button) => composerFileName(button))
+    );
+  }
+
+  /** Hands already-authorized File objects to ChatGPT's native upload control. */
+  function attachFiles(files) {
+    return safe(() => {
+      if (!Array.isArray(files) || files.length === 0) return true;
+      const input = attachmentInput();
+      if (!input || typeof DataTransfer !== 'function') return false;
+      const transfer = new DataTransfer();
+      for (const file of files) transfer.items.add(file);
+      input.files = transfer.files;
+      input.dispatchEvent(new Event('change', { bubbles: true }));
+      return Boolean(input.files && input.files.length === files.length);
+    }, false);
+  }
+
   /**
    * Whether the page is currently drawn light or dark: `'light'` or `'dark'`.
    *
@@ -1305,6 +1358,223 @@ var CLF_DOM = (() => {
     }, false);
   }
 
+  const normalizeModelLabel = value => String(value || '').toLowerCase().replace(/[^a-z0-9.]/g, '');
+  /** One bounded read through the existing MAIN-world helper; no provider API or setters. */
+  function readPickerState() {
+    return new Promise(resolve => {
+      const nonce = crypto.randomUUID();
+      const finish = value => { clearTimeout(timer); window.removeEventListener('message', receive); resolve(value); };
+      const receive = event => {
+        const data = event.data;
+        if (event.source !== window || event.origin !== location.origin || data?.source !== 'clf-picker-reply' || data.nonce !== nonce || data.v !== 1) return;
+        const state = data.picker;
+        const valid = state && typeof state.version === 'string' && Number.isInteger(state.currentBucket) &&
+          Array.isArray(state.versions) && state.versions.length > 0 && state.versions.length <= 20 &&
+          state.versions.every(v => typeof v.id === 'string' && /^[a-zA-Z0-9._-]{1,80}$/.test(v.id) && typeof v.label === 'string' && v.label.length > 0 && v.label.length <= 80) &&
+          Array.isArray(state.choices) && state.choices.length > 0 && state.choices.length <= 12 &&
+          state.choices.every(c => Number.isInteger(c.bucket) && typeof c.id === 'string' && /^[a-zA-Z0-9._-]{1,80}$/.test(c.id) && typeof c.label === 'string' && c.label.length > 0 && c.label.length <= 80 &&
+            typeof c.familyId === 'string' && /^[a-zA-Z0-9._-]{1,80}$/.test(c.familyId) && typeof c.familyLabel === 'string' && c.familyLabel.length > 0 && c.familyLabel.length <= 80 &&
+            ['none','minimal','low','medium','high','xhigh','max','ultra','pro'].includes(c.effort) && typeof c.available === 'boolean') &&
+          new Set(state.versions.map(v => v.id)).size === state.versions.length && new Set(state.choices.map(c => c.bucket)).size === state.choices.length &&
+          state.versions.some(v => v.id === state.version) && state.choices.some(c => c.bucket === state.currentBucket);
+        finish(valid ? state : null);
+      };
+      const timer = setTimeout(() => finish(null), 1500);
+      window.addEventListener('message', receive);
+      window.postMessage({ source: 'clf-picker-ask', nonce }, location.origin);
+    });
+  }
+  /** UI only transports a requested selection. Provider state proves identity and availability. */
+  function modelPickerAccess(stillCurrent) {
+    const shown = node => node && !node.closest('[hidden],[aria-hidden="true"],[inert]') && node.getClientRects().length > 0;
+    const picker = () => document.querySelector('[data-testid="composer-intelligence-picker-content"]');
+    const trigger = () => {
+      const candidates = [...(composerActions()?.host?.querySelectorAll('button[aria-haspopup="menu"]') || [])]
+        .filter(node => shown(node) && !node.closest(OWN_SURFACES) && node.id !== 'composer-plus-btn' && node.getAttribute('data-testid') !== 'composer-plus-btn');
+      return candidates.length === 1 ? candidates[0] : null;
+    };
+    const wait = (read, timeout = 3000) => new Promise(resolve => {
+      let reading = false, dirty = false, done = false;
+      const finish = value => { if (done) return; done = true; observer.disconnect(); clearTimeout(timer); resolve(value); };
+      const check = async () => {
+        if (done) return;
+        if (!stillCurrent()) return finish(null);
+        if (reading) { dirty = true; return; }
+        reading = true;
+        try { let value = read(); if (value?.then) value = await value; if (stillCurrent() && value) finish(value); }
+        catch { finish(null); }
+        finally { reading = false; if (dirty && !done) { dirty = false; void check(); } }
+      };
+      const observer = new MutationObserver(check);
+      observer.observe(document.documentElement, { subtree: true, childList: true, attributes: true, characterData: true });
+      const timer = setTimeout(() => finish(null), timeout); void check();
+    });
+    const state = predicate => wait(async () => { const value = await readPickerState(); return value && (!predicate || predicate(value)) ? value : null; });
+    const key = (node, value) => { if (!node || !stillCurrent()) return false; node.focus(); node.dispatchEvent(new KeyboardEvent('keydown', { key: value, code: value, bubbles: true, cancelable: true })); return true; };
+    return {
+      state,
+      async open() {
+        if (!picker()) { const button = await wait(trigger, 15000); if (!key(button, 'Enter') || !await wait(picker)) return null; }
+        return state();
+      },
+      close() { key(trigger(), 'Escape'); },
+      async version(version) {
+        const before = await state(); if (!before) return null;
+        const versionRows = () => [...(picker()?.querySelectorAll('[role="menuitemradio"]') || [])].filter(shown);
+        if (before.version === version && !versionRows().length) return before;
+        const label = before.versions.find(v => v.id === version)?.label;
+        if (!label) return null;
+        // The picker may already show the version list (including a checked row).
+        // Select that row to return to its effort view; never assume the slider is open.
+        if (!versionRows().length) {
+          const toggle = [...picker().querySelectorAll('[role="menuitem"][aria-expanded]')].filter(shown);
+          if (toggle.length !== 1) return null;
+          toggle[0].click();
+        }
+        const option = await wait(() => {
+          const rows = versionRows().filter(node => node.textContent.trim() === label && node.getAttribute('aria-disabled') !== 'true');
+          return rows.length === 1 ? rows[0] : null;
+        });
+        if (!key(option, 'Enter')) return null;
+        return state(next => next.version === version && !versionRows().length);
+      },
+      async bucket(bucket) {
+        let current = await state();
+        for (let count = 0; current && count < 12; count++) {
+          if (current.currentBucket === bucket) return current;
+          const from = current.choices.findIndex(c => c.bucket === current.currentBucket), to = current.choices.findIndex(c => c.bucket === bucket);
+          if (from < 0 || to < 0) return null;
+          const expected = current.choices[from + (to > from ? 1 : -1)].bucket;
+          const controls = [...picker().querySelectorAll('[role="menuitem"][aria-keyshortcuts]')].filter(node => shown(node) && node.getAttribute('aria-keyshortcuts').includes('ArrowRight'));
+          if (controls.length !== 1 || !key(controls[0], to > from ? 'ArrowRight' : 'ArrowLeft')) return null;
+          const version = current.version;
+          current = await state(next => next.version === version && next.currentBucket === expected);
+        }
+        return null;
+      }
+    };
+  }
+  // The mounted provider picker carries the MAIN-world snapshot's exact identity.
+  // Removing that native node also removes the evidence; never cache across navigation.
+  function visibleModelSelection() {
+    const node = document.querySelector('[data-testid="composer-intelligence-picker-content"]');
+    const model = node?.getAttribute('data-clf-selected-model'), reasoningEffort = node?.getAttribute('data-clf-selected-effort');
+    return model && /^[a-zA-Z0-9._-]{1,80}$/.test(model) && ['none','minimal','low','medium','high','xhigh','max','ultra','pro'].includes(reasoningEffort)
+      ? { model, reasoningEffort } : null;
+  }
+  /** Account model discovery belongs to Chat; Work mounts a different picker.
+   * The caller owns one idle document and verifies draft/epoch before and after this transition. */
+  async function prepareChatModelSurface(stillCurrent = () => true) {
+    const radios = () => [...document.querySelectorAll('[role="radio"][data-tpp-toggle-value]')]
+      .filter(node => !node.closest(OWN_SURFACES) && node.getClientRects().length > 0);
+    const state = () => {
+      const nodes = radios(), chat = nodes.filter(node => node.getAttribute('data-tpp-toggle-value') === 'chatgpt'),
+        work = nodes.filter(node => node.getAttribute('data-tpp-toggle-value') === 'work');
+      return chat.length === 1 && work.length === 1 ? { chat: chat[0], work: work[0] } : null;
+    };
+    if (!stillCurrent()) return false;
+    const before = state();
+    // Existing ordinary conversations do not expose the new-chat surface toggle.
+    if (!before) return radios().length === 0;
+    if (before.chat.getAttribute('aria-checked') === 'true') return true;
+    if (before.work.getAttribute('aria-checked') !== 'true' || before.chat.disabled || before.chat.getAttribute('aria-disabled') === 'true') return false;
+    return new Promise(resolve => {
+      let done = false;
+      const finish = value => { if (done) return; done = true; observer.disconnect(); clearTimeout(timer); resolve(value); };
+      const check = () => {
+        if (!stillCurrent()) return finish(false);
+        const next = state();
+        if (next?.chat.getAttribute('aria-checked') === 'true' && next.work.getAttribute('aria-checked') === 'false') finish(true);
+      };
+      const observer = new MutationObserver(check);
+      observer.observe(document.documentElement, { subtree: true, childList: true, attributes: true });
+      const timer = setTimeout(() => finish(false), 5000);
+      before.chat.click(); check();
+    });
+  }
+  async function inspectModelSettings(stillCurrent = () => true, failure = () => {}) {
+    const ui = modelPickerAccess(stillCurrent), original = await ui.open();
+    if (!original) { ui.close(); failure('picker_unavailable'); return null; }
+    const result = new Map();
+    let restored = false;
+    try {
+      // One observation per version, not one mutation per effort. Computed choices
+      // include account/workspace denials which the raw global preset list does not prove.
+      for (const version of original.versions) {
+        const state = await ui.version(version.id);
+        if (!state) throw new Error('model_unconfirmed');
+        for (const choice of state.choices.filter(c => c.available)) {
+          // A provider family owns its execution lanes. Instant/Thinking/Pro slugs
+          // are selectable pairs within that family, not separate model rows.
+          const entry = result.get(choice.familyId) || { id: choice.familyId, label: choice.familyLabel, efforts: [], aliases: [] };
+          if (!entry.efforts.includes(choice.effort)) entry.efforts.push(choice.effort);
+          if (!entry.aliases.includes(choice.id)) entry.aliases.push(choice.id);
+          result.set(choice.familyId, entry);
+        }
+      }
+    } catch { failure('model_unconfirmed'); result.clear(); }
+    finally {
+      if (stillCurrent() && await ui.version(original.version)) {
+        const state = await ui.bucket(original.currentBucket);
+        const previous = original.choices.find(c => c.bucket === original.currentBucket);
+        const selected = state?.choices.find(c => c.bucket === state.currentBucket);
+        restored = selected?.id === previous.id && selected?.effort === previous.effort;
+      }
+      ui.close();
+    }
+    if (!restored) failure('restore_failed');
+    return restored && stillCurrent() && result.size ? [...result.values()] : null;
+  }
+  async function selectModelSettings(model, effort, stillCurrent = () => true) {
+    if (!model && !effort) return true;
+    const ui = modelPickerAccess(stillCurrent), original = await ui.open();
+    if (!original) { ui.close(); return false; }
+    let selected = false;
+    try {
+      // Exact provider slug is preferred. Existing saved display slugs may resolve
+      // only to an actually observed, available pair; never to an account default.
+      const matches = c => c.available && (!effort || c.effort === effort) && (!model || c.familyId === model || c.id === model || normalizeModelLabel(c.familyLabel) === normalizeModelLabel(model) || normalizeModelLabel(c.label) === normalizeModelLabel(model));
+      for (const version of [original.versions.find(v => v.id === original.version), ...original.versions.filter(v => v.id !== original.version)]) {
+        const state = await ui.version(version.id); if (!state) return false;
+        const choices = state.choices.filter(matches);
+        if (!choices.length) continue;
+        const choice = choices.find(c => c.bucket === state.currentBucket) || choices[0];
+        const after = await ui.bucket(choice.bucket);
+        const confirmed = after?.choices.find(c => c.bucket === after.currentBucket);
+        selected = stillCurrent() && confirmed?.available === true && confirmed.id === choice.id && confirmed.effort === choice.effort;
+        return selected;
+      }
+      return false;
+    } finally {
+      if (!selected && stillCurrent() && await ui.version(original.version)) await ui.bucket(original.currentBucket);
+      ui.close();
+    }
+  }
+
+  async function newChatControl(stillCurrent = () => true) {
+    const shown = node => node && !node.closest(OWN_SURFACES) && !node.closest('[hidden],[aria-hidden="true"],[inert]') && node.getClientRects().length > 0;
+    const link = (root = document) => [...root.querySelectorAll('a[data-testid="create-new-chat-button"][data-sidebar-item="true"][href="/"]')].find(shown) || null;
+    if (!stillCurrent()) return null;
+    if (link()) return link();
+    // Compact ChatGPT unmounts navigation when its sidebar is closed. Reveal the
+    // actual native control before concluding that this document cannot be reused.
+    const toggles = [...document.querySelectorAll('button[data-testid="open-sidebar-button"][aria-expanded="false"][aria-controls]')].filter(shown);
+    if (toggles.length !== 1 || toggles[0].disabled) return null;
+    const toggle = toggles[0], sidebarId = toggle.getAttribute('aria-controls');
+    return new Promise(resolve => {
+      let done = false;
+      const finish = value => { if (done) return; done = true; observer.disconnect(); clearTimeout(timer); resolve(value); };
+      const check = () => {
+        if (!stillCurrent()) return finish(null);
+        const sidebar = document.getElementById(sidebarId), control = sidebar && link(sidebar);
+        if (toggle.getAttribute('aria-expanded') === 'true' && control) finish(control);
+      };
+      const observer = new MutationObserver(check);
+      observer.observe(document.documentElement, { subtree: true, childList: true, attributes: true });
+      const timer = setTimeout(() => finish(null), 3000);
+      toggle.click(); check();
+    });
+  }
   /** Types into the composer. Refuses if the user already has a draft there, unless replace is true. */
   function insertPrompt(value, replace = false) {
     return safe(() => {
@@ -1414,6 +1684,12 @@ var CLF_DOM = (() => {
   }
 
   return {
+    composerVisible,
+    prepareChatModelSurface,
+    newChatControl,
+    visibleModelSelection,
+    inspectModelSettings,
+    selectModelSettings,
     conversationId,
     conversationFromPath,
     conversationTitle,
@@ -1440,6 +1716,9 @@ var CLF_DOM = (() => {
     errors,
     composer,
     composerBox,
+    attachmentInput,
+    attachFiles,
+    hasComposerAttachments,
     pageTheme,
     composerActions,
     composerStack,

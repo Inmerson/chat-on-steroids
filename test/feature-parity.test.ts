@@ -54,6 +54,7 @@ describe('portable browser-backed feature parity', () => {
       'view_image',
       'find',
       'apply_patch',
+      'download_artifact',
       'exec_command',
       'write_stdin',
       'session',

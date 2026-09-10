@@ -7399,6 +7399,294 @@ describe('folding away the chat’s opening instruction', () => {
 });
 
 describe('the fresh chat the app opened', () => {
+  it('does not claim or send over an attachment-only user draft', async () => {
+    const inputId = '61616161-7272-4838-8949-858585858585';
+    let claims = 0;
+    let sends = 0;
+    live = await harness(
+      `https://chatgpt.com/?cos-input=${inputId}`,
+      {
+        input_claim: () => {
+          claims += 1;
+          return { ok: true, input: null };
+        }
+      },
+      (document) => {
+        const attachment = document.createElement('button');
+        attachment.setAttribute('aria-label', 'Remove file: user-owned.pdf');
+        document.querySelector('#composer-form')!.append(attachment);
+        document.querySelector('[data-testid="send-button"]')!.addEventListener('click', () => { sends += 1; });
+      }
+    );
+
+    await settle(300);
+    expect(claims).toBe(0);
+    expect(sends).toBe(0);
+    expect(live.document.querySelector('button[aria-label="Remove file: user-owned.pdf"]')).not.toBeNull();
+  });
+
+  it('releases the exact browser claim when attachment transfer fails before any native send', async () => {
+    const inputId = '62626262-7373-4939-8a4a-969696969696';
+    const attachmentId = '63636363-7474-4a4a-8b5b-a7a7a7a7a7a7';
+    let claims = 0;
+    let releases = 0;
+    let sends = 0;
+    live = await harness(
+      `https://chatgpt.com/?cos-input=${inputId}`,
+      {
+        input_claim: () => {
+          claims += 1;
+          return {
+            ok: true,
+            input: {
+              id: inputId,
+              sessionId: null,
+              text: 'Use the exact attachment',
+              attachments: [{ id: attachmentId, name: 'missing.txt', size: 3, mimeType: 'text/plain' }],
+              images: [],
+              state: 'browser',
+              owner: 'worker-derived-owner',
+              createdAt: 1,
+              conversationId: null
+            }
+          };
+        },
+        input_attachment: () => ({ ok: false, status: 409, error: 'attachment_unavailable' }),
+        input_release: () => {
+          releases += 1;
+          return { ok: true, data: { ok: true } };
+        }
+      },
+      (document) => {
+        document.querySelector('[data-testid="send-button"]')!.addEventListener('click', () => { sends += 1; });
+      }
+    );
+
+    await settle(400);
+    expect(claims).toBe(1);
+    expect(releases).toBe(1);
+    expect(sends).toBe(0);
+  });
+
+  it('retries the same exact send-start fence when its first response is lost before native Send', async () => {
+    const inputId = '64646464-7575-4b5b-8c6c-b8b8b8b8b8b8';
+    const conversationId = '65656565-7676-4c6c-8d7d-c9c9c9c9c9c9';
+    let fences = 0;
+    let sends = 0;
+    live = await harness(
+      `https://chatgpt.com/?cos-input=${inputId}`,
+      {
+        input_claim: () => ({
+          ok: true,
+          input: {
+            id: inputId,
+            sessionId: null,
+            text: 'Fence this exact send',
+            attachments: [],
+            images: [],
+            state: 'browser',
+            owner: 'worker-derived-owner',
+            createdAt: 1,
+            conversationId: null
+          }
+        }),
+        input_send_started: () => {
+          fences += 1;
+          return fences === 1
+            ? { ok: false, status: 503, error: 'send_fence_response_lost' }
+            : { ok: true };
+        },
+        input_ack: () => ({ ok: true, data: { ok: true } })
+      },
+      (document, dom) => {
+        document.querySelector('[data-testid="send-button"]')!.addEventListener('click', () => {
+          sends += 1;
+          dom.reconfigure({ url: `https://chatgpt.com/c/${conversationId}?cos-input=${inputId}` });
+        });
+      }
+    );
+
+    await settle(900);
+    expect(fences).toBe(2);
+    expect(sends).toBe(1);
+  });
+
+  it('sends one marked desktop input and never repeats the native send when its ACK is lost', async () => {
+    const inputId = '71717171-8282-4939-8a4a-959595959595';
+    const conversationId = '61616161-7272-4838-8949-858585858585';
+    let sends = 0;
+    let claims = 0;
+    let acks = 0;
+    live = await harness(
+      `https://chatgpt.com/?cos-input=${inputId}`,
+      {
+        input_claim: () => {
+          claims += 1;
+          return {
+            ok: true,
+            input: {
+              id: inputId,
+              sessionId: null,
+              text: 'Desktop authored input',
+              attachments: [],
+              images: [],
+              state: 'browser',
+              owner: 'worker-derived-owner',
+              createdAt: 1,
+              conversationId: null
+            }
+          };
+        },
+        input_ack: () => {
+          acks += 1;
+          return { ok: false, status: 503, error: 'ack_response_lost' };
+        },
+        input_send_started: () => ({ ok: true })
+      },
+      (document, dom) => {
+        document.querySelector('[data-testid="send-button"]')!.addEventListener('click', () => {
+          sends += 1;
+          dom.reconfigure({ url: `https://chatgpt.com/c/${conversationId}?cos-input=${inputId}` });
+        });
+      }
+    );
+
+    await settle(500);
+    expect(sends).toBe(1);
+    expect(claims).toBe(1);
+    expect(acks).toBe(3);
+    expect(live.sent.find((message) => message.type === 'input_ack')).toMatchObject({
+      id: inputId,
+      conversationId
+    });
+
+    await live.runtimeMessage({ type: 'clf-run-input', id: inputId });
+    await settle(100);
+    expect(sends).toBe(1);
+    expect(claims).toBe(1);
+    expect(acks).toBe(3);
+  });
+
+  it('retries only the ACK when the worker has not durably accepted the first receipt', async () => {
+    const inputId = '72727272-8383-4a4a-8b5b-a6a6a6a6a6a6';
+    const conversationId = '73737373-8484-4b5b-8c6c-b7b7b7b7b7b7';
+    let sends = 0;
+    let acks = 0;
+    live = await harness(
+      `https://chatgpt.com/?cos-input=${inputId}`,
+      {
+        input_claim: () => ({
+          ok: true,
+          input: {
+            id: inputId,
+            sessionId: null,
+            text: 'Retry only my receipt',
+            attachments: [],
+            images: [],
+            state: 'browser',
+            owner: 'worker-derived-owner',
+            createdAt: 1,
+            conversationId: null
+          }
+        }),
+        input_send_started: () => ({ ok: true }),
+        input_ack: () => {
+          acks += 1;
+          return acks === 1
+            ? { ok: false, error: 'receipt_not_durable' }
+            : { ok: true, durable: true };
+        }
+      },
+      (document, dom) => {
+        document.querySelector('[data-testid="send-button"]')!.addEventListener('click', () => {
+          sends += 1;
+          dom.reconfigure({ url: `https://chatgpt.com/c/${conversationId}?cos-input=${inputId}` });
+        });
+      }
+    );
+
+    await settle(900);
+    expect(sends).toBe(1);
+    expect(acks).toBe(2);
+  });
+
+  it('fetches claimed attachment chunks before the native input send', async () => {
+    const inputId = '81818181-9292-4a4a-8b5b-a6a6a6a6a6a6';
+    const attachmentId = '91919191-a3a3-4b5b-8c6c-b7b7b7b7b7b7';
+    const conversationId = '51515151-6262-4737-8848-747474747474';
+    const chunkSize = 512 * 1024;
+    const bytes = new Uint8Array(chunkSize + 3);
+    bytes.fill(97);
+    bytes.set([98, 99, 100], chunkSize);
+    const chunks = [
+      Buffer.from(bytes.slice(0, chunkSize)).toString('base64'),
+      Buffer.from(bytes.slice(chunkSize)).toString('base64')
+    ];
+    const requestedOffsets: number[] = [];
+    let sends = 0;
+    let uploaded: File[] = [];
+    live = await harness(
+      `https://chatgpt.com/?cos-input=${inputId}`,
+      {
+        input_claim: () => ({
+          ok: true,
+          input: {
+            id: inputId,
+            sessionId: null,
+            text: 'Use the claimed attachment',
+            attachments: [{ id: attachmentId, name: 'payload.txt', size: bytes.length, mimeType: 'text/plain' }],
+            images: [],
+            state: 'browser',
+            owner: 'worker-derived-owner',
+            createdAt: 1,
+            conversationId: null
+          }
+        }),
+        input_attachment: (message) => {
+          requestedOffsets.push(message.offset);
+          const at = message.offset === 0 ? 0 : 1;
+          return { ok: true, data: { chunk: chunks[at], size: bytes.length } };
+        },
+        input_send_started: () => ({ ok: true }),
+        input_ack: () => ({ ok: true, data: { ok: true } })
+      },
+      (document, dom) => {
+        const fileInput = document.createElement('input');
+        fileInput.type = 'file';
+        fileInput.multiple = true;
+        Object.defineProperty(fileInput, 'files', {
+          configurable: true,
+          get: () => uploaded,
+          set: (value) => { uploaded = Array.from(value || []); }
+        });
+        document.querySelector('#composer-form')!.append(fileInput);
+        const view = dom.window as any;
+        view.DataTransfer = class {
+          private values: File[] = [];
+          items = { add: (file: File) => { this.values.push(file); } };
+          get files() { return this.values; }
+        };
+        document.querySelector('[data-testid="send-button"]')!.addEventListener('click', () => {
+          sends += 1;
+          dom.reconfigure({ url: `https://chatgpt.com/c/${conversationId}?cos-input=${inputId}` });
+        });
+      }
+    );
+
+    await settle(800);
+    expect(requestedOffsets).toEqual([0, chunkSize]);
+    expect(uploaded).toHaveLength(1);
+    expect(uploaded[0]!.name).toBe('payload.txt');
+    expect(uploaded[0]!.size).toBe(bytes.length);
+    expect(sends).toBe(1);
+    const claimAt = live.sent.findIndex((message) => message.type === 'input_claim');
+    const attachmentAt = live.sent.findIndex((message) => message.type === 'input_attachment');
+    const ackAt = live.sent.findIndex((message) => message.type === 'input_ack');
+    expect(claimAt).toBeGreaterThanOrEqual(0);
+    expect(attachmentAt).toBeGreaterThan(claimAt);
+    expect(ackAt).toBeGreaterThan(attachmentAt);
+  });
+
   it('arms the durable execution loop from the one approved-plan bootstrap without injecting a second kickoff', async () => {
     let sends = 0;
     live = await harness(

@@ -1669,6 +1669,43 @@ describe('canonical recorder 1.8', () => {
     });
   });
 
+  it('never records native download_artifact file credentials in args or summaries', async () => {
+    const conversationId = 'conv-recorder-artifact-credentials';
+    const requestId = 'wfr_recorder_artifact_credentials';
+    const sessionId = await sessionForConversation(conversationId);
+    const now = Date.now();
+    await recordChatObservations(conversationId, [{
+      kind: 'tool_evidence',
+      time: now,
+      fiberConversationId: conversationId,
+      calls: [{ messageId: 'artifact-call', tool: 'download_artifact', order: 0, answered: false, requestId }]
+    }]);
+
+    const signedUrl = 'https://files.openai.com/private/object?sig=TOP-SECRET-SIGNED-URL';
+    const fileId = 'file-TOP-SECRET-ID';
+    await recordToolCall({
+      tool: 'download_artifact',
+      args: {
+        file: { download_url: signedUrl, file_id: fileId, name: 'report.pdf' },
+        path: '/project/report.pdf'
+      },
+      content: [{ type: 'text', text: 'Saved /project/report.pdf' }],
+      outcome: 'ok',
+      durationMs: 2,
+      startedAt: now + 1,
+      requestId
+    });
+
+    const [event] = await readEvents(sessionId!, { kinds: ['tool_call'] });
+    expect(event?.kind).toBe('tool_call');
+    if (event?.kind !== 'tool_call') throw new Error('tool call was not recorded');
+    const durable = JSON.stringify(event);
+    expect(durable).not.toContain(signedUrl);
+    expect(durable).not.toContain(fileId);
+    expect(event.call.args.text).toContain('<native file credentials not stored>');
+    expect(event.call.args.text).toContain('/project/report.pdf');
+  });
+
   it('creates exactly one session when the same conversation is first observed concurrently', async () => {
     const conversationId = 'conv-concurrent-first-sight';
     const [first, second] = await Promise.all([

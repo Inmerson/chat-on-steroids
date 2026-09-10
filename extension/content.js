@@ -681,7 +681,7 @@
     }
   }
 
-  const AUTONOMOUS_SEND_OWNERS = new Set(['goal', 'loop', 'compact', 'bootstrap', 'revival']);
+  const AUTONOMOUS_SEND_OWNERS = new Set(['goal', 'loop', 'compact', 'bootstrap', 'revival', 'input']);
   let autonomousSendLease = null;
 
   function acquireAutonomousSend(owner) {
@@ -7892,6 +7892,22 @@
     }
   }
 
+  /** The fresh desktop-input UUID this page was opened to deliver, if any. */
+  function inputMarkerId() {
+    try {
+      const read = (params) => {
+        const value = params.get('cos-input');
+        return typeof value === 'string' && /^[a-f0-9-]{36}$/i.test(value) ? value : null;
+      };
+      const fromQuery = read(new URLSearchParams(location.search));
+      if (fromQuery) return fromQuery;
+      const hash = location.hash.startsWith('#') ? location.hash.slice(1) : location.hash;
+      return read(new URLSearchParams(hash));
+    } catch {
+      return null;
+    }
+  }
+
   /** The concrete conversation this document was opened at, before ChatGPT can retarget the SPA. */
   const OPENED_CONVERSATION = (() => {
     try {
@@ -7911,6 +7927,223 @@
   let commandAttempt = null;
   let commandReadinessInitialized = false;
   const commandReadinessWaiters = new Set();
+
+  const INPUT_ATTACHMENT_CHUNK_BYTES = 512 * 1024;
+  const inputsHandled = new Set();
+  let inputAttempt = null;
+
+  function ownsInputDocument(expectedEpoch) {
+    return (
+      alive &&
+      epoch === expectedEpoch &&
+      globalThis.__CLF_CONTENT_RECORDER__ === recorderHandle
+    );
+  }
+
+  function decodeInputBase64(value) {
+    if (typeof value !== 'string') return null;
+    try {
+      const raw = atob(value);
+      const bytes = new Uint8Array(raw.length);
+      for (let at = 0; at < raw.length; at++) bytes[at] = raw.charCodeAt(at);
+      return bytes;
+    } catch {
+      return null;
+    }
+  }
+
+  async function claimedAttachmentFile(inputId, attachment, expectedEpoch) {
+    if (
+      !attachment ||
+      typeof attachment.id !== 'string' ||
+      !/^[a-f0-9-]{36}$/i.test(attachment.id) ||
+      typeof attachment.name !== 'string' ||
+      !attachment.name ||
+      !Number.isSafeInteger(attachment.size) ||
+      attachment.size < 0 ||
+      typeof attachment.mimeType !== 'string'
+    ) return null;
+    const parts = [];
+    for (let offset = 0; offset < attachment.size; offset += INPUT_ATTACHMENT_CHUNK_BYTES) {
+      if (!ownsInputDocument(expectedEpoch)) return null;
+      const reply = await ask({ type: 'input_attachment', id: inputId, attachmentId: attachment.id, offset });
+      if (!reply || reply.ok !== true || !reply.data || reply.data.size !== attachment.size) return null;
+      const bytes = decodeInputBase64(reply.data.chunk);
+      const expected = Math.min(INPUT_ATTACHMENT_CHUNK_BYTES, attachment.size - offset);
+      if (!bytes || bytes.byteLength !== expected) return null;
+      parts.push(bytes);
+    }
+    try {
+      return new File(parts, attachment.name, { type: attachment.mimeType });
+    } catch {
+      return null;
+    }
+  }
+
+  function claimedImageFile(image, index) {
+    if (!image || typeof image.name !== 'string' || !image.name || typeof image.dataUrl !== 'string') return null;
+    const match = /^data:(image\/[\w.+-]+);base64,([A-Za-z0-9+/]+={0,2})$/.exec(image.dataUrl);
+    if (!match) return null;
+    const bytes = decodeInputBase64(match[2]);
+    if (!bytes) return null;
+    try {
+      return new File([bytes], image.name || `image-${index + 1}`, { type: match[1] });
+    } catch {
+      return null;
+    }
+  }
+
+  async function claimedInputFiles(input, expectedEpoch) {
+    const files = [];
+    const attachments = Array.isArray(input?.attachments) ? input.attachments : [];
+    if (attachments.length > 20) return null;
+    for (const attachment of attachments) {
+      const file = await claimedAttachmentFile(input.id, attachment, expectedEpoch);
+      if (!file) return null;
+      files.push(file);
+    }
+    const images = Array.isArray(input?.images) ? input.images : [];
+    if (images.length > 4) return null;
+    for (let at = 0; at < images.length; at++) {
+      const file = claimedImageFile(images[at], at);
+      if (!file) return null;
+      files.push(file);
+    }
+    return files;
+  }
+
+  function nativeInputMessageId(text) {
+    const compact = (value) => String(value || '').replace(/\s+/g, '');
+    const expected = compact(text);
+    try {
+      const messages = CLF_DOM.messages();
+      for (let at = messages.length - 1; at >= 0; at--) {
+        const message = messages[at];
+        if (message?.role !== 'user' || compact(message.text) !== expected) continue;
+        if (typeof message.id === 'string' && message.id) return message.id;
+      }
+    } catch {}
+    return null;
+  }
+
+  async function runFreshInput(id = inputMarkerId()) {
+    if (!id || !/^[a-f0-9-]{36}$/i.test(id) || inputsHandled.has(id) || inputAttempt || modelCatalogBusy) return false;
+    const expectedEpoch = epoch;
+    if (inputMarkerId() !== id || CLF_DOM.conversationId()) return false;
+    const initialComposer = await waitForComposer();
+    if (!initialComposer || (initialComposer.textContent || '').trim() || CLF_DOM.hasComposerAttachments()) return false;
+    const attempt = { id, cancelled: false, nativeSendAttempted: false };
+    inputAttempt = attempt;
+    desktopInputBusy = true;
+    try {
+      const claim = await ask({ type: 'input_claim', id });
+      if (attempt.cancelled || !ownsInputDocument(expectedEpoch) || inputMarkerId() !== id) return false;
+      const input = claim && claim.ok === true ? claim.input : null;
+      if (
+        !input ||
+        input.id !== id ||
+        input.sessionId !== null ||
+        input.conversationId !== null ||
+        typeof input.text !== 'string' ||
+        !input.text.trim()
+      ) return false;
+
+      const releaseClaim = async () => {
+        await ask({ type: 'input_release', id }).catch(() => undefined);
+        return false;
+      };
+
+      const files = await claimedInputFiles(input, expectedEpoch);
+      if (!files) return releaseClaim();
+      if (attempt.cancelled || !ownsInputDocument(expectedEpoch) || inputMarkerId() !== id) return false;
+      const readyComposer = await waitForComposer();
+      if (!readyComposer || (readyComposer.textContent || '').trim() || CLF_DOM.hasComposerAttachments()) return releaseClaim();
+      if (!acquireAutonomousSend('input')) return releaseClaim();
+      try {
+        const composer = CLF_DOM.composer();
+        if (
+          attempt.cancelled ||
+          !ownsInputDocument(expectedEpoch) ||
+          inputMarkerId() !== id ||
+          CLF_DOM.conversationId() ||
+          !composer ||
+          (composer.textContent || '').trim() ||
+          CLF_DOM.hasComposerAttachments()
+        ) return releaseClaim();
+        if (files.length > 0 && !CLF_DOM.attachFiles(files)) {
+          return !CLF_DOM.hasComposerAttachments() && !(CLF_DOM.composer()?.textContent || '').trim()
+            ? releaseClaim()
+            : false;
+        }
+        if (!CLF_DOM.insertPrompt(input.text)) {
+          return !CLF_DOM.hasComposerAttachments() && !(CLF_DOM.composer()?.textContent || '').trim()
+            ? releaseClaim()
+            : false;
+        }
+        await Promise.resolve();
+        const squeeze = (value) => String(value || '').replace(/\s+/g, '');
+        const current = CLF_DOM.composer();
+        if (!current || squeeze(current.textContent) !== squeeze(input.text)) return false;
+        if (!ownsInputDocument(expectedEpoch) || inputMarkerId() !== id || CLF_DOM.conversationId()) return false;
+        // Crossing this line is intentionally at-most-once. Even if ChatGPT's acceptance
+        // evidence or the later bridge ACK is lost, this document never attempts the native
+        // send again and no other document inherits its Core lease.
+        let sendFence = null;
+        for (let tries = 0; tries < 3; tries++) {
+          sendFence = await ask({ type: 'input_send_started', id });
+          if (sendFence?.ok === true) break;
+          if (
+            files.length > 0 ||
+            attempt.cancelled ||
+            !ownsInputDocument(expectedEpoch) ||
+            inputMarkerId() !== id ||
+            CLF_DOM.conversationId()
+          ) return false;
+          const retryComposer = CLF_DOM.composer();
+          if (
+            !retryComposer ||
+            squeeze(retryComposer.textContent) !== squeeze(input.text) ||
+            CLF_DOM.hasComposerAttachments()
+          ) return false;
+          await sleep(100);
+        }
+        if (!sendFence || sendFence.ok !== true || !ownsInputDocument(expectedEpoch) || inputMarkerId() !== id) return false;
+        attempt.nativeSendAttempted = true;
+        inputsHandled.add(id);
+        const sent = await CLF_DOM.send();
+        if (!sent) return false;
+      } finally {
+        releaseAutonomousSend('input');
+      }
+
+      for (let tries = 0; tries < 80; tries++) {
+        if (attempt.cancelled || !ownsInputDocument(expectedEpoch)) return false;
+        const conversation = CLF_DOM.conversationId();
+        if (conversation) {
+          const messageId = nativeInputMessageId(input.text);
+          for (let ackTry = 0; ackTry < 3; ackTry++) {
+            const receipt = await ask({
+              type: 'input_ack',
+              id,
+              conversationId: conversation,
+              ...(messageId ? { messageId } : {})
+            });
+            if (receipt?.durable === true || receipt?.ok === true) break;
+            if (attempt.cancelled || !ownsInputDocument(expectedEpoch)) return false;
+            await sleep(100);
+          }
+          return true;
+        }
+        await sleep(500);
+      }
+      return false;
+    } finally {
+      if (inputAttempt === attempt) {
+        inputAttempt = null;
+        desktopInputBusy = false;
+      }
+    }
+  }
 
   function ownsCommandDocument(expectedEpoch) {
     return (
@@ -8425,6 +8658,115 @@
     }
   }
 
+  // Browser-owned model discovery shares the native provider controls with desktop input.
+  // This branch does not own desktop-input transport itself yet; the final Task-1 integration
+  // supplies that state machine. Keeping the explicit guard here prevents provider-picker work
+  // from racing a future native-send path and is exercised independently by the catalog tests.
+  let desktopInputBusy = false;
+  async function acceptDesktopInput(_message) {
+    if (desktopInputBusy || modelCatalogBusy) return false;
+    return false;
+  }
+
+  let modelCatalogBusy = false;
+  let pluginRefreshBusy = false;
+  const pageViewChecks = new Set();
+
+  function waitPageView(read, current, milliseconds) {
+    return new Promise(resolve => {
+      let busy = false, dirty = false, done = false;
+      const finish = value => {
+        if (done) return;
+        done = true;
+        pageViewChecks.delete(check);
+        observer.disconnect();
+        clearTimeout(timer);
+        resolve(value);
+      };
+      const check = async () => {
+        if (done) return;
+        if (!current()) return finish(null);
+        if (busy) { dirty = true; return; }
+        busy = true;
+        try {
+          let value = read();
+          if (value?.then) value = await value;
+          if (current() && value) finish(value);
+        } catch {
+          finish(null);
+        } finally {
+          busy = false;
+          if (dirty && !done) { dirty = false; void check(); }
+        }
+      };
+      const observer = new MutationObserver(check);
+      observer.observe(document.documentElement, { subtree: true, childList: true, attributes: true, characterData: true });
+      pageViewChecks.add(check);
+      const timer = setTimeout(() => finish(null), milliseconds);
+      void check();
+    });
+  }
+
+  // Marker kept beside waitPageView because plugin refresh uses the same DOM-readiness primitive
+  // in newer upstream builds. Plugin refresh authority remains in the already-ported Core plugin
+  // platform; Task 1 does not grant this content script a new refresh transaction.
+  async function refreshManagedPlugin(_request) { return false; }
+
+  function catalogPageReady() {
+    return alive && !generating && !CLF_DOM.generating() && !desktopInputBusy && CLF_DOM.composerVisible() &&
+      !CLF_DOM.hasComposerAttachments() && (catalogHelper() || !CLF_DOM.composer().textContent?.trim());
+  }
+
+  function catalogHelper() {
+    return !conversationId && location.pathname === '/' &&
+      !!new URL(location.href).searchParams.get('cos-model-catalog') && !CLF_DOM.turns().length;
+  }
+
+  async function inspectAppModelCatalog(message) {
+    const ownedEpoch = epoch;
+    if (modelCatalogBusy || !/^[a-f0-9-]{36}$/i.test(message.nonce) || Date.now() >= message.expiresAt) return false;
+    modelCatalogBusy = true;
+    try {
+      const current = () => alive && epoch === ownedEpoch && Date.now() < message.expiresAt;
+      if (!catalogPageReady() && catalogHelper()) {
+        await waitPageView(catalogPageReady, () => current() && catalogHelper(), 15000);
+      }
+      if (!current() || !catalogPageReady()) return false;
+
+      const restoredText = CLF_DOM.composer().textContent;
+      if (catalogHelper() && restoredText?.trim() && !CLF_DOM.clearPromptExact(restoredText)) return false;
+
+      const switchCurrent = () => current() && !generating && !CLF_DOM.generating() && !desktopInputBusy &&
+        !CLF_DOM.hasComposerAttachments() && !CLF_DOM.composer()?.textContent?.trim();
+      if (!await CLF_DOM.prepareChatModelSurface(switchCurrent) || !switchCurrent()) {
+        if (switchCurrent()) {
+          await ask({ type: 'model_catalog', nonce: message.nonce, models: null, error: 'picker_unavailable' });
+        }
+        return false;
+      }
+      if (!CLF_DOM.composer()) await waitPageView(catalogPageReady, switchCurrent, 5000);
+
+      const composer = CLF_DOM.composer();
+      const draftText = composer?.textContent;
+      const attachments = CLF_DOM.hasComposerAttachments();
+      const onTarget = () => current() && catalogPageReady() &&
+        CLF_DOM.composer() === composer && composer.textContent === draftText &&
+        CLF_DOM.hasComposerAttachments() === attachments;
+      if (!onTarget()) return false;
+
+      let error;
+      const models = await CLF_DOM.inspectModelSettings(
+        () => onTarget() && Date.now() < message.expiresAt,
+        reason => { error ??= reason; }
+      ).catch(() => { error ??= 'inspection_failed'; return null; });
+      if (!onTarget()) return false;
+      const result = await ask({ type: 'model_catalog', nonce: message.nonce, models, error });
+      return result?.ok === true;
+    } finally {
+      modelCatalogBusy = false;
+    }
+  }
+
   /** Popup commands target this tab directly; no bridge credential is involved. */
   if (globalThis.chrome && chrome.runtime && chrome.runtime.onMessage) {
     const runtimeMessage = (message, _sender, sendResponse) => {
@@ -8433,6 +8775,16 @@
       // background.js uses this only to distinguish a live isolated-world recorder from the
       // dead context Chrome leaves behind when an unpacked extension is reloaded while the
       // ChatGPT document stays open. No page/session data crosses in this health check.
+      if (message.type === 'clf-model-catalog') {
+        void inspectAppModelCatalog(message)
+          .then(ok => sendResponse({ ok }))
+          .catch(() => sendResponse({ ok: false }));
+        return true;
+      }
+      if (message.type === 'clf-model-catalog-state') {
+        sendResponse({ ready: !modelCatalogBusy && (catalogPageReady() || (catalogHelper() && !CLF_DOM.composer())) });
+        return false;
+      }
       if (message.type === 'clf-recorder-ping') {
         sendResponse({ ok: true, recorderVersion: FIBER_VERSION });
         return false;
@@ -8459,6 +8811,25 @@
         });
         return false;
       }
+      if (message.type === 'clf-tab-close-check') {
+        void (async () => {
+          const observedEpoch = epoch;
+          sendResponse({
+            conversationId: CLF_DOM.conversationId(),
+            navigationEpoch: epoch,
+            safe: alive && epoch === observedEpoch && message.conversationId === conversationId &&
+              CLF_DOM.conversationId() === conversationId && !generating && !CLF_DOM.generating() &&
+              !desktopInputBusy && !modelCatalogBusy && !pluginRefreshBusy && !commandAttempt &&
+              queue.length === 0 && !flushWork && !!CLF_DOM.composer() &&
+              !(CLF_DOM.composer().textContent || '').trim() && !CLF_DOM.hasComposerAttachments()
+          });
+        })().catch(() => sendResponse({ safe: false }));
+        return true;
+      }
+      if (message.type === 'clf-close-temporary-planner') {
+        sendResponse({ safe: false });
+        return false;
+      }
       if (message.type === 'clf-render-stream') {
         RENDER_STREAM = message.enabled !== false;
         renderPreferenceReady = true;
@@ -8480,6 +8851,17 @@
           (claimed) => sendResponse({ ok: true, claimed: claimed === true }),
           { deferredRecovery: message.deferredRecovery === true }
         );
+        return true;
+      }
+      if (message.type === 'clf-run-input') {
+        const wanted = typeof message.id === 'string' && /^[a-f0-9-]{36}$/i.test(message.id) ? message.id : '';
+        if (!wanted || inputMarkerId() !== wanted) {
+          sendResponse({ ok: false, error: 'wrong_input_marker' });
+          return false;
+        }
+        void runFreshInput(wanted)
+          .then((sent) => sendResponse({ ok: true, sent: sent === true }))
+          .catch((err) => sendResponse({ ok: false, error: String(err && err.message ? err.message : err) }));
         return true;
       }
       if (message.type === 'clf-overwrite-now') {
@@ -8687,8 +9069,10 @@
   // awaited before the first observe() so a reloaded live turn cannot be duplicated.
   clearLegacyAutoLoopState();
   const startupCommandId = markerId();
+  const startupInputId = startupCommandId ? null : inputMarkerId();
   const commandStartup = startupCommandId && !OPENED_CONVERSATION ? runCommand(startupCommandId) : Promise.resolve();
-  void commandStartup
+  const startupDelivery = startupInputId && !OPENED_CONVERSATION ? runFreshInput(startupInputId) : commandStartup;
+  void startupDelivery
     .catch(() => undefined)
     .then(loadRenderPreference)
     .then(checkStatus)
@@ -8758,6 +9142,7 @@
     // intervals drain themselves on their next tick through every().
     alive = false;
     if (commandAttempt) commandAttempt.cancelled = true;
+    if (inputAttempt) inputAttempt.cancelled = true;
     notifyCommandReadiness();
     if (activityTimer !== null) {
       clearTimeout(activityTimer);

@@ -1266,13 +1266,67 @@
     post({ source: REPLY, nonce, scanToken, v: VERSION, scanOk, rows, turns }, location.origin);
   }
 
+  /** Picker data is account-evaluated state, never a scraped English announcement.
+   * Copy only selection metadata; no conversation, account object or callbacks cross worlds. */
+  function pickerSnapshot() {
+    const node = document.querySelector('[data-testid="composer-intelligence-picker-content"]');
+    let state = null;
+    try { state = readPickerSnapshot(node); } catch { /* Unknown state invalidates prior proof. */ }
+    const selected = state?.choices.find(choice => choice.bucket === state.currentBucket && choice.available);
+    for (const [attribute, value] of [['data-clf-selected-model', selected?.id], ['data-clf-selected-effort', selected?.effort]]) {
+      if (!value) node?.removeAttribute(attribute);
+      else if (node.getAttribute(attribute) !== value) node.setAttribute(attribute, value);
+    }
+    return state;
+  }
+
+  function readPickerSnapshot(node) {
+    let fiber = node && fiberOf(node);
+    for (let up = 0; fiber && up < MAX_CLIMB; up++, fiber = fiber.return) {
+      const props = fiber.memoizedProps;
+      const state = props?.composerIntelligencePickerState, data = props?.modelsData;
+      if (!state || !Array.isArray(data?.versions)) continue;
+      if (data.versions.length > 20 || !Array.isArray(state.bucketSelections) || state.bucketSelections.length > 12) return null;
+      const id = value => typeof value === 'string' && /^[a-zA-Z0-9._-]{1,80}$/.test(value) ? value : null;
+      const label = value => typeof value === 'string' && value.trim().length > 0 && value.length <= 80 ? value.trim() : null;
+      const effortOf = choice => choice.category?.modelLane === 'pro' ? 'pro'
+        : ['auto', 'instant'].includes(choice.category?.modelLane) ? 'none'
+        : ({ min: 'low', standard: 'medium', extended: 'high', max: 'xhigh', minimal: 'minimal', low: 'low', medium: 'medium', high: 'high', xhigh: 'xhigh', ultra: 'ultra' })[choice.thinkingEffort] || null;
+      const choices = state.bucketSelections.map(choice => {
+        const name = label(choice.category?.shortLabel);
+        const familyId = id(choice.category?.modelVersion) || id(choice.modelSlug);
+        const family = data.versions.find(version => version.id === familyId);
+        return { bucket: choice.bucket, id: id(choice.modelSlug),
+          label: name && (/^\d/.test(name) ? `GPT-${name}` : name), effort: effortOf(choice),
+          familyId, familyLabel: label(family?.displayTextForIntelligence) || label(choice.modelConfig?.title) || (name && (/^\d/.test(name) ? `GPT-${name}` : name)),
+          available: choice.availability?.status === 'available' && !props.modelSwitcherDenialsBySlug?.[choice.modelSlug] };
+      });
+      const versions = data.versions.filter(version => version.enabled === true).map(version => ({ id: id(version.id), label: label(version.displayTextForIntelligence) }));
+      if (!versions.length || versions.some(v => !v.id || !v.label) || choices.some(c => !Number.isInteger(c.bucket) || !c.id || !c.label || !c.effort) ||
+          new Set(versions.map(v => v.id)).size !== versions.length || new Set(choices.map(c => c.bucket)).size !== choices.length) return null;
+      const version = id(state.selectedVersionEntry?.id), currentBucket = state.currentBucket;
+      if (!versions.some(v => v.id === version) || !choices.some(c => c.bucket === currentBucket)) return null;
+      const selected = state.currentSelection;
+      const chosen = choices.find(c => c.bucket === currentBucket);
+      if (selected?.modelSlug !== chosen.id || effortOf(selected) !== chosen.effort) return null;
+      return { version, currentBucket, versions, choices };
+    }
+    return null;
+  }
+
   const listener = (event) => {
     // Only this window, only our own request shape. Anything else is not ours to answer.
     if (event.source !== window) return;
     const data = event.data;
-    if (!data || typeof data !== 'object' || data.source !== ASK) return;
+    if (!data || typeof data !== 'object' || ![ASK, 'clf-picker-ask'].includes(data.source)) return;
     const nonce = typeof data.nonce === 'string' ? data.nonce.slice(0, 64) : '';
     if (!nonce) return;
+    if (data.source === 'clf-picker-ask') {
+      let picker = null;
+      try { picker = pickerSnapshot(); } catch { /* Unknown provider shape fails closed. */ }
+      post({ source: 'clf-picker-reply', nonce, v: 1, picker }, location.origin);
+      return;
+    }
     try {
       scan(nonce);
     } catch {

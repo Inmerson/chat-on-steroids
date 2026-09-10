@@ -139,6 +139,7 @@ import {
   type ToolResult
 } from './kernel.js';
 import { registerSessionTool } from './session-tool.js';
+import { DEFAULT_MAX_ARTIFACT_BYTES, downloadArtifactFile } from './artifact-download.js';
 
 /** Entries one `read` of a directory returns before it says it stopped. */
 const MAX_DIR_ENTRIES = 200;
@@ -560,6 +561,38 @@ export function registerCoreTools(reg: SurfaceRegistrar): void {
           const meta = `\n\nfiles_scanned: ${scanned}\nelapsed_ms: ${elapsedMs}\nresults_returned: ${hits.length}${contentLimit}${reason}`;
           if (hits.length === 0) return ok(`No matches${meta}`);
           return ok(`${hits.length} matches\n${hits.join('\n')}${meta}`);
+        })
+    );
+  }
+
+  // ---------------------------------------------------------- download_artifact
+
+  // Native ChatGPT file injection is local-only by construction. There is deliberately no
+  // device_id: a path reported by a remote node must never be reinterpreted by this machine's
+  // sandbox resolver. Saving is a separate write permission from editing repository files.
+  if (exposedCaps.saveArtifact) {
+    reg.register(
+      'download_artifact',
+      {
+        title: 'Save a ChatGPT file',
+        description:
+          'Save a native file supplied by ChatGPT into an existing folder inside an approved root. ' +
+          'The destination must not already exist; this tool never overwrites files or creates parent folders.',
+        inputSchema: z
+          .object({
+            file: z.unknown().describe('Native ChatGPT file value injected by the client.'),
+            path: pathArg.describe('New destination file inside an approved root.')
+          })
+          .strict(),
+        annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
+        _meta: { 'openai/fileParams': ['file'] }
+      },
+      async ({ file, path: requestedPath }) =>
+        reg.guarded('saveArtifact', 'download_artifact', async () => {
+          const saved = await downloadArtifactFile(ctx.roots, requestedPath, file, {
+            maxFileBytes: DEFAULT_MAX_ARTIFACT_BYTES
+          });
+          return ok(`Saved ${saved.virtual}\n${saved.size} bytes\n${saved.sha256}`);
         })
     );
   }

@@ -51,6 +51,9 @@ export function sanitizeRecordedArgs(tool: string, args: unknown): unknown {
   if (!sanitized || typeof sanitized !== 'object' || Array.isArray(sanitized)) return sanitized;
 
   const copy: Record<string, unknown> = { ...(sanitized as Record<string, unknown>) };
+  if (tool === 'download_artifact' && Object.prototype.hasOwnProperty.call(copy, 'file')) {
+    copy['file'] = '<native file credentials not stored>';
+  }
   if (copy['env'] && typeof copy['env'] === 'object' && !Array.isArray(copy['env'])) {
     copy['env'] = Object.fromEntries(Object.keys(copy['env'] as object).map((key) => [key, '***']));
   }

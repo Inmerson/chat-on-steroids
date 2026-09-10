@@ -1080,6 +1080,7 @@ async function fileToolCall(input: ToolCallInput, target: Target): Promise<ToolC
     // raw capability out of args/result while still leaking it through that summary to
     // events.jsonl, the renderer and the extension activity feed.
     const resultText = redactResult(input.tool, textParts.join('\n'));
+    const recordedArgs = sanitizeRecordedArgs(input.tool, input.args);
     const assets: AssetRef[] = [...evidence.assets];
     for (const part of input.content) {
       if (part.type !== 'image' || !part.data) continue;
@@ -1089,7 +1090,7 @@ async function fileToolCall(input: ToolCallInput, target: Target): Promise<ToolC
 
     const summary: ActivitySummary = summarizeToolCall({
       tool: input.tool,
-      args: input.args,
+      args: recordedArgs,
       evidence,
       outcome: input.outcome,
       durationMs: input.durationMs,
@@ -1103,7 +1104,7 @@ async function fileToolCall(input: ToolCallInput, target: Target): Promise<ToolC
       requestId: input.requestId ?? null,
       conversationId: target.conversationId,
       attributionMethod: target.conversationId && input.requestId ? 'request_id' : 'unattributed',
-      args: await storeText(sessionId, safeJson(sanitizeRecordedArgs(input.tool, input.args)), MAX_TOOL_ARGS_CHARS),
+      args: await storeText(sessionId, safeJson(recordedArgs), MAX_TOOL_ARGS_CHARS),
       result: await storeText(sessionId, resultText, MAX_TOOL_RESULT_CHARS),
       outcome: input.outcome,
       durationMs: input.durationMs,

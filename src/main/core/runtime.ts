@@ -1,10 +1,11 @@
 import path from 'node:path';
-import { shell } from 'electron';
 import type { ConnectionStatus } from '../../shared/types.js';
 import type { CoreStatusEnvelope } from '../../shared/core-protocol.js';
 import { agentConversation, bindConversation, onRetiredWorkersPersist, onRetiredWorkersPersistNow, onSwarmChange, onSwarmPersist, onSwarmPersistNow, pauseSwarmForDisable, repairPrimeConversationAfterRecovery, restoreRetiredWorkers, restoreSwarm, snapshotRetiredWorkers, snapshotSwarm, type RetiredWorkersSnapshot, type SwarmSnapshot } from '../agents.js';
-import { onBridgeChange, setBrowserOpener, shutdownBridge, startBridge } from '../bridge.js';
+import { notifyBridgeWorkflowChange, onBridgeChange, setBrowserOpener, shutdownBridge, startBridge } from '../bridge.js';
 import { openInPreferredBrowser } from '../browser.js';
+import { wakeBrowserUrl } from '../browser-startup.js';
+import { configureChatModelDiscovery, restoreChatModels } from '../chat-models.js';
 import { unifiedExecManager } from '../codex/manager.js';
 import { connect, disconnect, getStatus, isServerRunning, shutdownConnection } from '../connection.js';
 import { getConfig, initConfigPath, loadConfig } from '../config.js';
@@ -67,6 +68,7 @@ async function restoreCoreState(userDataDir: string): Promise<() => void> {
   initSessionStore(userDataDir);
   initDurableStore(userDataDir);
   initLogFile(path.join(userDataDir, 'core.log'));
+  await restoreChatModels();
   await loadConfig();
   await pluginManager.initialize(userDataDir);
 
@@ -75,14 +77,13 @@ async function restoreCoreState(userDataDir: string): Promise<() => void> {
   await restoreRequestCorrelations();
   setAgentConversationLookup(agentConversation);
   setAgentBinder(bindConversation);
-  setBrowserOpener(async (url) => {
-    try {
-      const browser = await openInPreferredBrowser(url);
-      if (browser) return;
-    } catch (error) {
-      logWarn(`core could not open ChatGPT in the preferred browser: ${(error as Error).message}`);
+  setBrowserOpener(async (url) => { await openInPreferredBrowser(url); });
+  configureChatModelDiscovery({
+    changed: notifyBridgeWorkflowChange,
+    wake: async (nonce, allowOpen) => {
+      if (!(await startBridge())) throw new Error('The browser bridge could not start');
+      if (allowOpen) await wakeBrowserUrl(`https://chatgpt.com/?cos-model-catalog=${nonce}`, true, true);
     }
-    await shell.openExternal(url);
   });
 
   onSwarmPersist(() => writeDurableSoon(SWARM_STATE, snapshotSwarm()));

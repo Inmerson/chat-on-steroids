@@ -24,6 +24,9 @@ function hello(overrides: Partial<CoreHello> = {}): CoreHello {
 }
 
 describe('Core protocol compatibility', () => {
+  it('requires the v8 browser/model discovery contract from persistent Core', () => {
+    expect(CORE_PROTOCOL_VERSION).toBe(8);
+  });
   it('accepts product-version drift when the protocol and required capabilities match', () => {
     expect(isCoreCompatible({ protocolVersion: CORE_PROTOCOL_VERSION, requiredCapabilities: ['connection-status'] }, hello({ coreVersion: '2.2.0' }))).toBe(true);
   });

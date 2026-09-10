@@ -49,7 +49,10 @@ const CORE_UI_OPERATIONS = new Set<CoreUiOperation>([
   'plugins-set-enabled',
   'plugins-set-tool-enabled',
   'plugins-auth-start',
-  'plugins-auth-cancel'
+  'plugins-auth-cancel',
+  'chat-models-get',
+  'chat-models-request',
+  'browser-preferences'
 ]);
 
 export function coreEndpointForUserData(userDataDir: string, platform: NodeJS.Platform = process.platform): string {

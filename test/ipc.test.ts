@@ -7,6 +7,8 @@
 
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import path from 'node:path';
+import { promises as fs } from 'node:fs';
+import { randomUUID } from 'node:crypto';
 
 type Handler = (event: unknown, payload: unknown) => Promise<unknown>;
 const handlers = new Map<string, Handler>();
@@ -191,7 +193,7 @@ describe('turning multi-agent mode off', () => {
    * Pausing execution must withdraw queued browser work before the bridge goes away. The
    * durable worker history itself survives; only the pending transport is cancelled.
    */
-  it('cancels the run’s queued worker chats before the bridge goes away', async () => {
+  it('cancels the runâ€™s queued worker chats before the bridge goes away', async () => {
     await startBridge();
     spawn({ workers: [{ task: 'work' }], caller: { conversationId: 'c-prime' } });
     // Opening is asynchronous, as it is in the app.
@@ -632,7 +634,7 @@ describe('root namespace invariants', () => {
 
 /**
  * `link:open` is an allowlist, which means a button whose URL was never added to it does
- * not open a slightly wrong page — it throws, in a handler nobody is watching, and the
+ * not open a slightly wrong page â€” it throws, in a handler nobody is watching, and the
  * button does nothing at all. That is how "Open OpenRouter keys" shipped dead beside the
  * key field it exists to go and fetch.
  *
@@ -650,7 +652,7 @@ describe('every link the window offers', () => {
     ]);
 
     const offered = [...html.matchAll(/data-link="([^"]+)"/g)].map((match) => match[1]!);
-    expect(offered.length, 'the markup offers no links at all — has data-link been renamed?').toBeGreaterThan(0);
+    expect(offered.length, 'the markup offers no links at all â€” has data-link been renamed?').toBeGreaterThan(0);
 
     const block = /const ALLOWED_LINKS = new Set\(\[([\s\S]*?)\]\);/.exec(ipcSource);
     expect(block, 'ALLOWED_LINKS is gone or renamed').not.toBeNull();
@@ -681,8 +683,8 @@ describe('every link the window offers', () => {
 });
 
 /**
- * OpenRouter publishes twelve ids that begin with `~` — `~deepseek/deepseek-v4-flash-latest`
- * and its siblings — and they are aliases that always resolve to the newest model in a
+ * OpenRouter publishes twelve ids that begin with `~` â€” `~deepseek/deepseek-v4-flash-latest`
+ * and its siblings â€” and they are aliases that always resolve to the newest model in a
  * family. The picker lists them because the catalogue does, so a validator that refused the
  * `~` made the one kind of entry most worth choosing the one kind that could not be saved:
  * the click reported an error and the model in use silently stayed where it was.
@@ -786,7 +788,7 @@ describe('renderer pushes after the window is gone', () => {
     // Electron keeps the object after the window is destroyed, so the existing `?.` on
     // `getWindow()` never fires: the reference is truthy and reading `.webContents` throws.
     // The log push is the one that matters, because `onLog` listeners run synchronously on
-    // the writer's stack — during a quit that turned every teardown log line into a throw
+    // the writer's stack â€” during a quit that turned every teardown log line into a throw
     // inside the teardown step that wrote it.
     const { logInfo } = await import('../src/main/logger.js');
     let touchedWebContents = false;
@@ -801,5 +803,62 @@ describe('renderer pushes after the window is gone', () => {
     registerIpc(() => destroyed);
     expect(() => logInfo('teardown progress written after the window went away')).not.toThrow();
     expect(touchedWebContents).toBe(false);
+  });
+});
+
+
+describe('input attachment IPC', () => {
+  it('stages selected and dropped files without exposing host paths, then queues and cancels one typed input', async () => {
+    const { resetInputForTests } = await import('../src/main/session/input.js');
+    resetInputForTests();
+    await writeDurableNow('session-input', []);
+    const selectedPath = path.join(dir, 'selected-secret.txt');
+    await fs.writeFile(selectedPath, 'selected bytes');
+    vi.mocked(dialog.showOpenDialog).mockResolvedValueOnce({
+      canceled: false,
+      filePaths: [selectedPath]
+    } as never);
+
+    const selected = await handlers.get('sessions:files')!(null, undefined) as any;
+    expect(selected.ok, selected.error).toBe(true);
+    expect(selected.data).toHaveLength(1);
+    expect(selected.data[0]).toMatchObject({ name: 'selected-secret.txt', size: 14, mimeType: 'text/plain' });
+    expect(JSON.stringify(selected.data)).not.toContain(selectedPath);
+
+    const dropped = await handlers.get('sessions:dropFiles')!(null, {
+      files: [{ name: 'clipboard.txt', bytes: new Uint8Array(Buffer.from('clipboard')) }]
+    }) as any;
+    expect(dropped.ok, dropped.error).toBe(true);
+    expect(dropped.data[0]).toMatchObject({ name: 'clipboard.txt', size: 9 });
+
+    const id = randomUUID();
+    const sent = await handlers.get('sessions:send')!(null, {
+      id, sessionId: null, text: 'Start with these files', attachments: [selected.data[0], dropped.data[0]], images: []
+    }) as any;
+    expect(sent.ok, sent.error).toBe(true);
+    expect(sent.data).toMatchObject({ id, state: 'queued', conversationId: null });
+
+    const outbox = await handlers.get('sessions:outbox')!(null, undefined) as any;
+    expect(outbox.ok, outbox.error).toBe(true);
+    expect(outbox.data).toContainEqual(expect.objectContaining({ id, text: 'Start with these files' }));
+    const cancelled = await handlers.get('sessions:cancelInput')!(null, { id }) as any;
+    expect(cancelled).toEqual({ ok: true, data: true });
+  });
+
+  it('never returns an absolute selected-file path in attachment staging errors', async () => {
+    const privateDir = path.join(dir, 'TOP-SECRET-PRIVATE-DIRECTORY');
+    const missing = path.join(privateDir, 'gone.txt');
+    vi.mocked(dialog.showOpenDialog).mockResolvedValueOnce({ canceled: false, filePaths: [missing] } as never);
+
+    const reply = await handlers.get('sessions:files')!(null, undefined) as any;
+    expect(reply.ok).toBe(false);
+    expect(String(reply.error)).not.toContain(privateDir);
+    expect(String(reply.error)).not.toContain(missing);
+  });
+  it('stages bounded attached text through a named channel', async () => {
+    const reply = await handlers.get('sessions:attachText')!(null, { text: 'explicit pasted text' }) as any;
+    expect(reply.ok, reply.error).toBe(true);
+    expect(reply.data).toMatchObject({ name: 'Attached text.txt', mimeType: 'text/plain', size: 20 });
+    expect(reply.data).not.toHaveProperty('path');
   });
 });

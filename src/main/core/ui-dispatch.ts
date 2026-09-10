@@ -2,6 +2,7 @@ import { z } from 'zod';
 import type { CoreUiOperation } from '../../shared/core-protocol.js';
 import {
   CAPABILITIES,
+  CHAT_BROWSERS,
   GOAL_REASONING_LEVELS,
   type Config
 } from '../../shared/types.js';
@@ -44,6 +45,8 @@ import { createPairingTicket, deviceOverview, revokeRemote } from '../multidevic
 import { disconnectRemote } from '../multidevice/transport.js';
 import { pluginManager } from '../plugins/manager.js';
 import type { PluginConfigPatch, PluginInstallRequest } from '../../shared/plugins.js';
+import { getChatModels, startChatModelDiscovery } from '../chat-models.js';
+import { browserPreferencePatch, requestBrowserPreferences } from '../browser-preferences.js';
 
 const idSchema = z.string().min(8).max(64).regex(/^[0-9a-z-]+$/i);
 const agentIdSchema = z.string().min(1).max(64).regex(/^[0-9a-z-]+$/i);
@@ -89,6 +92,7 @@ const settingsPatch = z.object({
     binaryPath: z.string().max(4096)
   }),
   ui: z.object({
+    chatBrowser: z.enum(CHAT_BROWSERS).optional(),
     minimizeToTray: z.boolean(),
     autoConnect: z.boolean(),
     privacyScreenshots: z.boolean(),
@@ -141,6 +145,7 @@ function mergeSettings(current: Config, base: SettingsSnapshot, wanted: Settings
       binaryPath: pick(current.tunnel.binaryPath, base.tunnel.binaryPath, wanted.tunnel.binaryPath)
     },
     ui: {
+      chatBrowser: pick(current.ui.chatBrowser, base.ui.chatBrowser, wanted.ui.chatBrowser),
       minimizeToTray: pick(current.ui.minimizeToTray, base.ui.minimizeToTray, wanted.ui.minimizeToTray),
       autoConnect: pick(current.ui.autoConnect, base.ui.autoConnect, wanted.ui.autoConnect),
       privacyScreenshots: pick(current.ui.privacyScreenshots, base.ui.privacyScreenshots, wanted.ui.privacyScreenshots),
@@ -215,6 +220,9 @@ export interface CoreUiDispatcherDeps {
   pluginsSetToolEnabled: (id: string, name: string, enabled: boolean) => Promise<unknown>;
   pluginsAuthStart: (id: string) => Promise<unknown>;
   pluginsAuthCancel: (id: string) => Promise<unknown>;
+  chatModels: () => unknown;
+  requestChatModels: () => Promise<unknown>;
+  browserPreferences: (patch: unknown) => Promise<unknown>;
 }
 
 export type CoreUiDispatcher = (operation: CoreUiOperation, payload: unknown) => Promise<unknown>;
@@ -349,6 +357,16 @@ export function createCoreUiDispatcher(deps: CoreUiDispatcherDeps): CoreUiDispat
         const { id } = pluginIdentitySchema.parse(payload);
         return deps.pluginsAuthCancel(id);
       }
+      case 'chat-models-get':
+        z.null().parse(payload);
+        return deps.chatModels();
+      case 'chat-models-request':
+        z.null().parse(payload);
+        return deps.requestChatModels();
+      case 'browser-preferences': {
+        const value = browserPreferencePatch.parse(payload ?? {});
+        return deps.browserPreferences(value);
+      }
     }
   };
 }
@@ -482,7 +500,10 @@ const defaultDeps: CoreUiDispatcherDeps = {
   pluginsSetEnabled: (id, enabled) => pluginManager.setEnabled(id, enabled),
   pluginsSetToolEnabled: (id, name, enabled) => pluginManager.setToolEnabled(id, name, enabled),
   pluginsAuthStart: (id) => pluginManager.authenticate(id),
-  pluginsAuthCancel: (id) => pluginManager.cancelAuthentication(id)
+  pluginsAuthCancel: (id) => pluginManager.cancelAuthentication(id),
+  chatModels: getChatModels,
+  requestChatModels: () => startChatModelDiscovery(),
+  browserPreferences: requestBrowserPreferences
 };
 
 export const coreUiDispatcher = createCoreUiDispatcher(defaultDeps);

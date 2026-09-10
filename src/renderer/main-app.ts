@@ -30,6 +30,9 @@ import { $, ago, el, icon, run, shortAgo, toast } from './dom.js';
 import { chatApply, chatSettingsPatch, chatVisible, initChat } from './chat.js';
 import { controlCenterVisible, initControlCenter } from './control-center.js';
 import { coreHealthFacts } from './core-health-widget.js';
+import { initBrowserPreferences } from './browser-preferences.js';
+import { initChatModels } from './chat-models.js';
+import { initSidebarResize } from './sidebar-resize.js';
 import { applyPluginsState, initPlugins, refreshPlugins } from './plugins.js';
 
 declare global {
@@ -64,8 +67,8 @@ const GROUPS: Group[] = [
     id: 'write',
     title: 'Change files',
     icon: 'i-pencil',
-    blurb: 'Create, edit, move and delete, inside those folders only.',
-    caps: ['create', 'edit', 'move', 'deleteFile']
+    blurb: 'Create, edit, move, delete and save generated artifacts inside approved folders only.',
+    caps: ['create', 'edit', 'move', 'deleteFile', 'saveArtifact']
   },
   {
     id: 'desktop',
@@ -380,6 +383,7 @@ function save(over: { readOnly?: boolean; theme?: 'light' | 'dark' } = {}): Prom
       binaryPath: $<HTMLInputElement>('binaryPath').value.trim()
     },
     ui: {
+      chatBrowser: $<HTMLSelectElement>('chatBrowser').value as AppState['config']['ui']['chatBrowser'],
       autoConnect: $<HTMLInputElement>('autoConnect').checked,
       minimizeToTray: $<HTMLInputElement>('minimizeToTray').checked,
       privacyScreenshots: $<HTMLInputElement>('privacyScreenshots').checked,
@@ -903,6 +907,11 @@ function apply(next: AppState): void {
     previousState?.config.tunnel.steromiTunnelId
   );
   applyValue($<HTMLInputElement>('binaryPath'), config.tunnel.binaryPath, previousState?.config.tunnel.binaryPath);
+  applyValue(
+    $<HTMLSelectElement>('chatBrowser'),
+    config.ui.chatBrowser ?? 'chrome',
+    previousState?.config.ui.chatBrowser ?? 'chrome'
+  );
   applyChecked($<HTMLInputElement>('autoConnect'), config.ui.autoConnect, previousState?.config.ui.autoConnect);
   applyChecked(
     $<HTMLInputElement>('minimizeToTray'),
@@ -1590,6 +1599,7 @@ for (const id of [
   'autoConnect',
   'minimizeToTray',
   'privacyScreenshots',
+  'chatBrowser',
   'tunnelKind',
   'tunnelId',
   'desktopTunnelId',
@@ -1615,6 +1625,9 @@ async function refresh(): Promise<void> {
 }
 
 buildGroups();
+initSidebarResize();
+initBrowserPreferences();
+initChatModels();
 initPlugins(apply);
 initChat({ save: () => save(), state: () => state });
 initControlCenter(api);
