@@ -65,6 +65,9 @@ export class PluginManager {
   private closing = false;
   private connecting = new Map<Client, StdioClientTransport | undefined>();
   private authenticating = new Map<string, { controller: AbortController; promise: Promise<void> }>();
+  private committedRecords: RecordEntry[] = [];
+  private enabledPolicyGeneration = new Map<string, number>();
+  private toolPolicyGeneration = new Map<string, number>();
   onChanged(listener: () => void): () => void {
     this.listeners.add(listener);
     return () => this.listeners.delete(listener);
@@ -81,20 +84,33 @@ export class PluginManager {
     return next;
   }
   private async save(): Promise<void> {
-    await writeDurableNow('plugins', this.records);
+    // A durable generation must describe the state at the instant the transaction attempts
+    // to commit. Never hand durable.ts a mutable records array whose later mutations could
+    // change the meaning of a queued retry.
+    const snapshot = structuredClone(this.records);
+    await writeDurableNow('plugins', snapshot);
+    this.committedRecords = snapshot;
+  }
+  /** Replace a failed durable generation with the current safe in-memory state, even if storage is still unavailable. */
+  private async supersedeFailedSave(): Promise<void> {
+    await this.save().catch(() => undefined);
   }
   async initialize(userDataDir: string): Promise<void> {
     this.root = path.join(userDataDir, 'plugins');
     this.closing = false;
     await fs.mkdir(this.root, { recursive: true });
     const stored = await readDurable<RecordEntry[]>('plugins');
-    this.records = Array.isArray(stored) && stored.length <= 24
+    const restored = Array.isArray(stored) && stored.length <= 24
       ? stored.filter(p => this.validRecord(p)).map(p => {
         const { tools: _legacyTools, ...record } = p as RecordEntry & { tools?: unknown };
         const catalog = this.validCatalog(record.catalog);
-        return { ...record, catalog, status: record.enabled ? 'connecting' : 'disabled' };
+        return { ...record, catalog };
       })
       : [];
+    this.committedRecords = structuredClone(restored);
+    this.records = restored.map((record) => ({ ...record, status: record.enabled ? 'connecting' : 'disabled' }));
+    this.enabledPolicyGeneration.clear();
+    this.toolPolicyGeneration.clear();
     this.changed();
     // Installation + enabled policy owns the runtime. Restore connections in the
     // background so slow external servers never delay the app's first window.
@@ -267,6 +283,14 @@ export class PluginManager {
       }
     }
   }
+  private nextPolicyGeneration(store: Map<string, number>, id: string): number {
+    const generation = (store.get(id) ?? 0) + 1;
+    store.set(id, generation);
+    return generation;
+  }
+  private committedRow(id: string): RecordEntry | undefined {
+    return this.committedRecords.find((row) => row.id === id);
+  }
   install(request: PluginInstallRequest): Promise<PluginSnapshot> {
     return this.serial('install', async () => {
       if (this.closing) throw new Error('Plugins are shutting down');
@@ -316,6 +340,7 @@ export class PluginManager {
           await this.save();
         } catch (e) {
           this.records = this.records.filter((p) => p !== row);
+          await this.supersedeFailedSave();
           throw e;
         }
         await this.connect(row);
@@ -342,6 +367,11 @@ export class PluginManager {
         oldName = row.name;
       const oldSecrets = await this.credentials(row);
       try {
+        if (patch.credentials && !patch.source) {
+          const effectiveKeys = new Set(row.credentialKeys);
+          for (const [key, value] of Object.entries(patch.credentials)) value ? effectiveKeys.add(key) : effectiveKeys.delete(key);
+          this.validateCredentialLaunchTemplates(row.launch, [...effectiveKeys]);
+        }
         await this.storeCredentials(row, patch.credentials);
         if (patch.source) {
           await this.replace(row, patch.source, patch.config ?? row.config);
@@ -359,6 +389,7 @@ export class PluginManager {
         row.config = oldConfig;
         row.name = oldName;
         await this.disconnect(row);
+        await this.supersedeFailedSave();
         if (row.enabled) await this.connect(row);
         throw e;
       }
@@ -417,6 +448,7 @@ export class PluginManager {
       // Installation rollback must not undo a newer user policy request.
       Object.assign(row, old, { enabled: row.enabled, disabledTools: row.disabledTools });
       await fs.rm(directory, { recursive: true, force: true });
+      await this.supersedeFailedSave();
       if (row.enabled) await this.connect(row);
       throw new Error(`Update rolled back: ${String(this.redact((e as Error).message))}`);
     }
@@ -425,6 +457,7 @@ export class PluginManager {
   }
   setEnabled(id: string, enabled: boolean): Promise<PluginSnapshot> {
     const row = this.row(id);
+    const generation = this.nextPolicyGeneration(this.enabledPolicyGeneration, id);
     // The record is the live policy authority, including while lifecycle work is queued.
     row.enabled = enabled;
     // Revocation retires the current identity now, even while an update downloads
@@ -433,28 +466,64 @@ export class PluginManager {
     void retirement.catch(() => undefined);
     this.changed();
     return this.serial(id, async () => {
-      await retirement;
-      await this.disconnect(row);
-      await this.save();
-      if (row.enabled && this.records.includes(row)) await this.connect(row);
-      this.changed();
-      return this.snapshot();
+      try {
+        await retirement;
+        await this.disconnect(row);
+        await this.save();
+        if (row.enabled && this.records.includes(row)) await this.connect(row);
+        this.changed();
+        return this.snapshot();
+      } catch (error) {
+        // Equality is not enough here: Off -> On -> Off makes an old Off look current.
+        // Only the newest request may roll back, and it rolls back to the last state that
+        // actually committed rather than to an intermediate optimistic in-memory value.
+        if (this.enabledPolicyGeneration.get(id) === generation && this.records.includes(row)) {
+          const committed = this.committedRow(id);
+          if (committed) {
+            row.enabled = committed.enabled;
+            row.status = committed.status;
+            row.error = committed.error;
+          }
+          await this.disconnect(row);
+          await this.supersedeFailedSave();
+          if (committed?.enabled && committed.status === 'ready') await this.connect(row);
+          else {
+            row.status = committed?.enabled ? committed.status : 'disabled';
+            row.error = committed?.error;
+          }
+          this.changed();
+        }
+        throw error;
+      }
     });
   }
   setToolEnabled(id: string, name: string, enabled: boolean): Promise<PluginSnapshot> {
     const row = this.row(id);
     if (!row.catalog.some((t) => t.name === name)) throw new Error('Tool not found');
+    const generation = this.nextPolicyGeneration(this.toolPolicyGeneration, id);
     row.disabledTools = row.disabledTools.filter((n) => n !== name);
     if (!enabled) row.disabledTools.push(name);
     this.changed();
     return this.serial(id, async () => {
-      await this.save();
-      this.changed();
-      return this.snapshot();
+      try {
+        await this.save();
+        this.changed();
+        return this.snapshot();
+      } catch (error) {
+        if (this.toolPolicyGeneration.get(id) === generation && this.records.includes(row)) {
+          const committed = this.committedRow(id);
+          if (committed) row.disabledTools = [...committed.disabledTools];
+          await this.supersedeFailedSave();
+          this.changed();
+        }
+        throw error;
+      }
     });
   }
   uninstall(id: string): Promise<PluginSnapshot> {
     const row = this.row(id);
+    const generation = this.nextPolicyGeneration(this.enabledPolicyGeneration, id),
+      oldIndex = this.records.indexOf(row);
     row.enabled = false;
     const retirement = this.disconnect(row);
     void retirement.catch(() => undefined);
@@ -466,12 +535,31 @@ export class PluginManager {
       try {
         await this.save();
       } catch (e) {
-        this.records.push(row);
+        if (this.enabledPolicyGeneration.get(id) === generation) {
+          const committed = this.committedRow(id);
+          if (committed) {
+            if (!this.records.includes(row)) this.records.splice(Math.min(oldIndex, this.records.length), 0, row);
+            row.enabled = committed.enabled;
+            row.disabledTools = [...committed.disabledTools];
+            row.status = committed.status;
+            row.error = committed.error;
+            await this.disconnect(row);
+            await this.supersedeFailedSave();
+            if (committed.enabled && committed.status === 'ready') await this.connect(row);
+            else {
+              row.status = committed.enabled ? committed.status : 'disabled';
+              row.error = committed.error;
+            }
+            this.changed();
+          }
+        }
         throw e;
       }
       for (const key of row.credentialKeys) await clearSecret(`plugin:${id}:${key}`);
       await clearPluginOAuth(id);
       await fs.rm(path.join(this.root, id), { recursive: true, force: true });
+      this.enabledPolicyGeneration.delete(id);
+      this.toolPolicyGeneration.delete(id);
       this.changed();
       return this.snapshot();
     });
@@ -816,7 +904,12 @@ export class PluginManager {
       for (const block of result.content)
         if (block.type === 'image') {
           const data = Buffer.from(block.data, 'base64');
-          const info = await sharp(data, { limitInputPixels: 36000000 }).metadata();
+          let info: Awaited<ReturnType<ReturnType<typeof sharp>['metadata']>>;
+          try {
+            info = await sharp(data, { limitInputPixels: 36000000 }).metadata();
+          } catch {
+            return errorResult('PLUGIN_IMAGE_INVALID: Image bytes could not be safely decoded.');
+          }
           if (!info.width || !info.height || info.width * info.height > 36000000)
             return errorResult('PLUGIN_IMAGE_TOO_LARGE: Image exceeds the decoded-pixel limit.');
           if (block.mimeType !== `image/${info.format === 'svg' ? 'svg+xml' : info.format}`)

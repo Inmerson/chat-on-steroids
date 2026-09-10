@@ -52,7 +52,8 @@ export async function extractBundle(input: string, directory: string): Promise<u
   const zip = await fs.readFile(input);
   let total = 0,
     entries = 0;
-  const seen = new Map<string, { name: string; size: number; mode: number }>();
+  const seen = new Map<string, { name: string; size: number; mode: number; compressedSize: number; localStart: number; localEnd: number }>();
+  const localRanges: Array<{ start: number; end: number }> = [];
   let end = -1;
   for (let i = zip.length - 22; i >= Math.max(0, zip.length - 65557); i--)
     if (zip.readUInt32LE(i) === 0x06054b50 && i + 22 + zip.readUInt16LE(i + 20) === zip.length) {
@@ -74,8 +75,18 @@ export async function extractBundle(input: string, directory: string): Promise<u
   let i = centralOffset;
   for (let index = 0; index < count; index++) {
     if (i + 46 > end || zip.readUInt32LE(i) !== 0x02014b50) throw new Error('Invalid MCPB central directory');
-    const size = zip.readUInt32LE(i + 24),
-      length = zip.readUInt16LE(i + 28);
+    const flags = zip.readUInt16LE(i + 8),
+      method = zip.readUInt16LE(i + 10),
+      crc = zip.readUInt32LE(i + 16),
+      compressedSize = zip.readUInt32LE(i + 20),
+      size = zip.readUInt32LE(i + 24),
+      length = zip.readUInt16LE(i + 28),
+      extraLength = zip.readUInt16LE(i + 30),
+      commentLength = zip.readUInt16LE(i + 32),
+      localStart = zip.readUInt32LE(i + 42),
+      centralEnd = i + 46 + length + extraLength + commentLength;
+    if (centralEnd > end || compressedSize === 0xffffffff || localStart === 0xffffffff || ![0, 8].includes(method))
+      throw new Error('Invalid MCPB ZIP entry metadata');
     const name = zip.subarray(i + 46, i + 46 + length).toString('utf8');
     const mode = zip.readUInt32LE(i + 38) >>> 16;
     if (
@@ -86,16 +97,48 @@ export async function extractBundle(input: string, directory: string): Promise<u
     )
       throw new Error('MCPB contains an unsafe archive path or symbolic link');
     const key = name.toLowerCase();
-    if (seen.has(key) || zip.readUInt16LE(i + 8) & 1)
+    if (seen.has(key) || flags & 1)
       throw new Error('MCPB contains duplicate paths or encrypted files');
-    seen.set(key, { name, size, mode });
+    if (localStart + 30 > centralOffset || zip.readUInt32LE(localStart) !== 0x04034b50)
+      throw new Error('Invalid MCPB local header offset');
+    const localFlags = zip.readUInt16LE(localStart + 6),
+      localMethod = zip.readUInt16LE(localStart + 8),
+      localNameLength = zip.readUInt16LE(localStart + 26),
+      localExtraLength = zip.readUInt16LE(localStart + 28),
+      dataStart = localStart + 30 + localNameLength + localExtraLength,
+      dataEnd = dataStart + compressedSize;
+    if (localFlags !== flags || localMethod !== method || dataStart > centralOffset || dataEnd > centralOffset)
+      throw new Error('Invalid MCPB local header range');
+    const centralNameBytes = zip.subarray(i + 46, i + 46 + length),
+      localNameBytes = zip.subarray(localStart + 30, localStart + 30 + localNameLength);
+    if (localNameLength !== length || !centralNameBytes.equals(localNameBytes))
+      throw new Error('Invalid MCPB local header name');
+    let localEnd = dataEnd;
+    if (flags & 8) {
+      const descriptorWithSignature = dataEnd + 16 <= centralOffset && zip.readUInt32LE(dataEnd) === 0x08074b50 &&
+        zip.readUInt32LE(dataEnd + 4) === crc && zip.readUInt32LE(dataEnd + 8) === compressedSize && zip.readUInt32LE(dataEnd + 12) === size;
+      const descriptorWithoutSignature = dataEnd + 12 <= centralOffset && zip.readUInt32LE(dataEnd) === crc &&
+        zip.readUInt32LE(dataEnd + 4) === compressedSize && zip.readUInt32LE(dataEnd + 8) === size;
+      if (descriptorWithSignature) localEnd = dataEnd + 16;
+      else if (descriptorWithoutSignature) localEnd = dataEnd + 12;
+      else throw new Error('Invalid MCPB data descriptor');
+    } else if (
+      zip.readUInt32LE(localStart + 14) !== crc ||
+      zip.readUInt32LE(localStart + 18) !== compressedSize ||
+      zip.readUInt32LE(localStart + 22) !== size
+    ) throw new Error('Invalid MCPB local header size or checksum');
+    seen.set(key, { name, size, mode, compressedSize, localStart, localEnd });
+    localRanges.push({ start: localStart, end: localEnd });
     total += size;
     entries++;
     if (total > MAX_BUNDLE_BYTES || entries > 10000 || size === 0xffffffff)
       throw new Error('MCPB extraction limit exceeded');
-    i += 46 + length + zip.readUInt16LE(i + 30) + zip.readUInt16LE(i + 32);
+    i = centralEnd;
   }
   if (!entries || i !== end) throw new Error('MCPB is not a supported ZIP archive');
+  localRanges.sort((a, b) => a.start - b.start);
+  for (let index = 1; index < localRanges.length; index++)
+    if (localRanges[index - 1]!.end > localRanges[index]!.start) throw new Error('MCPB contains overlapping compressed entry ranges');
   for (const { name } of seen.values()) {
     const parts = name.replace(/\/$/, '').split('/');
     for (let n = 1; n < parts.length; n++)

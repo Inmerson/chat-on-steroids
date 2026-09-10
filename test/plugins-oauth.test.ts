@@ -7,6 +7,7 @@ vi.mock('../src/main/secrets.js', () => ({
   setSecret: vi.fn(async (key: string, value: string) => { stored.set(key, value); }),
   clearSecret: vi.fn(async (key: string) => { stored.delete(key); }),
 }));
+import { setSecret } from '../src/main/secrets.js';
 import { PluginOAuth, PluginNeedsAuth, PluginOAuthSetupError, clearPluginOAuth } from '../src/main/plugins/oauth.js';
 
 const endpoint = new URL('https://tools.example/mcp');
@@ -117,4 +118,22 @@ it.each(['cancel', 'timeout'] as const)('retires the callback and pending browse
   await rejected;
   await expect(fetch(url.searchParams.get('redirect_uri')!)).rejects.toThrow();
   expect(stored.get('plugin:one:oauth:state')).not.toContain('access-private-token');
+});
+
+it('removes a token write that was already inside setSecret when cancellation retired the provider', async () => {
+  const providerController = new AbortController();
+  const provider = await load(authority().fetcher, 'one', endpoint, providerController.signal);
+  let release!: () => void;
+  const blocked = new Promise<void>(resolve => { release = resolve; });
+  vi.mocked(setSecret).mockClear();
+  vi.mocked(setSecret).mockImplementationOnce(async (key, value) => {
+    await blocked;
+    stored.set(key, value);
+  });
+  const writing = provider.saveTokens({ access_token: 'blocked-private-token', token_type: 'Bearer', issuer });
+  await vi.waitFor(() => expect(vi.mocked(setSecret)).toHaveBeenCalledTimes(1));
+  providerController.abort();
+  release();
+  await expect(writing).rejects.toThrow();
+  expect(stored.get('plugin:one:oauth:state') ?? '').not.toContain('blocked-private-token');
 });

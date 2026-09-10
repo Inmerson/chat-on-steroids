@@ -20,7 +20,19 @@ type Credentials = {
 };
 type OpenAuthorization = (url: URL) => Promise<void>;
 const secretKey = (id: string): `plugin:${string}` => `plugin:${id}:oauth:state`;
-export const clearPluginOAuth = (id: string): Promise<void> => clearSecret(secretKey(id));
+const secretTransactions = new Map<string, Promise<void>>();
+async function withSecretTransaction<T>(key: string, operation: () => Promise<T>): Promise<T> {
+  const previous = secretTransactions.get(key) ?? Promise.resolve();
+  const next = previous.catch(() => undefined).then(operation);
+  const settled = next.then(() => undefined, () => undefined);
+  secretTransactions.set(key, settled);
+  void settled.finally(() => { if (secretTransactions.get(key) === settled) secretTransactions.delete(key); });
+  return next;
+}
+export const clearPluginOAuth = (id: string): Promise<void> => {
+  const key = secretKey(id);
+  return withSecretTransaction(key, () => clearSecret(key));
+};
 
 /** One installation + exact endpoint owns its encrypted OAuth credentials.
  * SDK owns discovery, issuer/resource validation, DCR, PKCE and token exchange.
@@ -58,7 +70,8 @@ export class PluginOAuth implements OAuthClientProvider {
   static async load(id: string, endpoint: URL, signal: AbortSignal, fetcher: typeof fetch, secret: (value: string) => void): Promise<PluginOAuth> {
     const provider = new PluginOAuth(id, endpoint, signal, fetcher, secret);
     try {
-      const raw = await getSecret(secretKey(id));
+      const key = secretKey(id);
+      const raw = await withSecretTransaction(key, () => getSecret(key));
       provider.check();
       if (raw && raw.length <= 131072) {
         const value = JSON.parse(raw) as Credentials;
@@ -87,8 +100,23 @@ export class PluginOAuth implements OAuthClientProvider {
     this.check(); this.rememberSecrets();
     const value = JSON.stringify(this.data);
     if (value.length > 131072) throw new Error('OAuth credential response is too large.');
-    await setSecret(secretKey(this.id), value);
-    this.check();
+    const key = secretKey(this.id);
+    await withSecretTransaction(key, async () => {
+      this.check();
+      const previous = await getSecret(key);
+      this.check();
+      await setSecret(key, value);
+      if (this.controller.signal.aborted) {
+        // setSecret itself is not cancellable. While this key is serialized, roll back
+        // an already-committed retired write before any newer auth transaction may use it.
+        const current = await getSecret(key);
+        if (current === value) {
+          if (previous === null) await clearSecret(key);
+          else await setSecret(key, previous);
+        }
+      }
+      this.check();
+    });
   }
   get redirectUrl(): string { return this.interactive?.redirectUri ?? this.data.redirectUri ?? 'http://127.0.0.1:1/oauth/callback'; }
   get clientMetadata() {

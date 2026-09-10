@@ -20,6 +20,29 @@ const manifest = {
   license: 'MIT',
   server: { type: 'node', entry_point: 'server.js', mcp_config: { command: 'node', args: ['${__dirname}/server.js'] } },
 };
+function zipEntries(bytes: Uint8Array) {
+  const zip = Buffer.from(bytes);
+  let end = -1;
+  for (let i = zip.length - 22; i >= 0; i--) if (zip.readUInt32LE(i) === 0x06054b50) { end = i; break; }
+  if (end < 0) throw new Error('test ZIP has no EOCD');
+  const count = zip.readUInt16LE(end + 10);
+  let central = zip.readUInt32LE(end + 16);
+  const entries = new Map<string, { central: number; local: number; compressedSize: number; size: number }>();
+  for (let index = 0; index < count; index++) {
+    const nameLength = zip.readUInt16LE(central + 28);
+    const extraLength = zip.readUInt16LE(central + 30);
+    const commentLength = zip.readUInt16LE(central + 32);
+    const name = zip.subarray(central + 46, central + 46 + nameLength).toString('utf8');
+    entries.set(name, {
+      central,
+      local: zip.readUInt32LE(central + 42),
+      compressedSize: zip.readUInt32LE(central + 20),
+      size: zip.readUInt32LE(central + 24),
+    });
+    central += 46 + nameLength + extraLength + commentLength;
+  }
+  return { zip, entries };
+}
 it('imports and validates a real MCPB ZIP with upstream schema tooling', async () => {
   const file = path.join(dir, 'fixture.mcpb');
   await fs.writeFile(
@@ -45,6 +68,33 @@ it('rejects file/directory collisions and malformed manifests', async () => {
   const file = path.join(dir, 'bad.mcpb');
   await fs.writeFile(file, zipSync({ 'manifest.json': strToU8('{}'), a: strToU8('file'), 'a/b': strToU8('nested') }));
   await expect(extractBundle(file, path.join(dir, 'extracted'))).rejects.toThrow('collision');
+});
+it('rejects central-directory entries that alias another local compressed range', async () => {
+  const file = path.join(dir, 'aliased-range.mcpb');
+  const { zip, entries } = zipEntries(zipSync({
+    'manifest.json': strToU8(JSON.stringify(manifest)),
+    'a.txt': strToU8('A'),
+    'b.txt': strToU8('B'),
+  }, { level: 0 }));
+  const a = entries.get('a.txt')!, b = entries.get('b.txt')!;
+  expect(a.compressedSize).toBe(b.compressedSize);
+  expect(a.size).toBe(b.size);
+  zip.writeUInt32LE(a.local, b.central + 42);
+  await fs.writeFile(file, zip);
+  await expect(extractBundle(file, path.join(dir, 'extracted'))).rejects.toThrow(/local|range|overlap/i);
+  await expect(fs.stat(path.join(dir, 'extracted'))).rejects.toThrow();
+});
+it('rejects a local header whose compressed size disagrees with the central directory', async () => {
+  const file = path.join(dir, 'local-size-mismatch.mcpb');
+  const { zip, entries } = zipEntries(zipSync({
+    'manifest.json': strToU8(JSON.stringify(manifest)),
+    'a.txt': strToU8('A'),
+  }, { level: 0 }));
+  const a = entries.get('a.txt')!;
+  zip.writeUInt32LE(a.compressedSize + 1, a.local + 18);
+  await fs.writeFile(file, zip);
+  await expect(extractBundle(file, path.join(dir, 'extracted'))).rejects.toThrow(/local|size|header/i);
+  await expect(fs.stat(path.join(dir, 'extracted'))).rejects.toThrow();
 });
 it('resolves known GitHub recipes and explains unknown repositories', () => {
   expect(resolveGithub({ kind: 'github', url: 'https://github.com/ahujasid/blender-mcp' }).package).toBe('blender-mcp');
