@@ -46,6 +46,30 @@ const boundedFetch: typeof fetch = async (input, init) => {
   );
   return new Response(body, { status: response.status, statusText: response.statusText, headers: response.headers });
 };
+const HEIF_MIME_TYPES = new Set([
+  'image/avif', 'image/avif-sequence', 'image/heic', 'image/heic-sequence', 'image/heif', 'image/heif-sequence',
+]);
+const HEIF_BRANDS = new Set([
+  'avif', 'avis', 'heic', 'heix', 'hevc', 'hevx', 'heim', 'heis', 'hevm', 'hevs', 'mif1', 'msf1',
+]);
+/** Reject libheif-routed ISO BMFF images in JS before any sharp/native parser sees their bytes. */
+function isHeifFamilyImage(data: Buffer): boolean {
+  if (data.length < 16 || data.toString('ascii', 4, 8) !== 'ftyp') return false;
+  const size = data.readUInt32BE(0);
+  let brandOffset = 8,
+    end = size === 0 ? data.length : Math.min(size, data.length);
+  if (size === 1) {
+    if (data.length < 24) return false;
+    const extended = data.readBigUInt64BE(8);
+    brandOffset = 16;
+    end = extended > BigInt(data.length) ? data.length : Number(extended);
+  }
+  if (end < brandOffset + 8) return false;
+  if (HEIF_BRANDS.has(data.toString('ascii', brandOffset, brandOffset + 4))) return true;
+  for (let offset = brandOffset + 8; offset + 4 <= end; offset += 4)
+    if (HEIF_BRANDS.has(data.toString('ascii', offset, offset + 4))) return true;
+  return false;
+}
 
 /** Installation policy owns connections; lifecycle mutations serialize per installation. */
 export class PluginManager {
@@ -67,7 +91,8 @@ export class PluginManager {
   private authenticating = new Map<string, { controller: AbortController; promise: Promise<void> }>();
   private committedRecords: RecordEntry[] = [];
   private enabledPolicyGeneration = new Map<string, number>();
-  private toolPolicyGeneration = new Map<string, number>();
+  private toolPolicyGeneration = new Map<string, Map<string, number>>();
+  private durableQueue: Promise<void> = Promise.resolve();
   onChanged(listener: () => void): () => void {
     this.listeners.add(listener);
     return () => this.listeners.delete(listener);
@@ -83,17 +108,44 @@ export class PluginManager {
     void settled.finally(() => { if (this.queues.get(id) === settled) this.queues.delete(id); });
     return next;
   }
-  private async save(): Promise<void> {
-    // A durable generation must describe the state at the instant the transaction attempts
-    // to commit. Never hand durable.ts a mutable records array whose later mutations could
-    // change the meaning of a queued retry.
-    const snapshot = structuredClone(this.records);
-    await writeDurableNow('plugins', snapshot);
-    this.committedRecords = snapshot;
+  private durable<T>(operation: () => Promise<T>): Promise<T> {
+    const next = this.durableQueue.catch(() => undefined).then(operation);
+    this.durableQueue = next.then(() => undefined, () => undefined);
+    return next;
   }
-  /** Replace a failed durable generation with the current safe in-memory state, even if storage is still unavailable. */
+  private async save(id: string): Promise<void> {
+    await this.durable(async () => {
+      // Build each generation from durable truth plus only this plugin's transaction.
+      // Another plugin may already have optimistic in-memory policy that must not leak in.
+      const snapshot = structuredClone(this.committedRecords);
+      const index = snapshot.findIndex(row => row.id === id);
+      const current = this.records.find(row => row.id === id);
+      if (current) {
+        const value = structuredClone(current);
+        if (index < 0) snapshot.push(value);
+        else snapshot[index] = value;
+      } else if (index >= 0) snapshot.splice(index, 1);
+      await writeDurableNow('plugins', snapshot);
+      this.committedRecords = snapshot;
+    });
+  }
+  private async saveToolPolicy(id: string, name: string): Promise<void> {
+    await this.durable(async () => {
+      const snapshot = structuredClone(this.committedRecords);
+      const committed = snapshot.find(row => row.id === id);
+      const current = this.records.find(row => row.id === id);
+      if (!committed || !current) throw new Error('Plugin not found');
+      committed.disabledTools = committed.disabledTools.filter(tool => tool !== name);
+      if (current.disabledTools.includes(name)) committed.disabledTools.push(name);
+      await writeDurableNow('plugins', snapshot);
+      this.committedRecords = snapshot;
+    });
+  }
+  /** Supersede a failed durable generation with durable truth, never unrelated optimistic state. */
   private async supersedeFailedSave(): Promise<void> {
-    await this.save().catch(() => undefined);
+    await this.durable(async () => {
+      await writeDurableNow('plugins', structuredClone(this.committedRecords));
+    }).catch(() => undefined);
   }
   async initialize(userDataDir: string): Promise<void> {
     this.root = path.join(userDataDir, 'plugins');
@@ -288,6 +340,13 @@ export class PluginManager {
     store.set(id, generation);
     return generation;
   }
+  private nextToolPolicyGeneration(id: string, name: string): number {
+    let tools = this.toolPolicyGeneration.get(id);
+    if (!tools) { tools = new Map(); this.toolPolicyGeneration.set(id, tools); }
+    const generation = (tools.get(name) ?? 0) + 1;
+    tools.set(name, generation);
+    return generation;
+  }
   private committedRow(id: string): RecordEntry | undefined {
     return this.committedRecords.find((row) => row.id === id);
   }
@@ -337,7 +396,7 @@ export class PluginManager {
         await this.storeCredentials(row, request.credentials);
         this.records.push(row);
         try {
-          await this.save();
+          await this.save(row.id);
         } catch (e) {
           this.records = this.records.filter((p) => p !== row);
           await this.supersedeFailedSave();
@@ -379,7 +438,7 @@ export class PluginManager {
           await this.disconnect(row);
           row.config = patch.config ?? row.config;
           if (patch.name) row.name = patch.name.slice(0, 100);
-          await this.save();
+          await this.save(row.id);
           if (row.enabled) await this.connect(row);
         }
       } catch (e) {
@@ -442,7 +501,7 @@ export class PluginManager {
         await this.connect(row);
         if (row.status !== 'ready' && row.status !== 'needs-auth') throw new Error(row.error ?? 'New server did not become ready');
       }
-      await this.save();
+      await this.save(row.id);
     } catch (e) {
       await this.disconnect(row);
       // Installation rollback must not undo a newer user policy request.
@@ -469,7 +528,7 @@ export class PluginManager {
       try {
         await retirement;
         await this.disconnect(row);
-        await this.save();
+        await this.save(row.id);
         if (row.enabled && this.records.includes(row)) await this.connect(row);
         this.changed();
         return this.snapshot();
@@ -500,19 +559,20 @@ export class PluginManager {
   setToolEnabled(id: string, name: string, enabled: boolean): Promise<PluginSnapshot> {
     const row = this.row(id);
     if (!row.catalog.some((t) => t.name === name)) throw new Error('Tool not found');
-    const generation = this.nextPolicyGeneration(this.toolPolicyGeneration, id);
+    const generation = this.nextToolPolicyGeneration(id, name);
     row.disabledTools = row.disabledTools.filter((n) => n !== name);
     if (!enabled) row.disabledTools.push(name);
     this.changed();
     return this.serial(id, async () => {
       try {
-        await this.save();
+        await this.saveToolPolicy(id, name);
         this.changed();
         return this.snapshot();
       } catch (error) {
-        if (this.toolPolicyGeneration.get(id) === generation && this.records.includes(row)) {
+        if (this.toolPolicyGeneration.get(id)?.get(name) === generation && this.records.includes(row)) {
           const committed = this.committedRow(id);
-          if (committed) row.disabledTools = [...committed.disabledTools];
+          row.disabledTools = row.disabledTools.filter(tool => tool !== name);
+          if (committed?.disabledTools.includes(name)) row.disabledTools.push(name);
           await this.supersedeFailedSave();
           this.changed();
         }
@@ -533,7 +593,7 @@ export class PluginManager {
       await retirement;
       await this.disconnect(row);
       try {
-        await this.save();
+        await this.save(id);
       } catch (e) {
         if (this.enabledPolicyGeneration.get(id) === generation) {
           const committed = this.committedRow(id);
@@ -821,7 +881,7 @@ export class PluginManager {
             if (this.live.get(row.id) !== live) return;
             live.tools = refreshed;
             this.publishTools(row, refreshed);
-            await this.save();
+            await this.save(row.id);
           } catch {
             if (this.live.get(row.id) !== live) return;
             if (live.users === 0) await this.disconnect(row);
@@ -844,7 +904,7 @@ export class PluginManager {
         /* Transport errors are deliberately not logged: they may contain headers or credentials. */
       };
       this.publishTools(row, tools);
-      await this.save();
+      await this.save(row.id);
     } catch (e) {
       oauth?.dispose();
       if (this.live.get(row.id)?.client === client) this.live.delete(row.id);
@@ -904,6 +964,9 @@ export class PluginManager {
       for (const block of result.content)
         if (block.type === 'image') {
           const data = Buffer.from(block.data, 'base64');
+          const declaredMime = block.mimeType.split(';', 1)[0]!.trim().toLowerCase();
+          if (HEIF_MIME_TYPES.has(declaredMime) || isHeifFamilyImage(data))
+            return errorResult('PLUGIN_IMAGE_INVALID: HEIF/AVIF plugin images are not accepted.');
           let info: Awaited<ReturnType<ReturnType<typeof sharp>['metadata']>>;
           try {
             info = await sharp(data, { limitInputPixels: 36000000 }).metadata();

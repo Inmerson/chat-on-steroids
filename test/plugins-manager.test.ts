@@ -26,17 +26,17 @@ const fixture = `const readline=require('node:readline');
 const tools=[{name:'Echo.Mixed',description:'Echo fixture',inputSchema:{type:'object',properties:{value:{type:'string'}},required:['value'],additionalProperties:false},annotations:{readOnlyHint:true,destructiveHint:false,openWorldHint:false},outputSchema:{type:'object',properties:{value:{type:'string'}},required:['value']}}];
 readline.createInterface({input:process.stdin}).on('line',line=>{const m=JSON.parse(line);if(m.id===undefined)return;let result;if(m.method==='initialize')result={protocolVersion:'2025-11-25',capabilities:{tools:{}},serverInfo:{name:'CoS test fixture',version:'1'}};else if(m.method==='tools/list')result={tools};else if(m.method==='tools/call')result={content:[{type:'text',text:process.env.TEST_SECRET||m.params.arguments.value}],structuredContent:{value:m.params.arguments.value},isError:m.params.arguments.value==='error'};else result={};process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:m.id,result})+'\\n');});`;
 let dir: string, manager: PluginManager, entry: string;
-function failNextPluginsDurableRename(): void {
+function failPluginsDurableRename(attemptToFail: number): void {
   const rename = fs.rename.bind(fs);
-  let failed = false;
+  let attempt = 0;
   vi.spyOn(fs, 'rename').mockImplementation(async (from, to) => {
-    if (!failed && String(to).endsWith(path.join('state', 'plugins.json'))) {
-      failed = true;
+    if (String(to).endsWith(path.join('state', 'plugins.json')) && ++attempt === attemptToFail) {
       throw Object.assign(new Error('deterministic plugins durable write failure'), { code: 'EIO' });
     }
     await rename(from, to);
   });
 }
+function failNextPluginsDurableRename(): void { failPluginsDurableRename(1); }
 beforeEach(async () => {
   dir = await makeTempDir('plugins-test-');
   initDurableStore(dir);
@@ -173,6 +173,50 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
     const result = await manager.call(manager.tools()[0]!.name, { value: 'safe' });
     expect(result).toMatchObject({ isError: true, content: [{ type: 'text', text: expect.stringContaining('PLUGIN_IMAGE_INVALID') }] });
     expect(JSON.stringify(result)).not.toContain(malformed);
+  });
+  it.each([
+    { label: 'declared AVIF MIME', mimeType: 'image/avif', brand: undefined },
+    { label: 'declared HEIF MIME', mimeType: 'image/heif', brand: undefined },
+    { label: 'AVIF byte signature', mimeType: 'image/png', brand: 'avif' },
+    { label: 'HEIF byte signature', mimeType: 'image/jpeg', brand: 'heic' },
+  ])('rejects $label before sharp/native metadata parsing', async ({ mimeType, brand }) => {
+    let bytes: Buffer;
+    if (brand) {
+      bytes = Buffer.alloc(24);
+      bytes.writeUInt32BE(bytes.length, 0);
+      bytes.write('ftyp', 4, 'ascii');
+      bytes.write(brand, 8, 'ascii');
+      bytes.writeUInt32BE(0, 12);
+      bytes.write('mif1', 16, 'ascii');
+      bytes.write(brand, 20, 'ascii');
+    } else {
+      bytes = await sharp({ create: { width: 1, height: 1, channels: 4, background: '#ffffff' } }).png().toBuffer();
+    }
+    const data = bytes.toString('base64');
+    await fs.writeFile(entry, fixture.replace(
+      "content:[{type:'text',text:process.env.TEST_SECRET||m.params.arguments.value}]",
+      `content:[{type:'image',mimeType:'${mimeType}',data:'${data}'}]`,
+    ));
+    await manager.install({ source: { kind: 'command', command: process.execPath, args: [entry] } });
+    const metadata = vi.spyOn((sharp as any).prototype, 'metadata');
+    const result = await manager.call(manager.tools()[0]!.name, { value: 'safe' });
+    expect(result).toMatchObject({ isError: true, content: [{ type: 'text', text: expect.stringContaining('PLUGIN_IMAGE_INVALID') }] });
+    expect(metadata).not.toHaveBeenCalled();
+  });
+  it.each(['png', 'jpeg', 'webp'] as const)('continues to validate and return safe %s plugin images', async format => {
+    const image = sharp({ create: { width: 1, height: 1, channels: 4, background: '#ffffff' } });
+    const bytes = await (format === 'png' ? image.png() : format === 'jpeg' ? image.jpeg() : image.webp()).toBuffer();
+    const data = bytes.toString('base64');
+    await fs.writeFile(entry, fixture.replace(
+      "content:[{type:'text',text:process.env.TEST_SECRET||m.params.arguments.value}]",
+      `content:[{type:'image',mimeType:'image/${format}',data:'${data}'}]`,
+    ));
+    await manager.install({ source: { kind: 'command', command: process.execPath, args: [entry] } });
+    const metadata = vi.spyOn((sharp as any).prototype, 'metadata');
+    const result = await manager.call(manager.tools()[0]!.name, { value: 'safe' });
+    expect(result).toMatchObject({ content: [{ type: 'image', mimeType: `image/${format}`, data }] });
+    expect(result.isError).not.toBe(true);
+    expect(metadata).toHaveBeenCalledTimes(1);
   });
   it('rejects plaintext configuration declared sensitive by a replacement bundle', async () => {
     const row = (await manager.install({ source: { kind: 'command', command: process.execPath, args: [entry] } })).plugins[0]!;
@@ -491,6 +535,28 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
     await flushDurable();
     expect(JSON.parse(await fs.readFile(path.join(dir, 'state', 'plugins.json'), 'utf8'))[0].enabled).toBe(true);
   });
+  it('keeps one plugin commit from persisting another plugin optimistic state and rolls the failed peer back', async () => {
+    const aEntry = path.join(dir, 'server-a.cjs');
+    const bEntry = path.join(dir, 'server-b.cjs');
+    await fs.writeFile(aEntry, fixture.replaceAll('Echo.Mixed', 'A.Echo'));
+    await fs.writeFile(bEntry, fixture.replaceAll('Echo.Mixed', 'B.Echo'));
+    const a = (await manager.install({ name: 'A', source: { kind: 'command', command: process.execPath, args: [aEntry] } })).plugins.find(plugin => plugin.name === 'A')!;
+    const b = (await manager.install({ name: 'B', source: { kind: 'command', command: process.execPath, args: [bEntry] } })).plugins.find(plugin => plugin.name === 'B')!;
+    failPluginsDurableRename(2);
+
+    const aCommit = manager.setToolEnabled(a.id, 'A.Echo', false);
+    const bFailed = manager.setToolEnabled(b.id, 'B.Echo', false);
+    await aCommit;
+    await expect(bFailed).rejects.toThrow('durable write failure');
+
+    expect(manager.snapshot().plugins.find(plugin => plugin.id === a.id)!.tools[0]).toMatchObject({ enabled: false, published: false });
+    expect(manager.snapshot().plugins.find(plugin => plugin.id === b.id)!.tools[0]).toMatchObject({ enabled: true, published: true });
+    expect(manager.tools().map(tool => tool.name)).toEqual(['B.Echo']);
+    await flushDurable();
+    const persisted = JSON.parse(await fs.readFile(path.join(dir, 'state', 'plugins.json'), 'utf8'));
+    expect(persisted.find((plugin: { id: string }) => plugin.id === a.id).disabledTools).toEqual(['A.Echo']);
+    expect(persisted.find((plugin: { id: string }) => plugin.id === b.id).disabledTools).toEqual([]);
+  });
   it('restores tool publication when setToolEnabled persistence fails', async () => {
     const row = (await manager.install({ source: { kind: 'command', command: process.execPath, args: [entry] } })).plugins[0]!;
     failNextPluginsDurableRename();
@@ -538,6 +604,27 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
     expect(manager.tools()).toEqual([]);
     await flushDurable();
     expect(JSON.parse(await fs.readFile(path.join(dir, 'state', 'plugins.json'), 'utf8'))[0].disabledTools).toEqual(['Echo.Mixed']);
+  });
+  it('does not let a later Tool B toggle suppress rollback of a failed Tool A toggle', async () => {
+    await fs.writeFile(entry, fixture.replace(
+      'const tools=[',
+      "const tools=[{name:'Echo.Second',description:'Second fixture',inputSchema:{type:'object'}},",
+    ));
+    const row = (await manager.install({ source: { kind: 'command', command: process.execPath, args: [entry] } })).plugins[0]!;
+    expect(row.tools.map(tool => tool.name).sort()).toEqual(['Echo.Mixed', 'Echo.Second']);
+    failNextPluginsDurableRename();
+
+    const failedA = manager.setToolEnabled(row.id, 'Echo.Mixed', false);
+    const laterB = manager.setToolEnabled(row.id, 'Echo.Second', false);
+    await expect(failedA).rejects.toThrow('durable write failure');
+    await laterB;
+
+    const tools = manager.snapshot().plugins[0]!.tools;
+    expect(tools.find(tool => tool.name === 'Echo.Mixed')).toMatchObject({ enabled: true, published: true });
+    expect(tools.find(tool => tool.name === 'Echo.Second')).toMatchObject({ enabled: false, published: false });
+    expect(manager.tools().map(tool => tool.name)).toEqual(['Echo.Mixed']);
+    await flushDurable();
+    expect(JSON.parse(await fs.readFile(path.join(dir, 'state', 'plugins.json'), 'utf8'))[0].disabledTools).toEqual(['Echo.Second']);
   });
   it('rejects credential-bearing URLs before persistence and secrets in plain configuration', async () => {
     await expect(
