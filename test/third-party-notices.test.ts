@@ -79,3 +79,10 @@ it('covers every reviewed catalog entry with hash-verified local notice material
     }
   }
 });
+
+
+it('preserves retained legal notice bytes across Git checkouts', async () => {
+  const attributes = await fs.readFile(path.join(process.cwd(), '.gitattributes'), 'utf8');
+  expect(attributes).toContain('docs/licenses/** -text -whitespace');
+  expect(attributes).toContain('THIRD-PARTY-NOTICES.txt -text -whitespace');
+});

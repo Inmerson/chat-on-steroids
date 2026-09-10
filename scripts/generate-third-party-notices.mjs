@@ -67,8 +67,5 @@ for (const entry of catalogLicenses) {
 }
 // Each CI host inventories its own optional native packages. Packaging regenerates the
 // shipped file on that host; comparing against another platform's text is not meaningful.
-if (!process.argv.includes('--check')) {
-  const rendered = notices.join('\n').replace(/[ \t]+$/gm, '').trimEnd() + '\n';
-  await fs.writeFile(path.join(root, 'THIRD-PARTY-NOTICES.txt'), rendered);
-}
+if (!process.argv.includes('--check')) await fs.writeFile(path.join(root, 'THIRD-PARTY-NOTICES.txt'), notices.join('\n'));
 console.log(`Validated license notices for ${count} production packages and ${catalogLicenses.length} catalog entries.`);
