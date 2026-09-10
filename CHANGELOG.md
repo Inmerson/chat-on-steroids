@@ -13,6 +13,57 @@ the app refuses the extension and asks you to reload the matching copy.
 
 No changes yet.
 
+## [2.2.0] — 2026-09-10
+
+2.2.0 is a selective upstream feature and resilience release built on the fork's 2.1.4 Core,
+Agent System 3.0, Control Center, and multi-device architecture. It adds browser/model discovery,
+durable file and image input, safe artifact downloads, workspace refinements, the completed Plugins
+platform, and a recovery/tunnel hardening pass without replacing fork-owned orchestration or
+permission boundaries.
+
+### Added
+- **Plugins workspace and Core-routed plugin surface.** Reviewed plugin catalogs, lifecycle and
+  configuration flow through Core, with bounded renderer/IPC surfaces, secret handling, license
+  inventory, and third-party notice verification.
+- **Browser choice and live ChatGPT model discovery.** Chrome, Edge, and Brave candidates can be
+  selected through the existing managed-browser lifecycle; startup/wake/layout helpers preserve
+  exact managed conversation ownership and the five-tab worker budget. The companion observes the
+  live ChatGPT model picker and projects model/reasoning state without inventing a static catalog.
+- **Durable text, image, and file input.** Inputs are staged through main-process boundaries,
+  retain exact session/conversation ownership across restart, and keep attachment source paths out
+  of model-visible history.
+- **Local artifact saving.** `download_artifact` is gated by the `saveArtifact` capability, accepts
+  trusted native ChatGPT/OpenAI file references, enforces approved destinations and bounded
+  streaming, and publishes with atomic no-overwrite semantics. It deliberately has no `device_id`,
+  so a remote path can never be reinterpreted as a local destination.
+- **Workspace refinements.** The existing fork workspace gains a collapsible/resizable sidebar,
+  sticky timeline behavior, browser/model controls, and safe tool-result/file presentation while
+  retaining Control Center, device/fleet, Core Health, and orchestration destinations.
+
+### Reliability and safety
+- Exact-conversation blocked-chat custody is durable and can refuse local tool calls until the user
+  explicitly releases that chat.
+- Session operations whose contract says "every session" use the uncapped durable summary catalog
+  rather than the UI-oriented bounded list.
+- OpenAI tunnel restarts are single-owner: a replacement waits for the process tree it replaces,
+  stale process output cannot control the new generation, and health/handshake state is not
+  inherited across restart. A single missed `/readyz` probe is confirmed on a second pass before
+  live in-flight work is terminated.
+- Structured tunnel warnings distinguish control-plane polling failures from local MCP probe errors,
+  multilingual access-limit verdicts propagate through recovery policy, and recorded mixed/RTL
+  answers preserve only bounded `ltr`/`rtl`/`auto` direction metadata.
+- Linux DEB release smoke teardown is best-effort and can no longer overwrite the actual product
+  smoke result with a cleanup failure.
+
+### Preserved fork behavior
+- Persistent Core Host/supervisor, Agent System 3.0 DAG/Manager authority, Control Center, durable
+  execution, Infinite Loop/scoped recovery, managed Agent/Execution browser ownership, authenticated
+  terminal continuation, multi-device registry/transport and explicit `device_id` routing remain
+  fork-owned and covered by the protected verification gate.
+- Upstream remains a source of individual capabilities, not an integration authority. The final
+  delta refresh found no newer upstream commit beyond `53d5aaa`; duplicate context/agent panes were
+  superseded by fork surfaces, and the heuristic usage/cost estimator was intentionally not ported.
+
 ## [2.1.4] — 2026-09-09
 
 2.1.4 adds the first release-ready multi-computer control plane while preserving Chat On Steroids'
