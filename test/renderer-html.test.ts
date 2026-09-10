@@ -56,4 +56,19 @@ describe('captured ChatGPT rendered HTML', () => {
     expect(rendered.querySelector('script')).toBeNull();
     expect(rendered.textContent).toBe('beforeafter');
   });
+
+  it('reads a right-to-left answer in its own direction', () => {
+    const rendered = renderedMessage('', 'مرحبا بالعالم');
+    expect(rendered.getAttribute('dir')).toBe('auto');
+  });
+
+  it('keeps the direction ChatGPT marked on a mixed-language answer', () => {
+    const rendered = renderedMessage('<p dir="rtl">مرحبا بالعالم</p><p dir="ltr">Hello world</p>', 'fallback');
+    expect([...rendered.querySelectorAll('p')].map((node) => node.getAttribute('dir'))).toEqual(['rtl', 'ltr']);
+  });
+
+  it('drops a direction value that is not one of the three allowed values', () => {
+    const rendered = renderedMessage('<p dir="javascript:alert(1)">text</p>', 'fallback');
+    expect(rendered.querySelector('p')!.hasAttribute('dir')).toBe(false);
+  });
 });

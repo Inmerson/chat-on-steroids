@@ -103,6 +103,8 @@ let detailFor: string | null = null;
 let detailCursor: number | null = null;
 /** The last swarm the app reported, so the header can summarise it without the log. */
 let swarm: SwarmState | null = null;
+/** Live Core-owned policy keyed by exact ChatGPT conversation id. */
+let blockedChats = new Set<string>();
 /** Badges the list is currently drawn with. See repaintBadges. */
 let badgeKey = '';
 
@@ -159,6 +161,7 @@ function sessionBadges(summary: SessionSummary): Badge[] {
   // The one session that is not a chat. Saying so on the row is what stops it reading
   // as a chat that mysteriously lost its name.
   if (summary.conversationId === null) return [{ text: 'not a chat', tone: '' }];
+  if (blockedChats.has(summary.conversationId)) badges.push({ text: 'blocked', tone: 'is-failed' });
   if (origin?.kind === 'worker') badges.push({ text: origin.agentId ?? 'worker', tone: '' });
   else if (origin?.kind === 'resume') badges.push({ text: 'resumed', tone: '' });
   else if (summary.agents.includes('prime')) badges.push({ text: 'prime', tone: '' });
@@ -216,6 +219,23 @@ function sessionRow(summary: SessionSummary): HTMLElement {
   bar.append(fill);
   bar.title = `~${compactNumber(summary.estimatedTokens)} rough context tokens from messages and tool I/O; transient progress is excluded`;
 
+  const actions = el('div', 'sess-actions');
+  if (summary.conversationId) {
+    const blocked = blockedChats.has(summary.conversationId);
+    const block = document.createElement('button');
+    block.className = `btn sess-action sess-block${blocked ? ' is-blocked' : ''}`;
+    block.type = 'button';
+    block.textContent = blocked ? 'Release' : 'Block';
+    block.title = blocked
+      ? 'Release this chat so its local tool calls can run again'
+      : 'Block this chat so every local tool call is refused until you release it';
+    block.addEventListener('click', (event) => {
+      event.stopPropagation();
+      void toggleSessionBlock(summary.id, !blocked);
+    });
+    actions.append(block);
+  }
+
   const remove = document.createElement('button');
   remove.className = 'btn sess-del';
   remove.type = 'button';
@@ -226,8 +246,16 @@ function sessionRow(summary: SessionSummary): HTMLElement {
     void deleteSession(summary.id);
   });
 
-  row.append(top, sub, bar, remove);
+  actions.append(remove);
+  row.append(top, sub, bar, actions);
   return row;
+}
+
+async function toggleSessionBlock(id: string, blocked: boolean): Promise<void> {
+  const next = await run(api.setSessionBlocked(id, blocked));
+  if (next === null) return;
+  blockedChats = new Set(next);
+  paintSessions();
 }
 
 async function deleteSession(id: string): Promise<void> {
@@ -280,6 +308,7 @@ async function loadSessions(): Promise<void> {
   }
   sessionTotal = typeof list.total === 'number' ? list.total : list.sessions.length;
   activeId = list.activeId;
+  blockedChats = new Set(list.blocked ?? []);
   if (loadedOlderSessions) {
     for (const entry of list.pressure) pressure.set(entry.id, entry);
   } else {
@@ -306,6 +335,7 @@ async function loadMoreSessions(): Promise<void> {
     loadedOlderSessions = true;
     sessionTotal = page.total;
     sessionPageCursor = page.nextCursor;
+    blockedChats = new Set(page.blocked ?? []);
     for (const entry of page.pressure) pressure.set(entry.id, entry);
     paintSessions();
   } finally {
@@ -432,6 +462,7 @@ async function loadHandoff(): Promise<void> {
 
 function textBlock(className: string, value: string, truncated: boolean, chars: number): HTMLElement {
   const node = el('p', className, value);
+  node.setAttribute('dir', 'auto');
   if (truncated) {
     node.append(el('span', 'cut', ` … cut, ${compactNumber(chars)} characters in the original`));
   }
@@ -468,6 +499,7 @@ function safeRenderedHref(value: string): string | null {
  */
 export function renderedMessage(html: string, fallback: string): HTMLElement {
   const box = el('div', 'msg rich');
+  box.setAttribute('dir', 'auto');
   const safeFallback = fallback.slice(0, MAX_RENDERED_HTML_CHARS);
   if (!html) {
     box.textContent = safeFallback;
@@ -499,7 +531,9 @@ export function renderedMessage(html: string, fallback: string): HTMLElement {
       const start = tagName === 'OL' ? element.getAttribute('start') : null;
       const colSpan = tagName === 'TD' || tagName === 'TH' ? element.getAttribute('colspan') : null;
       const rowSpan = tagName === 'TD' || tagName === 'TH' ? element.getAttribute('rowspan') : null;
+      const dir = element.getAttribute('dir')?.toLowerCase();
       for (const attribute of [...element.attributes]) element.removeAttribute(attribute.name);
+      if (dir === 'ltr' || dir === 'rtl' || dir === 'auto') element.setAttribute('dir', dir);
       if (href) {
         element.setAttribute('href', href);
         element.setAttribute('target', '_blank');

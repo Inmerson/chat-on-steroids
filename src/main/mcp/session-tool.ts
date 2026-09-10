@@ -14,7 +14,7 @@
 import { createHash } from 'node:crypto';
 import { z } from 'zod';
 import type { SessionEvent, SessionSummary, StoredText } from '../../shared/session.js';
-import { getSession, listAllSessions, readEvents } from '../session/store.js';
+import { getSession, readEverySummary, readEvents } from '../session/store.js';
 import { noteCount, noteDetail } from './call-context.js';
 import { expandStored, fail, friendlyError, guard, ok, type SurfaceRegistrar, type ToolResult } from './kernel.js';
 import {
@@ -395,7 +395,7 @@ async function searchSessions(queryInput?: string, cursorInput?: string): Promis
     offset = cursor.offset;
   }
 
-  const sessions = await listAllSessions();
+  const sessions = await readEverySummary();
   if (sessions.length === 0) return ok('No recorded sessions exist on this machine yet.');
   if (offset >= sessions.length) return ok('No older recorded sessions remain.\nsearch_complete: true');
 

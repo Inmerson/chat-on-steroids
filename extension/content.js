@@ -1944,7 +1944,13 @@
       const scope = error.turnId || '';
       if (!unreportedError(error, scope)) continue;
       markErrorReported(error, scope);
-      emit({ kind: 'chat_error', text: error.text, turnId: error.turnId || recordedTurn || undefined });
+      emit({
+        kind: 'chat_error',
+        text: error.text,
+        turnId: error.turnId || recordedTurn || undefined,
+        recoverable: error.recoverable === true,
+        blocking: error.blocking === true
+      });
     }
 
     // Last, so the next generation's idea of "what was already on the page" is this tick's

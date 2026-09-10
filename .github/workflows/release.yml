@@ -246,7 +246,15 @@ jobs:
         run: |
           set -euo pipefail
           deb_smoke_root="$(mktemp -d)"
-          trap 'rm -rf "$deb_smoke_root"' EXIT
+          cleanup_path_with_retries() {
+            target="$1"
+            for _attempt in 1 2 3 4 5; do
+              rm -rf "$target" 2>/dev/null && return 0
+              sleep 0.2
+            done
+            rm -rf "$target" 2>/dev/null || true
+          }
+          trap 'cleanup_path_with_retries "$deb_smoke_root"' EXIT
           mkdir -p \
             "$deb_smoke_root/home" \
             "$deb_smoke_root/config" \

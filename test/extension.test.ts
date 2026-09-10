@@ -130,6 +130,39 @@ describe('extension release metadata', () => {
   });
 });
 
+describe('compact checkpoint relay hardening', () => {
+  it('carries destinationLost only with its continuation token and drops unnamed fields', async () => {
+    const chat = '11111111-2222-3333-4444-555555555555';
+    const local = new FakeStorageArea({ port: 8765, token: 'paired-token' });
+    const session = new FakeStorageArea();
+    const posted: Record<string, unknown>[] = [];
+    const fetch = vi.fn(async (input: string, init: Record<string, unknown> = {}) => {
+      const url = new URL(input);
+      if (url.pathname === '/hello') return response(200, { app: 'chat-on-steroids', paired: true });
+      if (url.pathname === '/compact' && init.method === 'POST') {
+        posted.push(JSON.parse(String(init.body || '{}')));
+        return response(200, { ok: true });
+      }
+      return response(404, {});
+    });
+    const worker = loadWorker({ local, session, fetch, tabsGet: async () => ({ id: 44, url: `https://chatgpt.com/c/${chat}` }) });
+    await worker.registerTab(44);
+    await worker.send({ type: 'bind', conversationId: chat }, 44);
+    const token = '0123456789abcdef0123456789abcdef';
+
+    await worker.send({ type: 'compact', conversationId: chat, token, destinationLost: true }, 44);
+    await worker.send({ type: 'compact', conversationId: chat, token, sourceLost: true, invented: true }, 44);
+    await worker.send({ type: 'compact', conversationId: chat, destinationLost: true }, 44);
+
+    expect(posted).toHaveLength(3);
+    expect(posted[0]).toMatchObject({ conversationId: chat, token, destinationLost: true });
+    expect(posted[1]).toMatchObject({ conversationId: chat, token, sourceLost: true });
+    expect(posted[1]).not.toHaveProperty('invented');
+    expect(posted[2]).not.toHaveProperty('destinationLost');
+    expect(posted[2]).not.toHaveProperty('token');
+  });
+});
+
 // ---------------------------------------------------------------------- DOM
 
 const TURN_SELECTOR = 'section[data-testid^="conversation-turn"]';

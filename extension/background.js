@@ -2671,6 +2671,34 @@ async function maintainFreshInputDelivery() {
 // this serialized status pass rather than installing parallel schedulers.
 const maintain = maintainFreshInputDelivery;
 
+const COMPACT_CHECKPOINT_FLAGS = [
+  'sourceAttempt',
+  'sourceDispatch',
+  'sourceLost',
+  'destinationAttempt',
+  'destinationDispatch',
+  'destinationLost'
+];
+const COMPACT_CHECKPOINT_TEXT = ['summary', 'sourceMessageId', 'destinationMessageId'];
+const COMPACT_CHECKPOINT_COUNTS = { sourceProgress: 'sourceMessageId' };
+
+function compactCheckpointFields(message) {
+  if (typeof message?.token !== 'string' || !message.token) return {};
+  const fields = { token: message.token };
+  for (const key of COMPACT_CHECKPOINT_FLAGS) {
+    if (message[key] === true) fields[key] = true;
+  }
+  for (const key of COMPACT_CHECKPOINT_TEXT) {
+    if (typeof message[key] === 'string') fields[key] = message[key];
+  }
+  for (const [key, companion] of Object.entries(COMPACT_CHECKPOINT_COUNTS)) {
+    if (Number.isSafeInteger(message[key]) && message[key] >= 0 && typeof message[companion] === 'string') {
+      fields[key] = message[key];
+    }
+  }
+  return fields;
+}
+
 const HANDLERS = {
   async register_document(_message, sender) {
     const result = await registerDocument(sender, _message);
@@ -3120,14 +3148,10 @@ const HANDLERS = {
         conversationId: message.conversationId,
         resume: message.resume !== false,
         cancel: message.cancel === true,
-        // The capture. `token` names the transaction the page was given when it marked the
-        // compaction turn, and `summary` is that turn's own answer. Both are forwarded
-        // verbatim and only together: the app refuses a brief whose token does not name an
-        // open continuation for this chat, which is what keeps some other tab's text from
-        // ever becoming this session's handoff.
-        ...(typeof message.token === 'string' && typeof message.summary === 'string'
-          ? { token: message.token, summary: message.summary }
-          : {})
+        // Every continuation checkpoint is an explicit allowlist. In particular,
+        // destinationLost has to survive the extension relay so Core can retire a dead
+        // destination immediately, while arbitrary page fields never become bridge authority.
+        ...compactCheckpointFields(message)
       })
     });
     return ownsDocument(source) ? result : { ok: false, error: 'stale_document' };

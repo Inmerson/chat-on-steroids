@@ -16,7 +16,7 @@
  */
 
 import { readDurable, writeDurableSoon } from '../durable.js';
-import { listAllSessions, readRecentEvents } from './store.js';
+import { readEverySummary, readRecentEvents } from './store.js';
 
 export interface RequestCorrelation {
   requestId: string;
@@ -201,7 +201,7 @@ async function restoreRequestCorrelationsOnce(): Promise<void> {
   // is idempotent for the same conversation and still makes contradictions sticky.
   let sessions;
   try {
-    sessions = await listAllSessions();
+    sessions = await readEverySummary();
   } catch (error) {
     // A valid direct snapshot can be restored before the session store is initialized (some
     // tests and narrowly scoped consumers do exactly that). In the real app the store is ready

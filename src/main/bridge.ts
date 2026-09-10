@@ -801,6 +801,7 @@ function parseObservations(input: unknown): ChatObservation[] {
       observation.outcome = item['outcome'] as ChatObservation['outcome'];
     }
     if (typeof item['detail'] === 'string') observation.detail = item['detail'].slice(0, 500);
+    if (item['blocking'] === true) observation.blocking = true;
     if (Array.isArray(item['calls'])) observation.calls = parseCallEvidence(item['calls']);
     out.push(observation);
   }

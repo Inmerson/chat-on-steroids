@@ -74,8 +74,9 @@ import { readOverflowText } from '../session/store.js';
 import { backgroundExecRecoveryNotices } from '../codex/ownership.js';
 import type { StoredText, ToolOutcome } from '../../shared/session.js';
 import type { ProtocolOperation } from '../../shared/multidevice/types.js';
-import { requestCorrelation } from '../session/correlation.js';
+import { awaitRequestCorrelation, requestCorrelation } from '../session/correlation.js';
 import { acknowledgeToolInput, offerToolInput } from '../session/input.js';
+import { BLOCKED_CHAT_REFUSAL, anyChatBlocked, isChatBlocked } from '../session/blocked-chats.js';
 
 export interface ToolContext {
   roots: Root[];
@@ -456,6 +457,16 @@ async function dispatchTracked(
     context.caller.conversationId = requestOwner ?? transportOwner;
     if (requestOwner) bindTransportConversation(transportKey, requestOwner);
   }
+  // A user block is exact-conversation policy. Only pay the evidence wait while at least one
+  // block exists; otherwise ordinary Core calls retain their current no-wait ingress path.
+  if (!context.caller.conversationId && anyChatBlocked() && requestId) {
+    const exact = await awaitRequestCorrelation(requestId, IDENTITY_EVIDENCE_MS);
+    if (exact) {
+      const bound = bindTransportConversation(transportKey, exact.conversationId);
+      context.caller.conversationId = transportKey ? bound : exact.conversationId;
+    }
+  }
+  const blockedChat = isChatBlocked(context.caller.conversationId);
   // Ordinary Core authority is endpoint-scoped. Exact conversation evidence remains useful
   // when it is already available, but browser attribution is never awaited before local work.
   // Two things about liveness, both before the agent is resolved so that the answer this
@@ -465,14 +476,14 @@ async function dispatchTracked(
   // timer: nothing about a run changes while nothing is happening, and this is the moment
   // something is happening. Sleep rather than failure, so being early about a slow worker
   // costs the run nothing — its own next call takes the slot straight back.
-  const quietWorkers = sleepSilentDetachedWorkers();
+  const quietWorkers = blockedChat ? [] : sleepSilentDetachedWorkers();
   for (const quiet of quietWorkers) {
     if (quiet.report) await recordAgentMessage(quiet.report, 'sent');
   }
   // And this call is itself first-hand evidence that its own conversation is alive. That is
   // what undoes a worker given up on because its tab went away — the turn never stopped, so
   // the call arrives from a chat the app had written off, and the write-off was wrong.
-  const alive = noteAgentAlive(context.caller.conversationId);
+  const alive = blockedChat ? null : noteAgentAlive(context.caller.conversationId);
   if (alive?.report) await recordAgentMessage(alive.report, 'sent');
   // A prime message accepted while a worker's tab was closed could not safely be injected while
   // that server-side turn might still be running. If the silence check above has now proved the
@@ -500,7 +511,10 @@ async function dispatchTracked(
   // Authentication happens at the secret MCP endpoint. Conversation identity is retained for
   // attribution, workspaces and agent routing, but it is not an authorization gate for Core
   // capabilities: every authenticated chat receives the permissions the user enabled in-app.
-  const result = await runInCallContext(context, run);
+  const result = await runInCallContext(
+    context,
+    blockedChat ? () => Promise.resolve(fail(BLOCKED_CHAT_REFUSAL)) : run
+  );
   // Identity, once, from this call's own evidence — see callerConversation. `agents` has
   // already established its own inside the call and adopted it, and re-reading here would
   // only be able to disagree with the stronger answer it waited for.

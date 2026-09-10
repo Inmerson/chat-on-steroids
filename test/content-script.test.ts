@@ -5270,6 +5270,25 @@ describe('how a turn is recorded as having ended', () => {
     expect(emitted(live.sent, 'chat_error')).toHaveLength(1);
   });
 
+  it('forwards the access-limit verdict the dialog classifier reached, in any language', async () => {
+    live = await harness();
+    startGenerating(live.document);
+    assistantTurn(live.document, 'turn-1', []);
+    live.hook.observe();
+    await settle();
+
+    const notice = live.document.createElement('div');
+    notice.setAttribute('role', 'dialog');
+    Object.defineProperty(notice, 'getClientRects', { value: () => [{ width: 400, height: 200 }] });
+    notice.innerHTML = '<h2>요청이 너무 많습니다</h2><p>요청을 너무 빠르게 보내고 있습니다. 데이터를 보호하기 위해 대화에 대한 액세스가 일시적으로 제한되었습니다. 몇 분 후 다시 시도해 주세요.</p><button>알겠습니다</button>';
+    live.document.body.append(notice);
+    live.hook.observe();
+    await settle();
+
+    const [limit] = emitted(live.sent, 'chat_error').map((entry) => entry.event);
+    expect(limit.blocking).toBe(true);
+  });
+
   it('does not republish a banner ChatGPT simply leaves on screen', async () => {
     live = await harness();
     startGenerating(live.document);

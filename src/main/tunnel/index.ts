@@ -58,35 +58,19 @@ export class TunnelError extends Error {}
 
 export const TUNNEL_ID_PATTERN = /^tunnel_[0-9a-f]{32}$/;
 
-/**
- * Kills a child and everything it started. tunnel-client supervises cloudflared.
- *
- * Through the shared primitive rather than this module's own `spawn('taskkill')`, which
- * had the same defect the exec runner did and independently of it: the helper was looked
- * up on PATH, so an inherited path missing System32 meant the kill never started. That
- * failure arrives asynchronously as an `error` event, which the surrounding try/catch
- * could not reach and no listener handled — so the tunnel-client (and the cloudflared it
- * supervises) went on running while `stop()` reported success. terminateProcessTree uses
- * an absolute taskkill and falls back to signalling the pid directly.
- */
-function killTree(child: ChildProcess | null): void {
-  if (!child || child.pid === undefined || child.exitCode !== null) return;
-  const pid = child.pid;
-  void terminateProcessTree(pid).catch(() => {
-    try {
-      child.kill('SIGTERM');
-    } catch {
-      /* already gone */
-    }
-  });
-}
-
 /** Terminates an owned tunnel tree and waits for the child handle to observe exit. */
-async function stopTree(child: ChildProcess | null, timeoutMs = 3_000): Promise<void> {
-  if (!child || child.pid === undefined || child.exitCode !== null) return;
-  const closed = new Promise<void>((resolve) => {
-    if (child.exitCode !== null) resolve();
-    else child.once('close', () => resolve());
+async function stopTree(child: ChildProcess | null, timeoutMs = 3_000): Promise<boolean> {
+  if (
+    !child ||
+    child.pid === undefined ||
+    child.exitCode !== null ||
+    child.signalCode !== null
+  ) {
+    return true;
+  }
+  const closed = new Promise<boolean>((resolve) => {
+    if (child.exitCode !== null || child.signalCode !== null) resolve(true);
+    else child.once('close', () => resolve(true));
   });
   await terminateProcessTree(child.pid).catch(() => {
     try {
@@ -95,7 +79,7 @@ async function stopTree(child: ChildProcess | null, timeoutMs = 3_000): Promise<
       // Already gone.
     }
   });
-  await Promise.race([closed, new Promise<void>((resolve) => setTimeout(resolve, timeoutMs))]);
+  return Promise.race([closed, new Promise<boolean>((resolve) => setTimeout(() => resolve(false), timeoutMs))]);
 }
 
 function lineReader(onLine: (line: string) => void): (chunk: Buffer) => void {
@@ -183,6 +167,8 @@ const OFFLINE_RECHECK_MS = 5_000;
  * run has to outlive a full poll cycle before it counts.
  */
 const UNREACHABLE_CONFIRM_MS = 35_000;
+/** A single missed /readyz probe is not enough reason to kill live in-flight work. */
+const UNREADY_CONFIRM_MS = 15_000;
 
 /** A run of unreachable complaints not yet contradicted by a completed poll. */
 export interface UnreachableRun {
@@ -293,6 +279,8 @@ async function startOpenAiTunnel(opts: TunnelStartOptions): Promise<TunnelHandle
   let stopped = false;
   let child: ChildProcess | null = null;
   let timer: NodeJS.Timeout | null = null;
+  /** Restart retirement barrier. A replacement is never launched beside the process it replaces. */
+  let retirement: Promise<void> = Promise.resolve();
   /** Consecutive failed attempts, which is what the backoff grows on. */
   let attempts = 0;
   let lastError = '';
@@ -311,6 +299,8 @@ async function startOpenAiTunnel(opts: TunnelStartOptions): Promise<TunnelHandle
   let pollErrors = 0;
   /** When the current client process reached ready, for the first-poll grace period. */
   let launchedAt = 0;
+  /** When /readyz first failed for the current process; zero once it answers again. */
+  let unreadySince = 0;
   /** The client's local health server, once it has published its port. */
   let healthBase: string | null = null;
   /** Last snapshot of what the client says about itself, for the UI. */
@@ -352,17 +342,19 @@ async function startOpenAiTunnel(opts: TunnelStartOptions): Promise<TunnelHandle
     });
   };
 
-  const showStarting = (): void => {
+  const showStarting = (metricsUnavailable = false): void => {
     shown = null;
     opts.report({
       state: 'connecting-tunnel',
-      detail: 'Tunnel client is ready. Waiting for a verified handshake with OpenAI…',
+      detail: metricsUnavailable
+        ? 'Tunnel client is locally ready, but its OpenAI poll metrics are temporarily unavailable.'
+        : 'Tunnel client is ready. Waiting for a verified handshake with OpenAI…',
       handshakeAt: lastHandshake,
       health
     });
   };
 
-  const reportLiveness = (nowMs: number): void => {
+  const reportLiveness = (nowMs: number, metricsUnavailable = false): void => {
     const decision = openAiLivenessDecision(runHandshakeAt, launchedAt, run, nowMs);
     if (decision.resetBackoff) attempts = 0;
     if (decision.state === 'connected') {
@@ -374,7 +366,7 @@ async function startOpenAiTunnel(opts: TunnelStartOptions): Promise<TunnelHandle
       showOffline();
       return;
     }
-    showStarting();
+    showStarting(metricsUnavailable);
   };
 
   /**
@@ -424,8 +416,19 @@ async function startOpenAiTunnel(opts: TunnelStartOptions): Promise<TunnelHandle
     }
   };
 
-  const retry = (detail: string): void => {
-    if (stopped) return;
+  /** The caller that wins this compare-and-retire is the only restart owner for `proc`. */
+  const restart = (proc: ChildProcess, detail: string, terminate: boolean): void => {
+    if (stopped || child !== proc) return;
+    child = null;
+    clearTimer();
+    healthBase = null;
+    health = null;
+    lastHandshake = null;
+    runHandshakeAt = null;
+    launchedAt = 0;
+    unreadySince = 0;
+    run = NO_OUTAGE;
+    unreachableReason = '';
     attempts += 1;
     shown = null;
     const wait = retryDelayMs(attempts);
@@ -433,8 +436,22 @@ async function startOpenAiTunnel(opts: TunnelStartOptions): Promise<TunnelHandle
       state: 'connecting-tunnel',
       detail: `${detail} Reconnecting in ${Math.round(wait / 1000)}s…`
     });
-    clearTimer();
-    timer = setTimeout(() => void launch(), wait);
+    retirement = (async () => {
+      const retired = !terminate || (await stopTree(proc));
+      if (stopped) return;
+      if (!retired) {
+        opts.report({
+          state: 'tunnel-unavailable',
+          detail: 'The previous tunnel client could not be stopped safely. Disconnect and reconnect to try again.'
+        });
+        return;
+      }
+      timer = setTimeout(() => {
+        timer = null;
+        void launch();
+      }, wait);
+      timer.unref?.();
+    })();
   };
 
   /**
@@ -451,37 +468,67 @@ async function startOpenAiTunnel(opts: TunnelStartOptions): Promise<TunnelHandle
    * OpenAI happened within the last poll cycle, which is the only honest basis for
    * saying "connected". The log lines only supply the wording for *why* it is down.
    */
-  const watch = (base: string): void => {
+  const watch = (base: string, proc: ChildProcess): void => {
+    if (stopped || child !== proc) return;
     clearTimer();
     timer = setTimeout(
       () => {
         void (async () => {
-          if (stopped) return;
+          if (stopped || child !== proc) return;
           const ready = await probe(`${base}/readyz`);
+          if (stopped || child !== proc) return;
           if (!ready.ok) {
+            const now = Date.now();
+            if (unreadySince === 0) {
+              unreadySince = now;
+              logWarn(
+                `${tag} did not answer its readiness check: ${ready.detail || 'no detail'} — rechecking before replacing it`
+              );
+              watch(base, proc);
+              return;
+            }
+            if (now - unreadySince < UNREADY_CONFIRM_MS) {
+              watch(base, proc);
+              return;
+            }
             logWarn(`${tag} went unready: ${ready.detail}`);
-            await stopTree(child);
-            retry(ready.detail || 'The tunnel stopped responding.');
+            restart(proc, ready.detail || 'The tunnel stopped responding.', true);
             return;
+          }
+          if (unreadySince !== 0) {
+            logInfo(`${tag} answered its readiness check again; not replacing it`);
+            unreadySince = 0;
           }
 
           const read = await refreshHealth(base);
+          if (stopped || child !== proc) return;
           if (read !== null && read > 0) runHandshakeAt = read;
-          reportLiveness(Date.now());
-          watch(base);
+          reportLiveness(Date.now(), read === null || read === 0);
+          watch(base, proc);
         })();
       },
       shown === 'offline' ? OFFLINE_RECHECK_MS : WATCH_INTERVAL_MS
     );
+    timer.unref?.();
   };
 
   const launch = async (): Promise<void> => {
-    if (stopped) return;
+    if (stopped || child) return;
     clearTimer();
     lastError = '';
+    unreachableReason = '';
+    run = NO_OUTAGE;
+    lastHandshake = null;
     runHandshakeAt = null;
+    pollErrors = 0;
+    launchedAt = 0;
+    unreadySince = 0;
+    healthBase = null;
+    health = null;
+    shown = null;
     // A stale URL from the previous run would otherwise be read as this run's.
     await fs.rm(healthFile, { force: true }).catch(() => {});
+    if (stopped || child) return;
 
     opts.report({
       state: 'connecting-tunnel',
@@ -512,12 +559,14 @@ async function startOpenAiTunnel(opts: TunnelStartOptions): Promise<TunnelHandle
     let done = false;
 
     const handleLine = (line: string): void => {
+      if (stopped || child !== proc) return;
       if (AUTH_FAILURE.test(line)) {
         // A bad key or tunnel ID will not fix itself, so this one is terminal.
         done = true;
         stopped = true;
+        child = null;
         clearTimer();
-        killTree(proc);
+        retirement = stopTree(proc).then(() => undefined);
         opts.report({
           state: 'auth-failed',
           detail: 'The tunnel rejected the API key or tunnel ID. Check both in Connection settings.'
@@ -543,7 +592,9 @@ async function startOpenAiTunnel(opts: TunnelStartOptions): Promise<TunnelHandle
         if (level === 'ERROR' || level === 'FATAL' || level === 'WARN') {
           const errText = event['error'] ? String(event['error']) : '';
           lastError = `${level} ${message}${errText ? `: ${errText}` : ''}`.slice(0, 400);
-          if (isUnreachableError(message) || isUnreachableError(errText)) {
+          const unreachable =
+            isUnreachableError(message) || (/\bpoll\b/i.test(message) && isUnreachableError(errText));
+          if (unreachable) {
             // Retry chatter. noteUnreachable logs one plain line per run rather than a
             // socket dump per attempt, and the state it leads to is decided in `watch`.
             noteUnreachable(errText || message);
@@ -569,23 +620,25 @@ async function startOpenAiTunnel(opts: TunnelStartOptions): Promise<TunnelHandle
       if (stopped || proc !== child) return;
       done = true;
       logWarn(`${tag} client exited with code ${code}`);
-      retry(lastError || `Tunnel client stopped (exit ${code}).`);
+      restart(proc, lastError || `Tunnel client stopped (exit ${code}).`, false);
     });
 
     proc.on('error', (err) => {
       if (stopped || proc !== child) return;
       done = true;
       logError(`${tag} client failed to start: ${err.message}`);
-      retry(`Could not start tunnel-client: ${err.message}`);
+      restart(proc, `Could not start tunnel-client: ${err.message}`, true);
     });
 
     // /readyz on the client's own health server is the authoritative "it works"
     // signal; the process being alive proves nothing.
     const deadline = Date.now() + READY_TIMEOUT_MS;
-    while (!done && !stopped && Date.now() < deadline) {
+    while (!done && !stopped && child === proc && Date.now() < deadline) {
       const base = await readHealthUrl(healthFile);
+      if (stopped || child !== proc) return;
       if (base) {
         const ready = await probe(`${base}/readyz`);
+        if (stopped || child !== proc) return;
         if (ready.ok) {
           shown = null;
           healthBase = base;
@@ -593,18 +646,18 @@ async function startOpenAiTunnel(opts: TunnelStartOptions): Promise<TunnelHandle
           pollErrors = 0;
           run = NO_OUTAGE;
           const read = await refreshHealth(base);
+          if (stopped || child !== proc) return;
           if (read !== null && read > 0) runHandshakeAt = read;
-          reportLiveness(Date.now());
-          watch(base);
+          reportLiveness(Date.now(), read === null || read === 0);
+          watch(base, proc);
           return;
         }
         lastError = ready.detail || lastError;
       }
       await delay(1000);
     }
-    if (!done && !stopped) {
-      await stopTree(proc);
-      retry(lastError || 'The tunnel did not become ready within 60 seconds.');
+    if (!done && !stopped && child === proc) {
+      restart(proc, lastError || 'The tunnel did not become ready within 60 seconds.', true);
     }
   };
 
@@ -615,8 +668,9 @@ async function startOpenAiTunnel(opts: TunnelStartOptions): Promise<TunnelHandle
     stop: async () => {
       stopped = true;
       clearTimer();
-      await stopTree(child);
+      const active = child;
       child = null;
+      await Promise.all([retirement, stopTree(active)]);
       await fs.rm(workDir, { recursive: true, force: true }).catch(() => {});
     }
   };

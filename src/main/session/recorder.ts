@@ -43,7 +43,7 @@ import {
   endSession,
   findSessionByConversation,
   getSession,
-  listAllSessions,
+  readEverySummary,
   readAsset,
   readEvents,
   readRecentEvents,
@@ -774,7 +774,7 @@ export async function repairDeterministicAttribution(): Promise<{ sessions: numb
   let repairedSessions = 0;
   let repairedCalls = 0;
 
-  for (const summary of await listAllSessions()) {
+  for (const summary of await readEverySummary()) {
     if (summary.conversationId !== null || summary.title !== 'Unattributed activity') continue;
     const events = await readEvents(summary.id);
     const scannedThroughSeq = events.reduce((highest, event) => Math.max(highest, event.seq), 0);
@@ -1238,6 +1238,8 @@ export interface ChatObservation {
   fiberConversationId?: string;
   outcome?: TurnOutcome;
   detail?: string;
+  /** chat_error only: the DOM classifier identified a provider access limit. */
+  blocking?: boolean;
   /** tool_evidence only: the connector requests this turn's message model holds. */
   calls?: PageCallEvidence[];
 }

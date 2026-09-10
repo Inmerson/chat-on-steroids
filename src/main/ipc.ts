@@ -53,6 +53,7 @@ import {
   readHandoff
 } from './session/store.js';
 import { activeSessionId, forgetSession, onSessionChange } from './session/recorder.js';
+import { blockedChatIds, setChatBlocked } from './session/blocked-chats.js';
 import {
   PRIME_ID,
   agentConversation,
@@ -589,6 +590,7 @@ export function registerIpc(getWindow: () => BrowserWindow | null, quitToInstall
       total: page.total,
       nextCursor: page.nextCursor,
       activeId: activeSessionId(),
+      blocked: blockedChatIds(),
       pressure: sessions.map((summary) => ({
         id: summary.id,
         ...tokenPressure(summary.estimatedTokens, config.sessions.advisoryTokens, config.sessions.limitTokens)
@@ -679,8 +681,25 @@ export function registerIpc(getWindow: () => BrowserWindow | null, quitToInstall
     return recordedInputImage(id, assetId);
   });
 
+  handle('sessions:block', async (payload) => {
+    const { id, blocked } = z
+      .object({ id: z.string().min(8).max(64).regex(/^[0-9a-z-]+$/i), blocked: z.boolean() })
+      .strict()
+      .parse(payload);
+    const summary = await getSession(id);
+    const conversationId = summary?.conversationId;
+    if (!conversationId || !/^[0-9a-z-]{8,64}$/i.test(conversationId)) {
+      throw new Error('This session has no valid ChatGPT conversation');
+    }
+    setChatBlocked(conversationId, blocked);
+    logInfo(blocked ? `conversation ${conversationId} blocked from local tools` : `conversation ${conversationId} released for local tools`);
+    return blockedChatIds();
+  });
+
   handle('sessions:delete', async (payload) => {
     const { id } = sessionIdArg.parse(payload);
+    const summary = await getSession(id);
+    if (summary?.conversationId) setChatBlocked(summary.conversationId, false);
     // Detach first. The recorder maps live ChatGPT conversations to session ids, so
     // deleting the folder underneath a live one left it appending to a session that no
     // longer existed â€” the events went to a resurrected half-session with no summary.

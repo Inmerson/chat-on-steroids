@@ -1072,11 +1072,36 @@ var CLF_DOM = (() => {
    * announcement is not a banner. Neither is this extension's own surface, which was
    * recording "Chat On Steroids Desktop is now connected" as a ChatGPT failure.
    */
+  const acknowledgedAccessNotices = new WeakSet();
   function errors() {
     return safe(() => {
       const out = [];
       const texts = new Set();
+      // Provider access throttling is rendered as a dialog rather than a transport error.
+      // Classify the semantic notice here, where the DOM evidence exists, and carry only the
+      // verdict outward. English stays for older/current accounts; Korean covers the localized
+      // provider rendering that exposed the language-dependent recovery bug upstream.
+      for (const node of document.querySelectorAll('[role="dialog"], [role="alertdialog"]')) {
+        if (node.closest(OWN_SURFACES) || node.closest('[hidden],[inert],[aria-hidden="true"]') || !node.getClientRects().length) continue;
+        const heading = node.querySelector('h1,h2,h3,[role="heading"]');
+        const headingText = (heading?.textContent || '').trim();
+        const value = (node.innerText || node.textContent || '').replace(/\s+/g, ' ').trim();
+        const english = /^too many requests$/i.test(headingText) && /temporarily limited.*access/i.test(value) && /few minutes/i.test(value);
+        const korean = headingText === '요청이 너무 많습니다' && value.includes('데이터를 보호하기 위해 대화에 대한 액세스가 일시적으로 제한되었습니다.') && value.includes('몇 분 후 다시 시도해 주세요.');
+        if (value.length >= 500 || (!english && !korean)) continue;
+        const notice = value.startsWith(headingText) ? `${headingText} ${value.slice(headingText.length).trim()}` : value;
+        out.push({ text: notice, node, turnId: null, recoverable: false, blocking: true });
+        texts.add(value);
+        const buttons = [...node.querySelectorAll('button')].filter(button =>
+          displayed(button) && !button.disabled && button.getAttribute('aria-disabled') !== 'true' &&
+          (korean ? button.textContent.trim() === '알겠습니다' : /^got it$/i.test(button.textContent.trim())));
+        if (!acknowledgedAccessNotices.has(node) && buttons.length === 1) {
+          acknowledgedAccessNotices.add(node);
+          buttons[0].click();
+        }
+      }
       for (const node of document.querySelectorAll('[role="alert"]')) {
+        if (out.some(error => error.blocking && error.node.contains(node))) continue;
         if (node.closest && node.closest(OWN_SURFACES)) continue;
         if (!displayed(node)) continue;
         const value = (node.innerText || node.textContent || '').replace(/\s+/g, ' ').trim();

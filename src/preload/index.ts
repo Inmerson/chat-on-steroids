@@ -49,6 +49,7 @@ export interface GoalModelPage {
 export interface SessionList {
   sessions: SessionSummary[];
   activeId: string | null;
+  blocked: string[];
   pressure: Array<TokenPressure & { id: string }>;
   total: number;
   nextCursor: SessionListCursor | null;
@@ -131,6 +132,7 @@ const api = {
     call<SessionList>('sessions:list', options ?? {}),
   getSession: (id: string, options?: { from?: number; limit?: number }) =>
     call<SessionDetail>('sessions:events', { id, ...options }),
+  setSessionBlocked: (id: string, blocked: boolean) => call<string[]>('sessions:block', { id, blocked }),
   deleteSession: (id: string) => call<boolean>('sessions:delete', { id }),
   getHandoff: (id: string, handoffId?: string) => call<Handoff | null>('handoff:get', { id, handoffId }),
 

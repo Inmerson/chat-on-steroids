@@ -19,6 +19,7 @@ import { initSecretsPath } from '../secrets.js';
 import { startAgentRuntimeGc } from '../runtime-gc.js';
 import { CONTINUATIONS_STATE, restoreContinuations, setContinuationRecoveryHooks, type ContinuationSnapshot } from '../session/continuation.js';
 import { restoreRequestCorrelations } from '../session/correlation.js';
+import { restoreBlockedChats } from '../session/blocked-chats.js';
 import { flushRecorder, onSessionChange, queueDeterministicAttributionRepair, setAgentBinder, setAgentConversationLookup } from '../session/recorder.js';
 import { startSessionRetentionMaintenance } from '../session/retention.js';
 import { flushSessions, initSessionStore, pruneSessions } from '../session/store.js';
@@ -75,6 +76,7 @@ async function restoreCoreState(userDataDir: string): Promise<() => void> {
   restoreGoalObjectives(await readDurable<GoalObjectivesSnapshot>(GOAL_OBJECTIVES_STATE));
   restoreExecutions(await readDurable<ExecutionSnapshot>(EXECUTION_STATE));
   await restoreRequestCorrelations();
+  await restoreBlockedChats();
   setAgentConversationLookup(agentConversation);
   setAgentBinder(bindConversation);
   setBrowserOpener(async (url) => { await openInPreferredBrowser(url); });
