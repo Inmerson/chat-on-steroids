@@ -108,7 +108,7 @@ export interface FileChange {
 }
 
 /** Canonical outcomes written by current versions. Only tool_internal_error is a connector defect. */
-export type ToolOutcome = 'ok' | 'process_exit_nonzero' | 'tool_rejected' | 'tool_internal_error';
+export type ToolOutcome = 'ok' | 'process_exit_nonzero' | 'tool_execution_error' | 'tool_rejected' | 'tool_internal_error';
 /** Legacy spellings remain readable from durable history, but are never emitted by new calls. */
 export type StoredToolOutcome = ToolOutcome | 'error' | 'rejected';
 
@@ -180,6 +180,7 @@ export function normalizedToolOutcome(
   if (
     call.outcome === 'ok' ||
     call.outcome === 'process_exit_nonzero' ||
+    call.outcome === 'tool_execution_error' ||
     call.outcome === 'tool_rejected' ||
     call.outcome === 'tool_internal_error'
   ) {

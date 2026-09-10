@@ -1,8 +1,8 @@
 import type { ConnectionStatus } from './types.js';
 
-// v6 adds the fixed config-authority UI operations. A v5 Core must be replaced rather than
-// silently accepted by a v6 UI, because otherwise the UI would fall back to a second config writer.
-export const CORE_PROTOCOL_VERSION = 6;
+// v7 adds fixed plugin-authority UI operations. A v6 Core must be replaced rather than
+// silently accepted by a v7 UI, because plugin lifecycle/secrets belong to the persistent Core.
+export const CORE_PROTOCOL_VERSION = 7;
 
 export const CORE_CAPABILITIES = [
   'connection-status',
@@ -12,7 +12,8 @@ export const CORE_CAPABILITIES = [
   'structured-health',
   'secret-storage',
   'ui-runtime',
-  'config-authority'
+  'config-authority',
+  'plugin-authority'
 ] as const;
 
 export type CoreCapability = (typeof CORE_CAPABILITIES)[number];
@@ -89,7 +90,17 @@ export type CoreUiOperation =
   | 'diagnostics-run'
   | 'devices-overview'
   | 'devices-pairing-create'
-  | 'devices-revoke';
+  | 'devices-revoke'
+  | 'plugins-list'
+  | 'plugins-install'
+  | 'plugins-configure'
+  | 'plugins-restart'
+  | 'plugins-update'
+  | 'plugins-remove'
+  | 'plugins-set-enabled'
+  | 'plugins-set-tool-enabled'
+  | 'plugins-auth-start'
+  | 'plugins-auth-cancel';
 
 export type CoreCommandName =
   | 'hello'

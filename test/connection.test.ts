@@ -20,7 +20,7 @@ const mocks = vi.hoisted(() => {
     roots: [{ name: 'workspace', path: 'C:\\workspace' }],
     readOnly: true,
     capabilities: caps,
-    tunnel: { kind: 'cloudflared', tunnelId: '', desktopTunnelId: '', steromiTunnelId: '', binaryPath: '' },
+    tunnel: { kind: 'cloudflared', tunnelId: '', desktopTunnelId: '', steromiTunnelId: '', pluginsTunnelId: '', binaryPath: '' },
     ui: { privacyScreenshots: false },
     sessions: { record: false },
     multiAgent: { enabled: false }
@@ -63,7 +63,8 @@ vi.mock('../src/main/mcp/server.js', () => ({
       urls: {
         core: 'http://127.0.0.1:45678/mcp/core/core-token',
         desktop: 'http://127.0.0.1:45678/mcp/desktop/desktop-token',
-        steromi: 'http://127.0.0.1:45678/mcp/steromi/steromi-token'
+        steromi: 'http://127.0.0.1:45678/mcp/steromi/steromi-token',
+        plugins: 'http://127.0.0.1:45678/mcp/plugins/plugins-token'
       },
       stop: mocks.endpointStop
     };
@@ -127,6 +128,7 @@ describe('connection surface state', () => {
     mocks.config.tunnel.tunnelId = '';
     mocks.config.tunnel.desktopTunnelId = '';
     mocks.config.tunnel.steromiTunnelId = '';
+    mocks.config.tunnel.pluginsTunnelId = '';
     mocks.config.tunnel.binaryPath = '';
     vi.resetModules();
   });
@@ -171,6 +173,17 @@ describe('connection surface state', () => {
 
     expect(mocks.starts).toBe(2);
     expect(connection.getStatus().surfaces.find((surface) => surface.id === 'steromi')?.state).toBe('live');
+  });
+
+  it('starts an independent OpenAI tunnel for Plugins when its tunnel id is configured', async () => {
+    mocks.config.tunnel.kind = 'openai';
+    mocks.config.tunnel.pluginsTunnelId = 'tunnel_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb';
+    const connection = await import('../src/main/connection.js');
+
+    await connection.connect();
+
+    expect(mocks.starts).toBe(2);
+    expect(connection.getStatus().surfaces.find((surface) => surface.id === 'plugins')?.state).toBe('live');
   });
 
   it('keeps ordinary disconnect graceful and reserves forced MCP drain for final shutdown', async () => {

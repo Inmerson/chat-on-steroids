@@ -20,6 +20,9 @@ export function serverInstructions(
   surface: SurfaceId = 'core',
   platform: NodeJS.Platform = process.platform
 ): string {
+  if (surface === 'plugins') {
+    return 'External MCP tools explicitly installed and enabled by the user in Chat On Steroids. Each tool retains its upstream schema and annotations. External servers run with their own operating-system or service permissions; approved CoS folders do not sandbox them. Use only for the user\'s requested task. A failed or disconnected mutation may already have taken effect, so never automatically retry an ambiguous mutation. Core, Desktop and Steromi are separate connectors.';
+  }
   return surface === 'desktop'
     ? desktopInstructions(ctx)
     : surface === 'steromi'

@@ -220,6 +220,8 @@ const configSchema = z.object({
     desktopTunnelId: z.string().max(128).optional().default(''),
     // Optional third connector. Empty is normal until the user creates Steromi in ChatGPT.
     steromiTunnelId: z.string().max(128).optional().default(''),
+    // Optional external Plugins connector. Empty is normal until the user publishes it.
+    pluginsTunnelId: z.string().max(128).optional().default(''),
     binaryPath: z.string().max(4096)
   }),
   ui: z.object({
@@ -334,7 +336,7 @@ export function defaultConfig(_platform: NodeJS.Platform = process.platform): Co
     readOnly: true,
     allComputer: false,
     previousRoots: [],
-    tunnel: { kind: 'openai', tunnelId: '', desktopTunnelId: '', steromiTunnelId: '', binaryPath: '' },
+    tunnel: { kind: 'openai', tunnelId: '', desktopTunnelId: '', steromiTunnelId: '', pluginsTunnelId: '', binaryPath: '' },
     ui: { minimizeToTray: true, autoConnect: false, privacyScreenshots: false, theme: 'dark' },
     sessions: { ...DEFAULT_SESSIONS },
     compaction: { ...DEFAULT_COMPACTION },

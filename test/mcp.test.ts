@@ -915,7 +915,9 @@ describe('surface boundaries', () => {
       // The description is the only thing the model has before discovery, so it has to
       // carry real vocabulary rather than a label.
       expect(surface.description.length, surface.id).toBeGreaterThan(120);
-      expect(surface.tools.length, surface.id).toBeGreaterThan(0);
+      // Plugins is intentionally dynamic: an empty local installation means an empty
+      // declaration until the user explicitly installs/enables an external MCP plugin.
+      if (surface.id !== 'plugins') expect(surface.tools.length, surface.id).toBeGreaterThan(0);
     }
     expect(surfaceDefinition('core').required).toBe(true);
     expect(surfaceDefinition('desktop').required).toBe(false);

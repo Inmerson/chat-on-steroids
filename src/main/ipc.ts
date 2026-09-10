@@ -115,6 +115,10 @@ const settingsPatch = z.object({
       .string()
       .max(128)
       .refine((v) => v === '' || TUNNEL_ID_PATTERN.test(v), 'Expected tunnel_ followed by 32 hex characters'),
+    pluginsTunnelId: z
+      .string()
+      .max(128)
+      .refine((v) => v === '' || TUNNEL_ID_PATTERN.test(v), 'Expected tunnel_ followed by 32 hex characters'),
     binaryPath: z.string().max(4096)
   }),
   ui: z.object({
@@ -196,6 +200,11 @@ function mergeSettings(current: Config, base: SettingsSnapshot, wanted: Settings
         current.tunnel.steromiTunnelId,
         base.tunnel.steromiTunnelId,
         wanted.tunnel.steromiTunnelId
+      ),
+      pluginsTunnelId: pick(
+        current.tunnel.pluginsTunnelId,
+        base.tunnel.pluginsTunnelId,
+        wanted.tunnel.pluginsTunnelId
       ),
       binaryPath: pick(current.tunnel.binaryPath, base.tunnel.binaryPath, wanted.tunnel.binaryPath)
     },

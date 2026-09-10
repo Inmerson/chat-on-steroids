@@ -19,6 +19,7 @@ import { decorateCoreRegistrarWithAgentV3 } from './agents-v3.js';
 import { registerCoreTools } from './tools-core.js';
 import { registerDesktopTools } from './tools-desktop.js';
 import { registerSteromiApp } from './steromi-app.js';
+import { registerPluginTools } from './tools-plugins.js';
 import { surfaceDefinition, type SurfaceId } from './surfaces.js';
 import { serverInstructions } from './instructions.js';
 import { APP_VERSION } from './../version.js';
@@ -37,6 +38,8 @@ export function buildServer(ctx: ToolContext, surface: SurfaceId): McpServer {
     registerCoreTools(decorateCoreRegistrarWithAgentV3(registrar));
   } else if (surface === 'desktop') {
     registerDesktopTools(registrar);
+  } else if (surface === 'plugins') {
+    registerPluginTools(server);
   } else {
     registerSteromiApp(server, registrar);
     registerCoreTools(decorateCoreRegistrarWithAgentV3(registrar));

@@ -36,7 +36,20 @@ const CORE_UI_OPERATIONS = new Set<CoreUiOperation>([
   'swarm-clear-agent',
   'control-center-status',
   'goal-models',
-  'diagnostics-run'
+  'diagnostics-run',
+  'devices-overview',
+  'devices-pairing-create',
+  'devices-revoke',
+  'plugins-list',
+  'plugins-install',
+  'plugins-configure',
+  'plugins-restart',
+  'plugins-update',
+  'plugins-remove',
+  'plugins-set-enabled',
+  'plugins-set-tool-enabled',
+  'plugins-auth-start',
+  'plugins-auth-cancel'
 ]);
 
 export function coreEndpointForUserData(userDataDir: string, platform: NodeJS.Platform = process.platform): string {

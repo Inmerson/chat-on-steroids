@@ -42,9 +42,33 @@ import {
 import { applyCoreSettingsTransition } from './settings-runtime.js';
 import { createPairingTicket, deviceOverview, revokeRemote } from '../multidevice/registry.js';
 import { disconnectRemote } from '../multidevice/transport.js';
+import { pluginManager } from '../plugins/manager.js';
+import type { PluginConfigPatch, PluginInstallRequest } from '../../shared/plugins.js';
 
 const idSchema = z.string().min(8).max(64).regex(/^[0-9a-z-]+$/i);
 const agentIdSchema = z.string().min(1).max(64).regex(/^[0-9a-z-]+$/i);
+const pluginIdSchema = z.string().uuid();
+const pluginIdentitySchema = z.object({ id: pluginIdSchema }).strict();
+const pluginValuesSchema = z.record(z.string().min(1).max(128), z.string().max(16_384))
+  .refine((value) => Object.keys(value).length <= 64, 'At most 64 plugin fields');
+const pluginSourceSchema = z.object({
+  kind: z.enum(['npm', 'python', 'command', 'remote', 'mcpb', 'github']),
+  package: z.string().max(256).optional(),
+  version: z.string().max(128).optional(),
+  dependencies: z.array(z.object({ package: z.string().min(1).max(256), version: z.string().min(1).max(128) }).strict()).max(16).optional(),
+  command: z.string().max(4096).optional(),
+  args: z.array(z.string().max(4096)).max(128).optional(),
+  url: z.string().max(4096).optional(),
+  path: z.string().max(4096).optional(),
+  auth: z.literal('oauth').optional()
+}).strict();
+const pluginPatchSchema = z.object({
+  source: pluginSourceSchema.optional(),
+  name: z.string().min(1).max(100).optional(),
+  config: pluginValuesSchema.optional(),
+  credentials: pluginValuesSchema.optional()
+}).strict();
+const pluginInstallSchema = pluginPatchSchema.extend({ catalogId: z.string().max(80).optional() }).strict();
 
 const capabilityPatch = z.object(
   Object.fromEntries(CAPABILITIES.map((capability) => [capability, z.boolean()])) as Record<
@@ -61,6 +85,7 @@ const settingsPatch = z.object({
     tunnelId: z.string().max(128).refine((value) => value === '' || TUNNEL_ID_PATTERN.test(value)),
     desktopTunnelId: z.string().max(128).refine((value) => value === '' || TUNNEL_ID_PATTERN.test(value)),
     steromiTunnelId: z.string().max(128).refine((value) => value === '' || TUNNEL_ID_PATTERN.test(value)),
+    pluginsTunnelId: z.string().max(128).refine((value) => value === '' || TUNNEL_ID_PATTERN.test(value)),
     binaryPath: z.string().max(4096)
   }),
   ui: z.object({
@@ -112,6 +137,7 @@ function mergeSettings(current: Config, base: SettingsSnapshot, wanted: Settings
       tunnelId: pick(current.tunnel.tunnelId, base.tunnel.tunnelId, wanted.tunnel.tunnelId),
       desktopTunnelId: pick(current.tunnel.desktopTunnelId, base.tunnel.desktopTunnelId, wanted.tunnel.desktopTunnelId),
       steromiTunnelId: pick(current.tunnel.steromiTunnelId, base.tunnel.steromiTunnelId, wanted.tunnel.steromiTunnelId),
+      pluginsTunnelId: pick(current.tunnel.pluginsTunnelId, base.tunnel.pluginsTunnelId, wanted.tunnel.pluginsTunnelId),
       binaryPath: pick(current.tunnel.binaryPath, base.tunnel.binaryPath, wanted.tunnel.binaryPath)
     },
     ui: {
@@ -179,6 +205,16 @@ export interface CoreUiDispatcherDeps {
   devicesOverview: () => Promise<unknown>;
   createPairingTicket: () => Promise<unknown>;
   revokeDevice: (deviceId: string) => Promise<boolean>;
+  pluginsList: () => unknown;
+  pluginsInstall: (request: PluginInstallRequest) => Promise<unknown>;
+  pluginsConfigure: (id: string, patch: PluginConfigPatch) => Promise<unknown>;
+  pluginsRestart: (id: string) => Promise<unknown>;
+  pluginsUpdate: (id: string) => Promise<unknown>;
+  pluginsRemove: (id: string) => Promise<unknown>;
+  pluginsSetEnabled: (id: string, enabled: boolean) => Promise<unknown>;
+  pluginsSetToolEnabled: (id: string, name: string, enabled: boolean) => Promise<unknown>;
+  pluginsAuthStart: (id: string) => Promise<unknown>;
+  pluginsAuthCancel: (id: string) => Promise<unknown>;
 }
 
 export type CoreUiDispatcher = (operation: CoreUiOperation, payload: unknown) => Promise<unknown>;
@@ -273,6 +309,45 @@ export function createCoreUiDispatcher(deps: CoreUiDispatcherDeps): CoreUiDispat
       case 'devices-revoke': {
         const { deviceId } = z.object({ deviceId: z.string().regex(/^dev_[0-9a-f]{32}$/i) }).parse(payload);
         return deps.revokeDevice(deviceId);
+      }
+      case 'plugins-list':
+        z.null().parse(payload);
+        return deps.pluginsList();
+      case 'plugins-install': {
+        const request = pluginInstallSchema.parse(payload);
+        return deps.pluginsInstall(request);
+      }
+      case 'plugins-configure': {
+        const value = z.object({ id: pluginIdSchema, patch: pluginPatchSchema }).strict().parse(payload);
+        return deps.pluginsConfigure(value.id, value.patch);
+      }
+      case 'plugins-restart': {
+        const { id } = pluginIdentitySchema.parse(payload);
+        return deps.pluginsRestart(id);
+      }
+      case 'plugins-update': {
+        const { id } = pluginIdentitySchema.parse(payload);
+        return deps.pluginsUpdate(id);
+      }
+      case 'plugins-remove': {
+        const { id } = pluginIdentitySchema.parse(payload);
+        return deps.pluginsRemove(id);
+      }
+      case 'plugins-set-enabled': {
+        const value = pluginIdentitySchema.extend({ enabled: z.boolean() }).strict().parse(payload);
+        return deps.pluginsSetEnabled(value.id, value.enabled);
+      }
+      case 'plugins-set-tool-enabled': {
+        const value = pluginIdentitySchema.extend({ name: z.string().min(1).max(256), enabled: z.boolean() }).strict().parse(payload);
+        return deps.pluginsSetToolEnabled(value.id, value.name, value.enabled);
+      }
+      case 'plugins-auth-start': {
+        const { id } = pluginIdentitySchema.parse(payload);
+        return deps.pluginsAuthStart(id);
+      }
+      case 'plugins-auth-cancel': {
+        const { id } = pluginIdentitySchema.parse(payload);
+        return deps.pluginsAuthCancel(id);
       }
     }
   };
@@ -397,7 +472,17 @@ const defaultDeps: CoreUiDispatcherDeps = {
     const revoked = await revokeRemote(deviceId);
     if (revoked) disconnectRemote(deviceId);
     return revoked;
-  }
+  },
+  pluginsList: () => pluginManager.snapshot(),
+  pluginsInstall: (request) => pluginManager.install(request),
+  pluginsConfigure: (id, patch) => pluginManager.configure(id, patch),
+  pluginsRestart: (id) => pluginManager.restart(id),
+  pluginsUpdate: (id) => pluginManager.update(id),
+  pluginsRemove: (id) => pluginManager.uninstall(id),
+  pluginsSetEnabled: (id, enabled) => pluginManager.setEnabled(id, enabled),
+  pluginsSetToolEnabled: (id, name, enabled) => pluginManager.setToolEnabled(id, name, enabled),
+  pluginsAuthStart: (id) => pluginManager.authenticate(id),
+  pluginsAuthCancel: (id) => pluginManager.cancelAuthentication(id)
 };
 
 export const coreUiDispatcher = createCoreUiDispatcher(defaultDeps);

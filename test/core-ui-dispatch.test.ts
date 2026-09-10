@@ -14,7 +14,17 @@ function deps() {
     clearAgent: vi.fn(async () => ({ cleared: 'none', reason: 'not found', swarm: { running: false, agents: [] } })),
     controlCenter: vi.fn(async () => ({ state: 'idle' })),
     goalModels: vi.fn(async () => ({ models: [], total: 0 })),
-    revokeDevice: vi.fn(async () => true)
+    revokeDevice: vi.fn(async () => true),
+    pluginsList: vi.fn(() => ({ plugins: [], catalog: [], schemaRevision: 1 })),
+    pluginsInstall: vi.fn(async () => ({ plugins: [], catalog: [], schemaRevision: 2 })),
+    pluginsConfigure: vi.fn(async () => ({ plugins: [], catalog: [], schemaRevision: 3 })),
+    pluginsRestart: vi.fn(async () => ({ plugins: [], catalog: [], schemaRevision: 4 })),
+    pluginsUpdate: vi.fn(async () => ({ plugins: [], catalog: [], schemaRevision: 5 })),
+    pluginsRemove: vi.fn(async () => ({ plugins: [], catalog: [], schemaRevision: 6 })),
+    pluginsSetEnabled: vi.fn(async () => ({ plugins: [], catalog: [], schemaRevision: 7 })),
+    pluginsSetToolEnabled: vi.fn(async () => ({ plugins: [], catalog: [], schemaRevision: 8 })),
+    pluginsAuthStart: vi.fn(async () => ({ plugins: [], catalog: [], schemaRevision: 9 })),
+    pluginsAuthCancel: vi.fn(async () => ({ plugins: [], catalog: [], schemaRevision: 10 }))
   };
 }
 
@@ -61,5 +71,20 @@ describe('Core-owned UI runtime dispatch', () => {
     await expect((dispatch as any)('devices-revoke', { deviceId })).resolves.toBe(true);
     expect(d.revokeDevice).toHaveBeenCalledWith(deviceId);
     await expect((dispatch as any)('devices-revoke', { deviceId: '../escape' })).rejects.toThrow();
+  });
+
+  it('routes plugin management through fixed Core-owned operations and validates ids', async () => {
+    const d = deps();
+    const dispatch = createCoreUiDispatcher(d as never);
+    const pluginId = '11111111-2222-4333-8444-555555555555';
+
+    await expect((dispatch as any)('plugins-list', null)).resolves.toMatchObject({ schemaRevision: 1 });
+    await expect((dispatch as any)('plugins-install', { catalogId: 'memory' })).resolves.toMatchObject({ schemaRevision: 2 });
+    await expect((dispatch as any)('plugins-set-enabled', { id: pluginId, enabled: false })).resolves.toMatchObject({ schemaRevision: 7 });
+    expect(d.pluginsInstall).toHaveBeenCalledWith({ catalogId: 'memory' });
+    expect(d.pluginsSetEnabled).toHaveBeenCalledWith(pluginId, false);
+
+    await expect((dispatch as any)('plugins-remove', { id: '../escape' })).rejects.toThrow();
+    await expect((dispatch as any)('plugins-set-tool-enabled', { id: pluginId, name: '', enabled: true })).rejects.toThrow();
   });
 });

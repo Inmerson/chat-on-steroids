@@ -10,6 +10,7 @@ import { contextBridge, ipcRenderer } from 'electron';
 import type { AppState, Capabilities, Config, Diagnosis, LogEntry } from '../shared/types.js';
 import type { CoreHealthStatus } from '../shared/core-protocol.js';
 import type { ControlCenterStatus } from '../shared/control-center.js';
+import type { PluginConfigPatch, PluginInstallRequest, PluginSnapshot } from '../shared/plugins.js';
 import type {
   Handoff,
   SessionEvent,
@@ -84,6 +85,18 @@ const api = {
   writeClipboard: (text: string) => call<boolean>('clipboard:write', { text }),
   openLink: (url: string) => call<boolean>('link:open', { url }),
   installUpdate: () => call<boolean>('update:install'),
+  openPluginLegalNotices: () => call<void>('plugins:legalNotices'),
+  pluginsSnapshot: () => call<PluginSnapshot>('plugins:snapshot'),
+  pluginsInstall: (request: PluginInstallRequest) => call<PluginSnapshot>('plugins:install', request),
+  pluginsConfigure: (id: string, patch: PluginConfigPatch) => call<PluginSnapshot>('plugins:configure', { id, patch }),
+  pluginsRestart: (id: string) => call<PluginSnapshot>('plugins:restart', { id }),
+  pluginsAuthenticate: (id: string) => call<PluginSnapshot>('plugins:authenticate', { id }),
+  pluginsCancelAuthentication: (id: string) => call<PluginSnapshot>('plugins:cancelAuthentication', { id }),
+  pluginsUpdate: (id: string) => call<PluginSnapshot>('plugins:update', { id }),
+  pluginsUninstall: (id: string) => call<PluginSnapshot>('plugins:uninstall', { id }),
+  pluginsSetEnabled: (id: string, enabled: boolean) => call<PluginSnapshot>('plugins:enabled', { id, enabled }),
+  pluginsSetToolEnabled: (id: string, name: string, enabled: boolean) => call<PluginSnapshot>('plugins:tool', { id, name, enabled }),
+  pluginsImportBundle: () => call<string | null>('plugins:importBundle'),
 
   listSessions: (options?: { cursor?: SessionListCursor; limit?: number }) =>
     call<SessionList>('sessions:list', options ?? {}),

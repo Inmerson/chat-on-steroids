@@ -32,6 +32,7 @@ import { extensionDir } from './extension-path.js';
 import { extensionDownloadUrl } from './version.js';
 import { markInstallOnQuit, onUpdateChange, updateStatus } from './update.js';
 import { RELEASES_PAGE } from '../shared/types.js';
+import { registerPluginIpc } from './plugins-ipc.js';
 
 const ALLOWED_LINKS = new Set([
   'https://chatgpt.com/#settings/Apps',
@@ -93,6 +94,7 @@ const id = z.string().min(8).max(64).regex(/^[0-9a-z-]+$/i);
 const agentId = z.string().min(1).max(64).regex(/^[0-9a-z-]+$/i);
 
 export function registerUiIpc(getWindow: () => BrowserWindow | null, quitToInstall: () => void = () => {}): void {
+  registerPluginIpc(handle, getWindow);
   handle('state:get', async () => {
     const state = await buildState();
     logInfo('renderer state ready');

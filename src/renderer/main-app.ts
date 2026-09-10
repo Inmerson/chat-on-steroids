@@ -374,6 +374,7 @@ function save(over: { readOnly?: boolean; theme?: 'light' | 'dark' } = {}): Prom
       tunnelId: $<HTMLInputElement>('tunnelId').value.trim(),
       desktopTunnelId: $<HTMLInputElement>('desktopTunnelId').value.trim(),
       steromiTunnelId: $<HTMLInputElement>('steromiTunnelId').value.trim(),
+      pluginsTunnelId: previous.tunnel.pluginsTunnelId,
       binaryPath: $<HTMLInputElement>('binaryPath').value.trim()
     },
     ui: {

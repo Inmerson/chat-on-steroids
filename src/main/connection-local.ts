@@ -15,6 +15,7 @@ import { getSecret } from './secrets.js';
 import { startTunnel, TunnelError, type TunnelHandle } from './tunnel/index.js';
 import { desktopAutomationSupported } from './platform.js';
 import { executeRemote } from './multidevice/transport.js';
+import { pluginManager } from './plugins/manager.js';
 
 let endpoint: McpEndpoint | null = null;
 let tunnel: TunnelHandle | null = null;
@@ -22,6 +23,8 @@ let desktopTunnel: TunnelHandle | null = null;
 let desktopTunnelId: string | null = null;
 let steromiTunnel: TunnelHandle | null = null;
 let steromiTunnelId: string | null = null;
+let pluginsTunnel: TunnelHandle | null = null;
+let pluginsTunnelId: string | null = null;
 let activeCoreTransport: Pick<TunnelSettings, 'kind' | 'tunnelId' | 'binaryPath'> | null = null;
 let status: ConnectionStatus = {
   state: 'disconnected',
@@ -114,6 +117,7 @@ function toolsFor(id: SurfaceId): string[] {
   if (config.multiAgent.enabled) coreTools.push('agents');
   if (id === 'desktop') return desktopTools;
   if (id === 'steromi') return ['steromi_dashboard', ...coreTools, ...desktopTools];
+  if (id === 'plugins') return pluginManager.tools().map((tool) => tool.name);
   return coreTools;
 }
 
@@ -223,7 +227,7 @@ async function connectImpl(): Promise<void> {
           ...(report.publicUrl === undefined ? {} : { publicUrl: report.publicUrl })
         });
         if (config.tunnel.kind !== 'openai' && report.publicUrl !== undefined) {
-          for (const id of ['desktop', 'steromi'] as const) {
+          for (const id of ['desktop', 'steromi', 'plugins'] as const) {
             const sibling = status.surfaces.find((entry) => entry.id === id);
             if (!sibling?.available) continue;
             updateSurface(id, {
@@ -243,6 +247,7 @@ async function connectImpl(): Promise<void> {
     tunnel = startedTunnel;
     await startDesktopTunnel(generation, config.tunnel, apiKey);
     await startSteromiTunnel(generation, config.tunnel, apiKey);
+    await startPluginsTunnel(generation, config.tunnel, apiKey);
   } catch (err) {
     if (shutdownRequested || generation !== connectionGeneration) {
       await disconnectImpl(30_000);
@@ -377,6 +382,67 @@ async function stopSteromiTunnel(detail: string): Promise<void> {
   updateSurface('steromi', { state: 'off', detail, publicUrl: null });
 }
 
+async function startPluginsTunnel(
+  generation: number,
+  settings: TunnelSettings,
+  apiKey: string | null
+): Promise<void> {
+  if (settings.kind !== 'openai') return;
+  const plugins = status.surfaces.find((entry) => entry.id === 'plugins');
+  if (!plugins?.available || !endpoint) return;
+  if (!settings.pluginsTunnelId) {
+    updateSurface('plugins', {
+      state: 'off',
+      detail: 'Not published yet. Create a Secure Tunnel for Plugins and paste its tunnel id in Settings.'
+    });
+    return;
+  }
+
+  updateSurface('plugins', { state: 'starting', detail: 'Connecting…' });
+  try {
+    pluginsTunnelId = settings.pluginsTunnelId;
+    const started = await startTunnel({
+      localUrl: endpoint.urls.plugins,
+      settings: { ...settings, tunnelId: settings.pluginsTunnelId },
+      apiKey,
+      discoveryHeaders: tunnelProbeHeaders(),
+      label: 'plugins',
+      report: (report) => {
+        if (generation !== connectionGeneration) return;
+        updateSurface('plugins', {
+          state: surfaceStateForConnection(report.state),
+          detail: report.detail,
+          ...(report.publicUrl === undefined ? {} : { publicUrl: report.publicUrl })
+        });
+      }
+    });
+    if (shutdownRequested || generation !== connectionGeneration) {
+      await started.stop().catch(() => {});
+      pluginsTunnelId = null;
+      return;
+    }
+    pluginsTunnel = started;
+  } catch (err) {
+    if (shutdownRequested || generation !== connectionGeneration) {
+      pluginsTunnelId = null;
+      return;
+    }
+    const message = err instanceof TunnelError ? err.message : (err as Error).message;
+    logWarn(`plugins connector not published: ${message}`);
+    pluginsTunnelId = null;
+    updateSurface('plugins', { state: 'error', detail: message });
+  }
+}
+
+async function stopPluginsTunnel(detail: string): Promise<void> {
+  if (!pluginsTunnel) return;
+  await pluginsTunnel.stop().catch(() => {});
+  pluginsTunnel = null;
+  pluginsTunnelId = null;
+  logInfo('plugins connector unpublished');
+  updateSurface('plugins', { state: 'off', detail, publicUrl: null });
+}
+
 async function applySettingsImpl(): Promise<void> {
   if (shutdownRequested) return;
   if (!endpoint) return;
@@ -391,12 +457,13 @@ async function applySettingsImpl(): Promise<void> {
   const caps = effectiveCapabilities(config);
   const desktopAvailable = surfaceIsUseful('desktop', caps);
   const steromiAvailable = surfaceIsUseful('steromi', caps);
+  const pluginsAvailable = surfaceIsUseful('plugins', caps);
   if (desktopAutomationSupported() && (caps.screen || caps.control)) void prewarmComputerHelper();
   setStatus({ surfaces: describeSurfaces() });
 
   if (config.tunnel.kind !== 'openai') {
-    for (const id of ['desktop', 'steromi'] as const) {
-      const available = id === 'desktop' ? desktopAvailable : steromiAvailable;
+    for (const id of ['desktop', 'steromi', 'plugins'] as const) {
+      const available = id === 'desktop' ? desktopAvailable : id === 'steromi' ? steromiAvailable : pluginsAvailable;
       if (!available) continue;
       const sibling = status.surfaces.find((entry) => entry.id === id);
       updateSurface(id, {
@@ -420,6 +487,13 @@ async function applySettingsImpl(): Promise<void> {
   } else if (!steromiTunnel || steromiTunnelId !== config.tunnel.steromiTunnelId) {
     await stopSteromiTunnel('Reconnecting with the new tunnel…');
     await startSteromiTunnel(connectionGeneration, config.tunnel, await getSecret('openaiApiKey'));
+  }
+
+  if (!pluginsAvailable) {
+    await stopPluginsTunnel('Plugins are not available with the current configuration.');
+  } else if (!pluginsTunnel || pluginsTunnelId !== config.tunnel.pluginsTunnelId) {
+    await stopPluginsTunnel('Reconnecting with the new tunnel…');
+    await startPluginsTunnel(connectionGeneration, config.tunnel, await getSecret('openaiApiKey'));
   }
 }
 
@@ -445,6 +519,11 @@ async function disconnectImpl(endpointForceAfterMs?: number): Promise<void> {
     steromiTunnel = null;
   }
   steromiTunnelId = null;
+  if (pluginsTunnel) {
+    await pluginsTunnel.stop().catch(() => {});
+    pluginsTunnel = null;
+  }
+  pluginsTunnelId = null;
   if (tunnel) {
     await tunnel.stop().catch(() => {});
     tunnel = null;

@@ -25,6 +25,7 @@ import { CoreHealthController } from './health-controller.js';
 import { probeLocalMcp } from './probe.js';
 import { setConnectionGenerationProvider } from './request-lifecycle.js';
 import { applyCoreSettingsTransition } from './settings-runtime.js';
+import { pluginManager } from '../plugins/manager.js';
 
 const SWARM_STATE = 'swarm';
 const RETIRED_WORKERS_STATE = 'retired-workers';
@@ -67,6 +68,7 @@ async function restoreCoreState(userDataDir: string): Promise<() => void> {
   initDurableStore(userDataDir);
   initLogFile(path.join(userDataDir, 'core.log'));
   await loadConfig();
+  await pluginManager.initialize(userDataDir);
 
   restoreGoalObjectives(await readDurable<GoalObjectivesSnapshot>(GOAL_OBJECTIVES_STATE));
   restoreExecutions(await readDurable<ExecutionSnapshot>(EXECUTION_STATE));
@@ -191,7 +193,7 @@ export async function startCoreRuntime(userDataDir: string): Promise<CoreRuntime
       stopAgentRuntimeGc();
       stopRetention();
       await Promise.allSettled([shutdownConnection(), shutdownBridge()]);
-      await Promise.allSettled([unifiedExecManager.terminateAllProcesses(), stopComputerHelper()]);
+      await Promise.allSettled([unifiedExecManager.terminateAllProcesses(), stopComputerHelper(), pluginManager.close()]);
       await Promise.allSettled([flushRecorder()]);
       await Promise.allSettled([flushSessions(), flushDurable()]);
       logInfo('core runtime stopped');

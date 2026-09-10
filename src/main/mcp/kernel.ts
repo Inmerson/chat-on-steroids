@@ -398,7 +398,7 @@ function withInbox(
  * `agents` tool the terminal call is an *action* rather than a tool name, and the
  * re-offer rule has to follow the action.
  */
-async function dispatch(
+export async function dispatch(
   name: string,
   args: unknown,
   transportKey: string | null,

@@ -113,6 +113,8 @@ export interface TunnelSettings {
   desktopTunnelId: string;
   /** OpenAI tunnel id for the optional Steromi all-in-one connector. */
   steromiTunnelId: string;
+  /** OpenAI tunnel id for the optional external Plugins connector. */
+  pluginsTunnelId: string;
   /** Optional explicit path to tunnel-client / cloudflared. */
   binaryPath: string;
 }
@@ -298,7 +300,7 @@ export interface ConnectionStatus {
 }
 
 /** The identifiers of the connectors this app publishes. Mirrors `mcp/surfaces.ts`. */
-export type SurfaceId = 'core' | 'desktop' | 'steromi';
+export type SurfaceId = 'core' | 'desktop' | 'steromi' | 'plugins';
 
 export interface SurfaceStatus {
   id: SurfaceId;

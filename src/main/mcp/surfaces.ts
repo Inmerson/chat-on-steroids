@@ -18,13 +18,14 @@
  * the user already thinks in, plus enough schema weight that folding it into Core
  * would meaningfully raise Core's no-query cost.
  *
- * Three surfaces pass that test today.
+ * Four surfaces pass that test today; Plugins is dynamic and may advertise zero tools
+ * until the user explicitly installs an external MCP integration.
  */
 
 import type { Capabilities } from '../../shared/types.js';
 import { desktopAutomationSupported } from '../platform.js';
 
-export const SURFACE_IDS = ['core', 'desktop', 'steromi'] as const;
+export const SURFACE_IDS = ['core', 'desktop', 'steromi', 'plugins'] as const;
 export type SurfaceId = (typeof SURFACE_IDS)[number];
 
 /**
@@ -153,13 +154,25 @@ const STEROMI: SurfaceDefinition = {
   tools: ['steromi_dashboard', ...CORE.tools, ...DESKTOP.tools]
 };
 
+const PLUGINS: SurfaceDefinition = {
+  id: 'plugins',
+  serverName: 'chat-on-steroids-plugins',
+  connectorName: `${CONNECTOR_BRAND} Plugins`,
+  description:
+    'Tools from external MCP integrations installed and enabled in Chat On Steroids, including Blender and other connected applications and services.',
+  cardSummary: 'One separate connector for enabled external MCP plugins.',
+  required: false,
+  tools: []
+};
+
 export const SURFACES: Record<SurfaceId, SurfaceDefinition> = {
   core: CORE,
   desktop: DESKTOP,
-  steromi: STEROMI
+  steromi: STEROMI,
+  plugins: PLUGINS
 };
 
-export const SURFACE_LIST: readonly SurfaceDefinition[] = [CORE, DESKTOP, STEROMI];
+export const SURFACE_LIST: readonly SurfaceDefinition[] = [CORE, DESKTOP, STEROMI, PLUGINS];
 
 export function surfaceDefinition(id: SurfaceId): SurfaceDefinition {
   return SURFACES[id];
