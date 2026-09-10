@@ -5,6 +5,20 @@ import { describe, expect, it } from 'vitest';
 import { applyReleaseVersion, assertReleaseVersion } from '../scripts/set-release-version.mjs';
 
 describe('release version preparation', () => {
+  it('pins this release checkout to 2.2.0 before packaging', async () => {
+    const root = process.cwd();
+    const pkg = JSON.parse(await readFile(path.join(root, 'package.json'), 'utf8'));
+    const lock = JSON.parse(await readFile(path.join(root, 'package-lock.json'), 'utf8'));
+    const manifest = JSON.parse(await readFile(path.join(root, 'extension', 'manifest.json'), 'utf8'));
+    const versionSource = await readFile(path.join(root, 'src', 'main', 'version.ts'), 'utf8');
+
+    expect(pkg.version).toBe('2.2.0');
+    expect(lock.version).toBe('2.2.0');
+    expect(lock.packages[''].version).toBe('2.2.0');
+    expect(manifest.version).toBe('2.2.0');
+    expect(versionSource).toContain("APP_VERSION = '2.2.0'");
+  });
+
   it('accepts only exact stable semver release versions', () => {
     expect(assertReleaseVersion('2.1.3')).toBe('2.1.3');
     for (const invalid of ['v2.1.3', '2.1', '2.1.3-beta.1', '../2.1.3', ' 2.1.3 ']) {
