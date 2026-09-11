@@ -44,9 +44,25 @@ afterAll(async () => { await endpoint?.stop(); await flushRecorder(); resetDurab
 
 it('publishes plugin schemas only on the dedicated fourth surface', async () => {
   expect(new Set(Object.values(endpoint.urls)).size).toBe(4);
-  expect((await rpc('plugins', 'tools/list')).result.tools).toEqual([plugin.declaration]);
+  expect((await rpc('plugins', 'tools/list')).result.tools).toEqual([
+    plugin.declaration,
+    expect.objectContaining({ name: 'exec' })
+  ]);
   for (const surface of ['core', 'desktop', 'steromi'] as const) {
     expect((await rpc(surface, 'tools/list')).result.tools.some((tool: { name: string }) => tool.name === plugin.declaration.name)).toBe(false);
+  }
+});
+
+it('preserves an upstream plugin named exec instead of replacing its direct contract', async () => {
+  const original = plugin.declaration.name;
+  try {
+    plugin.declaration.name = 'exec';
+    expect((await rpc('plugins', 'tools/list')).result.tools).toEqual([plugin.declaration]);
+    const response = await rpc('plugins', 'tools/call', { name: 'exec', arguments: { name: 'scene' } });
+    expect(response.result.structuredContent).toEqual({ count: 1 });
+    expect(plugin.call).toHaveBeenCalledTimes(1);
+  } finally {
+    plugin.declaration.name = original;
   }
 });
 

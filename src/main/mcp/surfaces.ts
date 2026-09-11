@@ -92,9 +92,9 @@ export interface SurfaceDefinition {
  *    it here. A dedicated connector for one conditional schema is pure setup overhead with
  *    no discovery benefit.
  *
- * Core declares 9 possible tool names below, but at most 8 schemas are live at once. `find`
- * and the exec pair are mutually exclusive — `find` exists only when command execution is
- * off — so no runtime tools/list reaches all 8 declarations.
+ * Core declares 10 possible tool names below, but at most 9 schemas are live at once. `find`
+ * and the command pair are mutually exclusive — `find` exists only when command execution is
+ * off — so no runtime tools/list reaches all 10 declarations; the live maximum is 9.
  */
 const CORE: SurfaceDefinition = {
   id: 'core',
@@ -108,7 +108,7 @@ const CORE: SurfaceDefinition = {
     'enabled it — spawns and coordinates worker agents, subagents or a parallel swarm across several ChatGPT conversations.',
   cardSummary: 'Files, patches and the terminal. Required — this is the coding connector.',
   required: true,
-  tools: ['read', 'view_image', 'find', 'apply_patch', 'download_artifact', 'exec_command', 'write_stdin', 'session', 'agents']
+  tools: ['read', 'view_image', 'find', 'apply_patch', 'download_artifact', 'exec_command', 'write_stdin', 'session', 'agents', 'exec']
 };
 
 /**
@@ -133,7 +133,7 @@ const DESKTOP: SurfaceDefinition = {
   cardSummary:
     'Screenshots, windows, mouse/keyboard control and the clipboard. Optional — connect it only if you want desktop automation.',
   required: false,
-  tools: ['observe', 'computer']
+  tools: ['observe', 'computer', 'exec']
 };
 
 /**
@@ -151,7 +151,7 @@ const STEROMI: SurfaceDefinition = {
     'It also exposes an interactive ChatGPT control panel with Screen, Terminal, Files and Sessions tabs.',
   cardSummary: 'Core + Desktop in one optional connector, with an inline ChatGPT control panel.',
   required: false,
-  tools: ['steromi_dashboard', ...CORE.tools, ...DESKTOP.tools]
+  tools: ['steromi_dashboard', ...new Set([...CORE.tools, ...DESKTOP.tools])]
 };
 
 const PLUGINS: SurfaceDefinition = {

@@ -23,6 +23,7 @@ import { rawPromises as fs } from '../rawfs.js';
 import { inboundRequestId } from './inbound.js';
 import { McpServer, type ServerContext } from '@modelcontextprotocol/server';
 import { z } from 'zod';
+import { toolSchema } from './tool-declarations.js';
 import type { Capabilities, Root } from '../../shared/types.js';
 import { FsOpError, formatBytes, type FileInfo } from '../fsops.js';
 import { logInfo, logWarn } from '../logger.js';
@@ -833,6 +834,10 @@ export interface SurfaceRegistrar {
   featureDisabled(feature: string, setting: string): ToolResult;
   /** Names actually registered on this server, in registration order. */
   registered(): string[];
+  /** Current registered tool names/descriptions, used by bounded in-process composition. */
+  descriptions(): Array<{ name: string; description: string }>;
+  /** Invoke one registered tool through a fresh child dispatch while inheriting proven caller identity. */
+  invokeNested(name: string, args: unknown, parent: CallContext): Promise<ToolResult>;
 }
 
 export function createRegistrar(server: McpServer, ctx: ToolContext, surface: SurfaceId): SurfaceRegistrar {
@@ -848,6 +853,7 @@ export function createRegistrar(server: McpServer, ctx: ToolContext, surface: Su
   const agentToolsExposed = ctx.exposedAgentTools ?? agentToolsLive;
   const findExposed = ctx.exposedFind ?? (!exposedCaps.command && exposedCaps.search);
   const names: string[] = [];
+  const handlers = new Map<string, { description: string; run: (args: unknown) => Promise<ToolResult> }>();
 
   return {
     ctx,
@@ -859,8 +865,32 @@ export function createRegistrar(server: McpServer, ctx: ToolContext, surface: Su
     agentToolsExposed,
     findExposed,
     registered: () => [...names],
+    descriptions: () => [...handlers].map(([name, entry]) => ({ name, description: entry.description })),
+    invokeNested(name, args, parent) {
+      return dispatch(
+        name,
+        args,
+        parent.caller.transportKey,
+        parent.caller.requestId,
+        surface,
+        async () => {
+          const entry = handlers.get(name);
+          return entry ? entry.run(args) : fail('UNKNOWN_TOOL: this tool is not available on this connector.');
+        },
+        parent
+      );
+    },
     register(name, config, handler) {
       names.push(name);
+      handlers.set(name, {
+        description: config.description,
+        run: async (args) => {
+          const parsed = await config.inputSchema.safeParseAsync(args);
+          return parsed.success
+            ? handler(parsed.data)
+            : fail('INVALID_ARGUMENTS: arguments do not match this tool’s schema.');
+        }
+      });
       const publishedConfig =
         surface === 'steromi' && STEROMI_APP_CALLABLE_TOOLS.has(name)
           ? { ...config, _meta: steromiAppCallableMeta(config._meta) }
@@ -868,7 +898,11 @@ export function createRegistrar(server: McpServer, ctx: ToolContext, surface: Su
       // No identity field is ever added here. Every tool's schema is exactly what its
       // surface declared: who is calling is a fact about the conversation, established from
       // page evidence in `dispatch`, and never something the model is asked to carry.
-      server.registerTool(name, publishedConfig, ((args: never, mcpCtx?: McpCallContext) =>
+      server.registerTool(name, {
+        ...publishedConfig,
+        inputSchema: toolSchema(config.inputSchema),
+        ...(config.outputSchema ? { outputSchema: toolSchema(config.outputSchema) } : {})
+      }, ((args: never, mcpCtx?: McpCallContext) =>
         dispatch(name, args, mcpCtx?.sessionId ?? null, requestIdOf(mcpCtx), surface, () =>
           handler(args)
         )) as never);

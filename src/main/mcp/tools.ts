@@ -25,6 +25,7 @@ import { serverInstructions } from './instructions.js';
 import { APP_VERSION } from './../version.js';
 import { toVirtualPath } from '../sandbox.js';
 import { logWarn } from '../logger.js';
+import { registerCodeMode } from './code-mode-tool.js';
 
 export function buildServer(ctx: ToolContext, surface: SurfaceId): McpServer {
   const definition = surfaceDefinition(surface);
@@ -35,15 +36,19 @@ export function buildServer(ctx: ToolContext, surface: SurfaceId): McpServer {
 
   const registrar = createRegistrar(server, ctx, surface);
   if (surface === 'core') {
-    registerCoreTools(decorateCoreRegistrarWithAgentV3(registrar));
+    const coreRegistrar = decorateCoreRegistrarWithAgentV3(registrar);
+    registerCoreTools(coreRegistrar);
+    registerCodeMode(coreRegistrar);
   } else if (surface === 'desktop') {
     registerDesktopTools(registrar);
+    registerCodeMode(registrar);
   } else if (surface === 'plugins') {
     registerPluginTools(server);
   } else {
     registerSteromiApp(server, registrar);
     registerCoreTools(decorateCoreRegistrarWithAgentV3(registrar));
     registerDesktopTools(registrar);
+    registerCodeMode(registrar);
   }
 
   // Cheap self-check on a property the tests assert and the design depends on: a surface

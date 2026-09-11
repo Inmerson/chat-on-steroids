@@ -58,10 +58,12 @@ describe('portable browser-backed feature parity', () => {
       'exec_command',
       'write_stdin',
       'session',
-      'agents'
+      'agents',
+      'exec'
     ]);
     expect(surfaceIsUseful('core', config.capabilities, 'darwin')).toBe(true);
     expect(surfaceIsUseful('desktop', config.capabilities, 'darwin')).toBe(false);
+    expect(surfaceDefinition('steromi').tools.filter((name) => name === 'exec')).toHaveLength(1);
 
     const manifest = JSON.parse(
       readFileSync(new URL('../extension/manifest.json', import.meta.url), 'utf8')
