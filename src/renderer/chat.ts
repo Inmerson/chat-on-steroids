@@ -30,7 +30,9 @@ import {
   MAX_GOAL_SYSTEM_PROMPT_CHARS
 } from '../shared/goal.js';
 import { browserExtensionRequired, type AppState, type Config } from '../shared/types.js';
+import type { AgentPlan } from '../shared/agent-plan.js';
 import { $, ago, clockTime, compactNumber, el, icon, run, toast } from './dom.js';
+import { renderAgentPlan } from './agent-plan.js';
 
 const api = window.api;
 
@@ -113,6 +115,7 @@ let badgeKey = '';
 /** Handoff currently shown, and the id it was loaded for. */
 let handoff: Handoff | null = null;
 let handoffFor: string | null = null;
+let agentPlan: AgentPlan | null = null;
 
 let listTimer: number | undefined;
 let sessionsLoadGeneration = 0;
@@ -407,6 +410,8 @@ async function loadDetail(): Promise<void> {
     totalEvents = 0;
     detailFor = null;
     detailCursor = null;
+    agentPlan = null;
+    renderAgentPlan($('agentPlan'), null, null);
     paintDetail();
     return;
   }
@@ -432,6 +437,8 @@ async function loadDetail(): Promise<void> {
       ? detail.nextFrom
       : detail.events.reduce((cursor, event) => Math.max(cursor, event.seq + 1), incremental ? detailCursor! : 0);
   totalEvents = detail.total;
+  agentPlan = detail.plan ?? null;
+  renderAgentPlan($('agentPlan'), wanted, agentPlan);
   paintDetail();
   void loadHandoff();
   // A burst can contain more than one renderer-sized page between coalesced notifications.
@@ -1443,6 +1450,8 @@ export function initChat(next: Deps): void {
     openTools.clear();
     handoff = null;
     handoffFor = null;
+    agentPlan = null;
+    renderAgentPlan($('agentPlan'), selectedId, null);
     paintSessions();
     void loadDetail();
   });

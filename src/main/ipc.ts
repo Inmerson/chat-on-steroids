@@ -50,7 +50,8 @@ import {
   listSessionPage,
   readEvents,
   readRecentEvents,
-  readHandoff
+  readHandoff,
+  readSessionPlan
 } from './session/store.js';
 import { activeSessionId, forgetSession, onSessionChange } from './session/recorder.js';
 import { blockedChatIds, setChatBlocked } from './session/blocked-chats.js';
@@ -614,13 +615,13 @@ export function registerIpc(getWindow: () => BrowserWindow | null, quitToInstall
     // load was pure cloning/IPC work; later refreshes use the sequence cursor below.
     const cap = limit ?? 160;
     if (from === undefined) {
-      const events = await readRecentEvents(id, cap);
+      const [events, plan] = await Promise.all([readRecentEvents(id, cap), readSessionPlan(id)]);
       const nextFrom = events.reduce((cursor, event) => Math.max(cursor, event.seq + 1), 0);
-      return { summary, events, total: summary.events, nextFrom };
+      return { summary, events, total: summary.events, nextFrom, plan };
     }
-    const events = await readEvents(id, { from, limit: cap });
+    const [events, plan] = await Promise.all([readEvents(id, { from, limit: cap }), readSessionPlan(id)]);
     const nextFrom = events.reduce((cursor, event) => Math.max(cursor, event.seq + 1), from);
-    return { summary, events, total: summary.events, nextFrom };
+    return { summary, events, total: summary.events, nextFrom, plan };
   });
 
   const stageFiles = async (sources: AttachmentSource[]) => {

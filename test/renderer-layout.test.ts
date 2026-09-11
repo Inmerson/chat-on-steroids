@@ -226,8 +226,8 @@ describe('the chat panel cards', () => {
 
   it('gives the session card one row per child, including its navigation row', () => {
     const card = document.getElementById('chatTitle')!.closest('.card')!;
-    // Header, subhead, body, foot. If a child is added, the template must grow with it.
-    expect(card.children.length).toBe(4);
+    // Header, subhead, durable plan, body, foot. If a child is added, the template must grow with it.
+    expect(card.children.length).toBe(5);
     expect(card.classList.contains('is-session')).toBe(true);
     expect(tracks("[data-panel='chat'] .card.is-session")).toHaveLength(card.children.length);
   });

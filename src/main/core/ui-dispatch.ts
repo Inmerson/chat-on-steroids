@@ -38,7 +38,8 @@ import {
   listSessionPage,
   readEvents,
   readHandoff,
-  readRecentEvents
+  readRecentEvents,
+  readSessionPlan
 } from '../session/store.js';
 import { applyCoreSettingsTransition } from './settings-runtime.js';
 import { createPairingTicket, deviceOverview, revokeRemote } from '../multidevice/registry.js';
@@ -441,13 +442,13 @@ const defaultDeps: CoreUiDispatcherDeps = {
     if (!summary) throw new Error('Session not found');
     const cap = limit ?? 160;
     if (from === undefined) {
-      const events = await readRecentEvents(id, cap);
+      const [events, plan] = await Promise.all([readRecentEvents(id, cap), readSessionPlan(id)]);
       const nextFrom = events.reduce((cursor, event) => Math.max(cursor, event.seq + 1), 0);
-      return { summary, events, total: summary.events, nextFrom };
+      return { summary, events, total: summary.events, nextFrom, plan };
     }
-    const events = await readEvents(id, { from, limit: cap });
+    const [events, plan] = await Promise.all([readEvents(id, { from, limit: cap }), readSessionPlan(id)]);
     const nextFrom = events.reduce((cursor, event) => Math.max(cursor, event.seq + 1), from);
-    return { summary, events, total: summary.events, nextFrom };
+    return { summary, events, total: summary.events, nextFrom, plan };
   },
   deleteSession: async (id) => {
     forgetSession(id);

@@ -13,6 +13,7 @@ import type { ControlCenterStatus } from '../shared/control-center.js';
 import type { PluginConfigPatch, PluginInstallRequest, PluginSnapshot } from '../shared/plugins.js';
 import type { BrowserPreferences } from '../shared/browser-preferences.js';
 import type { ChatModelCatalog } from '../shared/chat-models.js';
+import type { AgentPlan } from '../shared/agent-plan.js';
 import type {
   Handoff,
   SessionEvent,
@@ -65,6 +66,7 @@ export interface SessionDetail {
   events: SessionEvent[];
   total: number;
   nextFrom: number;
+  plan: AgentPlan | null;
 }
 
 const api = {

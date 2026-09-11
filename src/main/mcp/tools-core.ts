@@ -140,6 +140,7 @@ import {
   type ToolResult
 } from './kernel.js';
 import { registerSessionTool } from './session-tool.js';
+import { registerPlanTool } from './plan-tool.js';
 import { DEFAULT_MAX_ARTIFACT_BYTES, downloadArtifactFile } from './artifact-download.js';
 
 /** Entries one `read` of a directory returns before it says it stopped. */
@@ -992,6 +993,11 @@ export function registerCoreTools(reg: SurfaceRegistrar): void {
   // discoverable even when recording is disabled. The recording-only actions enforce
   // `sessionToolsLive` inside their handler; execution_* does not depend on recording.
   registerSessionTool(reg);
+
+  // `update_plan` is a recording-backed projection of the current durable session. Unlike
+  // `session` itself it has no execution-control role, so hide it from snapshots that were
+  // created with recording/session tools entirely unexposed.
+  if (reg.sessionToolsExposed) registerPlanTool(reg);
 
   // ----------------------------------------------------------------- agents
 

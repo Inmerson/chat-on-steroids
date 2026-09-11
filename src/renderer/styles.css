@@ -1851,7 +1851,126 @@ input[readonly] {
    whole content — which is why the timeline painted over the header. Every child gets an
    explicit track; nothing here may rely on implicit rows. */
 [data-panel='chat'] .card.is-session {
-  grid-template-rows: auto auto minmax(0, 1fr) auto;
+  grid-template-rows: auto auto auto minmax(0, 1fr) auto;
+}
+
+.agent-plan {
+  min-width: 0;
+  border-bottom: 1px solid var(--edge);
+  color: var(--soft);
+  font-size: 13px;
+  overflow: hidden;
+}
+
+.agent-plan[hidden] {
+  display: none;
+}
+
+.agent-plan summary {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  list-style: none;
+  cursor: pointer;
+}
+
+.agent-plan summary::-webkit-details-marker {
+  display: none;
+}
+
+.agent-plan summary:focus-visible {
+  outline: 2px solid var(--ink);
+  outline-offset: -3px;
+  border-radius: var(--r-xs);
+}
+
+.agent-plan-heading {
+  min-height: 38px;
+  padding: 8px 12px;
+}
+
+.agent-plan-heading .ico {
+  width: 15px;
+  height: 15px;
+}
+
+.agent-plan-title {
+  flex: 1;
+  font-weight: 550;
+}
+
+.agent-plan-count {
+  color: var(--faint);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+
+.agent-plan-body {
+  max-height: min(300px, 34vh);
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding: 0 7px 7px;
+  border-top: 1px solid var(--edge);
+}
+
+.agent-plan-explanation {
+  margin: 9px 8px;
+  color: var(--faint);
+  line-height: 1.5;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.agent-plan-step-heading {
+  padding: 7px 5px;
+  border-radius: var(--r-xs);
+  min-height: 34px;
+}
+
+.agent-plan-step-heading:hover {
+  background: var(--hover);
+}
+
+.agent-plan-marker {
+  display: grid;
+  place-items: center;
+  width: 18px;
+  height: 18px;
+  flex-shrink: 0;
+  border: 1px solid var(--edge);
+  border-radius: 50%;
+  font-size: 10px;
+  color: var(--faint);
+}
+
+.agent-plan-step-title {
+  flex: 1;
+  min-width: 0;
+  line-height: 1.4;
+  overflow-wrap: anywhere;
+}
+
+.agent-plan-step[data-status='in_progress'] > summary {
+  color: var(--ink);
+}
+
+.agent-plan-step[data-status='in_progress'] .agent-plan-marker {
+  border-color: var(--ink);
+  color: var(--ink);
+}
+
+.agent-plan-step[data-status='completed'] .agent-plan-marker {
+  color: var(--soft);
+  border-color: transparent;
+}
+
+.agent-plan-details {
+  padding: 0 14px 10px 32px;
+  color: var(--faint);
+  font-size: 12px;
+  line-height: 1.6;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
 }
 
 #chatTitle {

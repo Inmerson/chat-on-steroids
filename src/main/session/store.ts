@@ -35,6 +35,13 @@ import type {
 } from '../../shared/session.js';
 import { eventTokens, normalizedToolOutcome } from '../../shared/session.js';
 import { chronological } from '../../shared/chronology.js';
+import {
+  agentPlanSchema,
+  agentPlanUpdateSchema,
+  MAX_AGENT_PLAN_BYTES,
+  type AgentPlan,
+  type AgentPlanUpdate
+} from '../../shared/agent-plan.js';
 import { getConfig } from '../config.js';
 import { logError, logInfo, logWarn } from '../logger.js';
 
@@ -1792,6 +1799,60 @@ export async function getSession(id: string): Promise<SessionSummary | null> {
   assertSessionId(id);
   const summary = await readAuthoritativeSummary(id);
   return summary ? { ...summary } : null;
+}
+
+/** A task plan is one replaceable session document, never an execution queue. */
+async function readPlanFile(id: string): Promise<AgentPlan | null> {
+  let handle: Awaited<ReturnType<typeof fs.open>> | null = null;
+  try {
+    handle = await fs.open(path.join(sessionDir(id), 'plan.json'), 'r');
+    const buffer = Buffer.alloc(MAX_AGENT_PLAN_BYTES + 1);
+    const { bytesRead } = await handle.read(buffer, 0, buffer.length, 0);
+    if (bytesRead > MAX_AGENT_PLAN_BYTES) return null;
+    const parsed = agentPlanSchema.safeParse(JSON.parse(buffer.toString('utf8', 0, bytesRead)));
+    return parsed.success ? parsed.data : null;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT' || error instanceof SyntaxError) return null;
+    throw error;
+  } finally {
+    await handle?.close();
+  }
+}
+
+export async function readSessionPlan(id: string): Promise<AgentPlan | null> {
+  assertSessionId(id);
+  await open.get(id)?.queue;
+  return readPlanFile(id);
+}
+
+export async function updateSessionPlan(
+  id: string,
+  conversationId: string,
+  input: AgentPlanUpdate,
+  startedAt: number
+): Promise<boolean> {
+  const plan = agentPlanSchema.parse({ ...agentPlanUpdateSchema.parse(input), updatedAt: startedAt });
+  const bytes = JSON.stringify(plan);
+  if (Buffer.byteLength(bytes, 'utf8') > MAX_AGENT_PLAN_BYTES) throw new Error('Plan exceeds its storage budget');
+
+  const entry = await ensureOpen(id);
+  return enqueueSessionOperation(entry, 'plan', async () => {
+    // Rebind and plan updates share this queue. A delayed source-chat call cannot overwrite
+    // the destination chat's plan after Compact & Resume.
+    if (entry.summary.conversationId !== conversationId) return false;
+    const previous = await readPlanFile(id);
+    if (previous && previous.updatedAt >= startedAt) return false;
+
+    const target = path.join(sessionDir(id), 'plan.json');
+    const temporary = `${target}.${process.pid}.${randomUUID()}.tmp`;
+    try {
+      await fs.writeFile(temporary, bytes, 'utf8');
+      await fs.rename(temporary, target);
+    } finally {
+      await fs.rm(temporary, { force: true }).catch(() => undefined);
+    }
+    return true;
+  });
 }
 
 export async function endSession(id: string): Promise<void> {

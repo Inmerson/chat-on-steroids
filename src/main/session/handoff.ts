@@ -11,7 +11,7 @@
 import { randomUUID } from 'node:crypto';
 import type { Handoff } from '../../shared/session.js';
 import { logInfo } from '../logger.js';
-import { getSession, saveHandoff } from './store.js';
+import { getSession, readSessionPlan, saveHandoff } from './store.js';
 
 export interface PrepareHandoffInput {
   sessionId: string;
@@ -21,6 +21,10 @@ export interface PrepareHandoffInput {
   /** How the recording looked when the brief was written. Defaults to the session's own counts. */
   sourceEvents?: number;
   sourceTokens?: number;
+}
+
+export function handoffPlanNotice(sessionId: string): string {
+  return `\n\nA task plan exists. Check the latest update_plan call with session(action="read", session_id="${sessionId}", include=["tools"]); expand its tool_call reference for the steps and statuses before continuing.`;
 }
 
 /**
@@ -119,11 +123,13 @@ export async function prepareHandoff(input: PrepareHandoffInput): Promise<Handof
   // store is indistinguishable from a real brief for the rest of its life.
   const shortfall = briefShortfall(text, input.sourceTokens ?? summary.estimatedTokens);
   if (shortfall) throw new Error(shortfall);
+  const plan = await readSessionPlan(input.sessionId);
+  const planNotice = plan?.plan.length ? handoffPlanNotice(input.sessionId) : '';
   const handoff: Handoff = {
     id: newHandoffId(),
     sessionId: input.sessionId,
     createdAt: Date.now(),
-    text,
+    text: text + planNotice,
     sourceEvents: input.sourceEvents ?? summary.events,
     sourceTokens: input.sourceTokens ?? summary.estimatedTokens,
     // The working folder is deliberately not here. It belongs to the durable local session

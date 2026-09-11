@@ -29,6 +29,8 @@ import {
   appendEvent,
   createSession,
   initSessionStore,
+  readSessionPlan,
+  rebindSession,
   upsertMessageEvent,
   writeOverflowText
 } from '../src/main/session/store.js';
@@ -646,7 +648,7 @@ describe('surface boundaries', () => {
     everything();
     const names = toolNames(await core('tools/list'));
     // find is absent because exec_command is present — they are mutually exclusive.
-    expect(names).toEqual(['agents', 'apply_patch', 'download_artifact', 'exec', 'exec_command', 'read', 'session', 'view_image', 'write_stdin']);
+    expect(names).toEqual(['agents', 'apply_patch', 'download_artifact', 'exec', 'exec_command', 'read', 'session', 'update_plan', 'view_image', 'write_stdin']);
     for (const name of surfaceDefinition('desktop').tools.filter((name) => name !== 'exec')) {
       expect(names, name).not.toContain(name);
     }
@@ -923,20 +925,20 @@ describe('surface boundaries', () => {
     const coreTools = toolList(await core('tools/list'));
     const desktopTools = toolList(await desktop('tools/list'));
 
-    // Counts are the design: Core is capped at nine live schemas because find and the command
-    // pair cannot both exist, plus one bounded Code Mode composition schema. Desktop has its
-    // two direct tools plus the same composition schema.
-    expect(coreTools).toHaveLength(9);
+    // Counts are the design: Core is capped at ten live schemas because find and the command
+    // pair cannot both exist, plus one bounded Code Mode composition schema and one durable
+    // display-only task-plan schema. Desktop has its two direct tools plus Code Mode.
+    expect(coreTools).toHaveLength(10);
     expect(desktopTools).toHaveLength(3);
 
     // And the size, which is what a discovery pull actually costs the model on every
     // conversation that touches the connector. The ceilings sit just above what the
-    // surface measures today (core 18.2k, desktop 8.56k with Code Mode on 2026-09-11) rather than at a
+    // surface measures today (core 19.5k with Code Mode + update_plan, desktop 8.56k on 2026-09-11) rather than at a
     // round number well above it: a budget with room to spare is a budget that never
     // catches the regression it exists to catch.
     const coreBytes = Buffer.byteLength(JSON.stringify(coreTools), 'utf8');
     const desktopBytes = Buffer.byteLength(JSON.stringify(desktopTools), 'utf8');
-    expect(coreBytes, `core tools/list is ${coreBytes} bytes`).toBeLessThan(18_500);
+    expect(coreBytes, `core tools/list is ${coreBytes} bytes`).toBeLessThan(19_800);
     expect(desktopBytes, `desktop tools/list is ${desktopBytes} bytes`).toBeLessThan(8_650);
 
     // Per tool as well as per surface, so one schema cannot quietly eat the whole budget
@@ -3670,6 +3672,81 @@ describe('exec session attribution and authenticated continuation', () => {
       await unifiedExecManager.terminateAllProcesses();
       resetExecOwnershipForTests();
     }
+  });
+});
+
+describe('agent-maintained plans over MCP', () => {
+  it('uses exact request proof, rejects foreign targets and fences a replaced chat', async () => {
+    ctx.sessionTools = true;
+    ctx.agentTools = false;
+    const source = await createSession({ conversationId: 'plan-http-source' });
+    const other = await createSession({ conversationId: 'plan-http-other' });
+    const args = {
+      plan: [
+        {
+          step: 'Implement the fix',
+          details: 'Validate session ownership.',
+          status: 'in_progress'
+        }
+      ]
+    };
+    const send = (requestId: string | null, arguments_: Record<string, unknown> = args) =>
+      modern(
+        'tools/call',
+        { name: 'update_plan', arguments: arguments_ },
+        requestId ? { 'x-request-id': `${requestId}/att1` } : {}
+      );
+
+    expect(failed(await send(null))).toBe(true);
+    expect(await readSessionPlan(source.id)).toBeNull();
+
+    const prove = (requestId: string, conversationId = 'plan-http-source') =>
+      observeRequestCorrelation({
+        requestId,
+        conversationId,
+        sessionId: source.id,
+        messageId: `msg-${requestId}`,
+        tool: 'update_plan',
+        observedAt: Date.now()
+      });
+
+    expect(prove('wfr_plan_owned')).toBe('stored');
+    expect(failed(await send('wfr_plan_owned', { ...args, session_id: other.id }))).toBe(true);
+    expect(failed(await send('wfr_plan_owned'))).toBe(false);
+    expect((await readSessionPlan(source.id))?.plan).toEqual(args.plan);
+    expect(await readSessionPlan(other.id)).toBeNull();
+
+    expect(await rebindSession(source.id, 'plan-http-source', 'plan-http-destination')).toBe(true);
+    expect(failed(await send('wfr_plan_owned', { plan: [] }))).toBe(true);
+    expect(prove('wfr_plan_destination', 'plan-http-destination')).toBe('stored');
+    expect(failed(await send('wfr_plan_destination', { plan: [] }))).toBe(false);
+    expect((await readSessionPlan(source.id))?.plan).toEqual([]);
+  });
+
+  it('validates statuses and fails closed when session recording is disabled after discovery', async () => {
+    ctx.sessionTools = true;
+    const declaration = toolList(await core('tools/list')).find((tool) => tool.name === 'update_plan');
+    expect(declaration?.inputSchema.required).toEqual(['plan']);
+    expect(declaration?.inputSchema.additionalProperties).toBe(false);
+
+    expect(
+      failed(
+        await core('tools/call', {
+          name: 'update_plan',
+          arguments: {
+            plan: [
+              { step: 'One', status: 'in_progress' },
+              { step: 'Two', status: 'in_progress' }
+            ]
+          }
+        })
+      )
+    ).toBe(true);
+
+    ctx.sessionTools = false;
+    const disabled = await core('tools/call', { name: 'update_plan', arguments: { plan: [] } });
+    expect(failed(disabled)).toBe(true);
+    expect(textOf(disabled)).toContain('Session recording');
   });
 });
 
