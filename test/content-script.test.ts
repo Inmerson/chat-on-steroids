@@ -10783,6 +10783,30 @@ describe('the goal loop', () => {
     expect(ackAttempts).toBeGreaterThanOrEqual(2);
   });
 
+  it('shows deferred completion as waiting without sending or acknowledging the draft', async () => {
+    const deferred = {
+      ...readyDraft('', 'deferred'),
+      error: 'tool_work_in_flight'
+    };
+    let sends = () => 0;
+    live = await harness(
+      `https://chatgpt.com/c/${CHAT}`,
+      liveFeed(deferred).replies,
+      (document) => {
+        sends = watchSend(document);
+      }
+    );
+    await live.hook.pullActivity();
+    await settle();
+
+    expect(sends()).toBe(0);
+    expect(acks(live)).toHaveLength(0);
+    expect(live.hook.goalStageView({ phase: 'drafting', error: '', model: MODEL, draft: deferred })).toMatchObject({
+      stage: 'Waiting for current work to settle',
+      kind: 'goal'
+    });
+  });
+
   /**
    * The loop's success condition. Nothing is typed, and the panel says so — a run that ends
    * because the work is done must not look like a run that failed.

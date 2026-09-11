@@ -24,11 +24,14 @@ vi.mock('electron', () => ({
 }));
 
 const { defaultConfig, initConfigPath, saveConfig } = await import('../src/main/config.js');
+const durable = await import('../src/main/durable.js');
+const execution = await import('../src/main/execution.js');
 const { initSecretsPath, setSecret } = await import('../src/main/secrets.js');
-const { appendEvent, createSession, initSessionStore, resetSessionStoreForTests } = await import(
+const { appendEvent, createSession, initSessionStore, resetSessionStoreForTests, updateSessionPlan } = await import(
   '../src/main/session/store.js'
 );
 const goal = await import('../src/main/goal.js');
+const { emptyEvidence, trackInFlight } = await import('../src/main/mcp/call-context.js');
 const { makeTempDir, removeTempDir } = await import('./helpers.js');
 
 let dir: string;
@@ -69,10 +72,13 @@ beforeAll(async () => {
   dir = await makeTempDir('clf-goal-');
   initConfigPath(dir);
   initSecretsPath(dir);
+  durable.initDurableStore(dir);
   initSessionStore(dir);
 });
 
 afterAll(async () => {
+  execution.resetExecutionsForTests();
+  durable.resetDurableForTests();
   resetSessionStoreForTests();
   await removeTempDir(dir);
   globalThis.fetch = realFetch;
@@ -80,6 +86,8 @@ afterAll(async () => {
 
 beforeEach(async () => {
   goal.resetGoalStateForTests();
+  execution.resetExecutionsForTests();
+  await durable.writeDurableNow(execution.EXECUTION_STATE, null);
   await saveConfig({
     ...defaultConfig(),
     goal: { ...defaultConfig().goal, enabled: true, model: 'deepseek/deepseek-v4-flash', reasoning: 'default' }
@@ -303,6 +311,7 @@ describe('what leaves this machine', () => {
     expect(trailer.role).toBe('system');
     expect(trailer.content).toContain('That was the conversation.');
     expect(trailer.content).toContain('NO_REPLY');
+    expect(trailer.content).toContain('Core may continue');
     expect(sent.body.stream).toBe(false);
     expect(sent.body.reasoning).toEqual({ exclude: true });
     expect(sent.body.response_format).toMatchObject({
@@ -585,6 +594,90 @@ describe('the reply', () => {
     const view = await settled('c-structured-stop');
     expect(view.stage).toBe('no-reply');
     expect(view.reply).toBe('');
+  });
+
+  it('does not stop when the provider says stop but the durable plan still has pending work', async () => {
+    const conversationId = 'c-structured-stop-pending-plan';
+    const sessionId = await seed(conversationId);
+    await updateSessionPlan(
+      sessionId,
+      conversationId,
+      {
+        plan: [
+          { step: 'Implement feature', status: 'completed' },
+          { step: 'Run requested verification', status: 'pending' }
+        ]
+      },
+      100
+    );
+    globalThis.fetch = (async () => decision('stop')) as never;
+
+    goal.startGoalDraft({ sessionId, conversationId, turnId: 'g-plan-stop' });
+    const view = await settled(conversationId);
+
+    expect(view.stage).toBe('ready');
+    expect(view.reply).toContain('Run requested verification');
+    expect(view.reply).not.toContain('Implement feature');
+  });
+
+  it('continues an infinite execution when the provider reports stop', async () => {
+    const conversationId = 'c-structured-stop-infinite';
+    const sessionId = await seed(conversationId);
+    const run = await execution.createExecution({ plan: 'Complete milestone A.', mode: 'infinite' });
+    await execution.bindExecutionConversation(run.id, conversationId);
+    globalThis.fetch = (async () => decision('stop')) as never;
+
+    goal.startGoalDraft({ sessionId, conversationId, turnId: 'g-infinite-stop' });
+    const view = await settled(conversationId);
+
+    expect(view.stage).toBe('ready');
+    expect(view.reply).toMatch(/next highest-value in-scope milestone/i);
+  });
+
+  it('defers completion while exact local tool work is still in flight', async () => {
+    const conversationId = 'c-structured-stop-tool-running';
+    const sessionId = await seed(conversationId);
+    let release!: () => void;
+    const blocked = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const running = trackInFlight(
+      {
+        startedAt: Date.now(),
+        transportKey: null,
+        agent: null,
+        caller: {
+          transportKey: null,
+          requestId: null,
+          conversationId,
+          sessionId
+        },
+        outcome: null,
+        evidence: emptyEvidence()
+      },
+      async () => {
+        await blocked;
+      }
+    );
+    globalThis.fetch = (async () => decision('stop')) as never;
+
+    try {
+      goal.startGoalDraft({ sessionId, conversationId, turnId: 'g-tool-running-stop' });
+      const view = await settled(conversationId);
+      expect(view.stage).toBe('deferred');
+      expect(view.reply).toBe('');
+      expect(view.error).toBe('tool_work_in_flight');
+    } finally {
+      release();
+      await running;
+    }
+
+    let finalView = goal.goalViewFor(conversationId);
+    for (let attempt = 0; attempt < 100 && finalView?.stage === 'deferred'; attempt++) {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      finalView = goal.goalViewFor(conversationId);
+    }
+    expect(finalView?.stage).toBe('no-reply');
   });
 
   it('never types a structured reply made only of tokenizer control markers', async () => {

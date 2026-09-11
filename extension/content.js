@@ -6780,6 +6780,15 @@
     if (draft.stage === 'answering') {
       return { stage: `${who} is answering`, detail: '', body: draft.text || '', kind: 'goal', ...bar(2) };
     }
+    if (draft.stage === 'deferred') {
+      return {
+        stage: 'Waiting for current work to settle',
+        detail: draft.error || '',
+        body: '',
+        kind: 'goal',
+        ...bar(2)
+      };
+    }
     if (draft.stage === 'ready') {
       return { stage: `${who} wrote the next message`, detail: '', body: draft.reply || '', kind: 'goal', ...bar(2, true) };
     }

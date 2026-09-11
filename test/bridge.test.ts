@@ -62,7 +62,7 @@ const {
   resetGoalStateForTests,
   setGoalObjective
 } = await import('../src/main/goal.js');
-const { createSession, deleteSession, getSession, initSessionStore, readEvents, resetSessionStoreForTests } = await import(
+const { createSession, deleteSession, getSession, initSessionStore, readEvents, resetSessionStoreForTests, updateSessionPlan } = await import(
   '../src/main/session/store.js'
 );
 const { closeConversation, liveConversations, noteChatOrigin, recordChatObservations, recordToolCall, resetRecorderForTests } = await import('../src/main/session/recorder.js');
@@ -4239,6 +4239,54 @@ describe('the goal loop over the bridge', () => {
     });
     expect(reply.status).toBe(200);
     expect(reply.body.error).not.toBe('session_not_recorded');
+  });
+
+  it('does not let another recorded chat pending plan veto this chat completion candidate', async () => {
+    await pair();
+    await saveConfig({
+      ...defaultConfig(),
+      sessions: { ...defaultConfig().sessions, record: true },
+      goal: { ...defaultConfig().goal, enabled: true }
+    });
+    await setSecret('openRouterApiKey', 'sk-or-test');
+    const chatA = 'cafe0101-0000-4000-8000-000000000101';
+    const chatB = 'cafe0102-0000-4000-8000-000000000102';
+    const sessionA = await createSession({ title: 'completion A', conversationId: chatA });
+    const sessionB = await createSession({ title: 'completion B', conversationId: chatB });
+    await recordChatObservations(chatA, [
+      { kind: 'user_message', time: Date.now(), text: 'finish A', messageId: 'm-completion-a' }
+    ]);
+    await recordChatObservations(chatB, [
+      { kind: 'user_message', time: Date.now(), text: 'finish B', messageId: 'm-completion-b' }
+    ]);
+    await updateSessionPlan(
+      sessionB.id,
+      chatB,
+      { plan: [{ step: 'Pending only in B', status: 'pending' }] },
+      Date.now()
+    );
+
+    const realFetch = globalThis.fetch;
+    globalThis.fetch = (async () =>
+      Response.json({ choices: [{ message: { content: JSON.stringify({ action: 'stop', reply: '' }) } }] })) as never;
+    try {
+      const started = await request('POST', '/goal/draft', {
+        body: { conversationId: chatA, turnId: 'g-completion-a' }
+      });
+      expect(started.status).toBe(200);
+      expect(started.body.sessionId).toBe(sessionA.id);
+
+      let feed: any = null;
+      for (let attempt = 0; attempt < 200; attempt++) {
+        feed = await request('GET', `/activity?conversationId=${chatA}`);
+        if (feed.body.goal?.draft?.stage === 'no-reply') break;
+        await new Promise((resolve) => setTimeout(resolve, 5));
+      }
+      expect(feed.body.goal.draft.stage).toBe('no-reply');
+      expect(feed.body.goal.draft.reply).toBe('');
+    } finally {
+      globalThis.fetch = realFetch;
+    }
   });
 
   /**

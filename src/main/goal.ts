@@ -4,8 +4,9 @@
  * ChatGPT finishes a long turn. Somebody has to decide whether all concrete work/questions the
  * user actually requested were clearly completed, and for an unattended run that somebody is an
  * OpenRouter model given the same conversation and a strict continuation-gate instruction. The
- * stock policy keeps going while a requested item is not clearly resolved, but still treats an
- * explicit whole-job completion claim as authoritative and never invents extra work.
+ * stock policy keeps going while a requested item is not clearly resolved. A model completion
+ * claim is only a candidate: Core checks exact durable/session evidence before the loop may stop,
+ * and still never invents extra work.
  * OpenRouter is asked for a strict `{ action, reply }` decision and the app validates it before
  * anything reaches the browser; provider reasoning, tokenizer markers and malformed protocol
  * output are never user messages. That is the whole feature, and the two halves live in different
@@ -44,6 +45,7 @@
 import { createHash } from 'node:crypto';
 import { getConfig } from './config.js';
 import { writeDurableNow, writeDurableSoon } from './durable.js';
+import { evaluateCompletionCandidate } from './goal-completion.js';
 import { logInfo, logWarn } from './logger.js';
 import { getSecret } from './secrets.js';
 import { getSession, readEvents, readHandoff, readRecentEvents } from './session/store.js';
@@ -76,6 +78,8 @@ const MAX_CONTEXT_CHARS = 120_000;
 const MAX_MESSAGE_CHARS = 12_000;
 /** How long one draft may take before it is abandoned as failed. */
 const REQUEST_TIMEOUT_MS = 180_000;
+/** Local completion evidence may settle shortly after the assistant turn. Recheck without another provider call. */
+const DEFERRED_COMPLETION_RECHECK_MS = 500;
 /** The catalogue is UI data; a dead provider must not leave the picker request hanging forever. */
 const MODEL_LIST_TIMEOUT_MS = 30_000;
 /** A single SSE record should be tiny; this still leaves ample room around the 12k reply cap. */
@@ -159,7 +163,9 @@ export type GoalStage =
   | 'answering'
   /** There is a message to type. */
   | 'ready'
-  /** The model said the goal is met. Nothing is typed, and the loop ends here. */
+  /** Core still sees local work settling. Nothing is typed and this is not verified completion. */
+  | 'deferred'
+  /** Core verified the model's completion candidate. Nothing is typed, and this Goal run ends here. */
   | 'no-reply'
   | 'failed';
 
@@ -199,6 +205,7 @@ interface GoalDraft extends GoalDraftView {
   acknowledged: boolean;
   work: Promise<void> | null;
   abort: AbortController | null;
+  deferredTimer: ReturnType<typeof setTimeout> | null;
 }
 
 /** At most one draft per conversation. A new turn replaces the old chat's finished draft. */
@@ -346,6 +353,8 @@ function expireDraftPayload(draft: GoalDraft): void {
   draft.reply = '';
   draft.error = null;
   draft.work = null;
+  if (draft.deferredTimer) clearTimeout(draft.deferredTimer);
+  draft.deferredTimer = null;
 }
 
 /** What the page should be told about this chat right now, or null when there is nothing. */
@@ -379,6 +388,8 @@ export function ackGoalDraft(conversationId: string, token: string, clientId?: s
   // reached fetch yet, run() observes `acknowledged` at its next await boundary; if it has,
   // aborting the controller closes the stream immediately.
   draft.abort?.abort();
+  if (draft.deferredTimer) clearTimeout(draft.deferredTimer);
+  draft.deferredTimer = null;
   if (draft.settledAt === 0) draft.settledAt = Date.now();
   return true;
 }
@@ -396,6 +407,8 @@ export function retireGoalDrafts(): number {
     if (draft.acknowledged) continue;
     draft.acknowledged = true;
     draft.abort?.abort();
+    if (draft.deferredTimer) clearTimeout(draft.deferredTimer);
+    draft.deferredTimer = null;
     if (draft.settledAt === 0) draft.settledAt = Date.now();
     draft.text = '';
     draft.reply = '';
@@ -416,6 +429,8 @@ export function retireGoalDraftsFor(conversationId: string): boolean {
   if (!draft || draft.acknowledged) return false;
   draft.acknowledged = true;
   draft.abort?.abort();
+  if (draft.deferredTimer) clearTimeout(draft.deferredTimer);
+  draft.deferredTimer = null;
   if (draft.settledAt === 0) draft.settledAt = Date.now();
   draft.text = '';
   draft.reply = '';
@@ -423,7 +438,10 @@ export function retireGoalDraftsFor(conversationId: string): boolean {
 }
 
 export function resetGoalStateForTests(): void {
-  for (const draft of drafts.values()) draft.abort?.abort();
+  for (const draft of drafts.values()) {
+    draft.abort?.abort();
+    if (draft.deferredTimer) clearTimeout(draft.deferredTimer);
+  }
   drafts.clear();
   goalObjectives.clear();
   firstUserCache.clear();
@@ -465,6 +483,7 @@ export function startGoalDraft(input: StartGoalDraftInput): GoalDraftView {
   // request: the answer it was writing was about a conversation that has since moved on.
   if (existing) {
     existing.abort?.abort();
+    if (existing.deferredTimer) clearTimeout(existing.deferredTimer);
     drafts.delete(input.conversationId);
   }
   const settings = getConfig().goal;
@@ -486,7 +505,8 @@ export function startGoalDraft(input: StartGoalDraftInput): GoalDraftView {
     settledAt: 0,
     acknowledged: false,
     work: null,
-    abort: null
+    abort: null,
+    deferredTimer: null
   };
   drafts.set(input.conversationId, draft);
   draft.work = run(draft).catch((err: Error) => {
@@ -495,13 +515,53 @@ export function startGoalDraft(input: StartGoalDraftInput): GoalDraftView {
   return view(draft);
 }
 
+function scheduleDeferredCompletionRecheck(draft: GoalDraft): void {
+  if (draft.deferredTimer || draft.acknowledged || drafts.get(draft.conversationId) !== draft) return;
+  draft.deferredTimer = setTimeout(() => {
+    draft.deferredTimer = null;
+    void recheckDeferredCompletion(draft);
+  }, DEFERRED_COMPLETION_RECHECK_MS);
+}
+
+async function recheckDeferredCompletion(draft: GoalDraft): Promise<void> {
+  if (draft.acknowledged || drafts.get(draft.conversationId) !== draft || draft.stage !== 'deferred') return;
+  try {
+    const gate = await evaluateCompletionCandidate({
+      sessionId: draft.sessionId,
+      conversationId: draft.conversationId,
+      objective: draft.objective
+    });
+    if (draft.acknowledged || drafts.get(draft.conversationId) !== draft || draft.stage !== 'deferred') return;
+    if (gate.action === 'wait') {
+      draft.error = gate.reason;
+      scheduleDeferredCompletionRecheck(draft);
+      return;
+    }
+    if (gate.action === 'continue') {
+      draft.reply = humanReply(gate.reply);
+      settle(draft, 'ready');
+      return;
+    }
+    draft.reply = '';
+    settle(draft, 'no-reply');
+  } catch (error) {
+    logWarn(
+      `goal: deferred completion recheck failed in ${draft.conversationId} — ${error instanceof Error ? error.message : String(error)}`
+    );
+    scheduleDeferredCompletionRecheck(draft);
+  }
+}
+
 function settle(draft: GoalDraft, stage: GoalStage, error: string | null = null): void {
   // A draft that was superseded is no longer this chat's draft, and must not be able to
   // publish a reply into the one that replaced it.
   if (drafts.get(draft.conversationId) !== draft) return;
+  if (draft.deferredTimer) clearTimeout(draft.deferredTimer);
+  draft.deferredTimer = null;
   draft.stage = stage;
   draft.error = error;
   draft.settledAt = Date.now();
+  if (stage === 'deferred') scheduleDeferredCompletionRecheck(draft);
 }
 
 /**
@@ -614,7 +674,23 @@ async function run(draft: GoalDraft): Promise<void> {
     if (decision.action === 'http') return settle(draft, 'failed', decision.error);
     if (decision.action === 'invalid') return settle(draft, 'failed', decision.error);
     if (decision.action === 'stop') {
-      logInfo(`goal: ${draft.model} says the goal is met in ${draft.conversationId}; nothing was sent`);
+      const gate = await evaluateCompletionCandidate({
+        sessionId: draft.sessionId,
+        conversationId: draft.conversationId,
+        objective: draft.objective
+      });
+      if (draft.acknowledged || drafts.get(draft.conversationId) !== draft) return;
+      if (gate.action === 'continue') {
+        draft.reply = humanReply(gate.reply);
+        logInfo(`goal: completion candidate vetoed in ${draft.conversationId} — ${gate.reason}`);
+        return settle(draft, 'ready');
+      }
+      if (gate.action === 'wait') {
+        logInfo(`goal: completion candidate deferred in ${draft.conversationId} — ${gate.reason}`);
+        draft.reply = '';
+        return settle(draft, 'deferred', gate.reason);
+      }
+      logInfo(`goal: completion candidate verified in ${draft.conversationId}; nothing was sent`);
       // Reaching the goal ends this Goal run, not the user's saved objective. Keeping the text
       // lets a reopened chat show what it was pursuing and lets a later manual correction such
       // as "that did not work" continue against the same objective. Nothing auto-restarts here:
