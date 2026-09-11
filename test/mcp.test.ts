@@ -3638,6 +3638,71 @@ describe('exec session attribution and authenticated continuation', () => {
     }
   });
 
+  it('ACKs the published result when exact session correlation arrives at exec admission after caller setup', async () => {
+    const conversationId = 'conv-background-admission-late-correlation';
+    const localSessionId = 'session-background-admission-late-correlation';
+    const sessionIds: number[] = [];
+    let restoreAllocate: (() => void) | null = null;
+
+    try {
+      for (let index = 0; index < MAX_UNREAD_EXEC_RESULTS_PER_CONVERSATION; index++) {
+        const requestId = `wfr_background_admission_late_correlation_${index}`;
+        expect(prove(requestId, conversationId, localSessionId)).toBe('stored');
+        const started = await asChat(requestId, 'exec_command', {
+          cmd: IS_WINDOWS
+            ? `Start-Sleep -Milliseconds 2000; Write-Output 'late-correlation-owed-${index}'; exit ${index + 1}`
+            : `sleep 2; printf '%s\\n' late-correlation-owed-${index}; exit ${index + 1}`,
+          workdir: '/workspace',
+          yield_time_ms: 100
+        });
+        const sessionId = Number(textOf(started).match(/Process running with session ID (\d+)/)?.[1]);
+        expect(Number.isInteger(sessionId), textOf(started)).toBe(true);
+        sessionIds.push(sessionId);
+      }
+
+      await vi.waitFor(
+        () => expect(backgroundExecObligations(localSessionId).exitedUnread).toHaveLength(
+          MAX_UNREAD_EXEC_RESULTS_PER_CONVERSATION
+        ),
+        { timeout: 8_000, interval: 25 }
+      );
+
+      const publishRequest = 'wfr_background_admission_late_correlation_publish';
+      expect(prove(publishRequest, conversationId, localSessionId)).toBe('stored');
+      const published = await asChat(publishRequest, 'read', { paths: ['/workspace/src/app.ts'] });
+      expect(failed(published), textOf(published)).toBe(false);
+      const publishedId = Number(textOf(published).match(/Background session (\d+) completed/)?.[1]);
+      expect(sessionIds).toContain(publishedId);
+      expect(backgroundExecObligations(localSessionId).exitedUnread).toHaveLength(
+        MAX_UNREAD_EXEC_RESULTS_PER_CONVERSATION
+      );
+
+      const admitRequest = 'wfr_background_admission_late_correlation_admit';
+      let callerSessionAtAdmission: string | null | undefined;
+      const allocateProcessId = unifiedExecManager.allocateProcessId.bind(unifiedExecManager);
+      const allocateSpy = vi.spyOn(unifiedExecManager, 'allocateProcessId').mockImplementation(() => {
+        callerSessionAtAdmission = currentCall()?.caller.sessionId;
+        expect(prove(admitRequest, conversationId, localSessionId)).toBe('stored');
+        return allocateProcessId();
+      });
+      restoreAllocate = () => allocateSpy.mockRestore();
+
+      const admitted = await asChat(admitRequest, 'exec_command', {
+        cmd: IS_WINDOWS ? "Write-Output 'admitted-after-late-correlation'" : "printf '%s\\n' admitted-after-late-correlation",
+        workdir: '/workspace',
+        yield_time_ms: 5_000
+      });
+
+      expect(callerSessionAtAdmission).toBeNull();
+      expect(failed(admitted), textOf(admitted)).toBe(false);
+      expect(textOf(admitted)).toContain('admitted-after-late-correlation');
+    } finally {
+      restoreAllocate?.();
+      await unifiedExecManager.terminateAllProcesses();
+      resetExecOwnershipForTests();
+    }
+  });
+
   it('explicit write_stdin ACKs only its target when a sibling has an outstanding publication', async () => {
     const conversationId = 'conv-background-explicit-poll-sibling';
     const localSessionId = 'session-background-explicit-poll-sibling';

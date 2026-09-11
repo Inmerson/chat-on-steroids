@@ -48,6 +48,7 @@ import { composeCommandBatch, parseCommandBatchSections } from '../codex/command
 import { formatExecOutputForModel, newStreamOutput } from '../codex/exec-output.js';
 import { DEFAULT_TRUNCATION_POLICY, EXEC_OUTPUT_CEILING_POLICY, unifiedExecManager } from '../codex/manager.js';
 import {
+  acknowledgeBackgroundExecOutput,
   acknowledgeBackgroundExecProcessForPoll,
   backgroundExecObligations,
   execOwnershipDenied,
@@ -856,6 +857,10 @@ export function registerCoreTools(reg: SurfaceRegistrar): void {
               currentCaller().conversationId
             );
             const ownerSession = provenSession(currentCaller().requestId, currentCaller().sessionId);
+            const call = currentCall();
+            if (call?.nested !== true) {
+              await acknowledgeBackgroundExecOutput(ownerSession, call?.startedAt ?? Date.now());
+            }
             const unread = backgroundExecObligations(ownerSession).exitedUnread;
             if (unread.length >= MAX_UNREAD_EXEC_RESULTS_PER_CONVERSATION) {
               unifiedExecManager.releaseProcessId(processId);

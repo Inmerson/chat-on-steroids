@@ -65,6 +65,8 @@ export interface CallCaller {
 export interface CallContext {
   /** Shared outer-response publication lease; nested calls inherit but never complete it. */
   publication?: OutputPublication;
+  /** True only for a tool invocation composed inside an outer Code Mode call. */
+  nested?: boolean;
   /** Wall-clock start of this MCP request, shared by identity-sensitive handlers. */
   startedAt: number;
   /** Stable per-conversation key when the transport offers one, else null. */

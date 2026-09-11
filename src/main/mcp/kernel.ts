@@ -438,6 +438,7 @@ export async function dispatch(
   // opens with the request and closes with it.
   const context: CallContext = {
     publication: parent?.publication ?? { completedAt: null, failed: false },
+    nested: parent !== undefined,
     startedAt: Date.now(),
     transportKey: parent ? parent.transportKey : transportKey,
     agent: parent?.agent ?? null,
