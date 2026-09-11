@@ -19,6 +19,9 @@ function generate(...args: string[]) {
 beforeEach(async () => {
   root = await makeTempDir('notices-');
   await write('scripts/generate-third-party-notices.mjs', await fs.readFile(new URL('../scripts/generate-third-party-notices.mjs', import.meta.url), 'utf8'));
+  for (const file of ['LICENSE', 'NOTICE']) {
+    await write(`docs/licenses/codex/${file}`, await fs.readFile(path.join(process.cwd(), 'docs/licenses/codex', file), 'utf8'));
+  }
   await write('package-lock.json', JSON.stringify({ packages: { 'node_modules/fixture': { version: '1.0.0' } } }));
   await write('node_modules/fixture/package.json', JSON.stringify({ name: 'fixture', version: '1.0.0', license: 'MIT' }));
   await write('node_modules/fixture/LICENSE', 'Fixture copyright and permission\n');
@@ -32,6 +35,10 @@ it('preserves license and NOTICE text; check mode leaves the shipped inventory u
   const notice = await fs.readFile(path.join(root, 'THIRD-PARTY-NOTICES.txt'), 'utf8');
   expect(notice).toContain('Fixture copyright and permission\n');
   expect(notice).toContain('Fixture attribution\n');
+  expect(notice).toContain('OpenAI Codex — adapted coding instructions and update_plan contract');
+  expect(notice).toContain('1a4096e273e80da30947e57fdfa45be92858ca91');
+  expect(notice).toContain('--- Codex LICENSE ---');
+  expect(notice).toContain('--- Codex NOTICE ---');
   await write('THIRD-PARTY-NOTICES.txt', 'other platform inventory');
   expect(generate('--check').status).toBe(0);
   expect(await fs.readFile(path.join(root, 'THIRD-PARTY-NOTICES.txt'), 'utf8')).toBe('other platform inventory');
@@ -78,6 +85,25 @@ it('covers every reviewed catalog entry with hash-verified local notice material
       expect(createHash('sha256').update(bytes).digest('hex'), `${entry.id}:${notice.file}`).toBe(notice.sha256);
     }
   }
+});
+
+it('retains Codex provenance and the exact QuickJS production runtime versions', async () => {
+  const repo = process.cwd();
+  const license = await fs.readFile(path.join(repo, 'docs/licenses/codex/LICENSE'), 'utf8');
+  const notice = await fs.readFile(path.join(repo, 'docs/licenses/codex/NOTICE'), 'utf8');
+  const provenance = await fs.readFile(path.join(repo, 'docs/licenses/codex/README.md'), 'utf8');
+  const lock = JSON.parse(await fs.readFile(path.join(repo, 'package-lock.json'), 'utf8')) as {
+    packages: Record<string, { version?: string; dev?: boolean }>;
+  };
+
+  expect(license).toContain('Apache License');
+  expect(notice).toContain('OpenAI Codex');
+  expect(provenance).toContain('OpenAI Codex');
+  expect(provenance).toContain('1a4096e273e80da30947e57fdfa45be92858ca91');
+  expect(lock.packages['node_modules/quickjs-emscripten-core']?.version).toBe('0.32.0');
+  expect(lock.packages['node_modules/quickjs-emscripten-core']?.dev).not.toBe(true);
+  expect(lock.packages['node_modules/@jitl/quickjs-wasmfile-release-sync']?.version).toBe('0.32.0');
+  expect(lock.packages['node_modules/@jitl/quickjs-wasmfile-release-sync']?.dev).not.toBe(true);
 });
 
 
