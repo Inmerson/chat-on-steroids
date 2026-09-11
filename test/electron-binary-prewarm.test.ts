@@ -20,5 +20,8 @@ describe('Electron binary bootstrap', () => {
     expect(pkg.scripts['verify:ci']).toMatch(
       /^node scripts\/ensure-electron-binary\.mjs && npm run rg &&/
     );
+    expect(pkg.scripts['verify:ci']).toContain(
+      'vitest run --exclude test/mcp-shutdown.test.ts --exclude test/session.test.ts && vitest run test/session.test.ts && vitest run test/mcp-shutdown.test.ts'
+    );
   });
 });
