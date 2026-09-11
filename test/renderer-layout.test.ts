@@ -73,6 +73,30 @@ describe('upstream-style application shell', () => {
       expect(document.querySelector(`[data-panel="${panel}"]`), panel).not.toBeNull();
     }
   });
+
+  it('gives the conversation sidebar the upstream bounded navigation column', () => {
+    const sidebar = rule('.sidebar');
+    expect(sidebar).toContain('grid-column: 1');
+    expect(sidebar).toContain('display: flex');
+    expect(sidebar).toContain('flex-direction: column');
+    expect(sidebar).toContain('min-height: 0');
+    expect(sidebar).toContain('border-right: 1px solid var(--line)');
+  });
+
+  it('lets the conversation catalogue consume the remaining sidebar height without widening the window', () => {
+    const sessions = rule('.sidebar-sessions');
+    expect(sessions).toContain('display: flex');
+    expect(sessions).toContain('flex-direction: column');
+    expect(sessions).toContain('flex: 1');
+    expect(sessions).toContain('min-height: 0');
+    expect(rule('.sidebar-sessions > .scroll')).toContain('flex: 1');
+  });
+
+  it('keeps Settings as the separated bottom action from the upstream shell', () => {
+    const bottom = rule('.sidebar-bottom');
+    expect(bottom).toContain('border-top: 1px solid var(--line)');
+    expect(bottom).toContain('margin-top: auto');
+  });
 });
 
 describe('the session card header', () => {

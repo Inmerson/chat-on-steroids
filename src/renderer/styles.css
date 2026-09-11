@@ -2666,11 +2666,12 @@ nav button.is-sel::after {
   transform: translateX(-50%);
 }
 
-/* ---------------------------------------------------------------- canvas workspace */
+/* ------------------------------------------------------------- upstream app shell */
 /*
-   The renderer keeps the same five destinations and named control anchors.  This is a
-   presentation-only shell: the left rail borrows the focused working posture of the
-   upstream client while Control stays a projection of Core-owned orchestration truth.
+   The shell follows the upstream conversation-first desktop posture, but the panels inside
+   it remain the current 2.2.0 surfaces. The sidebar owns navigation only; Core/session/tool
+   authority is unchanged. Control Center and the coordinator cards keep their own styles
+   below this block and are merely reached from Settings instead of defining the whole shell.
  */
 :root {
   --accent: #396f9d;
@@ -2686,7 +2687,7 @@ nav button.is-sel::after {
 
 .app {
   display: grid;
-  grid-template-columns: var(--sidebar-width, 224px) minmax(0, 1fr);
+  grid-template-columns: var(--sidebar-width, 232px) minmax(0, 1fr);
   grid-template-rows: auto auto minmax(0, 1fr);
   background: var(--page);
 }
@@ -2695,64 +2696,148 @@ nav button.is-sel::after {
 .app > .notice { grid-column: 2; grid-row: 2; }
 .app > main { grid-column: 2; grid-row: 3; min-width: 0; }
 
-#tabs {
+.sidebar {
   position: relative;
   grid-column: 1;
   grid-row: 1 / -1;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+  padding: 18px 12px 10px;
+  border-right: 1px solid var(--line);
+  background: var(--sunk);
+}
+
+:root[data-theme='dark'] .sidebar {
+  --accent-wash: #1a2227;
+  --accent-edge: #343e45;
+  --hover: rgb(148 181 205 / 10%);
+  background: linear-gradient(180deg, #1a2129 0%, #1a2128 8%, #1d2124 29%, #1c2125 39%, #1a2227 52%, #1a2227 100%);
+}
+
+.sidebar-brand {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-height: 38px;
+  padding: 0 8px 18px;
+}
+
+.sidebar-brand .mark {
+  flex: 0 0 auto;
+  width: 27px;
+  height: 27px;
+  border-radius: 8px;
+}
+.sidebar-brand strong { font-size: 14px; font-weight: 600; letter-spacing: -0.025em; }
+.sidebar .sidebar-toggle {
+  width: 25px;
+  min-height: 25px;
+  margin-left: auto;
+  padding: 0;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: transparent;
+  color: var(--soft);
+  font: inherit;
+  font-size: 16px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.sidebar .new-chat,
+#backToChat,
+.sidebar-bottom .btn {
+  width: 100%;
+  justify-content: flex-start;
+  gap: 9px;
+  min-height: 36px;
+  padding: 8px 10px;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  font-size: 12.5px;
+}
+.sidebar .new-chat { margin-bottom: 8px; }
+.sidebar .new-chat:hover,
+#backToChat:hover,
+.sidebar-bottom .btn:hover { background: var(--hover); }
+
+.sidebar-sessions {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0;
+  margin-top: 4px;
+}
+.sidebar-sessions > h2 {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  min-height: 32px;
+  padding: 7px 8px;
+  color: var(--faint);
+  font-size: 10.5px;
+  font-weight: 550;
+  letter-spacing: 0.01em;
+}
+.sidebar-sessions > h2 .btn { padding: 4px; font-size: 0; }
+.sidebar-sessions > h2 .btn .ico { width: 14px; height: 14px; }
+.sidebar-sessions > .scroll {
+  flex: 1;
+  min-height: 0;
+  margin-right: -12px;
+  padding-right: 4px;
+}
+.sidebar-sessions .foot { flex: none; border: 0; padding: 8px; font-size: 9.5px; }
+
+.sidebar-bottom {
+  display: flex;
+  align-items: center;
+  margin-top: auto;
+  padding-top: 10px;
+  border-top: 1px solid var(--line);
+}
+
+#settingsNav { flex: 1; min-height: 0; overflow-y: auto; }
+#tabs {
+  position: static;
   display: flex;
   flex-direction: column;
   align-items: stretch;
   justify-content: flex-start;
   gap: 3px;
   min-height: 0;
-  padding: 16px 10px 12px;
-  border-top: 0;
-  border-right: 1px solid var(--line);
-  background:
-    linear-gradient(180deg, color-mix(in srgb, var(--sunk) 94%, transparent), var(--sunk));
+  padding: 0;
+  border: 0;
+  background: transparent;
 }
 
-.rail-brand {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  min-height: 50px;
-  padding: 2px 8px 20px;
-}
-
-.rail-brand .mark {
-  flex: 0 0 auto;
-  width: 30px;
-  height: 30px;
-  border-radius: 9px;
-  background: linear-gradient(145deg, var(--ink), color-mix(in srgb, var(--ink) 76%, var(--soft)));
-}
-
-.rail-brand strong,
-.rail-brand small { display: block; }
-.rail-brand strong { font-size: 13px; font-weight: 650; letter-spacing: -0.02em; }
-.rail-brand small { margin-top: 2px; color: var(--faint); font-size: 8.5px; font-weight: 700; letter-spacing: 0.1em; }
-
-#tabs .sidebar-toggle {
-  width: 25px; min-height: 25px; margin-left: auto; justify-content: center; padding: 0;
-  border: 1px solid var(--line); border-radius: 7px; background: var(--card); color: var(--soft);
-  font-size: 18px; line-height: 1;
-}
 .sidebar-resize {
-  position: absolute; z-index: 8; top: 0; right: -4px; bottom: 0; width: 8px; cursor: ew-resize; touch-action: none;
+  position: absolute; z-index: 8; top: 0; right: -4px; bottom: 0; width: 8px; cursor: col-resize; touch-action: none;
 }
-.sidebar-resize:focus-visible { outline: 2px solid var(--accent); outline-offset: -3px; }
-.app.is-resizing-sidebar { cursor: ew-resize; user-select: none; }
+.sidebar-resize:hover,
+.sidebar-resize:focus-visible,
+.app.is-resizing-sidebar .sidebar-resize { background: var(--accent-wash); outline: 1px solid var(--accent-edge); }
+.app.is-resizing-sidebar,
+.app.is-resizing-sidebar * { cursor: col-resize !important; user-select: none !important; }
 .app.is-sidebar-collapsed { --sidebar-width: 64px !important; }
-.app.is-sidebar-collapsed .rail-brand { justify-content: center; padding: 2px 0 16px; }
-.app.is-sidebar-collapsed .rail-brand > span:last-of-type,
+.app.is-sidebar-collapsed .sidebar { padding-inline: 8px; }
+.app.is-sidebar-collapsed .sidebar-brand { justify-content: center; padding-inline: 0; }
+.app.is-sidebar-collapsed .sidebar-brand > span:nth-child(2),
+.app.is-sidebar-collapsed .sidebar-sessions,
+.app.is-sidebar-collapsed #backToChat,
 .app.is-sidebar-collapsed .rail-label,
 .app.is-sidebar-collapsed .rail-pulse,
 .app.is-sidebar-collapsed .rail-actions,
 .app.is-sidebar-collapsed .rail-footer { display: none; }
+.app.is-sidebar-collapsed .sidebar .new-chat,
+.app.is-sidebar-collapsed .sidebar-bottom .btn { justify-content: center; padding-inline: 8px; font-size: 0; }
+.app.is-sidebar-collapsed .sidebar .new-chat .ico,
+.app.is-sidebar-collapsed .sidebar-bottom .btn .ico { width: 17px; height: 17px; }
 .app.is-sidebar-collapsed #tabs > button[data-tab] { justify-content: center; padding: 8px; }
 .app.is-sidebar-collapsed #tabs > button[data-tab] span:not(.badge) { display: none; }
-.app.is-sidebar-collapsed #tabs .sidebar-toggle { position: absolute; right: 7px; bottom: 8px; margin: 0; }
 .app.is-sidebar-collapsed .sidebar-resize { display: none; }
 
 .rail-label {
@@ -2835,10 +2920,10 @@ nav button.is-sel::after {
 .rail-status-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--green); box-shadow: 0 0 0 3px var(--green-wash); }
 
 .app > header {
-  min-height: 54px;
-  padding: 9px 22px;
+  min-height: 48px;
+  padding: 8px 20px;
   border-bottom: 1px solid var(--line);
-  background: color-mix(in srgb, var(--page) 88%, transparent);
+  background: var(--page);
 }
 
 .app > header > .mark,
