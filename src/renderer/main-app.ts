@@ -89,6 +89,17 @@ const GROUPS: Group[] = [
 let state: AppState | null = null;
 /** Guards against saving while we are writing values into the controls. */
 let applying = false;
+type ShellMode = 'chat' | 'settings';
+const SETTINGS_LABELS: Record<string, string> = {
+  home: 'Workspace',
+  control: 'Agents & automation',
+  plugins: 'Plugins',
+  setup: 'Setup',
+  activity: 'Activity'
+};
+let shellMode: ShellMode = 'chat';
+let lastSettingsTab = 'home';
+let chatShellTitle = 'New chat';
 
 /**
  * Applies persisted form state without erasing a value the user is currently editing.
@@ -126,16 +137,37 @@ function showTab(name: string): void {
   chatVisible(name === 'chat');
   controlCenterVisible(name === 'control');
   if (name === 'plugins') void refreshPlugins();
+  if (name !== 'chat' && SETTINGS_LABELS[name]) lastSettingsTab = name;
+  paintShellHeading();
   // A feed that was appended to while its panel was hidden could not be scrolled then —
   // a hidden element has no scroll height. Pin it now that it has one, so a panel always
   // opens on the newest line rather than on whatever was oldest in the buffer.
   for (const id of FEEDS) stickToNewest(id);
 }
 
+function paintShellHeading(): void {
+  $('shellTitle').textContent = shellMode === 'chat' ? chatShellTitle : 'Chat On Steroids';
+  $('shellSub').textContent = shellMode === 'chat' ? 'Chat' : SETTINGS_LABELS[lastSettingsTab] ?? 'Settings';
+}
+
+function showShellMode(mode: ShellMode, settingsTab = lastSettingsTab): void {
+  shellMode = mode;
+  const app = document.querySelector<HTMLElement>('.app');
+  app?.classList.toggle('is-settings', mode === 'settings');
+  $('sidebarSessions').hidden = mode !== 'chat';
+  $('settingsNav').hidden = mode !== 'settings';
+  $('backToChat').hidden = mode !== 'settings';
+  $('newChat').hidden = mode !== 'chat';
+  $('sidebarSettings').hidden = mode === 'settings';
+  showTab(mode === 'chat' ? 'chat' : settingsTab);
+}
+
 $('tabs').addEventListener('click', (event) => {
   const button = (event.target as HTMLElement).closest<HTMLButtonElement>('[data-tab]');
   if (button?.dataset.tab) showTab(button.dataset.tab);
 });
+$('sidebarSettings').addEventListener('click', () => showShellMode('settings'));
+$('backToChat').addEventListener('click', () => showShellMode('chat'));
 
 // ------------------------------------------------------------ permissions
 
@@ -1629,13 +1661,21 @@ initSidebarResize();
 initBrowserPreferences();
 initChatModels();
 initPlugins(apply);
-initChat({ save: () => save(), state: () => state });
+initChat({
+  save: () => save(),
+  state: () => state,
+  title: (title) => {
+    chatShellTitle = title || 'New chat';
+    paintShellHeading();
+  }
+});
 initControlCenter(api);
 
 void (async () => {
   await refresh();
   // A first run has nothing set up, so open on the wizard rather than an empty Home.
-  if (state && missingStep(state)?.step === 'folder') showTab('setup');
+  if (state && missingStep(state)?.step === 'folder') showShellMode('settings', 'setup');
+  else showShellMode('chat');
   const entries = await run(api.getLog());
   for (const entry of entries ?? []) addLogLine(entry);
   const swarm = await run(api.getSwarm());

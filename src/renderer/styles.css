@@ -2926,6 +2926,22 @@ nav button.is-sel::after {
   background: var(--page);
 }
 
+.shell-heading {
+  display: grid;
+  min-width: 0;
+  margin-right: auto;
+  line-height: 1.2;
+}
+.shell-heading strong {
+  overflow: hidden;
+  color: var(--ink);
+  font-size: 12.5px;
+  font-weight: 600;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.shell-heading small { margin-top: 2px; color: var(--faint); font-size: 9.5px; }
+
 .app > header > .mark,
 .app > header > .title { display: none; }
 

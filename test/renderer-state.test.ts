@@ -483,6 +483,85 @@ async function mountChat(
 
 const settle = () => new Promise((resolve) => setTimeout(resolve, 0));
 
+it('opens in Chat mode and preserves the selected session across a Settings round-trip', async () => {
+  const selected = {
+    id: 'session-a',
+    title: 'Coding Task Guidelines',
+    conversationId: 'conversation-a',
+    chatIds: ['conversation-a'],
+    startedAt: 1,
+    updatedAt: 2,
+    endedAt: null,
+    events: 0,
+    userMessages: 1,
+    toolCalls: 0,
+    processExitNonzero: 0,
+    toolRejected: 0,
+    toolInternalErrors: 0,
+    errors: 0,
+    estimatedTokens: 0,
+    contextTokens: 0,
+    autoCompactTriggeredAt: null,
+    lastHandoffId: null,
+    lastHandoffAt: null,
+    lastTurnOutcome: null,
+    activeTurnId: null,
+    agents: [],
+    origin: null
+  };
+  const ok = (data: any) => Promise.resolve({ ok: true as const, data });
+  const mounted = await mountChat({}, [], {
+    listSessions: () => ok({ sessions: [selected], activeId: selected.id, blocked: [], pressure: [], total: 1, nextCursor: null }),
+    getSession: () => ok({ summary: selected, events: [], total: 0, nextFrom: 0 })
+  });
+  const doc = mounted.window.document;
+
+  await vi.waitFor(() => expect(doc.querySelector('#sessionList [data-id="session-a"]')?.classList.contains('is-sel')).toBe(true));
+  expect(doc.querySelector('.app')!.classList.contains('is-settings')).toBe(false);
+  expect(doc.getElementById('shellTitle')?.textContent).toBe('Coding Task Guidelines');
+  expect(doc.getElementById('shellSub')?.textContent).toBe('Chat');
+  expect(doc.getElementById('sidebarSessions')!.hidden).toBe(false);
+  expect(doc.getElementById('settingsNav')!.hidden).toBe(true);
+  expect(doc.querySelector('[data-panel="chat"]')!.classList.contains('is-active')).toBe(true);
+
+  (doc.getElementById('sidebarSettings') as HTMLButtonElement).click();
+  expect(doc.querySelector('.app')!.classList.contains('is-settings')).toBe(true);
+  expect(doc.getElementById('shellTitle')?.textContent).toBe('Chat On Steroids');
+  expect(doc.getElementById('shellSub')?.textContent).toBe('Workspace');
+  expect(doc.getElementById('sidebarSessions')!.hidden).toBe(true);
+  expect(doc.getElementById('settingsNav')!.hidden).toBe(false);
+  expect(doc.querySelector('[data-panel="home"]')!.classList.contains('is-active')).toBe(true);
+
+  doc.querySelector<HTMLButtonElement>('#settingsNav [data-tab="plugins"]')!.click();
+  expect(doc.querySelector('[data-panel="plugins"]')!.classList.contains('is-active')).toBe(true);
+  doc.querySelector<HTMLButtonElement>('#settingsNav [data-tab="control"]')!.click();
+  expect(doc.querySelector('[data-panel="control"]')!.classList.contains('is-active')).toBe(true);
+  expect(doc.getElementById('shellSub')?.textContent).toBe('Agents & automation');
+
+  (doc.getElementById('backToChat') as HTMLButtonElement).click();
+  expect(doc.querySelector('.app')!.classList.contains('is-settings')).toBe(false);
+  expect(doc.getElementById('shellTitle')?.textContent).toBe('Coding Task Guidelines');
+  expect(doc.getElementById('shellSub')?.textContent).toBe('Chat');
+  expect(doc.getElementById('sidebarSessions')!.hidden).toBe(false);
+  expect(doc.getElementById('settingsNav')!.hidden).toBe(true);
+  expect(doc.querySelector('[data-panel="chat"]')!.classList.contains('is-active')).toBe(true);
+  expect(doc.querySelector('#sessionList [data-id="session-a"]')?.classList.contains('is-sel')).toBe(true);
+});
+
+it('keeps every current settings destination reachable from the restored shell', async () => {
+  const mounted = await mountChat();
+  const doc = mounted.window.document;
+  (doc.getElementById('sidebarSettings') as HTMLButtonElement).click();
+
+  for (const name of ['home', 'control', 'plugins', 'setup', 'activity']) {
+    const button = doc.querySelector<HTMLButtonElement>(`#settingsNav [data-tab="${name}"]`)!;
+    button.click();
+    expect(doc.querySelector(`[data-panel="${name}"]`)!.classList.contains('is-active'), name).toBe(true);
+  }
+  expect(doc.getElementById('themeBtn')).not.toBeNull();
+  expect(doc.getElementById('connectBtn')).not.toBeNull();
+});
+
 it('shows a verified staged update without breaking the shell and installs only from the ready state', async () => {
   const installUpdate = vi.fn(() => Promise.resolve({ ok: true as const, data: true }));
   const mounted = await mountChat(

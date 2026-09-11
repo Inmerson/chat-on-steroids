@@ -82,6 +82,8 @@ interface Deps {
   /** The renderer's single save path — reads every control, including ours. */
   save: () => Promise<void>;
   state: () => AppState | null;
+  /** Presentation only: lets the outer shell mirror the selected recorded chat title. */
+  title?: (title: string) => void;
 }
 
 let deps: Deps;
@@ -320,6 +322,7 @@ async function loadSessions(): Promise<void> {
     detailCursor = null;
   }
   if (selectedId === null) selectedId = activeId ?? sessions[0]?.id ?? null;
+  deps.title?.(sessions.find((entry) => entry.id === selectedId)?.title || 'New chat');
   paintSessions();
   await loadDetail();
 }
@@ -1433,6 +1436,7 @@ export function initChat(next: Deps): void {
     const row = (event.target as HTMLElement).closest<HTMLElement>('[data-id]');
     if (!row?.dataset.id || row.dataset.id === selectedId) return;
     selectedId = row.dataset.id;
+    deps.title?.(sessions.find((entry) => entry.id === selectedId)?.title || 'New chat');
     detailFor = null;
     detailCursor = null;
     // A different session is a different set of calls; nothing here should arrive open.
