@@ -1,9 +1,9 @@
 /**
  * Server instructions shown to the model once, alongside the tool list.
  *
- * Kept short on purpose: this text is prepended to context on every conversation that uses
- * the connector, and the tool descriptions already carry the per-tool detail. It states
- * what exists and how to be efficient — it is not where security is enforced.
+ * Core includes the adapted Codex collaboration contract plus a compact description of the
+ * live local surface. Tool descriptions still own per-tool detail; this text states cross-tool
+ * behavior and efficiency rules, while live guards remain the security authority.
  *
  * Written per surface. Two connectors mean two of these, and each says only what its own
  * tools can do: telling the Core conversation about `computer` would be describing a tool
@@ -14,6 +14,9 @@ import { getConfig } from '../config.js';
 import { isGitRepository } from '../toolchain.js';
 import type { ToolContext } from './kernel.js';
 import { surfaceDefinition, type SurfaceId } from './surfaces.js';
+import { CODING_INSTRUCTIONS } from './coding-instructions.js';
+import { canAddCodeMode, CODE_MODE_INSTRUCTIONS } from './code-mode-tool.js';
+import { pluginManager } from '../plugins/manager.js';
 
 export function serverInstructions(
   ctx: ToolContext,
@@ -21,7 +24,8 @@ export function serverInstructions(
   platform: NodeJS.Platform = process.platform
 ): string {
   if (surface === 'plugins') {
-    return 'External MCP tools explicitly installed and enabled by the user in Chat On Steroids. Each tool retains its upstream schema and annotations. External servers run with their own operating-system or service permissions; approved CoS folders do not sandbox them. Use only for the user\'s requested task. A failed or disconnected mutation may already have taken effect, so never automatically retry an ambiguous mutation. Core, Desktop and Steromi are separate connectors.';
+    const base = 'External MCP tools explicitly installed and enabled by the user in Chat On Steroids. Each tool retains its upstream schema and annotations. External servers run with their own operating-system or service permissions; approved CoS folders do not sandbox them. Use only for the user\'s requested task. A failed or disconnected mutation may already have taken effect, so never automatically retry an ambiguous mutation. Core, Desktop and Steromi are separate connectors.';
+    return base + (canAddCodeMode(pluginManager.tools()) ? `\n\n${CODE_MODE_INSTRUCTIONS}` : '');
   }
   return surface === 'desktop'
     ? desktopInstructions(ctx)
@@ -33,7 +37,8 @@ export function serverInstructions(
 function coreInstructions(
   ctx: ToolContext,
   platform: NodeJS.Platform,
-  includeConnectorRedirect = true
+  includeConnectorRedirect = true,
+  includeCodeMode = true
 ): string {
   const config = getConfig();
   const sessionTools = ctx.sessionTools ?? config.sessions.record;
@@ -54,6 +59,9 @@ function coreInstructions(
     : 'Read/write for the tools that are listed. Anything not listed is switched off.';
 
   const lines = [
+    CODING_INSTRUCTIONS,
+    '',
+    '# Local tools',
     `Local ${hostName} coding bridge: read and change files in folders the user approved, and run commands on this computer.`,
     '',
     `Roots: ${roots}`,
@@ -116,21 +124,12 @@ function coreInstructions(
     );
   }
 
-  lines.push(
-    '',
-    // This connector often runs long local tasks where silence looks like a stalled MCP.
-    // Keep progress unusually visible, but do it in compact phase-level updates rather than
-    // narrating every cheap read and wasting the context the connector is meant to save.
-    'Keep the user visibly informed more than usual while you work. Before a meaningful tool run,',
-    'say in one short line what you are doing. On longer work, send another short progress update',
-    'after a few meaningful calls or when the phase changes; do not stay silent until the end.',
-    'Report findings, changes, failures and plan changes immediately, and name the paths you modified.',
-    'Do not narrate every trivial call.'
-  );
-
   if (sessionTools) {
     lines.push(
       '',
+      '# Task plan and recorded history',
+      'Use update_plan for tasks with several meaningful steps; skip it for simple tasks. Send the complete current plan on every update, keep at most one step in_progress, and update it when a step finishes or the approach changes.',
+      'The plan is a durable user-visible record only. It does not execute steps, advance queued work or replace Agent System 3.0.',
       // A chat continuing compacted work is *opened* with the brief already in it, so there
       // is nothing to fetch and nothing to call first. What it may not know is that the
       // detail behind the brief is still on disk and can be asked for.
@@ -158,10 +157,12 @@ function coreInstructions(
     );
   }
 
+  if (includeCodeMode) lines.push('', CODE_MODE_INSTRUCTIONS);
+
   return lines.join('\n');
 }
 
-function desktopInstructions(ctx: ToolContext, includeConnectorRedirect = true): string {
+function desktopInstructions(ctx: ToolContext, includeConnectorRedirect = true, includeCodeMode = true): string {
   const lines = [
     'Local Windows desktop control: look at this PC’s screen and windows, and drive its mouse and keyboard.',
     '',
@@ -199,6 +200,14 @@ function desktopInstructions(ctx: ToolContext, includeConnectorRedirect = true):
     );
   }
 
+  const exposed = ctx.exposedCaps ?? ctx.caps;
+  if (
+    includeCodeMode &&
+    (exposed.screen || exposed.control || exposed.clipboardRead || exposed.clipboardWrite)
+  ) {
+    lines.push('', CODE_MODE_INSTRUCTIONS);
+  }
+
   return lines.join('\n');
 }
 
@@ -207,8 +216,10 @@ function steromiInstructions(ctx: ToolContext, platform: NodeJS.Platform): strin
     'Steromi all-in-one combines the current coding and desktop surfaces in one connector.',
     'Use steromi_dashboard when an interactive Screen, Terminal, Files and Sessions panel would help the user.',
     '',
-    coreInstructions(ctx, platform, false),
+    coreInstructions(ctx, platform, false, false),
     '',
-    desktopInstructions(ctx, false)
+    desktopInstructions(ctx, false, false),
+    '',
+    CODE_MODE_INSTRUCTIONS
   ].join('\n');
 }

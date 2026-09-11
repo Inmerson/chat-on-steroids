@@ -1033,17 +1033,18 @@ describe('2025-era clients', () => {
       expect(instructions).toContain('normal POSIX shell');
       expect(instructions).not.toContain('PowerShell does not expand * or ? for native programs');
     }
-    // Progress guidance lives once at server level rather than bloating every tool description.
-    expect(instructions).toContain('Keep the user visibly informed more than usual while you work');
+    // Progress guidance lives once in the adapted Codex collaboration contract rather than
+    // being repeated again in the local-tool preamble or every tool description.
+    expect(instructions).toContain('Share progress updates while working');
     // The two round-trip levers the recorded sessions actually pay for. Both are instructions
     // rather than tool descriptions because they are about *how many calls to make*, which is a
     // decision taken before any one tool's schema is read.
     expect(instructions).toContain('exec_command cmds');
     expect(instructions).toContain('read a file whole rather than in windows');
-    // Short enough not to burn the model's context on every conversation. Everything added
-    // since this bound was set paid for itself by tightening a line that said the same thing
-    // at greater length; raise it only for guidance that removes calls, never for prose.
-    expect(instructions.length).toBeLessThan(2500);
+    // The adapted Codex collaboration contract is intentionally part of MCP initialization
+    // (13.2k chars by itself at the pinned provenance revision). Keep the complete Core payload
+    // close to the measured Windows worst case so accidental duplication still fails loudly.
+    expect(instructions.length).toBeLessThan(16_000);
   });
 
   it('points at the other connector rather than pretending the capability does not exist', async () => {
