@@ -181,10 +181,13 @@ describe('runCommand', () => {
   });
 
   it('launches a long-running executable without waiting for it to exit', async () => {
-    const started = Date.now();
-    const result = await launchCommand(node, ['-e', 'setTimeout(() => {}, 1500)'], cwd);
-    expect(result.pid).toBeGreaterThan(0);
-    expect(Date.now() - started).toBeLessThan(1000);
+    const result = await launchCommand(node, ['-e', 'setTimeout(() => {}, 5000)'], cwd);
+    try {
+      expect(result.pid).toBeGreaterThan(0);
+      expect(() => process.kill(result.pid, 0)).not.toThrow();
+    } finally {
+      await terminateProcessTree(result.pid, true).catch(() => undefined);
+    }
   });
 
   it.runIf(IS_WINDOWS)('actually executes a launched PowerShell payload, not only reporting spawn', async () => {
