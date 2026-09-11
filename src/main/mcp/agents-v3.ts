@@ -17,6 +17,7 @@ import {
   guard,
   IDENTITY_EVIDENCE_MS,
   PRIME_EVIDENCE_MS,
+  setCallerConversation,
   type SurfaceRegistrar,
   type ToolResult
 } from './kernel.js';
@@ -63,7 +64,7 @@ async function callerNowForAgentV3(startedAt: number): Promise<Caller> {
   const caller: Caller = { ...base, conversationId: resolved };
   if (resolved) {
     const call = currentCall();
-    if (call) call.caller.conversationId = resolved;
+    if (call) setCallerConversation(call, resolved);
     await repairPrimeFromResumeShadow(resolved);
   }
   await adoptAgent(agentForCaller(caller));

@@ -135,6 +135,7 @@ import {
   lineNumberArg,
   resolveCwd,
   resolveIn,
+  setCallerConversation,
   type SurfaceRegistrar,
   type ToolResult
 } from './kernel.js';
@@ -1435,7 +1436,7 @@ async function callerNow(): Promise<Caller> {
   const attributed: Caller = { ...base, conversationId: attributedConversation };
   if (attributedConversation) {
     const call = currentCall();
-    if (call) call.caller.conversationId = attributedConversation;
+    if (call) setCallerConversation(call, attributedConversation);
     // A pre-fix Compact & Resume can leave this exact app-opened replacement chat with its own
     // shadow session while the reusable-worker run is still bound to the source chat. Repair
     // only that durably-proven historical failure before membership is evaluated; unrelated

@@ -264,6 +264,13 @@ function callerConversation(tool: string, startedAt: number, requestId: string |
   return freshCallOrigin(tool, startedAt, requestId);
 }
 
+/** Publishes both halves of one exact request proof into the call context. */
+export function setCallerConversation(context: CallContext, conversationId: string | null): void {
+  context.caller.conversationId = conversationId;
+  const exact = conversationId ? requestCorrelation(context.caller.requestId) : null;
+  context.caller.sessionId = exact?.conversationId === conversationId ? exact.sessionId : null;
+}
+
 /** The only SDK handler context field this layer consumes; request identity comes from ingress ALS. */
 type McpCallContext = Pick<ServerContext, 'sessionId'>;
 
@@ -407,7 +414,8 @@ export async function dispatch(
   transportKey: string | null,
   requestId: string | null,
   surface: SurfaceId,
-  run: () => Promise<ToolResult>
+  run: () => Promise<ToolResult>,
+  parent?: CallContext
 ): Promise<ToolResult> {
   // The context is built here, one layer out from where the work happens, because the
   // compaction barrier asks about the whole request and not just the handler. A call is
@@ -417,14 +425,27 @@ export async function dispatch(
   // opens with the request and closes with it.
   const context: CallContext = {
     startedAt: Date.now(),
-    transportKey,
-    agent: null,
-    caller: { transportKey, requestId, conversationId: null },
+    transportKey: parent ? parent.transportKey : transportKey,
+    agent: parent?.agent ?? null,
+    caller: parent
+      ? { ...parent.caller }
+      : { transportKey, requestId, conversationId: null, sessionId: null },
     outcome: null,
     evidence: emptyEvidence()
   };
   return trackMcpRequest(() =>
-    trackInFlight(context, () => dispatchTracked(context, name, args, transportKey, requestId, surface, run))
+    trackInFlight(context, () =>
+      dispatchTracked(
+        context,
+        name,
+        args,
+        context.caller.transportKey,
+        context.caller.requestId,
+        surface,
+        run,
+        parent !== undefined
+      )
+    )
   );
 }
 
@@ -435,7 +456,8 @@ async function dispatchTracked(
   transportKey: string | null,
   requestId: string | null,
   surface: SurfaceId,
-  run: () => Promise<ToolResult>
+  run: () => Promise<ToolResult>,
+  nested: boolean
 ): Promise<ToolResult> {
   noteTransportIdentity(transportKey);
   // Recorded here rather than in `guard` because only this layer knows which server
@@ -448,22 +470,24 @@ async function dispatchTracked(
   // request id, identity-sensitive handlers (workspace/session/agents) see it before they
   // touch state. If the page is one tick late this stays null; only handlers that actually
   // require identity wait for their own exact mate. Ordinary absolute reads/execs never wait.
-  const transportOwner = transportConversation(transportKey);
-  const requestOwner = callerConversation(name, startedAt, requestId);
-  if (transportOwner && requestOwner && transportOwner !== requestOwner) {
-    bindTransportConversation(transportKey, requestOwner);
-    context.caller.conversationId = null;
-  } else {
-    context.caller.conversationId = requestOwner ?? transportOwner;
-    if (requestOwner) bindTransportConversation(transportKey, requestOwner);
+  if (!nested) {
+    const transportOwner = transportConversation(transportKey);
+    const requestOwner = callerConversation(name, startedAt, requestId);
+    if (transportOwner && requestOwner && transportOwner !== requestOwner) {
+      bindTransportConversation(transportKey, requestOwner);
+      setCallerConversation(context, null);
+    } else {
+      setCallerConversation(context, requestOwner ?? transportOwner);
+      if (requestOwner) bindTransportConversation(transportKey, requestOwner);
+    }
   }
   // A user block is exact-conversation policy. Only pay the evidence wait while at least one
   // block exists; otherwise ordinary Core calls retain their current no-wait ingress path.
-  if (!context.caller.conversationId && anyChatBlocked() && requestId) {
+  if (!nested && !context.caller.conversationId && anyChatBlocked() && requestId) {
     const exact = await awaitRequestCorrelation(requestId, IDENTITY_EVIDENCE_MS);
     if (exact) {
       const bound = bindTransportConversation(transportKey, exact.conversationId);
-      context.caller.conversationId = transportKey ? bound : exact.conversationId;
+      setCallerConversation(context, transportKey ? bound : exact.conversationId);
     }
   }
   const blockedChat = isChatBlocked(context.caller.conversationId);
@@ -476,14 +500,14 @@ async function dispatchTracked(
   // timer: nothing about a run changes while nothing is happening, and this is the moment
   // something is happening. Sleep rather than failure, so being early about a slow worker
   // costs the run nothing — its own next call takes the slot straight back.
-  const quietWorkers = blockedChat ? [] : sleepSilentDetachedWorkers();
+  const quietWorkers = blockedChat || nested ? [] : sleepSilentDetachedWorkers();
   for (const quiet of quietWorkers) {
     if (quiet.report) await recordAgentMessage(quiet.report, 'sent');
   }
   // And this call is itself first-hand evidence that its own conversation is alive. That is
   // what undoes a worker given up on because its tab went away — the turn never stopped, so
   // the call arrives from a chat the app had written off, and the write-off was wrong.
-  const alive = blockedChat ? null : noteAgentAlive(context.caller.conversationId);
+  const alive = blockedChat || nested ? null : noteAgentAlive(context.caller.conversationId);
   if (alive?.report) await recordAgentMessage(alive.report, 'sent');
   // A prime message accepted while a worker's tab was closed could not safely be injected while
   // that server-side turn might still be running. If the silence check above has now proved the
@@ -507,7 +531,9 @@ async function dispatchTracked(
       );
     }
   }
-  context.agent = isFinish ? agentForFinishCaller(context.caller) : agentForCaller(context.caller);
+  if (!context.agent) {
+    context.agent = isFinish ? agentForFinishCaller(context.caller) : agentForCaller(context.caller);
+  }
   // Authentication happens at the secret MCP endpoint. Conversation identity is retained for
   // attribution, workspaces and agent routing, but it is not an authorization gate for Core
   // capabilities: every authenticated chat receives the permissions the user enabled in-app.
@@ -518,14 +544,14 @@ async function dispatchTracked(
   // Identity, once, from this call's own evidence — see callerConversation. `agents` has
   // already established its own inside the call and adopted it, and re-reading here would
   // only be able to disagree with the stronger answer it waited for.
-  if (!context.caller.conversationId) {
+  if (!nested && !context.caller.conversationId) {
     const resolved = callerConversation(name, startedAt, requestId);
     if (resolved) {
       const bound = bindTransportConversation(transportKey, resolved);
-      context.caller.conversationId = transportKey ? bound : resolved;
+      setCallerConversation(context, transportKey ? bound : resolved);
     }
   }
-  const inputCorrelation = requestCorrelation(context.caller.requestId);
+  const inputCorrelation = nested ? null : requestCorrelation(context.caller.requestId);
   const exactInputCaller = inputCorrelation && context.caller.conversationId === inputCorrelation.conversationId
     ? inputCorrelation
     : null;
@@ -551,15 +577,18 @@ async function dispatchTracked(
   // retry after a lost result. The SDK exposes the JSON-RPC id, but a model-issued retry is
   // a new MCP request with a new id, so that id cannot prove the previous finish result was
   // seen. The broker therefore re-offers rather than assuming; see acknowledgeOffers.
-  const acknowledgedForConversation = acknowledgeOffersForConversation(
-    context.caller.conversationId,
-    isFinish,
-    startedAt,
-    isFinish
-  );
-  const acknowledged =
-    acknowledgedForConversation?.messages ??
-    (context.agent ? acknowledgeOffers(context.agent, isFinish, startedAt) : []);
+  const acknowledgedForConversation = nested
+    ? null
+    : acknowledgeOffersForConversation(
+        context.caller.conversationId,
+        isFinish,
+        startedAt,
+        isFinish
+      );
+  const acknowledged = nested
+    ? []
+    : acknowledgedForConversation?.messages ??
+      (context.agent ? acknowledgeOffers(context.agent, isFinish, startedAt) : []);
   for (const message of acknowledged) {
     // The exact caller conversation is stronger than the friendly recipient id and remains
     // unique after a run parks. Without this override, a parked Prime A acknowledging its report
@@ -573,10 +602,12 @@ async function dispatchTracked(
   // Inbox messages are part of the MCP result ChatGPT actually receives. Build the delivered
   // result before recording so session(action=read, tool_call=T…) is genuine wire forensics rather than a
   // subtly earlier internal value that omits the worker report most likely to matter later.
-  let delivered = withBackgroundExecRecovery(
-    context.caller.conversationId,
-    withInbox(context.caller.conversationId, context.agent, result, isFinish)
-  );
+  let delivered = nested
+    ? result
+    : withBackgroundExecRecovery(
+        context.caller.conversationId,
+        withInbox(context.caller.conversationId, context.agent, result, isFinish)
+      );
   if (exactInputCaller) {
     const userInput = await offerToolInput(
       exactInputCaller.sessionId,
@@ -639,7 +670,7 @@ async function dispatchTracked(
   // Retire a completed run only after this call has had every chance to acknowledge and
   // receive its inbox. Doing it inside acknowledgeOffers would let `agents status` destroy
   // the run halfway through identifying itself; here the handler and result are already done.
-  releaseQuiescentRun();
+  if (!nested) releaseQuiescentRun();
   return delivered;
 }
 

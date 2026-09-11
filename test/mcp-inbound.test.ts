@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { inboundRequestId, requestIdFromHeader, withInboundRequestId } from '../src/main/mcp/inbound.js';
+import { currentCaller } from '../src/main/mcp/call-context.js';
 
 describe('MCP inbound request id boundary', () => {
   it('normalizes the raw x-request-id to the page join key once at ingress', () => {
@@ -30,5 +31,14 @@ describe('MCP inbound request id boundary', () => {
 
     expect(seen).toEqual(['wfr_a', 'wfr_b']);
     expect(inboundRequestId()).toBeNull();
+  });
+
+  it('exposes an empty exact-session principal outside a tool call', () => {
+    expect(currentCaller()).toEqual({
+      transportKey: null,
+      requestId: null,
+      conversationId: null,
+      sessionId: null
+    });
   });
 });

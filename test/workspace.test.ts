@@ -51,7 +51,7 @@ function asAgent(agent: string | null): CallContext {
     startedAt: Date.now(),
     transportKey: null,
     agent,
-    caller: { transportKey: null, secret: null, requestId: null, conversationId: null },
+    caller: { transportKey: null, requestId: null, conversationId: null, sessionId: null },
     outcome: null,
     evidence: emptyEvidence()
   } as CallContext;

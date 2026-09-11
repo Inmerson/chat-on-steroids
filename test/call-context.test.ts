@@ -13,7 +13,7 @@ function callFrom(conversationId: string | null): CallContext {
     startedAt: Date.now(),
     transportKey: null,
     agent: null,
-    caller: { transportKey: null, requestId: null, conversationId },
+    caller: { transportKey: null, requestId: null, conversationId, sessionId: null },
     outcome: null,
     evidence: emptyEvidence()
   };

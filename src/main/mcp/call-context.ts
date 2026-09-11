@@ -57,6 +57,8 @@ export interface CallCaller {
    * evidence named one. Never anything the model wrote.
    */
   conversationId: string | null;
+  /** Durable local session epoch carried by the same exact request proof. */
+  sessionId: string | null;
 }
 
 export interface CallContext {
@@ -223,7 +225,12 @@ export function currentAgent(): string | null {
 
 /** Who the running call was proven to be. Empty outside a call. */
 export function currentCaller(): CallCaller {
-  return storage.getStore()?.caller ?? { transportKey: null, requestId: null, conversationId: null };
+  return storage.getStore()?.caller ?? {
+    transportKey: null,
+    requestId: null,
+    conversationId: null,
+    sessionId: null
+  };
 }
 
 /** Asks for `agent` to be bound to this call's conversation once it can be identified. */

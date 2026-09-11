@@ -23,7 +23,7 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vites
 import { effectiveCapabilities, defaultConfig } from '../src/main/config.js';
 import { lastRequestAt, selfTestHeaders, startMcpServer, tunnelProbeHeaders, type McpEndpoint } from '../src/main/mcp/server.js';
 import { lastToolCallAt, type ToolContext } from '../src/main/mcp/tools.js';
-import { friendlyError } from '../src/main/mcp/kernel.js';
+import { dispatch, friendlyError } from '../src/main/mcp/kernel.js';
 import { SURFACE_LIST, surfaceDefinition, type SurfaceId } from '../src/main/mcp/surfaces.js';
 import {
   appendEvent,
@@ -35,7 +35,7 @@ import {
 import { resetWorkspaces, setWorkspaceFor } from '../src/main/workspace.js';
 import { DEFAULT_CAPABILITIES, type Capabilities, type Root } from '../src/shared/types.js';
 import type { ToolOutcome } from '../src/shared/session.js';
-import { emptyEvidence, noteExec, noteOutcome, runInCallContext, type CallContext } from '../src/main/mcp/call-context.js';
+import { currentCall, emptyEvidence, noteExec, noteOutcome, runInCallContext, type CallContext } from '../src/main/mcp/call-context.js';
 import { observeRequestCorrelation } from '../src/main/session/correlation.js';
 import {
   backgroundExecObligations,
@@ -296,6 +296,58 @@ beforeEach(async () => {
   // A fresh endpoint gives every test a fresh ChatGPT tool-surface snapshot. Tests
   // that change permissions mid-flight still exercise the real live-config path.
   endpoint = await startMcpServer(() => ctx);
+});
+
+it('carries the exact local session principal and agent into a nested dispatch with fresh evidence', async () => {
+  const requestId = 'wfr_nested_session_principal';
+  const conversationId = 'conversation-nested-session-principal';
+  const sessionId = 'session-nested-session-principal';
+  expect(
+    observeRequestCorrelation({
+      requestId,
+      conversationId,
+      sessionId,
+      messageId: 'message-nested-session-principal',
+      tool: 'outer_probe',
+      observedAt: Date.now()
+    })
+  ).toBe('stored');
+
+  let outerCaller: CallContext['caller'] | null = null;
+  let nestedCaller: CallContext['caller'] | null = null;
+  let nestedAgent: string | null = null;
+
+  const result = await dispatch('outer_probe', {}, null, requestId, 'core', async () => {
+    const outer = currentCall();
+    expect(outer).not.toBeNull();
+    outer!.agent = 'worker-test';
+    outerCaller = { ...outer!.caller };
+
+    await dispatch(
+      'nested_probe',
+      {},
+      outer!.caller.transportKey,
+      outer!.caller.requestId,
+      'core',
+      async () => {
+        const nested = currentCall();
+        expect(nested).not.toBeNull();
+        nestedCaller = { ...nested!.caller };
+        nestedAgent = nested!.agent;
+        nested!.evidence.detail = 'nested-only';
+        return { content: [{ type: 'text', text: 'nested-ok' }] };
+      },
+      outer!
+    );
+
+    expect(outer!.evidence.detail).toBeNull();
+    return { content: [{ type: 'text', text: 'outer-ok' }] };
+  });
+
+  expect(result.isError).not.toBe(true);
+  expect(outerCaller).toEqual({ transportKey: null, requestId, conversationId, sessionId });
+  expect(nestedCaller).toEqual(outerCaller);
+  expect(nestedAgent).toBe('worker-test');
 });
 
 // ------------------------------------------------------------------- tests
@@ -3626,7 +3678,7 @@ describe('the outcome a shell command is recorded with', () => {
       startedAt: Date.now(),
       transportKey: null,
       agent: null,
-      caller: { transportKey: null, requestId: null, conversationId: null },
+      caller: { transportKey: null, requestId: null, conversationId: null, sessionId: null },
       outcome: preset,
       evidence: emptyEvidence()
     };
@@ -3662,7 +3714,7 @@ describe('the outcome a shell command is recorded with', () => {
       startedAt: Date.now(),
       transportKey: null,
       agent: null,
-      caller: { transportKey: null, requestId: null, conversationId: null },
+      caller: { transportKey: null, requestId: null, conversationId: null, sessionId: null },
       outcome: null,
       evidence: emptyEvidence()
     };
