@@ -3444,11 +3444,15 @@ describe('exec session attribution and authenticated continuation', () => {
   });
 
   /** What the page reports once it has seen this connector request leave a given chat. */
-  const prove = (requestId: string, conversationId: string) =>
+  const prove = (
+    requestId: string,
+    conversationId: string,
+    sessionId = `session:${conversationId}`
+  ) =>
     observeRequestCorrelation({
       requestId,
       conversationId,
-      sessionId: '2026-08-20-execown',
+      sessionId,
       messageId: `msg-${requestId}`,
       tool: 'exec_command',
       observedAt: Date.now()
@@ -3520,6 +3524,7 @@ describe('exec session attribution and authenticated continuation', () => {
 
   it('refuses new commands for the exact chat at the unread-result bound, then admits after a drain', async () => {
     const conversationId = 'conv-background-admission';
+    const localSessionId = `session:${conversationId}`;
     const sessionIds: number[] = [];
 
     for (let index = 0; index < MAX_UNREAD_EXEC_RESULTS_PER_CONVERSATION; index++) {
@@ -3527,8 +3532,8 @@ describe('exec session attribution and authenticated continuation', () => {
       expect(prove(requestId, conversationId)).toBe('stored');
       const started = await asChat(requestId, 'exec_command', {
         cmd: IS_WINDOWS
-          ? `Start-Sleep -Milliseconds 500; Write-Output 'owed-${index}'; exit ${index + 1}`
-          : `sleep 0.5; printf '%s\\n' owed-${index}; exit ${index + 1}`,
+          ? `Start-Sleep -Milliseconds 2000; Write-Output 'owed-${index}'; exit ${index + 1}`
+          : `sleep 2; printf '%s\\n' owed-${index}; exit ${index + 1}`,
         workdir: '/workspace',
         yield_time_ms: 100
       });
@@ -3538,7 +3543,7 @@ describe('exec session attribution and authenticated continuation', () => {
     }
 
     await vi.waitFor(
-      () => expect(backgroundExecObligations(conversationId).exitedUnread.map((row) => row.processId)).toEqual(
+      () => expect(backgroundExecObligations(localSessionId).exitedUnread.map((row) => row.processId)).toEqual(
         [...sessionIds].sort((left, right) => left - right)
       ),
       { timeout: 8_000, interval: 25 }
@@ -3554,8 +3559,16 @@ describe('exec session attribution and authenticated continuation', () => {
     expect(textOf(blocked)).toContain('EXEC_RESULTS_UNREAD');
     for (const sessionId of sessionIds) expect(textOf(blocked)).toContain(String(sessionId));
 
-    const drained = await asChat(blockedRequest, 'write_stdin', { session_id: sessionIds[0], chars: '' });
-    expect(textOf(drained)).toContain('owed-0');
+    // Even a tool-level refusal is a successfully returned outer MCP response, so it may carry
+    // one bounded completed-result page. Explicit write_stdin then ACKs exactly that process and
+    // must not replay the already-published bytes.
+    const publishedId = Number(textOf(blocked).match(/Background session (\d+) completed/)?.[1]);
+    expect(sessionIds).toContain(publishedId);
+    const publishedIndex = sessionIds.indexOf(publishedId);
+    expect(textOf(blocked)).toContain(`owed-${publishedIndex}`);
+    const drained = await asChat(blockedRequest, 'write_stdin', { session_id: publishedId, chars: '' });
+    expect(textOf(drained)).not.toContain(`owed-${publishedIndex}`);
+    expect(textOf(drained)).toContain(`Process exited with code ${publishedIndex + 1}`);
 
     const admitted = await asChat(blockedRequest, 'exec_command', {
       cmd: IS_WINDOWS ? "Write-Output 'admitted-after-drain'" : "printf '%s\\n' admitted-after-drain",
@@ -3565,14 +3578,16 @@ describe('exec session attribution and authenticated continuation', () => {
     expect(failed(admitted), textOf(admitted)).toBe(false);
     expect(textOf(admitted)).toContain('admitted-after-drain');
 
-    for (const sessionId of sessionIds.slice(1)) {
+    for (const sessionId of sessionIds.filter((id) => id !== publishedId)) {
       await asChat(blockedRequest, 'write_stdin', { session_id: sessionId, chars: '' });
     }
   });
 
-  it('re-offers an exited unread result on later owner calls without draining it or leaking it', async () => {
-    expect(prove('wfr_background_owner', 'conv-background-owner')).toBe('stored');
-    expect(prove('wfr_background_other', 'conv-background-other')).toBe('stored');
+  it('publishes completed output only to its durable session and ACKs it only on a later owner call', async () => {
+    const ownerSession = 'session-background-owner';
+    const otherSession = 'session-background-other';
+    expect(prove('wfr_background_owner', 'conv-background-owner', ownerSession)).toBe('stored');
+    expect(prove('wfr_background_other', 'conv-background-other', otherSession)).toBe('stored');
     const started = await asChat('wfr_background_owner', 'exec_command', {
       cmd: IS_WINDOWS
         ? "Start-Sleep -Milliseconds 650; Write-Output 'background-e2e-once'; exit 7"
@@ -3585,7 +3600,7 @@ describe('exec session attribution and authenticated continuation', () => {
     expect(Number.isInteger(sessionId)).toBe(true);
 
     await vi.waitFor(
-      () => expect(backgroundExecObligations('conv-background-owner').exitedUnread).toEqual([
+      () => expect(backgroundExecObligations(ownerSession).exitedUnread).toEqual([
         { processId: sessionId, exitCode: 7 }
       ]),
       { timeout: 5_000, interval: 20 }
@@ -3593,21 +3608,30 @@ describe('exec session attribution and authenticated continuation', () => {
 
     const stranger = await asChat('wfr_background_other', 'read', { paths: ['/workspace/src/app.ts'] });
     expect(textOf(stranger)).not.toContain(`Background session ${sessionId}`);
+    // A successful response from another exact local session is not a receipt for this one.
+    expect(backgroundExecObligations(ownerSession).exitedUnread).toEqual([
+      { processId: sessionId, exitCode: 7 }
+    ]);
 
     const later = await asChat('wfr_background_owner', 'read', { paths: ['/workspace/src/app.ts'] });
-    expect(textOf(later)).toContain(
-      `Background session ${sessionId} finished with exit code 7 and has unread output`
-    );
-    expect(textOf(later)).toContain(`write_stdin(session_id=${sessionId}, chars="")`);
-    expect(textOf(later)).not.toContain('background-e2e-once');
+    expect(textOf(later)).toContain('--- Background command results ---');
+    expect(textOf(later)).toContain(`Background session ${sessionId} completed`);
+    expect(textOf(later)).toContain('background-e2e-once');
+    // Offering is transactional: the process is still retained until a later owner request
+    // proves this exact outer MCP response returned successfully.
+    expect(backgroundExecObligations(ownerSession).exitedUnread).toEqual([
+      { processId: sessionId, exitCode: 7 }
+    ]);
 
-    const drained = await asChat('wfr_background_owner', 'write_stdin', { session_id: sessionId, chars: '' });
-    expect(textOf(drained)).toContain('background-e2e-once');
-    expect(textOf(drained)).toContain('Process exited with code 7');
-    expect(textOf(drained)).not.toContain('Background command recovery');
+    const strangerAgain = await asChat('wfr_background_other', 'read', { paths: ['/workspace/src/app.ts'] });
+    expect(textOf(strangerAgain)).not.toContain(`Background session ${sessionId}`);
+    expect(backgroundExecObligations(ownerSession).exitedUnread).toEqual([
+      { processId: sessionId, exitCode: 7 }
+    ]);
 
     const after = await asChat('wfr_background_owner', 'read', { paths: ['/workspace/src/app.ts'] });
     expect(textOf(after)).not.toContain(`Background session ${sessionId}`);
+    expect(backgroundExecObligations(ownerSession).exitedUnread).toEqual([]);
   });
 
   it('clears stale terminal attribution before publishing a recycled process id', async () => {

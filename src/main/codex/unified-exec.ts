@@ -445,6 +445,11 @@ class UnifiedExecProcess {
     return drained;
   }
 
+  /** Completed output is immutable once both exit and stream closure are observed. */
+  completedOutput(): Buffer | null {
+    return this.hasExited() && this.outputClosed ? this.buffer.toBytesWithOmissionMarker() : null;
+  }
+
   hasExited(): boolean {
     return this.exited;
   }
@@ -639,6 +644,24 @@ interface ProcessEntry {
   tty: boolean;
   initialExecCommandActive: boolean;
   lastUsed: number;
+  /** Cursor into this process's completed unread buffer; offers never consume bytes. */
+  delivery?: { offset: number; offer?: { end: number; publication: OutputPublication } };
+}
+
+/** Local response completion, not a claim that a remote model understood the output. */
+export interface OutputPublication {
+  completedAt: number | null;
+  failed: boolean;
+}
+
+export interface CompletedOutputPage {
+  processId: number;
+  command: string;
+  exitCode: number | null;
+  output: string;
+  start: number;
+  end: number;
+  total: number;
 }
 
 export interface BackgroundExecState {
@@ -827,7 +850,11 @@ export class UnifiedExecProcessManager {
 
       const originalTokenCount = approxTokensFromByteCount(collected.totalBytes());
       const outputOmittedBytes = collected.omittedBytes() === 0 ? null : collected.omittedBytes();
-      const rawOutput = collected.toBytesWithOmissionMarker();
+      // An explicit poll may replay an offered-but-unacknowledged page, but must not repeat
+      // pages this durable session already acknowledged through later successful responses.
+      const deliveredOffset = current.delivery?.offset ?? 0;
+      const visible = collected.toBytesWithOmissionMarker();
+      const rawOutput = deliveredOffset > 0 ? visible.subarray(deliveredOffset) : visible;
       const chunkId = generateChunkId();
 
       const failure = process.failureMessage();
@@ -898,6 +925,118 @@ export class UnifiedExecProcessManager {
       running: running.sort((left, right) => left - right),
       exitedUnread: exitedUnread.sort((left, right) => left.processId - right.processId)
     };
+  }
+
+  /** Exited rows not handled by the starting exec; polling or acknowledged delivery releases them. */
+  exitedUnread(processIds: ReadonlySet<number>): Array<{ processId: number; exitCode: number | null }> {
+    return this.backgroundState(processIds).exitedUnread;
+  }
+
+  /** A later owner call acknowledges a successfully published page. */
+  async acknowledgeCompletedOutput(
+    processIds: ReadonlySet<number>,
+    startedAt: number,
+    except?: number
+  ): Promise<number[]> {
+    const retired: number[] = [];
+    for (const id of processIds) {
+      if (id === except) continue;
+      const entry = this.processes.get(id);
+      if (!entry?.delivery?.offer) continue;
+      const release = await entry.process.interactionLock.lock();
+      try {
+        if (this.processes.get(id) !== entry) continue;
+        const offered = entry.delivery?.offer;
+        if (
+          !offered ||
+          offered.publication.failed ||
+          offered.publication.completedAt === null ||
+          startedAt <= offered.publication.completedAt
+        ) {
+          continue;
+        }
+        const output = entry.process.completedOutput();
+        if (output === null) continue;
+        entry.delivery = { offset: offered.end };
+        if (offered.end >= output.length) {
+          this.releaseProcessId(id);
+          retired.push(id);
+        }
+      } finally {
+        release();
+      }
+    }
+    return retired;
+  }
+
+  /**
+   * ACK the page previously offered for one explicit write_stdin target without retiring the
+   * row before that poll can drain its remaining suffix. The direct poll is an exact-process
+   * action, so it must never advance delivery cursors for sibling background sessions.
+   */
+  async acknowledgeCompletedProcessForPoll(processId: number, startedAt: number): Promise<void> {
+    const entry = this.processes.get(processId);
+    if (!entry?.delivery?.offer) return;
+    const release = await entry.process.interactionLock.lock();
+    try {
+      if (this.processes.get(processId) !== entry) return;
+      const offered = entry.delivery?.offer;
+      if (
+        !offered ||
+        offered.publication.failed ||
+        offered.publication.completedAt === null ||
+        startedAt <= offered.publication.completedAt
+      ) {
+        return;
+      }
+      const output = entry.process.completedOutput();
+      if (output === null) return;
+      entry.delivery = { offset: offered.end };
+    } finally {
+      release();
+    }
+  }
+
+  /**
+   * Offer one bounded page without draining the process. A failed response reoffers the same
+   * bytes; a concurrent older response cannot advance a newer delivery cursor.
+   */
+  async offerCompletedOutput(
+    processIds: ReadonlySet<number>,
+    publication: OutputPublication,
+    maxBytes: number
+  ): Promise<CompletedOutputPage | null> {
+    if (publication.failed || maxBytes < 4) return null;
+    for (const { processId } of this.backgroundState(processIds).exitedUnread) {
+      const entry = this.processes.get(processId);
+      if (!entry) continue;
+      const release = await entry.process.interactionLock.lock();
+      try {
+        if (this.processes.get(processId) !== entry || entry.initialExecCommandActive) continue;
+        const output = entry.process.completedOutput();
+        if (output === null) continue;
+        const delivery = (entry.delivery ??= { offset: 0 });
+        if (delivery.offer && !delivery.offer.publication.failed) continue;
+        const start = delivery.offset;
+        let end = Math.min(output.length, start + Math.floor(maxBytes));
+        // Never split a UTF-8 continuation byte across separately rendered MCP responses.
+        while (end > start && end < output.length && (output[end]! & 0xc0) === 0x80) end--;
+        if (end === start && output.length > start) continue;
+        delivery.offer = { end, publication };
+        return {
+          processId,
+          command: entry.hookCommand,
+          exitCode: entry.process.exitCode(),
+          output: output.subarray(start, end).toString('utf8'),
+          start,
+          end,
+          total: output.length
+        };
+      } finally {
+        release();
+      }
+    }
+    return null;
   }
 
   listRuntimeProcesses(): ManagedProcessRuntimeInfo[] {

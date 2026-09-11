@@ -72,7 +72,12 @@ import {
   recordToolCall
 } from '../session/recorder.js';
 import { readOverflowText } from '../session/store.js';
-import { backgroundExecRecoveryNotices } from '../codex/ownership.js';
+import {
+  acknowledgeBackgroundExecOutput,
+  backgroundExecRecoveryNotices,
+  offerBackgroundExecOutput
+} from '../codex/ownership.js';
+import { DEFAULT_MAX_OUTPUT_TOKENS } from '../codex/unified-exec-constants.js';
 import type { StoredText, ToolOutcome } from '../../shared/session.js';
 import type { ProtocolOperation } from '../../shared/multidevice/types.js';
 import { awaitRequestCorrelation, requestCorrelation } from '../session/correlation.js';
@@ -352,18 +357,25 @@ function noteTransportIdentity(transportKey: string | null): void {
  * Messages are *offered* here, not retired. They are retired when this agent calls
  * again, because that is the first real evidence this result reached ChatGPT.
  */
-/** Appends same-conversation background reminders without consuming terminal output. */
-function withBackgroundExecRecovery(
-  conversationId: string | null | undefined,
-  result: ToolResult
-): ToolResult {
-  const notices = backgroundExecRecoveryNotices(conversationId);
-  if (notices.length === 0) return result;
+/** Append at most one completed-output page, otherwise bounded unattended-running reminders. */
+async function withBackgroundExecRecovery(context: CallContext, result: ToolResult): Promise<ToolResult> {
+  const { publication, caller } = context;
+  if (!publication || !caller.requestId || !caller.sessionId) return result;
+  const used = result.content.reduce(
+    (bytes, part) => bytes + (part.type === 'text' ? Buffer.byteLength(part.text, 'utf8') : 0),
+    0
+  );
+  const budget = Math.min(12_000, DEFAULT_MAX_OUTPUT_TOKENS * 4 - used) - 64;
+  if (budget < 1_024) return result;
+  const output = await offerBackgroundExecOutput(caller.sessionId, publication, budget);
+  // Completed data wins the remaining response budget. Running reminders can wait.
+  const text = output ?? backgroundExecRecoveryNotices(caller.sessionId, publication).join('\n');
+  if (!text) return result;
   return {
     ...result,
     content: [
       ...result.content,
-      { type: 'text', text: `\n--- Background command recovery ---\n${notices.join('\n')}` }
+      { type: 'text', text: `\n--- Background command results ---\n${text}` }
     ]
   };
 }
@@ -425,6 +437,7 @@ export async function dispatch(
   // those gaps describes a machine that has not finished changing. The counter therefore
   // opens with the request and closes with it.
   const context: CallContext = {
+    publication: parent?.publication ?? { completedAt: null, failed: false },
     startedAt: Date.now(),
     transportKey: parent ? parent.transportKey : transportKey,
     agent: parent?.agent ?? null,
@@ -434,20 +447,28 @@ export async function dispatch(
     outcome: null,
     evidence: emptyEvidence()
   };
-  return trackMcpRequest(() =>
-    trackInFlight(context, () =>
-      dispatchTracked(
-        context,
-        name,
-        args,
-        context.caller.transportKey,
-        context.caller.requestId,
-        surface,
-        run,
-        parent !== undefined
+  try {
+    const result = await trackMcpRequest(() =>
+      trackInFlight(context, () =>
+        dispatchTracked(
+          context,
+          name,
+          args,
+          context.caller.transportKey,
+          context.caller.requestId,
+          surface,
+          run,
+          parent !== undefined
+        )
       )
-    )
-  );
+    );
+    // Nested composition shares the outer lease; only the outer MCP dispatch publishes it.
+    if (!parent) context.publication!.completedAt = Date.now();
+    return result;
+  } catch (error) {
+    if (!parent) context.publication!.failed = true;
+    throw error;
+  }
 }
 
 async function dispatchTracked(
@@ -552,6 +573,13 @@ async function dispatchTracked(
       setCallerConversation(context, transportKey ? bound : resolved);
     }
   }
+  if (!nested && !blockedChat) {
+    const explicitPoll =
+      name === 'write_stdin' && args && typeof args === 'object'
+        ? (args as { session_id?: number }).session_id
+        : undefined;
+    await acknowledgeBackgroundExecOutput(context.caller.sessionId, startedAt, explicitPoll);
+  }
   const inputCorrelation = nested ? null : requestCorrelation(context.caller.requestId);
   const exactInputCaller = inputCorrelation && context.caller.conversationId === inputCorrelation.conversationId
     ? inputCorrelation
@@ -605,10 +633,7 @@ async function dispatchTracked(
   // subtly earlier internal value that omits the worker report most likely to matter later.
   let delivered = nested
     ? result
-    : withBackgroundExecRecovery(
-        context.caller.conversationId,
-        withInbox(context.caller.conversationId, context.agent, result, isFinish)
-      );
+    : withInbox(context.caller.conversationId, context.agent, result, isFinish);
   if (exactInputCaller) {
     const userInput = await offerToolInput(
       exactInputCaller.sessionId,
@@ -633,6 +658,9 @@ async function dispatchTracked(
       }
       delivered = { ...delivered, content: [...delivered.content, ...content] };
     }
+  }
+  if (!nested && !blockedChat) {
+    delivered = await withBackgroundExecRecovery(context, delivered);
   }
   const recorderStartedAt = Date.now();
   const recording = recordToolCall({

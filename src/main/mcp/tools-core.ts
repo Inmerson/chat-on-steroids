@@ -48,12 +48,15 @@ import { composeCommandBatch, parseCommandBatchSections } from '../codex/command
 import { formatExecOutputForModel, newStreamOutput } from '../codex/exec-output.js';
 import { DEFAULT_TRUNCATION_POLICY, EXEC_OUTPUT_CEILING_POLICY, unifiedExecManager } from '../codex/manager.js';
 import {
+  acknowledgeBackgroundExecProcessForPoll,
   backgroundExecObligations,
   execOwnershipDenied,
   forgetExecOwner,
   MAX_UNREAD_EXEC_RESULTS_PER_CONVERSATION,
+  noteExecAttended,
   noteExecOwner,
-  provenConversation
+  provenConversation,
+  provenSession
 } from '../codex/ownership.js';
 import {
   UnifiedExecError,
@@ -848,14 +851,18 @@ export function registerCoreTools(reg: SurfaceRegistrar): void {
               }
             }
 
-            const owner = provenConversation(currentCaller().requestId, currentCaller().conversationId);
-            const unread = backgroundExecObligations(owner).exitedUnread;
+            const ownerConversation = provenConversation(
+              currentCaller().requestId,
+              currentCaller().conversationId
+            );
+            const ownerSession = provenSession(currentCaller().requestId, currentCaller().sessionId);
+            const unread = backgroundExecObligations(ownerSession).exitedUnread;
             if (unread.length >= MAX_UNREAD_EXEC_RESULTS_PER_CONVERSATION) {
               unifiedExecManager.releaseProcessId(processId);
               const sessionIds = unread.map((session) => session.processId).join(', ');
               return fail(
-                `EXEC_RESULTS_UNREAD: ${unread.length} completed background results are still waiting for this conversation. ` +
-                  `Drain session IDs ${sessionIds} with write_stdin before starting another command. No child was spawned.`
+                `EXEC_RESULTS_UNREAD: ${unread.length} completed background results are still waiting for this session. ` +
+                  `Their output follows in later tool responses; explicit write_stdin is also available for IDs ${sessionIds}. No child was spawned.`
               );
             }
 
@@ -877,7 +884,7 @@ export function registerCoreTools(reg: SurfaceRegistrar): void {
             if (output.processId === null) {
               forgetExecOwner(processId);
             } else {
-              noteExecOwner(output.processId, owner);
+              noteExecOwner(output.processId, ownerConversation, ownerSession);
             }
             const responseText = execCommandResponseText(output);
             // A search that found nothing exits 1 and has not failed. Recording it as an
@@ -958,6 +965,14 @@ export function registerCoreTools(reg: SurfaceRegistrar): void {
           if (execOwnershipDenied(input.session_id, asking)) {
             return fail(`write_stdin failed: session ${input.session_id} is unavailable under the current terminal policy.`);
           }
+          // Exact-process manual custody: settle only this process's previously published page
+          // before polling so write_stdin returns the still-unacknowledged suffix. This does not
+          // change the fork's endpoint-scoped cross-chat continuation authority.
+          await acknowledgeBackgroundExecProcessForPoll(
+            input.session_id,
+            currentCall()?.startedAt ?? Date.now()
+          );
+          noteExecAttended(input.session_id);
           try {
             const output = await unifiedExecManager.writeStdin({
               processId: input.session_id,
@@ -967,6 +982,7 @@ export function registerCoreTools(reg: SurfaceRegistrar): void {
               truncationPolicy: EXEC_OUTPUT_CEILING_POLICY
             });
             if (output.processId === null) forgetExecOwner(input.session_id);
+            else noteExecAttended(input.session_id);
             noteExec({
               ...(output.processId === null ? {} : { id: String(output.processId) }),
               running: output.processId !== null,
