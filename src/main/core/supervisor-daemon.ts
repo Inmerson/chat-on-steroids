@@ -16,6 +16,7 @@ interface SupervisorLike {
 export interface RunCoreSupervisorDaemonOptions {
   execPath: string;
   userDataDir: string;
+  noSandbox?: boolean;
   signal?: AbortSignal;
   intervalMs?: number;
   maxIterations?: number;
@@ -62,7 +63,8 @@ export async function runCoreSupervisorDaemon(
           adapter: createCoreProcessAdapter({
             execPath: options.execPath,
             userDataDir: options.userDataDir,
-            token
+            token,
+            noSandbox: options.noSandbox
           })
         });
 

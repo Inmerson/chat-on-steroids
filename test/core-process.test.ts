@@ -75,6 +75,25 @@ describe('Core process adapter', () => {
     expect(spawned.unref).toHaveBeenCalledTimes(1);
   });
 
+  it('propagates an existing no-sandbox launch to the detached Core Host', async () => {
+    const spawned = child(7778);
+    const spawn = vi.fn(() => spawned) as unknown as SpawnLike;
+    const adapter = createCoreProcessAdapter({
+      execPath: 'cos',
+      userDataDir: 'profile',
+      token: 'a'.repeat(64),
+      spawn,
+      noSandbox: true
+    });
+
+    await adapter.spawn();
+    expect(spawn).toHaveBeenCalledWith(
+      'cos',
+      ['--core-host', '--core-user-data', 'profile', '--no-sandbox'],
+      expect.objectContaining({ detached: true, stdio: 'ignore', windowsHide: true, shell: false })
+    );
+  });
+
   it('starts the independent supervisor detached with no UI-owned stdio handles', () => {
     const spawned = child(8888);
     const spawn = vi.fn(() => spawned) as unknown as SpawnLike;
@@ -88,5 +107,18 @@ describe('Core process adapter', () => {
       expect.objectContaining({ detached: true, stdio: 'ignore', windowsHide: true, shell: false })
     );
     expect(spawned.unref).toHaveBeenCalledTimes(1);
+  });
+
+  it('propagates an existing no-sandbox launch to the detached supervisor', () => {
+    const spawned = child(8889);
+    const spawn = vi.fn(() => spawned) as unknown as SpawnLike;
+
+    startCoreSupervisorDetached({ execPath: 'cos', userDataDir: 'profile', spawn, noSandbox: true });
+
+    expect(spawn).toHaveBeenCalledWith(
+      'cos',
+      ['--core-supervisor', '--core-user-data', 'profile', '--no-sandbox'],
+      expect.objectContaining({ detached: true, stdio: 'ignore', windowsHide: true, shell: false })
+    );
   });
 });

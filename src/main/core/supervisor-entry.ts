@@ -20,6 +20,7 @@ export async function runCoreSupervisorEntry(options: CoreSupervisorEntryOptions
     const result = await runCoreSupervisorDaemon({
       execPath: process.execPath,
       userDataDir: options.userDataDir,
+      noSandbox: process.platform === 'linux' && app.commandLine.hasSwitch('no-sandbox'),
       signal: abort.signal
     });
     logInfo(`core supervisor stopped (${result}) pid=${process.pid}`);

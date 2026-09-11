@@ -34,6 +34,7 @@ export interface CoreProcessAdapterOptions {
   execPath: string;
   userDataDir: string;
   token: string;
+  noSandbox?: boolean;
   spawn?: SpawnLike;
   clientFactory?: () => CoreClientLike;
   now?: () => number;
@@ -87,9 +88,11 @@ export function createCoreProcessAdapter(options: CoreProcessAdapterOptions): Co
       }
     },
     spawn: async (): Promise<CoreSpawnResult> => {
+      const args = ['--core-host', '--core-user-data', options.userDataDir];
+      if (options.noSandbox) args.push('--no-sandbox');
       const child = spawn(
         options.execPath,
-        ['--core-host', '--core-user-data', options.userDataDir],
+        args,
         detachedOptions()
       );
       if (!child.pid) throw new Error('Core Host process did not report a PID');
@@ -110,15 +113,18 @@ export function createCoreProcessAdapter(options: CoreProcessAdapterOptions): Co
 export interface StartCoreSupervisorOptions {
   execPath: string;
   userDataDir: string;
+  noSandbox?: boolean;
   spawn?: SpawnLike;
 }
 
 /** UI fire-and-forgets this daemon; the daemon, not Electron UI, owns Core crash recovery. */
 export function startCoreSupervisorDetached(options: StartCoreSupervisorOptions): number {
   const spawn = options.spawn ?? (nodeSpawn as unknown as SpawnLike);
+  const args = ['--core-supervisor', '--core-user-data', options.userDataDir];
+  if (options.noSandbox) args.push('--no-sandbox');
   const child = spawn(
     options.execPath,
-    ['--core-supervisor', '--core-user-data', options.userDataDir],
+    args,
     detachedOptions()
   );
   if (!child.pid) throw new Error('Core supervisor process did not report a PID');

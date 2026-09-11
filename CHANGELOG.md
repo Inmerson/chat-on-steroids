@@ -57,6 +57,9 @@ permission boundaries.
   answers preserve only bounded `ltr`/`rtl`/`auto` direction metadata.
 - Linux DEB release smoke teardown is best-effort and can no longer overwrite the actual product
   smoke result with a cleanup failure.
+- Linux AppImage launches that require the runtime's conditional `--no-sandbox` fallback now carry
+  that same already-selected Chromium mode into the detached Core supervisor and Core Host instead
+  of letting the UI start while its backend helpers fail to initialize.
 
 ### Preserved fork behavior
 - Persistent Core Host/supervisor, Agent System 3.0 DAG/Manager authority, Control Center, durable

@@ -264,7 +264,11 @@ export function uiConnectionFacade(): UiConnectionFacade {
     token: ensureCoreIpcToken,
     client: (endpoint, token) => new CoreIpcClient(endpoint, token),
     startSupervisor: (userDataDir) => {
-      startCoreSupervisorDetached({ execPath: process.execPath, userDataDir });
+      startCoreSupervisorDetached({
+        execPath: process.execPath,
+        userDataDir,
+        noSandbox: process.platform === 'linux' && app.commandLine.hasSwitch('no-sandbox')
+      });
     }
   });
   return singleton;
