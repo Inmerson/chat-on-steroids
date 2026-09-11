@@ -1827,15 +1827,15 @@ input[readonly] {
 }
 
 /* -------------------------------------------------------------------- chat
-   Sessions on the left, one session on the right. The right card switches
-   between three views rather than stacking them, because the window cannot
-   grow and a timeline that shares the screen with a settings form reads as
-   neither. */
+   The session catalogue now lives in the upstream-style sidebar, so the
+   selected session owns the whole main Chat column. Its card still switches
+   between views rather than stacking them, because the window cannot grow and
+   a timeline that shares the screen with a settings form reads as neither. */
 
 [data-panel='chat'] {
   padding: 12px 14px 14px;
   gap: 12px;
-  grid-template-columns: 310px minmax(0, 1fr);
+  grid-template-columns: minmax(0, 1fr);
   grid-template-rows: minmax(0, 1fr);
 }
 

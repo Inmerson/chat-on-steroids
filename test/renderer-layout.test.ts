@@ -211,6 +211,12 @@ describe('the chat panel cards', () => {
     return match![1]!.trim().replace(/minmax\([^)]*\)/g, 'minmax').split(/\s+/);
   }
 
+  it('gives the selected session the full main chat width after the catalogue moved into the sidebar', () => {
+    const panel = rule("[data-panel='chat']");
+    expect(panel).toContain('grid-template-columns: minmax(0, 1fr)');
+    expect(panel).not.toContain('310px');
+  });
+
   it('keeps the session catalogue in the conversation sidebar rather than duplicating it in the main chat panel', () => {
     const list = document.getElementById('sessionList')!;
     expect(list.closest('.sidebar-sessions')).not.toBeNull();
