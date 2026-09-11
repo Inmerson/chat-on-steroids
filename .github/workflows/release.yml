@@ -275,7 +275,7 @@ jobs:
             echo "Installed DEB GUI exited before the intentional timeout (status $status)" >&2
             exit 1
           fi
-          grep -Fq '[info] app started' deb-gui.log
+          grep -Fq '[info] UI started; Core runtime is independently supervised' deb-gui.log
           grep -Fq '[info] window loaded' deb-gui.log
           grep -Fq '[info] renderer state ready' deb-gui.log
           if grep -Fq '[error] window failed to load' deb-gui.log || grep -Fq '[error] renderer:' deb-gui.log; then
@@ -333,7 +333,7 @@ jobs:
               echo "AppImage $label GUI exited before the intentional timeout (status $status)" >&2
               exit 1
             fi
-            grep -Fq '[info] app started' "$log"
+            grep -Fq '[info] UI started; Core runtime is independently supervised' "$log"
             grep -Fq '[info] window loaded' "$log"
             grep -Fq '[info] renderer state ready' "$log"
             if grep -Fq '[error] window failed to load' "$log" || grep -Fq '[error] renderer:' "$log"; then

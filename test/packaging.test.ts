@@ -256,7 +256,7 @@ describe('cross-platform packaging targets', () => {
 
     const macGuiScript = readFileSync(path.join(root, 'scripts', 'smoke-macos-gui.mjs'), 'utf8');
     expect(macGuiScript).toContain("CLF_DEBUG: '1'");
-    expect(macGuiScript).toContain("output.includes('[info] app started')");
+    expect(macGuiScript).toContain("output.includes('[info] UI started; Core runtime is independently supervised')");
     expect(macGuiScript).toContain("output.includes('[info] window loaded')");
     expect(macGuiScript).toContain("output.includes('[info] renderer state ready')");
     expect(macGuiScript).toContain("output.includes('[error] window failed to load')");
@@ -285,7 +285,7 @@ describe('cross-platform packaging targets', () => {
     expect(debGui).toContain('XDG_STATE_HOME="$deb_smoke_root/state"');
     expect(debGui).toContain('xvfb-run -a /usr/bin/chat-on-steroids');
     expect(debGui).toContain('--kill-after=5s 12s');
-    expect(debGui).toContain("grep -Fq '[info] app started' deb-gui.log");
+    expect(debGui).toContain("grep -Fq '[info] UI started; Core runtime is independently supervised' deb-gui.log");
     expect(debGui).toContain("grep -Fq '[info] window loaded' deb-gui.log");
     expect(debGui).toContain("grep -Fq '[info] renderer state ready' deb-gui.log");
     expect(debGui).toContain("grep -Fq '[error] window failed to load' deb-gui.log");
@@ -308,7 +308,7 @@ describe('cross-platform packaging targets', () => {
     expect(appImageGui).toContain("printf '#!/bin/sh\\nexit 1\\n' > \"$fake_bin/unshare\"");
     expect(appImageGui).toContain('PATH="$launch_path"');
     expect(appImageGui).toContain('CLF_DEBUG=1 timeout --signal=TERM --kill-after=5s 12s xvfb-run -a "$appimage" >"$log"');
-    expect(appImageGui).toContain("grep -Fq '[info] app started' \"$log\"");
+    expect(appImageGui).toContain("grep -Fq '[info] UI started; Core runtime is independently supervised' \"$log\"");
     expect(appImageGui).toContain("grep -Fq '[info] window loaded' \"$log\"");
     expect(appImageGui).toContain("grep -Fq '[info] renderer state ready' \"$log\"");
     expect(appImageGui).toContain("grep -Fq '[error] window failed to load' \"$log\"");
@@ -423,7 +423,7 @@ describe('cross-platform packaging targets', () => {
     expect(releaseWorkflow).toContain('run_appimage_smoke forced-fallback "$fallback_smoke_root" "$fake_bin:$PATH" appimage-fallback-gui.log');
     expect(releaseWorkflow).toContain('CLF_DEBUG=1 timeout --signal=TERM --kill-after=5s 12s xvfb-run -a "$appimage" >"$log"');
     expect(releaseWorkflow).toContain('CLF_DEBUG=1 timeout --signal=TERM --kill-after=5s 12s xvfb-run -a /usr/bin/chat-on-steroids');
-    expect(releaseWorkflow).toContain("grep -Fq '[info] app started' \"$log\"");
+    expect(releaseWorkflow).toContain("grep -Fq '[info] UI started; Core runtime is independently supervised' \"$log\"");
     expect(releaseWorkflow).toContain("grep -Fq '[info] window loaded' \"$log\"");
     expect(releaseWorkflow).toContain("test \"$(dpkg-deb --field \"$deb\" Package)\" = chat-on-steroids");
     expect(releaseWorkflow).toContain("test \"$(dpkg-deb --field \"$deb\" Version)\" = \"$(node -p \"require('./package.json').version\")\"");

@@ -61,7 +61,7 @@ try {
     return null;
   };
   const ready = () =>
-    output.includes('[info] app started') &&
+    output.includes('[info] UI started; Core runtime is independently supervised') &&
     output.includes('[info] window loaded') &&
     output.includes('[info] renderer state ready') &&
     Date.now() - startedAt >= minimumSurvivalMs;
@@ -77,7 +77,7 @@ try {
     const failure = startupFailure();
     if (failure) finish(new Error(`macOS GUI startup failed: ${failure}`));
     else if (ready()) finish();
-    else finish(new Error('macOS GUI did not report app started, window loaded and renderer state ready within 15 seconds'));
+    else finish(new Error('macOS GUI did not report UI started, window loaded and renderer state ready within 15 seconds'));
   }, startupDeadlineMs);
   });
 } catch (error) {
