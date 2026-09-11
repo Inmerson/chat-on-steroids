@@ -21,6 +21,54 @@ export type ReviewOutcome = 'APPROVED' | 'CHANGES_REQUESTED' | 'BLOCKED';
 
 export type AssignmentStrategy = 'reuse' | 'spawn';
 
+export type AutonomousSwarmRunStatus = 'RUNNING' | 'PAUSED' | 'STOPPED' | 'COMPLETED';
+
+export interface AutonomousSwarmRun {
+  goalRunId: string;
+  primeConversationId: string;
+  bindingEpoch: string;
+  objective: string;
+  graphVersion: number;
+  status: AutonomousSwarmRunStatus;
+  lastReason: string | null;
+  cooldownUntil: number | null;
+}
+
+export interface AutonomousDispatchQueueEntry {
+  goalRunId: string;
+  taskId: string;
+  primeConversationId: string;
+  queuedAt: number;
+  attempt: number;
+}
+
+/**
+ * One write-before-browser-action permit. Browser-derived identity fields are filled only by
+ * the durable event that proves them and are never reconstructed from tab recency.
+ */
+export interface DispatchLease {
+  leaseId: string;
+  goalRunId: string;
+  taskId: string;
+  primeConversationId: string;
+  workerId: string;
+  /** Exact broker-run incarnation that owns this worker conversation. */
+  workerRunId: string;
+  conversationId: string;
+  commandId: string | null;
+  browserEpoch: number | null;
+  turnId: string | null;
+  createdAt: number;
+}
+
+export interface AutonomousSwarmState {
+  runs: Record<string, AutonomousSwarmRun>;
+  queue: AutonomousDispatchQueueEntry[];
+  activeLeases: Record<string, DispatchLease>;
+  /** Durable round-robin cursor for restart-stable Prime scheduling fairness. Legacy snapshots may omit it. */
+  lastGrantedPrimeId?: string | null;
+}
+
 export interface CompletionVerification {
   command: string;
   outcome: 'passed' | 'failed';

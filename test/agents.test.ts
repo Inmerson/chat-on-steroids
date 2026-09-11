@@ -86,7 +86,9 @@ const {
   TRANSFER_TTL_MS,
   statusForCaller,
   workerConversationGone,
-  workerRevivalClaimed
+  workerRevivalClaimed,
+  workerCountsForPrime,
+  totalOwnedWorkerChats
 } = await import('../src/main/agents.js');
 const { startMcpServer } = await import('../src/main/mcp/server.js');
 const { runningToolCalls } = await import('../src/main/mcp/call-context.js');
@@ -171,6 +173,61 @@ function fillContext(conversationId: string): void {
 }
 
 describe('spawning a run', () => {
+  it('owns up to two workers per prime while allowing multiple primes to be active', () => {
+    const primeA: Caller = { conversationId: 'c-prime-a' };
+    const primeB: Caller = { conversationId: 'c-prime-b' };
+    const primeC: Caller = { conversationId: 'c-prime-c' };
+    const primeD: Caller = { conversationId: 'c-prime-d' };
+
+    for (const [owner, prefix] of [
+      [primeA, 'A'],
+      [primeB, 'B'],
+      [primeC, 'C']
+    ] as const) {
+      const staged = stageSpawn({
+        caller: owner,
+        workers: [{ task: `${prefix} one` }, { task: `${prefix} two` }]
+      });
+      staged.commit();
+    }
+
+    expect(totalOwnedWorkerChats()).toBe(6);
+    expect(workerCountsForPrime('c-prime-a').owned).toBe(2);
+    expect(workerCountsForPrime('c-prime-b').owned).toBe(2);
+    expect(workerCountsForPrime('c-prime-c').owned).toBe(2);
+    expect(() => stageSpawn({ caller: primeA, workers: [{ task: 'A third' }] })).toThrow(/2|workersPerPrime|limit/i);
+    expect(() => stageSpawn({ caller: primeD, workers: [{ task: 'D first after six are owned' }] })).toThrow(
+      /6|totalWorkerChats|global/i
+    );
+    expect(workerCountsForPrime('c-prime-d').owned).toBe(0);
+    expect(totalOwnedWorkerChats()).toBe(6);
+
+    expect(statusForCaller(primeA).state.agents.filter((agent) => agent.role === 'worker')).toHaveLength(2);
+    expect(statusForCaller(primeB).state.agents.filter((agent) => agent.role === 'worker')).toHaveLength(2);
+    expect(() => statusForCaller({ conversationId: 'c-stranger' })).toThrow(/AGENTS_BUSY|No sub-agent/i);
+  });
+
+  it('never lets a worker create another prime or reassign a sleeping worker across primes', () => {
+    const primeA: Caller = { conversationId: 'c-prime-a-owner' };
+    const primeB: Caller = { conversationId: 'c-prime-b-owner' };
+    const runA = stageSpawn({ caller: primeA, workers: [{ task: 'A private task' }] });
+    runA.commit();
+    expect(bindConversation('worker-1', 'c-worker-a-owner', runA.runId)).toBe(true);
+    const workerA: Caller = { conversationId: 'c-worker-a-owner' };
+    expect(() => stageSpawn({ caller: workerA, workers: [{ task: 'nested worker' }] })).toThrow(/worker|must not create/i);
+    finishAgent(workerA, 'A result');
+
+    const runB = stageSpawn({ caller: primeB, workers: [{ task: 'B private task' }] });
+    runB.commit();
+    expect(runB.created[0]?.id).toBe('worker-1');
+    expect(statusForCaller(primeB).state.agents.some((agent) => agent.conversationId === 'c-worker-a-owner')).toBe(false);
+    expect(bindConversation('worker-1', 'c-worker-b-owner', runB.runId)).toBe(true);
+    expect(statusForCaller(primeA).state.agents.find((agent) => agent.id === 'worker-1')).toMatchObject({
+      conversationId: 'c-worker-a-owner',
+      state: 'sleeping'
+    });
+  });
+
   it('transfer health evidence reads an expired Prime transfer without clearing it', () => {
     const startedAt = 2_000_000_000;
     const now = vi.spyOn(Date, 'now').mockReturnValue(startedAt);
@@ -947,7 +1004,7 @@ describe('a worker that is sleeping', () => {
     expect(releaseQuiescentRun()).toBe(true);
 
     const saved = snapshotSwarm()!;
-    expect(saved.version).toBe(5);
+    expect(saved.version).toBe(6);
     expect(saved.runId).toBeNull();
     expect(saved.dormantRuns).toHaveLength(2);
 
@@ -1395,6 +1452,8 @@ describe('restart', () => {
   it('repairs the legacy bound-but-invited crash snapshot instead of opening a duplicate worker chat', () => {
     startSwarm(1);
     const snapshot = snapshotSwarm()!;
+    snapshot.version = 5;
+    delete snapshot.activeRuns;
     const worker = snapshot.agents.find((entry) => entry.info.id === 'worker-1')!.info;
     worker.conversationId = 'c-worker-1';
     worker.state = 'invited';
@@ -1412,6 +1471,8 @@ describe('restart', () => {
     startSwarm(1);
     startWorker('worker-1');
     const snapshot = snapshotSwarm()!;
+    snapshot.version = 5;
+    delete snapshot.activeRuns;
     const worker = snapshot.agents.find((entry) => entry.info.id === 'worker-1')!.info;
     worker.state = 'finished';
     worker.finishedAt = Date.now();
@@ -1426,9 +1487,55 @@ describe('restart', () => {
     expect(swarmStateForCaller(prime).agents.find((agent) => agent.id === 'worker-1')?.state).toBe('finished');
   });
 
+  it('upgrades a legacy single-run snapshot to exactly one version-6 active owner', () => {
+    startSwarm(1);
+    const legacy = snapshotSwarm()!;
+    legacy.version = 5;
+    delete legacy.activeRuns;
+
+    resetAgentsForTests();
+    restoreSwarm(legacy);
+
+    const upgraded = snapshotSwarm()!;
+    expect(upgraded.version).toBe(6);
+    expect(upgraded.activeRuns).toHaveLength(1);
+    expect(upgraded.activeRuns?.[0]).toMatchObject({
+      primeConversationId: PRIME_CHAT,
+      runId: upgraded.runId
+    });
+  });
+
+  it('fails closed when a version-6 snapshot gives one conversation to two active owners', () => {
+    const primeA: Caller = { conversationId: 'c-corrupt-prime-a' };
+    const primeB: Caller = { conversationId: 'c-corrupt-prime-b' };
+    const stagedA = stageSpawn({ caller: primeA, workers: [{ task: 'A exact owner' }] });
+    stagedA.commit();
+    const stagedB = stageSpawn({ caller: primeB, workers: [{ task: 'B exact owner' }] });
+    stagedB.commit();
+    expect(bindConversation('worker-1', 'c-corrupt-worker-a', stagedA.runId)).toBe(true);
+    expect(bindConversation('worker-1', 'c-corrupt-worker-b', stagedB.runId)).toBe(true);
+
+    const corrupt = snapshotSwarm()!;
+    expect(corrupt.version).toBe(6);
+    expect(corrupt.activeRuns).toHaveLength(2);
+    const runB = corrupt.activeRuns?.find((entry) => entry.primeConversationId === primeB.conversationId);
+    const workerB = runB?.agents.find((entry) => entry.info.id === 'worker-1');
+    expect(workerB).toBeDefined();
+    workerB!.info.conversationId = 'c-corrupt-worker-a';
+
+    resetAgentsForTests();
+    restoreSwarm(corrupt);
+
+    expect(swarmRunning()).toBe(false);
+    expect(totalOwnedWorkerChats()).toBe(0);
+    expect(snapshotSwarm()).toBeNull();
+  });
+
   it('re-keys a pre-UUID version-4 snapshot instead of restoring its 32-bit run incarnation', () => {
     startSwarm(1);
     const snapshot = snapshotSwarm()!;
+    snapshot.version = 4;
+    delete snapshot.activeRuns;
     snapshot.runId = 'deadbeef';
 
     resetAgentsForTests();

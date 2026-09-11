@@ -8,12 +8,16 @@
 
 import { randomUUID } from 'node:crypto';
 import * as durable from './durable.js';
+import { codingBackendLabel, type AiCodingBackend } from './orchestration/external-ai.js';
 
 export const EXECUTION_STATE = 'execution-runs';
 export const MAX_EXECUTION_PLAN_CHARS = 120_000;
 const MAX_EXECUTION_TITLE_CHARS = 160;
 
-export type ExecutionLoopMode = 'standard' | 'infinite';
+export type ExecutionLoopMode = 'standard' | 'infinite' | 'autonomous_swarm' | 'ralph';
+export type ExecutionMethod = 'native' | 'gsd';
+export type ExecutionCodingBackend = 'chatgpt' | AiCodingBackend;
+export type ExecutionReviewBackend = 'native' | 'coderabbit';
 export type ExecutionRunStatus = 'starting' | 'running' | 'paused' | 'stopped' | 'failed' | 'completed';
 
 export interface ExecutionRun {
@@ -21,6 +25,11 @@ export interface ExecutionRun {
   title: string | null;
   plan: string;
   mode: ExecutionLoopMode;
+  method: ExecutionMethod;
+  codingBackend: ExecutionCodingBackend;
+  reviewBackend: ExecutionReviewBackend;
+  workspaceReal: string | null;
+  workspaceVirtual: string | null;
   status: ExecutionRunStatus;
   conversationId: string | null;
   commandId: string | null;
@@ -60,7 +69,19 @@ function validPlan(value: string): string {
 }
 
 function validMode(value: unknown): value is ExecutionLoopMode {
-  return value === 'standard' || value === 'infinite';
+  return value === 'standard' || value === 'infinite' || value === 'autonomous_swarm' || value === 'ralph';
+}
+
+function validMethod(value: unknown): value is ExecutionMethod {
+  return value === 'native' || value === 'gsd';
+}
+
+function validCodingBackend(value: unknown): value is ExecutionCodingBackend {
+  return ['chatgpt', 'claude', 'codex', 'copilot', 'cursor', 'gemini', 'opencode'].includes(String(value));
+}
+
+function validReviewBackend(value: unknown): value is ExecutionReviewBackend {
+  return value === 'native' || value === 'coderabbit';
 }
 
 function validStatus(value: unknown): value is ExecutionRunStatus {
@@ -71,23 +92,38 @@ function validIdentifier(value: unknown): value is string {
   return typeof value === 'string' && value.length >= 1 && value.length <= 256;
 }
 
+function validWorkspacePath(value: unknown): value is string {
+  return typeof value === 'string' && value.length >= 1 && value.length <= 4096 && !/[\r\n\0]/.test(value);
+}
+
 function restoredRun(raw: unknown): ExecutionRun | null {
   if (!raw || typeof raw !== 'object') return null;
   const row = raw as Partial<ExecutionRun>;
   if (!validIdentifier(row.id)) return null;
   if (typeof row.plan !== 'string' || row.plan.trim().length === 0 || row.plan.length > MAX_EXECUTION_PLAN_CHARS) return null;
   if (!validMode(row.mode) || !validStatus(row.status)) return null;
+  const method = row.method === undefined ? 'native' : row.method;
+  const codingBackend = row.codingBackend === undefined ? 'chatgpt' : row.codingBackend;
+  const reviewBackend = row.reviewBackend === undefined ? 'native' : row.reviewBackend;
+  if (!validMethod(method) || !validCodingBackend(codingBackend) || !validReviewBackend(reviewBackend)) return null;
   if (row.title !== null && (typeof row.title !== 'string' || row.title.length > MAX_EXECUTION_TITLE_CHARS)) return null;
   if (row.conversationId !== null && !validIdentifier(row.conversationId)) return null;
   if (row.commandId !== null && !validIdentifier(row.commandId)) return null;
   if (!Number.isFinite(row.createdAt) || !Number.isFinite(row.updatedAt)) return null;
   if (row.stoppedAt !== null && !Number.isFinite(row.stoppedAt)) return null;
   if (row.lastError !== null && typeof row.lastError !== 'string') return null;
+  if (row.workspaceReal !== undefined && row.workspaceReal !== null && !validWorkspacePath(row.workspaceReal)) return null;
+  if (row.workspaceVirtual !== undefined && row.workspaceVirtual !== null && !validWorkspacePath(row.workspaceVirtual)) return null;
   return {
     id: row.id,
     title: row.title ?? null,
     plan: row.plan,
     mode: row.mode,
+    method,
+    codingBackend,
+    reviewBackend,
+    workspaceReal: row.workspaceReal ?? null,
+    workspaceVirtual: row.workspaceVirtual ?? null,
     status: row.status,
     conversationId: row.conversationId ?? null,
     commandId: row.commandId ?? null,
@@ -145,15 +181,33 @@ export async function createExecution(input: {
   plan: string;
   title?: string;
   mode: ExecutionLoopMode;
+  method?: ExecutionMethod;
+  codingBackend?: ExecutionCodingBackend;
+  reviewBackend?: ExecutionReviewBackend;
+  workspace?: { real: string; virtual: string } | null;
 }): Promise<ExecutionRun> {
   const plan = validPlan(input.plan);
-  if (!validMode(input.mode)) throw new Error('Execution mode must be standard or infinite');
+  if (!validMode(input.mode)) throw new Error('Execution mode must be standard, infinite, autonomous_swarm, or ralph');
+  const method = input.method ?? 'native';
+  const codingBackend = input.codingBackend ?? 'chatgpt';
+  const reviewBackend = input.reviewBackend ?? 'native';
+  if (!validMethod(method)) throw new Error('Execution method must be native or gsd');
+  if (!validCodingBackend(codingBackend)) throw new Error('Execution coding backend is invalid');
+  if (!validReviewBackend(reviewBackend)) throw new Error('Execution review backend must be native or coderabbit');
+  if (input.workspace && (!validWorkspacePath(input.workspace.real) || !validWorkspacePath(input.workspace.virtual))) {
+    throw new Error('Execution workspace is invalid');
+  }
   const now = Date.now();
   const run: ExecutionRun = {
     id: randomUUID(),
     title: normalizedTitle(input.title),
     plan,
     mode: input.mode,
+    method,
+    codingBackend,
+    reviewBackend,
+    workspaceReal: input.workspace?.real ?? null,
+    workspaceVirtual: input.workspace?.virtual ?? null,
     status: 'starting',
     conversationId: null,
     commandId: null,
@@ -215,15 +269,42 @@ export async function setExecutionStatus(
 export function executionBootstrapText(id: string): string {
   const run = runs.get(id);
   if (!run) throw new Error(`Unknown execution run: ${id}`);
-  const modeLine =
+  const modeLines =
     run.mode === 'infinite'
-      ? 'Only after this milestone is verified complete, you may select the next highest-value improvement and continue.'
-      : 'Do not expand into unrelated feature work.';
+      ? ['Only after this milestone is verified complete, you may select the next highest-value improvement and continue.']
+      : run.mode === 'ralph'
+        ? [
+            'Ralph-style long-running loop: work on exactly one highest-priority incomplete task per iteration, verify it, record the result, then begin the next iteration.',
+            'Do not parallelize independent implementation tasks in Ralph mode. Continue until the approved plan is complete or a real BLOCKED/DECIDE boundary requires the user.'
+          ]
+        : ['Do not expand into unrelated feature work.'];
+  const methodLines = run.method === 'gsd'
+    ? [
+        'Execution method: GSD-style Discuss → Plan → Execute → Verify → Ship.',
+        'Capture unresolved implementation decisions before changing code; decompose work into bounded dependency-ordered tasks with explicit acceptance criteria and verification evidence.',
+        'Keep durable task/state artifacts in Core/Agent System 3.0 rather than relying on conversation memory, and do not declare the run complete until integrated verification passes.'
+      ]
+    : [];
+  const codingLines = run.codingBackend === 'chatgpt'
+    ? []
+    : [
+        `Coding backend: ${codingBackendLabel(run.codingBackend)}. Delegate bounded implementation work through session action=execution_delegate; inspect and verify its changes locally before accepting them.`,
+        'Do not silently fall back to another external AI backend if that CLI is missing, unauthenticated, rate-limited, or fails.'
+      ];
+  const reviewLines = run.reviewBackend === 'coderabbit'
+    ? [
+        'Review backend: CodeRabbit. Before declaring implementation complete, run session action=execution_review and address Critical/Warning findings, then re-review when fixes changed the diff.',
+        'CodeRabbit review sends repository diffs to the CodeRabbit service; use it only for this explicitly configured run and never include secrets or credentials in the diff.'
+      ]
+    : [];
   return [
     '@Chat On Steroids Core',
     '',
     'Execute only the approved plan below autonomously. Preserve unrelated working-tree changes. Make routine technical decisions yourself when safe. Use Chat On Steroids Core tools as needed. Verify the implementation before declaring completion. Stop and surface a blocker only for a real authorization, destructive, privacy, or unresolved ambiguity boundary.',
-    modeLine,
+    ...modeLines,
+    ...methodLines,
+    ...codingLines,
+    ...reviewLines,
     '',
     'APPROVED PLAN',
     run.plan

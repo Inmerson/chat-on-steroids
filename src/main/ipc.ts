@@ -70,6 +70,7 @@ import { syncLoginStartup } from './background-startup.js';
 import { controlCenterStatus } from './orchestration/control-center.js';
 import { markInstallOnQuit, onUpdateChange, updateStatus } from './update.js';
 import { captureAgentRuntimeTargets, releaseCapturedAgentRuntimeTargets } from './runtime-gc.js';
+import { createPairingTicket, deviceOverview } from './multidevice/registry.js';
 
 /** The only URLs the renderer may ask the OS to open. */
 const ALLOWED_LINKS = new Set([
@@ -270,7 +271,8 @@ async function buildState(): Promise<AppState> {
     resolvedBinary: resolvedBinary(config),
     bundledTunnelVersion: bundledVersion(),
     bridge: await bridgeStatus(),
-    update: updateStatus()
+    update: updateStatus(),
+    devices: await deviceOverview()
   };
 }
 
@@ -315,9 +317,20 @@ export function registerIpc(getWindow: () => BrowserWindow | null, quitToInstall
     nativeTheme.themeSource = next.ui.theme;
     // BrowserWindow's native backing color is fixed at construction unless updated explicitly.
     // Keep it in lock-step too: the default macOS application menu exposes Reload, and after a
-    // live theme switch an old opposite background otherwise flashes behind the renderer while it
-    // paints again. This is also the color Electron shows during any later renderer reload/failure.
     getWindow()?.setBackgroundColor(next.ui.theme === 'dark' ? '#0e0e11' : '#ffffff');
+    const isDark = next.ui.theme === 'dark';
+    const win = getWindow();
+    if (win && !win.isDestroyed()) {
+      if (process.platform === 'win32') {
+        try {
+          win.setTitleBarOverlay({
+            color: isDark ? '#0a0b10' : '#ffffff',
+            symbolColor: isDark ? '#f1f4f9' : '#0f172a',
+            height: 32
+          });
+        } catch {}
+      }
+    }
     if (
       before.goal.enabled !== next.goal.enabled ||
       before.goal.model !== next.goal.model ||
@@ -528,6 +541,7 @@ export function registerIpc(getWindow: () => BrowserWindow | null, quitToInstall
   });
 
   handle('diagnostics:run', async () => runDiagnostics());
+  handle('devices:pairing:create', async () => createPairingTicket());
 
   handle('log:get', async () => getLog());
   handle('log:text', async () => formatLogForClipboard());

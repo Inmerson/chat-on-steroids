@@ -71,6 +71,7 @@ function orchestration(overrides: Partial<OrchestrationState> = {}): Orchestrati
     assignmentIntents: {},
     worktreeIntents: {},
     worktrees: {},
+    autonomousSwarm: { runs: {}, queue: [], activeLeases: {} },
     ...overrides
   };
 }
@@ -234,7 +235,7 @@ describe('Control Center projector', () => {
       null,
       swarm([]),
       observedAt,
-      { budget: 5, used: 3, queued: 2, observedAt: observedAt - 10, receivedAt: observedAt - 20 }
+      { budget: 6, used: 3, queued: 2, observedAt: observedAt - 10, receivedAt: observedAt - 20 }
     );
 
     expect(status.browser).toEqual({
@@ -253,7 +254,7 @@ describe('Control Center projector', () => {
       null,
       swarm([]),
       observedAt,
-      { budget: 5, used: 4, queued: 1, observedAt: observedAt - 70_000, receivedAt: observedAt - 60_001 }
+      { budget: 6, used: 4, queued: 1, observedAt: observedAt - 70_000, receivedAt: observedAt - 60_001 }
     );
 
     expect(status.browser).toMatchObject({

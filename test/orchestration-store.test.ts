@@ -59,6 +59,39 @@ describe('V3 orchestration durable store', () => {
     await expect(readOrchestrationEvents(1)).resolves.toEqual([second]);
   });
 
+  it('treats an identical event id as one durable append', async () => {
+    await tempStore();
+    const input = event('RUN_CREATED', 'run-idempotent');
+
+    const first = await appendOrchestrationEvent(input);
+    const repeated = await appendOrchestrationEvent(input);
+
+    expect(repeated).toEqual(first);
+    expect(await readOrchestrationEvents()).toEqual([first]);
+  });
+
+  it('rejects a conflicting reuse of an event id instead of choosing one history', async () => {
+    await tempStore();
+    const input = event('RUN_CREATED', 'run-conflict');
+    await appendOrchestrationEvent(input);
+
+    await expect(
+      appendOrchestrationEvent({ ...input, payload: { changed: true } })
+    ).rejects.toThrow(/event id|conflict|idempot/i);
+    expect(await readOrchestrationEvents()).toHaveLength(1);
+  });
+
+  it('refuses an individually unbounded durable event before writing it', async () => {
+    await tempStore();
+    await expect(
+      appendOrchestrationEvent({
+        ...event('RUN_CREATED', 'run-large-event'),
+        payload: { raw: 'x'.repeat(70_000) }
+      })
+    ).rejects.toThrow(/event.*large|bounded|65536|64/i);
+    expect(await readOrchestrationEvents()).toEqual([]);
+  });
+
   it('writes and restores an atomic orchestration snapshot', async () => {
     const dir = await tempStore();
     const snapshot = { version: 1 as const, lastSeq: 2, state: { runId: 'run-1', tasks: [] } };

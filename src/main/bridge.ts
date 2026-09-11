@@ -148,12 +148,12 @@ const STALE_SWARM_SWEEP_MS = 30_000;
 let observationWritesInFlight = 0;
 /** Requests allowed per rolling minute, across all routes. */
 const RATE_LIMIT = 900;
-const AGENT_TAB_BUDGET = 5;
+const AGENT_TAB_BUDGET = 6;
 const MAX_AGENT_TAB_QUEUE = 400;
 const MAX_TELEMETRY_CLOCK_SKEW_MS = 60_000;
 
 export interface BrowserAgentTabTelemetry {
-  budget: 5;
+  budget: 6;
   used: number;
   queued: number;
   observedAt: number;
@@ -392,7 +392,7 @@ export interface BridgeCommand {
   /** Durable Core execution identity when this command belongs to a managed autonomous run. */
   executionRunId: string | null;
   /** Loop mode is projected from the durable run rather than trusted from the browser. */
-  loopMode: 'standard' | 'infinite' | null;
+  loopMode: 'standard' | 'infinite' | 'autonomous_swarm' | 'ralph' | null;
 }
 
 let server: http.Server | null = null;
@@ -4214,18 +4214,24 @@ function drop(command: Command, why: string): boolean {
   releaseQuiescentRun();
   if (needsBrokerFence) {
     void persistCriticalSwarmNow()
-      .then((durable) => {
+      .then(async (durable) => {
         if (!durable) {
           logWarn(
             `bridge: kept retired ${specKey(command.spec)} durable because its broker transition had no immediate persistence sink`
           );
           return;
         }
-        if (commandRetirementsAwaitingBroker.delete(command.id)) persistCommands();
+        if (commandRetirementsAwaitingBroker.delete(command.id)) {
+          // The broker transition is now fsync-equivalent, so retire the old transport with the
+          // same strength instead of leaving a second crash window behind a debounce timer.
+          // A stale extra command is the safe side before this point; after it, the exact
+          // command-removal snapshot should be durable before this cleanup chain is considered done.
+          await writeDurableNow(COMMANDS_STATE, commandSnapshot());
+        }
       })
       .catch((err) => {
         logWarn(
-          `bridge: kept retired ${specKey(command.spec)} durable because its broker transition could not be persisted — ${err instanceof Error ? err.message : String(err)}`
+          `bridge: kept retired ${specKey(command.spec)} durable because broker/transport cleanup could not be persisted — ${err instanceof Error ? err.message : String(err)}`
         );
       });
   }

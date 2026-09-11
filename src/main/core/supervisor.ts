@@ -20,6 +20,11 @@ export interface CoreProcessAdapter {
   probe(): Promise<CoreProbeResult>;
   spawn(): Promise<CoreSpawnResult>;
   stop(): Promise<void>;
+  /**
+   * Optional process-liveness fence for a host this supervisor itself spawned. It is never used
+   * as a health signal; it only prevents a transient IPC failure from creating a second owner.
+   */
+  isSpawnedHostAlive?(pid: number): Promise<boolean>;
 }
 
 export interface CoreSupervisorOptions {
@@ -37,6 +42,7 @@ export interface EnsureHostResult {
 
 export const CORE_RESTART_BACKOFF_MS = [2_000, 5_000, 10_000, 30_000, 60_000, 120_000, 180_000] as const;
 const MAX_CORE_RESTART_BACKOFF_MS = CORE_RESTART_BACKOFF_MS[CORE_RESTART_BACKOFF_MS.length - 1]!;
+export const CORE_STARTUP_GRACE_MS = 30_000;
 
 const sleepDefault = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -64,7 +70,10 @@ export class CoreSupervisor {
     this.sleep = options.sleep ?? sleepDefault;
     this.now = options.now ?? Date.now;
     this.healthyResetMs = options.healthyResetMs ?? 300_000;
-    this.startupGraceMs = options.startupGraceMs ?? 5_000;
+    // Electron helpers need time to bring up Chromium on cold or busy Windows machines. A
+    // short grace period turns a slow startup into a spawn storm, so do not create another
+    // host until the original owner has had a realistic chance to publish its IPC endpoint.
+    this.startupGraceMs = options.startupGraceMs ?? CORE_STARTUP_GRACE_MS;
   }
 
   async ensureHost(_reason: string): Promise<EnsureHostResult> {
@@ -107,6 +116,21 @@ export class CoreSupervisor {
 
     if (this.lastSpawnAt !== null && now - this.lastSpawnAt < this.startupGraceMs && this.lastSpawnPid !== null) {
       return { state: 'spawned', pid: this.lastSpawnPid };
+    }
+
+    // A failed IPC request is not proof that the process we just created has died. In
+    // particular, Windows can briefly reject named-pipe requests while Chromium is busy. Keep
+    // one owner until it exits, rather than multiplying Core Hosts that all contend for the
+    // same profile and tunnel resources.
+    if (this.lastSpawnPid !== null && this.adapter.isSpawnedHostAlive) {
+      try {
+        if (await this.adapter.isSpawnedHostAlive(this.lastSpawnPid)) {
+          return { state: 'spawned', pid: this.lastSpawnPid };
+        }
+      } catch {
+        // Liveness is only a duplicate-prevention fence. A failed check falls back to normal
+        // probe/backoff recovery rather than claiming a dead process is healthy.
+      }
     }
     this.recordRapidDeath(now);
 

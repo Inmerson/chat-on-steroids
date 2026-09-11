@@ -13,6 +13,14 @@ the app refuses the extension and asks you to reload the matching copy.
 
 No changes yet.
 
+## [2.1.3] — 2026-09-08
+
+### Fixed
+- Connection actions now ignore rapid repeated clicks while a previous connect or disconnect
+  request is in flight, preventing duplicate transition requests and the resulting UI stall.
+- Workspace and setup pages open at their top when selected, instead of retaining a previous
+  bottom scroll position. Live Chat and Activity timelines retain their intentional behavior.
+
 ## [2.1.2] — 2026-09-05
 
 2.1.2 is a selective upstream-synchronization and reliability patch for the 2.1 autonomous-

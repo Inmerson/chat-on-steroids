@@ -8,7 +8,7 @@
 
 import { app, BrowserWindow, clipboard, dialog, ipcMain, nativeTheme, shell } from 'electron';
 import { z } from 'zod';
-import type { AppState, BridgeStatus, Config, Diagnosis } from '../shared/types.js';
+import type { AppState, BridgeStatus, Config, Diagnosis, DeviceOverview } from '../shared/types.js';
 import type { Handoff, SwarmState } from '../shared/session.js';
 import type { ControlCenterStatus } from '../shared/control-center.js';
 import {
@@ -52,10 +52,11 @@ function resolvedBinary(config: Config): string | null {
 }
 
 async function buildState(): Promise<AppState> {
-  const [config, bridge, secrets] = await Promise.all([
+  const [config, bridge, secrets, devices] = await Promise.all([
     callCoreUi<Config>('config-get'),
     callCoreUi<BridgeStatus>('bridge-status'),
-    getCoreSecretStatus()
+    getCoreSecretStatus(),
+    callCoreUi<DeviceOverview>('devices-overview')
   ]);
   return {
     config,
@@ -67,7 +68,8 @@ async function buildState(): Promise<AppState> {
     resolvedBinary: resolvedBinary(config),
     bundledTunnelVersion: bundledVersion(),
     bridge,
-    update: updateStatus()
+    update: updateStatus(),
+    devices
   };
 }
 
@@ -90,11 +92,33 @@ function handle<T>(channel: string, fn: (payload: unknown) => Promise<T>): void 
 const id = z.string().min(8).max(64).regex(/^[0-9a-z-]+$/i);
 const agentId = z.string().min(1).max(64).regex(/^[0-9a-z-]+$/i);
 
+function applyWindowTheme(win: BrowserWindow | null, isDark: boolean): void {
+  if (!win || win.isDestroyed()) return;
+  win.setBackgroundColor(isDark ? '#090a0f' : '#ffffff');
+  if (process.platform === 'win32') {
+    try {
+      win.setTitleBarOverlay({
+        color: isDark ? '#0a0b10' : '#ffffff',
+        symbolColor: isDark ? '#f1f4f9' : '#0f172a',
+        height: 32
+      });
+    } catch {}
+  }
+}
+
 export function registerUiIpc(getWindow: () => BrowserWindow | null, quitToInstall: () => void = () => {}): void {
   handle('state:get', async () => {
     const state = await buildState();
     logInfo('renderer state ready');
+    applyWindowTheme(getWindow(), state.config.ui.theme === 'dark');
     return state;
+  });
+
+  handle('theme:set', async (payload) => {
+    const { theme } = z.object({ theme: z.enum(['light', 'dark']) }).parse(payload);
+    nativeTheme.themeSource = theme;
+    applyWindowTheme(getWindow(), theme === 'dark');
+    return true;
   });
 
   handle('settings:save', async (payload) => {
@@ -103,7 +127,7 @@ export function registerUiIpc(getWindow: () => BrowserWindow | null, quitToInsta
     await refreshUiConfigMirror();
     syncLoginStartup(app, next.ui.autoConnect);
     nativeTheme.themeSource = next.ui.theme;
-    getWindow()?.setBackgroundColor(next.ui.theme === 'dark' ? '#0e0e11' : '#ffffff');
+    applyWindowTheme(getWindow(), next.ui.theme === 'dark');
     logInfo('settings updated through Core authority');
     return buildState();
   });
@@ -178,6 +202,12 @@ export function registerUiIpc(getWindow: () => BrowserWindow | null, quitToInsta
   handle('connection:connect', async () => { await connect(); return buildState(); });
   handle('connection:disconnect', async () => { await disconnect(); return buildState(); });
   handle('diagnostics:run', async () => callCoreUi<Diagnosis>('diagnostics-run'));
+  handle('devices:pairing:create', async () => callCoreUi<{ pairingId: string; code: string; expiresAt: number }>('devices-pairing-create'));
+  handle('devices:revoke', async (payload) => {
+    const { deviceId } = z.object({ deviceId: z.string().regex(/^dev_[0-9a-f]{32}$/i) }).parse(payload);
+    await callCoreUi<boolean>('devices-revoke', { deviceId });
+    return buildState();
+  });
 
   handle('log:get', async () => getLog());
   handle('log:text', async () => formatLogForClipboard());

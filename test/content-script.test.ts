@@ -7434,6 +7434,40 @@ describe('the fresh chat the app opened', () => {
     expect(live.sent.filter((message) => message.type === 'ack' && message.status === 'sent')).toHaveLength(1);
   });
 
+  it('preserves Ralph as a managed durable loop mode instead of degrading it to standard', async () => {
+    let sends = 0;
+    live = await harness(
+      'https://chatgpt.com/?clf=cmd-execution-ralph',
+      {
+        redeem: () => ({
+          ok: true,
+          command: {
+            id: 'cmd-execution-ralph',
+            type: 'execution',
+            text: '@Chat On Steroids Core\n\nRun the approved Ralph loop.',
+            agent: null,
+            conversationId: null,
+            executionRunId: 'execution-run-ralph',
+            loopMode: 'ralph'
+          }
+        }),
+        ack: () => ({ ok: true, data: { committed: true } })
+      },
+      (document, dom) => {
+        document.querySelector('[data-testid="send-button"]')!.addEventListener('click', () => {
+          sends += 1;
+          if (sends === 1) dom.reconfigure({ url: 'https://chatgpt.com/c/71717171-8282-4939-9050-616161616161' });
+        });
+      }
+    );
+
+    await settle(500);
+    expect(sends).toBe(1);
+    expect(live.hook.getCurrentExecutionRunId()).toBe('execution-run-ralph');
+    expect(live.hook.getAutoLoopMode()).toBe('ralph');
+    expect(live.hook.isAutoLoopActive()).toBe(true);
+  });
+
   it('delivers the bootstrap before unrelated status restoration can stall startup', async () => {
     let releaseStatus: () => void = () => undefined;
     const statusHeld = new Promise((resolve) => {

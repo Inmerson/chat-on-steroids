@@ -2,7 +2,11 @@ import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { defaultConfig, initConfigPath, loadConfig, saveConfig, updateConfig } from '../src/main/config.js';
-import { DEFAULT_CAPABILITIES } from '../src/shared/types.js';
+import {
+  AUTONOMOUS_SWARM_LIMITS,
+  DEFAULT_CAPABILITIES,
+  autonomousSwarmLimits
+} from '../src/shared/types.js';
 import { makeTempDir, removeTempDir } from './helpers.js';
 
 let dir: string;
@@ -301,6 +305,16 @@ describe('settings migration', () => {
 
 /** Fresh-install defaults, while migrations above prove existing choices stay narrow. */
 describe('shipped defaults', () => {
+  it('keeps autonomous-swarm capacity immutable while preserving the legacy worker preference', async () => {
+    expect(autonomousSwarmLimits()).toEqual({ activeTurns: 2, totalWorkerChats: 6, workersPerPrime: 2 });
+    expect(AUTONOMOUS_SWARM_LIMITS).toEqual({ activeTurns: 2, totalWorkerChats: 6, workersPerPrime: 2 });
+    expect(Object.isFrozen(AUTONOMOUS_SWARM_LIMITS)).toBe(true);
+
+    const config = defaultConfig();
+    await saveConfig({ ...config, multiAgent: { enabled: true, maxWorkers: 7 } });
+    expect((await loadConfig()).multiAgent.maxWorkers).toBe(7);
+  });
+
   it('records sessions from first launch', () => {
     expect(defaultConfig().sessions.record).toBe(true);
   });

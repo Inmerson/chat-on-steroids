@@ -1,7 +1,13 @@
 import { transitionTask } from './task-state.js';
+import {
+  applyAutonomousSwarmEvent,
+  EMPTY_AUTONOMOUS_SWARM_STATE,
+  isAutonomousSwarmEvent
+} from './autonomous-swarm.js';
 import type { OrchestrationEvent, OrchestrationEventType } from './store.js';
 import type {
   AssignmentIntentRecord,
+  AutonomousSwarmState,
   TaskRecord,
   TaskState,
   TaskWorktreeRecord,
@@ -18,6 +24,7 @@ export interface OrchestrationState {
   assignmentIntents: Record<string, AssignmentIntentRecord>;
   worktreeIntents: Record<string, WorktreeIntentRecord>;
   worktrees: Record<string, TaskWorktreeRecord>;
+  autonomousSwarm: AutonomousSwarmState;
 }
 
 export const EMPTY_ORCHESTRATION_STATE: OrchestrationState = {
@@ -29,7 +36,8 @@ export const EMPTY_ORCHESTRATION_STATE: OrchestrationState = {
   tasks: {},
   assignmentIntents: {},
   worktreeIntents: {},
-  worktrees: {}
+  worktrees: {},
+  autonomousSwarm: EMPTY_AUTONOMOUS_SWARM_STATE
 };
 
 const TASK_EVENT_STATES: Partial<Record<OrchestrationEventType, TaskState>> = {
@@ -163,6 +171,15 @@ function sameWorktree(left: WorktreeIntentRecord, right: TaskWorktreeRecord): bo
 }
 
 export function applyOrchestrationEvent(state: OrchestrationState, event: OrchestrationEvent): OrchestrationState {
+  if (isAutonomousSwarmEvent(event.type)) {
+    if (event.type === 'SWARM_RUN_COMPLETED') {
+      const unverified = Object.values(state.tasks).filter((task) => task.state !== 'VERIFIED');
+      if (unverified.length > 0) {
+        throw new Error(`SWARM_RUN_COMPLETED requires every required task to be VERIFIED; pending: ${unverified.map((task) => task.taskId).join(', ')}`);
+      }
+    }
+    return { ...state, autonomousSwarm: applyAutonomousSwarmEvent(state.autonomousSwarm, event) };
+  }
   requireSameRun(state, event);
 
   if (event.type === 'RUN_CREATED') {

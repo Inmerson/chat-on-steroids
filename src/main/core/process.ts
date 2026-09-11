@@ -1,4 +1,5 @@
 import { spawn as nodeSpawn } from 'node:child_process';
+import path from 'node:path';
 import {
   CORE_CAPABILITIES,
   CORE_PROTOCOL_VERSION,
@@ -54,6 +55,14 @@ function detachedOptions(): {
   return { detached: true, stdio: 'ignore', windowsHide: true, shell: false };
 }
 
+function electronLaunchArgs(execPath: string, args: string[]): string[] {
+  const base = path.basename(execPath).toLowerCase();
+  if (base.startsWith('electron')) {
+    return ['.', ...args];
+  }
+  return args;
+}
+
 /**
  * The supervisor judges a Core by its authenticated/versioned IPC hello. A stale PID, process
  * handle or executable name is never accepted as health because none proves the MCP runtime is
@@ -65,6 +74,17 @@ export function createCoreProcessAdapter(options: CoreProcessAdapterOptions): Co
   const now = options.now ?? Date.now;
   let firstHealthyPid: number | null = null;
   let firstHealthyAt: number | null = null;
+
+  const isSpawnedHostAlive = async (pid: number): Promise<boolean> => {
+    try {
+      // Signal 0 performs no mutation. This PID only originates from `spawn()` in this adapter,
+      // so it is a liveness fence against duplicate hosts, never an identity or health proof.
+      process.kill(pid, 0);
+      return true;
+    } catch {
+      return false;
+    }
+  };
 
   return {
     probe: async (): Promise<CoreProbeResult> => {
@@ -89,7 +109,7 @@ export function createCoreProcessAdapter(options: CoreProcessAdapterOptions): Co
     spawn: async (): Promise<CoreSpawnResult> => {
       const child = spawn(
         options.execPath,
-        ['--core-host', '--core-user-data', options.userDataDir],
+        electronLaunchArgs(options.execPath, ['--core-host', '--core-user-data', options.userDataDir]),
         detachedOptions()
       );
       if (!child.pid) throw new Error('Core Host process did not report a PID');
@@ -103,7 +123,8 @@ export function createCoreProcessAdapter(options: CoreProcessAdapterOptions): Co
       } catch {
         // A dead/unreachable Core is already stopped from the supervisor's point of view.
       }
-    }
+    },
+    isSpawnedHostAlive
   };
 }
 
@@ -118,7 +139,7 @@ export function startCoreSupervisorDetached(options: StartCoreSupervisorOptions)
   const spawn = options.spawn ?? (nodeSpawn as unknown as SpawnLike);
   const child = spawn(
     options.execPath,
-    ['--core-supervisor', '--core-user-data', options.userDataDir],
+    electronLaunchArgs(options.execPath, ['--core-supervisor', '--core-user-data', options.userDataDir]),
     detachedOptions()
   );
   if (!child.pid) throw new Error('Core supervisor process did not report a PID');

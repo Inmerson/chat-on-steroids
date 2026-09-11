@@ -11,6 +11,7 @@ import { logError, logInfo, logWarn } from './logger.js';
 import { lastRequestAt, startMcpServer, tunnelProbeHeaders, type McpEndpoint } from './mcp/server.js';
 import { lastToolCallAt } from './mcp/tools.js';
 import { SURFACE_LIST, surfaceIsUseful, type SurfaceId } from './mcp/surfaces.js';
+import { executeRemote } from './multidevice/transport.js';
 import { getSecret } from './secrets.js';
 import { startTunnel, TunnelError, type TunnelHandle } from './tunnel/index.js';
 import { desktopAutomationSupported } from './platform.js';
@@ -181,7 +182,8 @@ async function connectImpl(): Promise<void> {
         roots: live.roots,
         caps: effectiveCapabilities(live),
         readOnly: live.readOnly,
-        privacyScreenshots: live.ui.privacyScreenshots
+        privacyScreenshots: live.ui.privacyScreenshots,
+        multiDevice: { execute: executeRemote }
       };
     });
     if (shutdownRequested || generation !== connectionGeneration) {

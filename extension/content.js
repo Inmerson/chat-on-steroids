@@ -5423,7 +5423,7 @@
   const MCP_TRIGGER_PREFIX = '@Chat On Steroids Core\n\n';
 
   let autoLoopActive = false;
-  let autoLoopMode = 'off'; // 'off' | 'standard' | 'infinite'
+  let autoLoopMode = 'off'; // 'off' | 'standard' | 'infinite' | 'autonomous_swarm' | 'ralph'
   let autoLoopTurns = 0;
   const MAX_AUTO_LOOP_TURNS = 20;
   let autoLoopTimer = null;
@@ -5548,7 +5548,7 @@
 
   function autoLoopSnapshot() {
     return {
-      mode: autoLoopMode === 'infinite' ? 'infinite' : 'standard',
+      mode: ['standard', 'infinite', 'autonomous_swarm', 'ralph'].includes(autoLoopMode) ? autoLoopMode : 'standard',
       turns: autoLoopTurns,
       lastReason: autoLoopLastReason || '',
       recentFingerprints: autoLoopRecentFingerprints.slice(-8),
@@ -5558,7 +5558,7 @@
   }
 
   function restoreAutoLoopSnapshot(snapshot) {
-    if (!snapshot || (snapshot.mode !== 'standard' && snapshot.mode !== 'infinite')) return false;
+    if (!snapshot || !['standard', 'infinite', 'autonomous_swarm', 'ralph'].includes(snapshot.mode)) return false;
     if (!Number.isInteger(snapshot.turns) || snapshot.turns < 0) return false;
     autoLoopActive = true;
     autoLoopMode = snapshot.mode;
@@ -5579,7 +5579,7 @@
 
   function managedExecutionIdentity(runId, mode) {
     const id = typeof runId === 'string' && runId ? runId : null;
-    const loopMode = mode === 'infinite' ? 'infinite' : mode === 'standard' ? 'standard' : null;
+    const loopMode = ['standard', 'infinite', 'autonomous_swarm', 'ralph'].includes(mode) ? mode : null;
     return id && loopMode ? { id, mode: loopMode } : null;
   }
 

@@ -25,6 +25,16 @@ import {
   setExecutionStatus,
   type ExecutionRun
 } from '../execution.js';
+import {
+  AI_CODING_BACKENDS,
+  codingBackendLabel,
+  runCodeRabbitReview,
+  runCodingBackend,
+  type AiCodingBackend,
+  type CodeRabbitReviewScope,
+  type ExternalAiResult
+} from '../orchestration/external-ai.js';
+import { currentWorkspace } from '../workspace.js';
 
 const SEARCH_RESULT_TOKENS = 3_000;
 const READ_RESULT_TOKENS = 5_000;
@@ -48,9 +58,28 @@ interface ExecutionBrowserControl {
 
 let executionBrowserControlOverride: ExecutionBrowserControl | null = null;
 
+interface ExecutionExternalAiControl {
+  runCoding(input: { backend: AiCodingBackend; cwd: string; prompt: string }): Promise<ExternalAiResult>;
+  runReview(input: { cwd: string; scope?: CodeRabbitReviewScope; base?: string }): Promise<ExternalAiResult>;
+}
+
+let executionExternalAiControlOverride: ExecutionExternalAiControl | null = null;
+
 /** Test seam only; production lazily resolves the bridge when an execution action actually needs it. */
 export function setExecutionBrowserControlForTests(control: ExecutionBrowserControl | null): void {
   executionBrowserControlOverride = control;
+}
+
+/** Test seam only; production always uses the local external-AI adapters. */
+export function setExecutionExternalAiControlForTests(control: ExecutionExternalAiControl | null): void {
+  executionExternalAiControlOverride = control;
+}
+
+function executionExternalAiControl(): ExecutionExternalAiControl {
+  return executionExternalAiControlOverride ?? {
+    runCoding: runCodingBackend,
+    runReview: runCodeRabbitReview
+  };
 }
 
 async function executionBrowserControl(): Promise<ExecutionBrowserControl> {
@@ -131,56 +160,75 @@ const inputSchema = z
         'execution_status',
         'execution_pause',
         'execution_resume',
-        'execution_stop'
+        'execution_stop',
+        'execution_delegate',
+        'execution_review'
       ])
-      .describe('Search/read local recordings or control one durable autonomous desktop execution.'),
-    query: z.string().max(500).optional().describe('search only. Omit to list the 30 newest recordings.'),
-    session_id: z.string().min(8).max(64).optional().describe('read only. Exact id returned by search.'),
+      .describe('Operation.'),
+    query: z.string().max(500).optional(),
+    session_id: z.string().min(8).max(64).optional(),
     include: z
       .array(includeKind)
       .min(1)
       .max(5)
       .refine((values) => new Set(values).size === values.length, 'include entries must be unique')
-      .optional()
-      .describe('read only. Defaults to user, assistant, tools, errors and agents.'),
+      .optional(),
     tool_call: z
       .string()
       .regex(/^T[0-9A-Z]+$/i)
       .max(16)
-      .optional()
-      .describe('read only. Expand one short session-local tool reference such as T2F.'),
+      .optional(),
     cursor: z
       .string()
       .min(1)
       .max(CURSOR_MAX_CHARS)
       .optional()
-      .describe(
-        'A short token this tool printed earlier: update_cursor, continuation_cursor, older_cursor, read_cursor or next_cursor. Copy it exactly; it carries a checksum and a mistyped copy is refused.'
-      ),
+      .describe('Opaque cursor returned by this tool.'),
     plan: z
       .string()
       .min(1)
       .max(MAX_EXECUTION_PLAN_CHARS)
-      .optional()
-      .describe('execution_start only. The complete approved plan to execute on the desktop.'),
+      .optional(),
     title: z
       .string()
       .max(EXECUTION_TITLE_MAX_CHARS)
-      .optional()
-      .describe('execution_start only. Optional short label for the durable execution run.'),
+      .optional(),
     mode: z
-      .enum(['standard', 'infinite'])
-      .optional()
-      .describe('execution_start only. Defaults to standard.'),
+      .enum(['standard', 'infinite', 'autonomous_swarm', 'ralph'])
+      .optional(),
+    method: z
+      .enum(['native', 'gsd'])
+      .optional(),
+    coding_backend: z
+      .enum(['chatgpt', ...AI_CODING_BACKENDS])
+      .optional(),
+    review_backend: z
+      .enum(['native', 'coderabbit'])
+      .optional(),
     execution_id: z
       .string()
       .min(8)
       .max(64)
+      .optional(),
+    prompt: z
+      .string()
+      .min(1)
+      .max(20_000)
+      .optional(),
+    review_scope: z
+      .enum(['all', 'committed', 'uncommitted'])
+      .optional(),
+    review_base: z
+      .string()
+      .min(1)
+      .max(256)
       .optional()
-      .describe('execution_status/pause/resume/stop only. Exact execution id returned by execution_start.')
   })
   .superRefine((input, ctx) => {
-    const executionFields = ['plan', 'title', 'mode', 'execution_id'] as const;
+    const executionFields = [
+      'plan', 'title', 'mode', 'method', 'coding_backend', 'review_backend', 'execution_id',
+      'prompt', 'review_scope', 'review_base'
+    ] as const;
     const recordingFields = ['query', 'session_id', 'include', 'tool_call', 'cursor'] as const;
     if (input.action === 'search') {
       for (const field of ['session_id', 'include', 'tool_call'] as const) {
@@ -236,14 +284,35 @@ const inputSchema = z
       if (input.execution_id !== undefined) {
         ctx.addIssue({ code: 'custom', path: ['execution_id'], message: 'execution_id is not valid with action=execution_start' });
       }
+      for (const field of ['prompt', 'review_scope', 'review_base'] as const) {
+        if (input[field] !== undefined) {
+          ctx.addIssue({ code: 'custom', path: [field], message: `${field} is not valid with action=execution_start` });
+        }
+      }
       return;
     }
     if (!input.execution_id) {
       ctx.addIssue({ code: 'custom', path: ['execution_id'], message: `execution_id is required with action=${input.action}` });
     }
-    for (const field of ['plan', 'title', 'mode'] as const) {
+    for (const field of ['plan', 'title', 'mode', 'method', 'coding_backend', 'review_backend'] as const) {
       if (input[field] !== undefined) {
         ctx.addIssue({ code: 'custom', path: [field], message: `${field} is only valid with action=execution_start` });
+      }
+    }
+    if (input.action === 'execution_delegate') {
+      if (!input.prompt) ctx.addIssue({ code: 'custom', path: ['prompt'], message: 'prompt is required with action=execution_delegate' });
+      for (const field of ['review_scope', 'review_base'] as const) {
+        if (input[field] !== undefined) ctx.addIssue({ code: 'custom', path: [field], message: `${field} is only valid with action=execution_review` });
+      }
+      return;
+    }
+    if (input.action === 'execution_review') {
+      if (input.prompt !== undefined) ctx.addIssue({ code: 'custom', path: ['prompt'], message: 'prompt is only valid with action=execution_delegate' });
+      return;
+    }
+    for (const field of ['prompt', 'review_scope', 'review_base'] as const) {
+      if (input[field] !== undefined) {
+        ctx.addIssue({ code: 'custom', path: [field], message: `${field} is only valid with execution_delegate/execution_review` });
       }
     }
   })
@@ -257,6 +326,7 @@ export function registerSessionTool(reg: SurfaceRegistrar): void {
       description:
         'Search/read this app’s local recordings or control a durable autonomous desktop execution. ' +
         'execution_start accepts a complete approved plan and returns an execution_id; use execution_status, execution_pause, execution_resume or execution_stop with that id later, including from another authenticated ChatGPT conversation. ' +
+        'A run may use GSD workflow framing, Ralph-style serial iterations, an explicitly selected installed AI CLI through execution_delegate, and CodeRabbit through execution_review. External coding/review backends can send task or diff content to their provider and are never enabled by default. ' +
         'Execution state lives in Core and does not depend on the controlling chat staying open. ' +
         'For recordings, search and read include other and concurrently running chats. ' +
         'action=search lists the 30 newest sessions when query is omitted, or finds recordings containing a term. ' +
@@ -273,7 +343,7 @@ export function registerSessionTool(reg: SurfaceRegistrar): void {
           if (input.action === 'search') return searchSessions(input.query, input.cursor);
           return readSession(input.session_id!, input.include, input.tool_call, input.cursor);
         }
-        return executionAction(input);
+        return executionAction(input, reg);
       })
   );
 }
@@ -285,6 +355,10 @@ function executionResult(run: ExecutionRun, heading = 'Desktop execution'): Tool
       `execution_id: ${run.id}`,
       `status: ${run.status}`,
       `mode: ${run.mode}`,
+      `method: ${run.method}`,
+      `coding_backend: ${run.codingBackend}`,
+      `review_backend: ${run.reviewBackend}`,
+      run.workspaceVirtual ? `workspace: ${run.workspaceVirtual}` : 'workspace: pending',
       run.title ? `title: ${run.title}` : null,
       run.conversationId ? `conversation_id: ${run.conversationId}` : 'conversation_id: pending',
       run.commandId ? `command_id: ${run.commandId}` : 'command_id: none',
@@ -295,12 +369,23 @@ function executionResult(run: ExecutionRun, heading = 'Desktop execution'): Tool
   );
 }
 
-async function executionAction(input: z.infer<typeof inputSchema>): Promise<ToolResult> {
+async function executionAction(input: z.infer<typeof inputSchema>, reg: SurfaceRegistrar): Promise<ToolResult> {
   if (input.action === 'execution_start') {
+    const learned = currentWorkspace();
+    const onlyRoot = !learned && reg.ctx.roots.length === 1 ? reg.ctx.roots[0] : null;
+    const workspace = learned
+      ? { real: learned.real, virtual: learned.virtual }
+      : onlyRoot
+        ? { real: onlyRoot.path, virtual: `/${onlyRoot.name}` }
+        : null;
     const run = await createExecution({
       plan: input.plan!,
       title: input.title,
-      mode: input.mode ?? 'standard'
+      mode: input.mode ?? 'standard',
+      method: input.method ?? 'native',
+      codingBackend: input.coding_backend ?? 'chatgpt',
+      reviewBackend: input.review_backend ?? 'native',
+      workspace
     });
     try {
       const browser = await executionBrowserControl();
@@ -323,6 +408,54 @@ async function executionAction(input: z.infer<typeof inputSchema>): Promise<Tool
   const current = executionRun(id);
   if (!current) return fail(`No desktop execution exists with id ${id}.`);
   if (input.action === 'execution_status') return executionResult(current);
+
+  if (input.action === 'execution_delegate') {
+    if (!reg.exposedCaps.command) {
+      return fail('execution_delegate requires Command permission and a writable Core configuration.');
+    }
+    if (current.status === 'stopped' || current.status === 'failed' || current.status === 'completed') {
+      return fail(`Desktop execution ${id} is already ${current.status} and cannot delegate more coding work.`);
+    }
+    if (current.codingBackend === 'chatgpt') {
+      return fail('This execution uses the native ChatGPT coding backend; start a run with an explicit external coding_backend to delegate through a local AI CLI.');
+    }
+    if (!current.workspaceReal) {
+      return fail('This execution has no proven approved workspace. Establish a project workspace before starting an external-backend run.');
+    }
+    try {
+      const result = await executionExternalAiControl().runCoding({
+        backend: current.codingBackend,
+        cwd: current.workspaceReal,
+        prompt: input.prompt!
+      });
+      return ok(
+        `${codingBackendLabel(current.codingBackend)} external coding pass completed${result.truncated ? ' (output truncated by Core)' : ''}.\n` +
+        result.output
+      );
+    } catch (error) {
+      return fail(`External coding backend failed: ${friendlyError(error)}`);
+    }
+  }
+
+  if (input.action === 'execution_review') {
+    if (!reg.exposedCaps.command) return fail('execution_review requires Command permission.');
+    if (current.reviewBackend !== 'coderabbit') {
+      return fail('This execution is not configured for CodeRabbit review; start it with review_backend=coderabbit first.');
+    }
+    if (!current.workspaceReal) {
+      return fail('This execution has no proven approved workspace. Establish a project workspace before starting a CodeRabbit-enabled run.');
+    }
+    try {
+      const result = await executionExternalAiControl().runReview({
+        cwd: current.workspaceReal,
+        scope: input.review_scope ?? 'all',
+        base: input.review_base
+      });
+      return ok(`CodeRabbit review completed${result.truncated ? ' (output truncated by Core)' : ''}.\n${result.output}`);
+    } catch (error) {
+      return fail(`CodeRabbit review failed: ${friendlyError(error)}`);
+    }
+  }
 
   if (input.action === 'execution_pause') {
     if (current.status === 'paused') return executionResult(current, 'Desktop execution already paused');

@@ -1,5 +1,6 @@
 import path from 'node:path';
 import { app } from 'electron';
+import { getConfig } from '../config.js';
 import { CORE_CAPABILITIES, CORE_PROTOCOL_VERSION, type CoreStatusEnvelope } from '../../shared/core-protocol.js';
 import { retireGoalDrafts } from '../goal.js';
 import { initLogFile, logError, logInfo } from '../logger.js';
@@ -8,6 +9,7 @@ import { APP_VERSION } from '../version.js';
 import { ensureCoreIpcToken, startCoreIpcServer } from './ipc.js';
 import { startCoreRuntime, type CoreRuntime } from './runtime.js';
 import { coreUiDispatcher } from './ui-dispatch.js';
+import { startCoordinatorTransport, type CoordinatorTransport } from '../multidevice/transport.js';
 
 export interface CoreHostEntryOptions {
   userDataDir: string;
@@ -27,6 +29,7 @@ export async function runCoreHost(options: CoreHostEntryOptions): Promise<void> 
   const token = await ensureCoreIpcToken(options.userDataDir);
   const abort = new AbortController();
   let runtime: CoreRuntime | null = null;
+  let coordinatorTransport: CoordinatorTransport | null = null;
   let stopping = false;
 
   const requestStop = (): void => {
@@ -35,9 +38,23 @@ export async function runCoreHost(options: CoreHostEntryOptions): Promise<void> 
     abort.abort();
   };
 
-  const requireRuntime = (): CoreRuntime => {
-    if (!runtime) throw new Error('Core Host is still starting');
-    return runtime;
+  let notifyRuntimeReady: (r: CoreRuntime) => void = () => {};
+  const runtimeReady = new Promise<CoreRuntime>((resolve) => {
+    notifyRuntimeReady = resolve;
+  });
+
+  const requireRuntime = async (timeoutMs = 15_000): Promise<CoreRuntime> => {
+    if (runtime) return runtime;
+    let timer: NodeJS.Timeout | undefined;
+    const timeout = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => reject(new Error('Core Host is still starting')), timeoutMs);
+      timer.unref?.();
+    });
+    try {
+      return await Promise.race([runtimeReady, timeout]);
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
   };
 
   const ipc = await startCoreIpcServer({
@@ -52,29 +69,32 @@ export async function runCoreHost(options: CoreHostEntryOptions): Promise<void> 
     }),
     status: () => runtime?.statusEnvelope() ?? STARTING_STATUS,
     connect: async () => {
-      await requireRuntime().connect();
+      const rt = await requireRuntime();
+      await rt.connect();
     },
     disconnect: async () => {
-      await requireRuntime().disconnect();
+      const rt = await requireRuntime();
+      await rt.disconnect();
     },
     applySettings: async () => {
-      await requireRuntime().reloadSettings();
+      const rt = await requireRuntime();
+      await rt.reloadSettings();
     },
     secretStatus: async () => {
-      requireRuntime();
+      await requireRuntime();
       return {
         hasApiKey: await hasSecret('openaiApiKey'),
         hasGoalKey: await hasSecret('openRouterApiKey')
       };
     },
     setSecret: async (key, value) => {
-      requireRuntime();
+      await requireRuntime();
       await setSecret(key, value);
       if (key === 'openRouterApiKey') retireGoalDrafts();
       logInfo(`${key === 'openRouterApiKey' ? 'openrouter key' : 'api key'} ${value.trim() === '' ? 'cleared' : 'stored'}`);
     },
     uiCall: async (operation, payload) => {
-      requireRuntime();
+      await requireRuntime();
       return coreUiDispatcher(operation, payload);
     },
     shutdownCore: async () => {
@@ -90,7 +110,17 @@ export async function runCoreHost(options: CoreHostEntryOptions): Promise<void> 
 
   try {
     logInfo(`core host started pid=${process.pid} protocol=${CORE_PROTOCOL_VERSION}`);
+    // The authenticated IPC listener is deliberately available while Electron is still
+    // warming up. The supervisor can therefore attach to this owner instead of mistaking a
+    // slow Chromium startup for a dead Core and spawning another helper process.
+    await app.whenReady();
     runtime = await startCoreRuntime(options.userDataDir);
+    notifyRuntimeReady(runtime);
+    const device = getConfig().device;
+    coordinatorTransport = device.role === 'coordinator'
+      ? await startCoordinatorTransport({ host: device.coordinatorHost, port: device.coordinatorPort })
+      : null;
+    if (coordinatorTransport) logInfo(`coordinator transport listening on ${coordinatorTransport.address().host}:${coordinatorTransport.address().port}`);
     await new Promise<void>((resolve) => {
       if (abort.signal.aborted) resolve();
       else abort.signal.addEventListener('abort', () => resolve(), { once: true });
@@ -99,6 +129,7 @@ export async function runCoreHost(options: CoreHostEntryOptions): Promise<void> 
     logError(`core host failed: ${(error as Error).message}`);
   } finally {
     if (runtime) await runtime.shutdown().catch((error) => logError(`core runtime shutdown failed: ${(error as Error).message}`));
+    await coordinatorTransport?.close().catch(() => undefined);
     await ipc.close().catch(() => undefined);
     process.removeListener('SIGTERM', stopSignal);
     process.removeListener('SIGINT', stopSignal);

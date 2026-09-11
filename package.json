@@ -1,6 +1,6 @@
 {
   "name": "chat-on-steroids",
-  "version": "2.1.2",
+  "version": "2.1.3",
   "description": "Local coding bridge for ChatGPT over MCP, with Windows-only desktop control and approved-folder capability limits.",
   "license": "MIT",
   "author": "Chat On Steroids",
@@ -10,6 +10,8 @@
   "scripts": {
     "dev": "electron-vite dev",
     "build": "electron-vite build",
+    "node-agent": "node scripts/run-node-agent.mjs",
+    "dist:node-agent": "node scripts/package-node-agent.mjs",
     "typecheck": "tsc --noEmit -p tsconfig.json",
     "test": "vitest run",
     "test:watch": "vitest",
@@ -46,6 +48,7 @@
   },
   "dependencies": {
     "@modelcontextprotocol/node": "^2.0.0",
+    "@modelcontextprotocol/sdk": "1.30.0",
     "@modelcontextprotocol/server": "^2.0.0",
     "node-pty": "1.2.0-beta.15",
     "sharp": "0.35.3",
@@ -56,6 +59,7 @@
   "devDependencies": {
     "@types/jsdom": "^30.0.0",
     "@types/node": "^22.15.0",
+    "@yao-pkg/pkg": "^5.16.0",
     "electron": "43.4.1",
     "electron-builder": "^26.15.7",
     "electron-vite": "^5.0.0",

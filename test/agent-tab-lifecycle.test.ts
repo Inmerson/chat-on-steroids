@@ -123,14 +123,14 @@ const marked = (id: string) => ({ tab: { id: 17, url: `https://chatgpt.com/?clf=
 describe('ephemeral agent tab lifecycle', () => {
   it('opens a queued agent tab in the background when capacity becomes available', async () => {
     const h = makeHarness();
-    for (let index = 0; index < 5; index++) {
+    for (let index = 0; index < 6; index++) {
       const id = `cmd-worker-${index + 1}`;
       await h.message(
         { type: 'agent_tab_register', id },
         { tab: { id: 20 + index, url: `https://chatgpt.com/?clf=${id}#clf=${id}` } }
       );
     }
-    const queuedId = 'cmd-worker-6';
+    const queuedId = 'cmd-worker-7';
     await h.message(
       { type: 'agent_tab_register', id: queuedId },
       { tab: { id: 30, url: `https://chatgpt.com/?clf=${queuedId}#clf=${queuedId}` } }

@@ -75,6 +75,8 @@ import { backgroundExecRecoveryNotices } from '../codex/ownership.js';
 import type { StoredText, ToolOutcome } from '../../shared/session.js';
 
 export interface ToolContext {
+  /** Optional authenticated remote-device transport. Device IDs are always explicit. */
+  multiDevice?: { execute(deviceId: string, operation: string, payload: unknown): Promise<unknown> };
   roots: Root[];
   /** Capabilities currently allowed by the live settings. */
   caps: Capabilities;

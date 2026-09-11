@@ -2306,10 +2306,54 @@ describe('extension observation journal', () => {
     await new Promise((resolve) => setTimeout(resolve, 0));
 
     expect(bodies).toEqual([
-      { id: 'resume-retry', status: 'sent', conversationId, client: 'page-one' }
+      { id: 'resume-retry', status: 'sent', conversationId, client: 'page-one', browserEpoch: 0 }
     ]);
     expect(session.data.commandAckOutbox).toEqual([]);
     expect(session.data.settled).toEqual(['resume-retry']);
+  });
+
+  it('stamps command acknowledgements with the registered browser navigation epoch and preserves it across retry', async () => {
+    const local = new FakeStorageArea({ port: 8765, token: 'paired-token' });
+    const session = new FakeStorageArea();
+    const bodies: Array<Record<string, unknown>> = [];
+    let healthy = false;
+    const fetch = vi.fn(async (input: string, init: Record<string, unknown> = {}) => {
+      const url = new URL(input);
+      if (url.pathname === '/hello') return response(200, { app: 'chat-on-steroids', paired: true });
+      if (url.pathname === '/commands/ack') {
+        bodies.push(JSON.parse(String(init.body)));
+        return healthy ? response(200, { ok: true, committed: true }) : response(503, { error: 'retry' });
+      }
+      return response(404, {});
+    });
+    const worker = loadWorker({ local, session, fetch });
+    const conversationId = '23232323-3434-4565-8787-909090909090';
+    const tab = { id: 83, windowId: 7, url: `https://chatgpt.com/c/${conversationId}` };
+    const documentId = 'autonomous-command-document';
+    await worker.registerDocument(tab, documentId, 7);
+
+    await worker.sendFrom(
+      {
+        type: 'ack',
+        id: 'autonomous-command',
+        status: 'sent',
+        conversationId,
+        client: documentId,
+        navigationEpoch: 7
+      },
+      tab,
+      documentId
+    );
+
+    expect(bodies.at(-1)).toMatchObject({ id: 'autonomous-command', conversationId, browserEpoch: 7 });
+    expect(session.data.commandAckOutbox).toMatchObject([
+      { id: 'autonomous-command', conversationId, browserEpoch: 7 }
+    ]);
+
+    healthy = true;
+    await worker.send({ type: 'status' });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(bodies.at(-1)).toMatchObject({ id: 'autonomous-command', conversationId, browserEpoch: 7 });
   });
 
   it('keeps a fresh command page journal behind its pending ACK after the route gets an id', async () => {
@@ -3267,7 +3311,7 @@ describe('extension connection', () => {
   it('piggybacks a valid agent-tab telemetry snapshot on authenticated bridge requests', async () => {
     const observedAt = Date.now() - 25;
     const session = new FakeStorageArea({
-      agentTabLeaseTelemetry: { budget: 5, used: 3, queued: 2, observedAt }
+      agentTabLeaseTelemetry: { budget: 6, used: 3, queued: 2, observedAt }
     });
     let activityHeaders: Record<string, string> | null = null;
     const fetch = vi.fn(async (input: string, init: Record<string, unknown> = {}) => {
@@ -3290,7 +3334,7 @@ describe('extension connection', () => {
     await worker.send({ type: 'activity', conversationId, since: 0 });
 
     expect(activityHeaders).toMatchObject({
-      'x-agent-tab-budget': '5',
+      'x-agent-tab-budget': '6',
       'x-agent-tabs-used': '3',
       'x-agent-tabs-queued': '2',
       'x-agent-tabs-observed-at': String(observedAt)
@@ -3299,7 +3343,7 @@ describe('extension connection', () => {
 
   it('omits the entire agent-tab telemetry header set when the stored snapshot is malformed', async () => {
     const session = new FakeStorageArea({
-      agentTabLeaseTelemetry: { budget: 5, used: 6, queued: 2, observedAt: Date.now() }
+      agentTabLeaseTelemetry: { budget: 6, used: 7, queued: 2, observedAt: Date.now() }
     });
     let activityHeaders: Record<string, string> | null = null;
     const fetch = vi.fn(async (input: string, init: Record<string, unknown> = {}) => {
@@ -3330,8 +3374,8 @@ describe('extension connection', () => {
   it('uses the newest valid session telemetry after chrome.storage.onChanged', async () => {
     const firstObservedAt = Date.now() - 50;
     const secondObservedAt = Date.now();
-    const first = { budget: 5, used: 1, queued: 0, observedAt: firstObservedAt };
-    const second = { budget: 5, used: 4, queued: 3, observedAt: secondObservedAt };
+    const first = { budget: 6, used: 1, queued: 0, observedAt: firstObservedAt };
+    const second = { budget: 6, used: 4, queued: 3, observedAt: secondObservedAt };
     const session = new FakeStorageArea({ agentTabLeaseTelemetry: first });
     const usedHeaders: string[] = [];
     const fetch = vi.fn(async (input: string, init: Record<string, unknown> = {}) => {

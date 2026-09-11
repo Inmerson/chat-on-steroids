@@ -1,4 +1,5 @@
 import { spawnSync } from 'node:child_process';
+import { mkdir } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { normalizeArch, normalizePlatform, PLATFORM_INFO } from './packaging-targets.mjs';
@@ -32,6 +33,14 @@ for (const arch of arches) {
   run(node, ['scripts/fetch-tunnel-client.mjs', ...targetArgs]);
   run(node, ['scripts/fetch-ripgrep.mjs', ...targetArgs]);
   run(node, ['scripts/prepare-packaging-native.mjs', ...targetArgs]);
+  // The Node Agent is an auxiliary executable, not a second installer. Stage it inside
+  // the main installer so every Windows installation has the same role choices.
+  if (platform === 'win32') {
+    const agentDir = path.join('resources', 'packaging', 'node-agent', 'win32', arch);
+    await mkdir(path.join(root, agentDir), { recursive: true });
+    const pkgBin = path.join('node_modules', '@yao-pkg', 'pkg', 'lib-es5', 'bin.js');
+    run(node, [pkgBin, 'out/main/node-agent/main.js', '--targets', `node22-win-${arch}`, '--output', path.join(agentDir, 'Chat-On-Steroids-Node-Agent.exe')]);
+  }
 
   const builderArgs = [
     path.join('node_modules', 'electron-builder', 'out', 'cli', 'cli.js'),

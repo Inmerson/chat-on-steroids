@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { CoreSupervisor, type CoreProcessAdapter } from '../src/main/core/supervisor.js';
+import { CORE_STARTUP_GRACE_MS, CoreSupervisor, type CoreProcessAdapter } from '../src/main/core/supervisor.js';
 
 function harness(options: { initiallyHealthy?: boolean } = {}) {
   let healthy = options.initiallyHealthy ?? false;
@@ -56,6 +56,49 @@ describe('CoreSupervisor', () => {
     ]);
 
     expect(adapter.spawn).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not spawn another Core while a cold Electron helper is still within its startup grace period', async () => {
+    let now = 0;
+    const adapter: CoreProcessAdapter = {
+      probe: vi.fn(async () => ({ healthy: false as const })),
+      spawn: vi.fn(async () => ({ pid: 4100, startedAt: now })),
+      stop: vi.fn(async () => undefined)
+    };
+    const supervisor = new CoreSupervisor({
+      adapter,
+      now: () => now,
+      sleep: async () => undefined
+    });
+
+    await supervisor.ensureHost('initial-start');
+    now = CORE_STARTUP_GRACE_MS - 1;
+    await supervisor.ensureHost('watchdog');
+
+    expect(adapter.spawn).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not duplicate a still-running Core when one IPC probe is temporarily unavailable', async () => {
+    let now = 0;
+    const adapter: CoreProcessAdapter = {
+      probe: vi.fn(async () => ({ healthy: false as const })),
+      spawn: vi.fn(async () => ({ pid: 4100, startedAt: now })),
+      stop: vi.fn(async () => undefined),
+      isSpawnedHostAlive: vi.fn(async () => true)
+    };
+    const supervisor = new CoreSupervisor({
+      adapter,
+      now: () => now,
+      sleep: async () => undefined,
+      startupGraceMs: 1
+    });
+
+    await supervisor.ensureHost('initial-start');
+    now = 2;
+    await supervisor.ensureHost('watchdog-ipc-timeout');
+
+    expect(adapter.spawn).toHaveBeenCalledTimes(1);
+    expect(adapter.isSpawnedHostAlive).toHaveBeenCalledWith(4100);
   });
 
   it('uses the required bounded exponential backoff when spawn itself fails', async () => {

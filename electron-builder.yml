@@ -65,6 +65,9 @@ win:
     - from: resources/packaging/rg/win32/${arch}
       to: rg
       filter: ['**/*']
+    - from: resources/packaging/node-agent/win32/${arch}
+      to: node-agent
+      filter: ['**/*']
 
 nsis:
   include: scripts/windows-installer-acl.nsh

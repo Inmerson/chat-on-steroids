@@ -57,14 +57,29 @@ if (!hasSingleInstanceLock) {
 function createWindow(): void {
   const layout = windowLayoutForWorkArea(screen.getPrimaryDisplay().workArea);
   const icon = browserWindowIconPath(process.platform, app.isPackaged, process.resourcesPath);
+  const isDark = getConfig().ui.theme === 'dark';
   window = new BrowserWindow({
     ...layout,
     ...(icon ? { icon } : {}),
     fullscreenable: false,
     show: true,
     autoHideMenuBar: true,
-    backgroundColor: getConfig().ui.theme === 'dark' ? '#0e0e11' : '#ffffff',
+    backgroundColor: isDark ? '#090a0f' : '#ffffff',
     title: 'Chat On Steroids',
+    ...(process.platform === 'win32'
+      ? {
+          titleBarStyle: 'hidden' as const,
+          titleBarOverlay: {
+            color: isDark ? '#0a0b10' : '#ffffff',
+            symbolColor: isDark ? '#f1f4f9' : '#0f172a',
+            height: 32
+          }
+        }
+      : process.platform === 'darwin'
+        ? {
+            titleBarStyle: 'hiddenInset' as const
+          }
+        : {}),
     webPreferences: {
       preload: path.join(app.getAppPath(), 'out', 'preload', 'index.js'),
       contextIsolation: true,
@@ -227,7 +242,7 @@ void app.whenReady().then(async () => {
   onStatusChange(refreshTray);
 
   logInfo('UI started; Core runtime is independently supervised');
-  if (getConfig().ui.autoConnect) void connect();
+  if (getConfig().ui.autoConnect) void connect().catch((error) => logWarn(`autoConnect initial attempt: ${(error as Error).message}`));
   startUpdateChecks();
 });
 

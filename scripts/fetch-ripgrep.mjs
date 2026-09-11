@@ -78,9 +78,13 @@ async function main() {
   say(`ripgrep ${version} ${platform}-${arch} staged`);
 
   if (platform === process.platform && arch === process.arch) {
-    await rm(devOutDir, { recursive: true, force: true });
-    await cp(outDir, devOutDir, { recursive: true });
-    say(`resources/rg mirrors ${platform}-${arch} for development`);
+    try {
+      await rm(devOutDir, { recursive: true, force: true });
+      await cp(outDir, devOutDir, { recursive: true });
+      say(`resources/rg mirrors ${platform}-${arch} for development`);
+    } catch {
+      say(`resources/rg in-use; keeping existing files`);
+    }
   }
 }
 

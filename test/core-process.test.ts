@@ -75,6 +75,16 @@ describe('Core process adapter', () => {
     expect(spawned.unref).toHaveBeenCalledTimes(1);
   });
 
+  it('uses a non-mutating process liveness check only as a duplicate-spawn fence', async () => {
+    const adapter = createCoreProcessAdapter({
+      execPath: 'cos.exe',
+      userDataDir: 'profile',
+      token: 'a'.repeat(64)
+    });
+
+    await expect(adapter.isSpawnedHostAlive?.(process.pid)).resolves.toBe(true);
+  });
+
   it('starts the independent supervisor detached with no UI-owned stdio handles', () => {
     const spawned = child(8888);
     const spawn = vi.fn(() => spawned) as unknown as SpawnLike;

@@ -9,7 +9,12 @@ export default defineConfig({
     build: {
       // Keep the emitted name `out/main/index.js` (package.json's main) while routing the
       // executable into UI, persistent Core Host, or supervisor mode before UI bootstrap runs.
-      rollupOptions: { input: { index: resolve(__dirname, 'src/main/bootstrap.ts') } }
+      rollupOptions: {
+        input: {
+          index: resolve(__dirname, 'src/main/bootstrap.ts'),
+          'node-agent/main': resolve(__dirname, 'src/node-agent/main.ts')
+        }
+      }
     }
   },
   preload: {

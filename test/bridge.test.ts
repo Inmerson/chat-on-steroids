@@ -427,7 +427,7 @@ describe('who is allowed to talk to it', () => {
     await pair();
     const observedAt = Date.now() - 25;
     const telemetryHeaders = {
-      'x-agent-tab-budget': '5',
+      'x-agent-tab-budget': '6',
       'x-agent-tabs-used': '3',
       'x-agent-tabs-queued': '2',
       'x-agent-tabs-observed-at': String(observedAt)
@@ -436,7 +436,7 @@ describe('who is allowed to talk to it', () => {
     expect(browserAgentTabTelemetry()).toBeNull();
     expect((await request('GET', '/status', { headers: telemetryHeaders })).status).toBe(200);
     expect(browserAgentTabTelemetry()).toMatchObject({
-      budget: 5,
+      budget: 6,
       used: 3,
       queued: 2,
       observedAt
@@ -449,7 +449,7 @@ describe('who is allowed to talk to it', () => {
     const reply = await request('GET', '/status', {
       auth: null,
       headers: {
-        'x-agent-tab-budget': '5',
+        'x-agent-tab-budget': '6',
         'x-agent-tabs-used': '2',
         'x-agent-tabs-queued': '1',
         'x-agent-tabs-observed-at': String(observedAt)
@@ -464,19 +464,19 @@ describe('who is allowed to talk to it', () => {
     await pair();
     const goodObservedAt = Date.now() - 50;
     const goodHeaders = {
-      'x-agent-tab-budget': '5',
+      'x-agent-tab-budget': '6',
       'x-agent-tabs-used': '4',
       'x-agent-tabs-queued': '3',
       'x-agent-tabs-observed-at': String(goodObservedAt)
     };
     expect((await request('GET', '/status', { headers: goodHeaders })).status).toBe(200);
     const good = browserAgentTabTelemetry();
-    expect(good).toMatchObject({ budget: 5, used: 4, queued: 3, observedAt: goodObservedAt });
+    expect(good).toMatchObject({ budget: 6, used: 4, queued: 3, observedAt: goodObservedAt });
 
     expect(
       (await request('GET', '/status', {
         headers: {
-          'x-agent-tab-budget': '5',
+          'x-agent-tab-budget': '6',
           'x-agent-tabs-used': '1',
           'x-agent-tabs-observed-at': String(Date.now())
         }
@@ -487,8 +487,8 @@ describe('who is allowed to talk to it', () => {
     expect(
       (await request('GET', '/status', {
         headers: {
-          'x-agent-tab-budget': '5',
-          'x-agent-tabs-used': '6',
+          'x-agent-tab-budget': '6',
+          'x-agent-tabs-used': '7',
           'x-agent-tabs-queued': '0',
           'x-agent-tabs-observed-at': String(Date.now())
         }

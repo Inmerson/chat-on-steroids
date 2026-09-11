@@ -361,6 +361,30 @@ describe('the session timeline', () => {
 });
 
 describe('the window as a whole', () => {
+  it('prepares the overview as a local coordinator without inventing remote devices', () => {
+    const overview = document.querySelector<HTMLElement>('.overview-deck');
+    expect(overview).not.toBeNull();
+    expect(document.getElementById('coordinatorCard')).not.toBeNull();
+    expect(document.getElementById('coordinatorConnect')).not.toBeNull();
+    expect(document.getElementById('coordinatorActiveFile')?.textContent).toContain('No active file reported');
+    expect(document.getElementById('coordinatorLocation')?.textContent).toContain('No approved workspace');
+    expect(document.getElementById('fleetCount')?.textContent).toContain('1 local computer');
+    expect(overview?.textContent).toContain('No remote computers are paired yet');
+    expect(overview?.querySelectorAll('.fleet-local')).toHaveLength(1);
+  });
+
+  it('keeps the workspace rail connected to real connection and health controls', async () => {
+    const app = await fs.readFile(path.join(process.cwd(), 'src', 'renderer', 'main-app.ts'), 'utf8');
+    const railConnect = document.getElementById('railConnect');
+    const railCheck = document.getElementById('railRunChecks');
+    expect(railConnect?.textContent).toContain('Connect');
+    expect(railCheck?.textContent).toContain('System check');
+    expect(document.getElementById('railConnectionState')).not.toBeNull();
+    expect(document.getElementById('railConnectionDetail')).not.toBeNull();
+    expect(app).toContain("$('railConnect').addEventListener('click', () => void toggleConnection())");
+    expect(app).toContain("$<HTMLButtonElement>('runChecks').click()");
+  });
+
   it('exposes Control as a normal fifth destination with one bounded canvas panel', () => {
     const controlTab = document.querySelector<HTMLButtonElement>('nav button[data-tab="control"]');
     const controlPanel = document.querySelector<HTMLElement>('.panel[data-panel="control"]');

@@ -32,6 +32,7 @@ export interface SettingsPatch {
   sessions: Config['sessions'];
   compaction: Config['compaction'];
   multiAgent: Config['multiAgent'];
+  device: Config['device'];
   goal: Config['goal'];
 }
 
@@ -63,6 +64,7 @@ export interface SessionDetail {
 const api = {
   getState: () => call<AppState>('state:get'),
   getCoreHealth: () => call<CoreHealthStatus | null>('core:health'),
+  setTheme: (theme: 'light' | 'dark') => call<boolean>('theme:set', { theme }),
   saveSettings: (patch: SettingsPatch, base: SettingsPatch) => call<AppState>('settings:save', { patch, base }),
   addRoot: () => call<AppState>('roots:add'),
   removeRoot: (name: string) => call<AppState>('roots:remove', { name }),
@@ -75,6 +77,8 @@ const api = {
   connect: () => call<AppState>('connection:connect'),
   disconnect: () => call<AppState>('connection:disconnect'),
   runDiagnostics: () => call<Diagnosis>('diagnostics:run'),
+  createPairingTicket: () => call<{ pairingId: string; code: string; expiresAt: number }>('devices:pairing:create'),
+  revokeDevice: (deviceId: string) => call<AppState>('devices:revoke', { deviceId }),
   getLog: () => call<LogEntry[]>('log:get'),
   getLogText: () => call<string>('log:text'),
   getLogJson: () => call<string>('log:json'),

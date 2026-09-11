@@ -18,6 +18,7 @@ import {
 } from '../agents.js';
 import { readDurable, writeDurableNow } from '../durable.js';
 import { childEnv } from '../exec.js';
+import { redact } from '../logger.js';
 import type { Root } from '../../shared/types.js';
 import {
   assignmentEvidenceForPrime,
@@ -265,6 +266,11 @@ function boundedList(values: unknown, field: string, maxItem = MAX_ITEM): string
   return values.map((value, index) => boundedText(value, `${field}[${index}]`, maxItem));
 }
 
+/** Worker/reviewer prose is untrusted and durable. Bound it first, then mask credential shapes. */
+function boundedUntrustedList(values: unknown, field: string, maxItem = MAX_ITEM): string[] {
+  return boundedList(values, field, maxItem).map(redact);
+}
+
 function normalizePath(value: string): string {
   return value.replace(/\\/g, '/').replace(/^\.\//, '').replace(/\/{2,}/g, '/');
 }
@@ -322,14 +328,14 @@ function normalizeCompletionInput(input: CompletionInput): CompletionInput {
   const revision = boundedText(input.revision, 'revision', 64).toLowerCase();
   if (!/^[0-9a-f]{40}$/.test(revision)) throw new Error('revision must be a full Git commit id');
   const changedFiles = boundedList(input.changedFiles, 'changed_files', 1000).map(normalizePath);
-  const risks = boundedList(input.risks, 'risks');
-  const notes = boundedList(input.notes, 'notes');
+  const risks = boundedUntrustedList(input.risks, 'risks');
+  const notes = boundedUntrustedList(input.notes, 'notes');
   if (!Array.isArray(input.verification) || input.verification.length > MAX_LIST) {
     throw new Error('verification must be a bounded array');
   }
   const verification = input.verification.map((entry, index) => {
     if (!entry || typeof entry !== 'object') throw new Error(`verification[${index}] must be an object`);
-    const command = boundedText(entry.command, `verification[${index}].command`, 1000);
+    const command = redact(boundedText(entry.command, `verification[${index}].command`, 1000));
     if (entry.outcome !== 'passed' && entry.outcome !== 'failed') throw new Error(`verification[${index}].outcome is invalid`);
     const evidenceRevision = boundedText(entry.revision, `verification[${index}].revision`, 64).toLowerCase();
     if (!/^[0-9a-f]{40}$/.test(evidenceRevision)) throw new Error(`verification[${index}].revision must be a full Git commit id`);
@@ -1187,7 +1193,7 @@ export async function submitTaskCompletionForRuntime(
 function normalizeReview(input: ReviewInput): ReviewInput {
   const taskId = boundedText(input.taskId, 'task_id', 160);
   if (input.verdict !== 'APPROVED' && input.verdict !== 'CHANGES_REQUESTED' && input.verdict !== 'BLOCKED') throw new Error('Invalid review verdict');
-  return { taskId, verdict: input.verdict, findings: boundedList(input.findings, 'findings') };
+  return { taskId, verdict: input.verdict, findings: boundedUntrustedList(input.findings, 'findings') };
 }
 
 export async function submitTaskReviewForRuntime(
@@ -1312,7 +1318,7 @@ export async function submitRunReviewForRuntime(
   const run = (await workflowStateForRun(runtime.runId)) ?? emptyRun(runtime.runId);
   const review = run.systemReview;
   if (!review?.reviewerId || review.reviewerId !== actorAgentId) throw new Error(`${actorAgentId} is not the assigned System Reviewer`);
-  const boundedFindings = boundedList(findings, 'findings');
+  const boundedFindings = boundedUntrustedList(findings, 'findings');
   if (verdict === 'APPROVED') {
     const orchestration = await recoverOrchestrationState();
     const tasks = Object.values(orchestration.state.tasks);

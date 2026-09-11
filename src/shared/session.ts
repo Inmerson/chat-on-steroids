@@ -579,6 +579,13 @@ export interface AgentInfo {
   contextTokens: number;
 }
 
+/** Exact app-owned worker-chat identity; never inferred from worker ids or recency. */
+export interface WorkerConversationOwnership {
+  primeConversationId: string;
+  workerId: string;
+  runId: string;
+}
+
 /**
  * One brokered message, with delivery tracked at-least-once — within a stated limit.
  *

@@ -216,7 +216,7 @@ describe('turning multi-agent mode off', () => {
     const reply = await save(settings({ record: false, multiAgent: false }));
     expect(reply.ok, reply.error).toBe(true);
     expect(await readDurable<any>('ipc-swarm')).toMatchObject({
-      version: 5,
+      version: 6,
       runId: null,
       primeConversationId: null,
       agents: [],

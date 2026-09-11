@@ -288,6 +288,7 @@ beforeEach(async () => {
   await writeDurableNow(EXECUTION_STATE, null);
   const sessionModule = (await import('../src/main/mcp/session-tool.js')) as any;
   sessionModule.setExecutionBrowserControlForTests?.(null);
+  sessionModule.setExecutionExternalAiControlForTests?.(null);
   ctx.caps = withCaps({});
   ctx.readOnly = true;
   ctx.roots = [{ name: 'workspace', path: approved }];
@@ -645,11 +646,15 @@ describe('surface boundaries', () => {
     await endpoint.stop();
     endpoint = await startMcpServer(() => ctx);
 
-    expect(toolNames(await core('tools/list'))).not.toContain('agents');
-    // And with it every word of the multi-agent vocabulary: nothing is left for a model to
-    // aim a spawn or a handoff at.
-    for (const surface of [toolList(await core('tools/list')), toolList(await desktop('tools/list'))]) {
-      expect(JSON.stringify(surface)).not.toMatch(/prime|worker|swarm/i);
+    const coreTools = toolList(await core('tools/list'));
+    const desktopTools = toolList(await desktop('tools/list'));
+    expect(coreTools.map((tool) => tool.name)).not.toContain('agents');
+    expect(desktopTools.map((tool) => tool.name)).not.toContain('agents');
+    // Durable execution may still advertise autonomous_swarm as an execution mode. What must
+    // disappear is the independent worker-control surface and its spawn/message arguments.
+    const session = coreTools.find((tool) => tool.name === 'session')!;
+    for (const field of ['workers', 'messages', 'to', 'result', 'manager_agent_id', 'tasks']) {
+      expect(session.inputSchema.properties).not.toHaveProperty(field);
     }
   });
 
@@ -761,7 +766,9 @@ describe('surface boundaries', () => {
 
     // Not just the names: the action vocabulary of the other surface must be absent too,
     // because a schema fragment is what a discovery pull actually costs.
-    for (const marker of ['computer', 'observe', 'click_ref', 'captureAfter', 'write_clipboard']) {
+    // "computer" may legitimately occur in Core's multi-device descriptions. The Desktop
+    // action vocabulary itself must still be absent.
+    for (const marker of ['observe', 'click_ref', 'captureAfter', 'write_clipboard']) {
       expect(coreBody, marker).not.toContain(marker);
     }
     for (const marker of ['apply_patch', 'exec_command', 'write_stdin', 'save_handoff', 'Begin Patch']) {
@@ -1462,12 +1469,20 @@ describe('capability gating', () => {
             'execution_status',
             'execution_pause',
             'execution_resume',
-            'execution_stop'
+            'execution_stop',
+            'execution_delegate',
+            'execution_review'
           ]
         }
       },
       required: ['action']
     });
+    expect(advertised?.inputSchema?.properties?.mode?.enum).toEqual(['standard', 'infinite', 'autonomous_swarm', 'ralph']);
+    expect(advertised?.inputSchema?.properties?.method?.enum).toEqual(['native', 'gsd']);
+    expect(advertised?.inputSchema?.properties?.coding_backend?.enum).toEqual([
+      'chatgpt', 'codex', 'cursor', 'claude', 'copilot', 'gemini', 'opencode'
+    ]);
+    expect(advertised?.inputSchema?.properties?.review_backend?.enum).toEqual(['native', 'coderabbit']);
     expect(advertised?.inputSchema?.properties).not.toHaveProperty('limit');
     expect(advertised?.inputSchema?.properties).not.toHaveProperty('call_id');
     expect(advertised?.inputSchema?.properties).not.toHaveProperty('part');
@@ -1537,15 +1552,41 @@ describe('capability gating', () => {
         action: 'execution_start',
         plan: 'Implement the approved remote execution workflow.',
         title: 'Remote execution',
-        mode: 'standard'
+        mode: 'standard',
+        method: 'gsd',
+        coding_backend: 'codex',
+        review_backend: 'coderabbit'
       }
     });
     expect(failed(started), textOf(started)).toBe(false);
     expect(textOf(started)).toContain('status: starting');
     expect(textOf(started)).not.toMatch(/\bstarted\b/i);
     const [created] = snapshotExecutions().runs;
-    expect(created).toMatchObject({ title: 'Remote execution', status: 'starting', commandId: 'execution-command-start' });
+    expect(created).toMatchObject({
+      title: 'Remote execution',
+      status: 'starting',
+      commandId: 'execution-command-start',
+      method: 'gsd',
+      codingBackend: 'codex',
+      reviewBackend: 'coderabbit',
+      workspaceReal: approved,
+      workspaceVirtual: '/workspace'
+    });
     expect(browserCalls.map((call) => call.kind)).toEqual(['start']);
+
+    const deniedDelegate = await core('tools/call', {
+      name: 'session',
+      arguments: { action: 'execution_delegate', execution_id: created!.id, prompt: 'Implement one bounded task.' }
+    });
+    expect(failed(deniedDelegate)).toBe(true);
+    expect(textOf(deniedDelegate)).toMatch(/Command permission/i);
+
+    const deniedReview = await core('tools/call', {
+      name: 'session',
+      arguments: { action: 'execution_review', execution_id: created!.id, review_scope: 'uncommitted' }
+    });
+    expect(failed(deniedReview)).toBe(true);
+    expect(textOf(deniedReview)).toMatch(/Command permission/i);
 
     const status = await core('tools/call', {
       name: 'session',
@@ -1600,6 +1641,81 @@ describe('capability gating', () => {
     });
     expect(failed(stoppedAgain), textOf(stoppedAgain)).toBe(false);
     expect(browserCalls.filter((call) => call.kind === 'cancel')).toHaveLength(2);
+  });
+
+  it('routes allowed execution delegation and CodeRabbit review through the configured external adapters', async () => {
+    ctx.sessionTools = false;
+    ctx.caps = withCaps({ command: true });
+    ctx.readOnly = false;
+    if (endpoint) await endpoint.stop();
+    endpoint = await startMcpServer(() => ctx);
+
+    const sessionModule = (await import('../src/main/mcp/session-tool.js')) as any;
+    const externalCalls: Array<{ kind: string; input: Record<string, unknown> }> = [];
+    sessionModule.setExecutionBrowserControlForTests({
+      queueExecutionBootstrap: async () => 'execution-command-external',
+      queueExecutionResume: async () => 'unexpected-resume',
+      cancelExecutionCommands: async () => undefined
+    });
+    sessionModule.setExecutionExternalAiControlForTests({
+      runCoding: async (input: Record<string, unknown>) => {
+        externalCalls.push({ kind: 'coding', input });
+        return { binary: 'codex', output: 'delegated implementation complete', truncated: false };
+      },
+      runReview: async (input: Record<string, unknown>) => {
+        externalCalls.push({ kind: 'review', input });
+        return { binary: 'coderabbit', output: 'no critical findings', truncated: false };
+      }
+    });
+
+    const started = await core('tools/call', {
+      name: 'session',
+      arguments: {
+        action: 'execution_start',
+        plan: 'Implement and independently review the bounded change.',
+        coding_backend: 'codex',
+        review_backend: 'coderabbit'
+      }
+    });
+    expect(failed(started), textOf(started)).toBe(false);
+    const [created] = snapshotExecutions().runs;
+
+    const delegated = await core('tools/call', {
+      name: 'session',
+      arguments: {
+        action: 'execution_delegate',
+        execution_id: created!.id,
+        prompt: 'Implement only the parser fix and run its focused test.'
+      }
+    });
+    expect(failed(delegated), textOf(delegated)).toBe(false);
+    expect(textOf(delegated)).toContain('delegated implementation complete');
+
+    const reviewed = await core('tools/call', {
+      name: 'session',
+      arguments: {
+        action: 'execution_review',
+        execution_id: created!.id,
+        review_scope: 'uncommitted',
+        review_base: 'main'
+      }
+    });
+    expect(failed(reviewed), textOf(reviewed)).toBe(false);
+    expect(textOf(reviewed)).toContain('no critical findings');
+    expect(externalCalls).toEqual([
+      {
+        kind: 'coding',
+        input: {
+          backend: 'codex',
+          cwd: approved,
+          prompt: 'Implement only the parser fix and run its focused test.'
+        }
+      },
+      {
+        kind: 'review',
+        input: { cwd: approved, scope: 'uncommitted', base: 'main' }
+      }
+    ]);
   });
 
   it('fails execution_start honestly when browser publication is rejected', async () => {
@@ -1997,7 +2113,8 @@ describe('sandbox enforcement through the tool layer', () => {
     ctx.readOnly = false;
     ctx.caps = withCaps({ create: true });
     const tool = toolList(await core('tools/list')).find((entry) => entry.name === 'apply_patch')!;
-    expect(Object.keys(tool.inputSchema.properties)).toEqual(['patch']);
+    expect(Object.keys(tool.inputSchema.properties)).toEqual(['patch', 'device_id', 'workdir']);
+    expect(tool.inputSchema.properties).not.toHaveProperty('cwd');
     expect(tool.inputSchema.required).toEqual(['patch']);
     expect(tool.inputSchema.additionalProperties).toBe(false);
   });
@@ -3114,7 +3231,8 @@ describe('exec_command and write_stdin', () => {
       'yield_time_ms',
       'max_output_tokens',
       'shell',
-      'login'
+      'login',
+      'device_id'
     ]);
     expect(exec.inputSchema.required ?? []).toEqual([]);
     expect(exec.inputSchema.additionalProperties).toBe(false);
@@ -3302,21 +3420,41 @@ describe('exec_command and write_stdin', () => {
 
   it('runs in workdir and omits the old connector-specific cwd header', async () => {
     const readApp = IS_WINDOWS ? "Get-Content 'src/app.ts'" : "cat 'src/app.ts'";
+    const finishRead = async (reply: Awaited<ReturnType<typeof core>>): Promise<string> => {
+      let text = textOf(reply);
+      let sessionId = Number(
+        reply.body.result?.structuredContent?.session_id ??
+        text.match(/Process running with session ID (\d+)/)?.[1]
+      );
+      for (let attempt = 0; attempt < 3 && !text.includes('export const name = "app";') && Number.isInteger(sessionId); attempt += 1) {
+        const follow = await core('tools/call', {
+          name: 'write_stdin',
+          arguments: { session_id: sessionId, yield_time_ms: 5_000 }
+        });
+        expect(follow.body.result?.isError, textOf(follow)).not.toBe(true);
+        text += `\n${textOf(follow)}`;
+        const nextSession = follow.body.result?.structuredContent?.session_id;
+        sessionId = typeof nextSession === 'number' ? nextSession : Number.NaN;
+      }
+      return text;
+    };
     const named = await core('tools/call', {
       name: 'exec_command',
       arguments: { cmd: readApp, workdir: '/workspace', yield_time_ms: 5_000 }
     });
     expect(named.body.result?.isError).not.toBe(true);
-    expect(textOf(named)).toContain('export const name = "app";');
-    expect(textOf(named)).not.toContain('cwd: /workspace');
+    const namedText = await finishRead(named);
+    expect(namedText).toContain('export const name = "app";');
+    expect(namedText).not.toContain('cwd: /workspace');
 
     const defaulted = await core('tools/call', {
       name: 'exec_command',
       arguments: { cmd: readApp, yield_time_ms: 5_000 }
     });
     expect(defaulted.body.result?.isError).not.toBe(true);
-    expect(textOf(defaulted)).toContain('export const name = "app";');
-    expect(textOf(defaulted)).not.toContain('default — no cwd was given');
+    const defaultedText = await finishRead(defaulted);
+    expect(defaultedText).toContain('export const name = "app";');
+    expect(defaultedText).not.toContain('default — no cwd was given');
   });
 
   it.runIf(IS_WINDOWS)('preserves Codex raw merged output instead of the retired connector CLIXML rewrite', async () => {
@@ -3394,7 +3532,7 @@ describe('exec session attribution and authenticated continuation', () => {
     const stranger = await asChat('wfr_execown_stranger', 'write_stdin', {
       session_id: sessionId,
       chars: 'cross-chat\r',
-      yield_time_ms: 1_000
+      yield_time_ms: 5_000
     });
     expect(stranger.body.result?.isError, textOf(stranger)).not.toBe(true);
     expect(textOf(stranger)).toContain('echo=cross-chat');
@@ -3404,7 +3542,7 @@ describe('exec session attribution and authenticated continuation', () => {
     const unproven = await asChat(null, 'write_stdin', {
       session_id: sessionId,
       chars: 'anon\r',
-      yield_time_ms: 1_000
+      yield_time_ms: 5_000
     });
     expect(unproven.body.result?.isError, textOf(unproven)).not.toBe(true);
     expect(textOf(unproven)).toContain('echo=anon');

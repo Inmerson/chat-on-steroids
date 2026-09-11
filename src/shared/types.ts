@@ -215,6 +215,43 @@ export interface MultiAgentSettings {
   maxWorkers: number;
 }
 
+/**
+ * Product-level autonomous-swarm capacity. These are hard limits, not user preferences.
+ * Legacy `multiAgent.maxWorkers` stays persisted for compatibility with older/manual runs,
+ * but autonomous scheduling must never derive capacity from it.
+ */
+export const AUTONOMOUS_SWARM_LIMITS = Object.freeze({
+  activeTurns: 2,
+  totalWorkerChats: 6,
+  workersPerPrime: 2
+} as const);
+
+/** A callable projection keeps consumers from copying the literal values into local policy. */
+export function autonomousSwarmLimits(): typeof AUTONOMOUS_SWARM_LIMITS {
+  return AUTONOMOUS_SWARM_LIMITS;
+}
+
+/** Safe read-only capacity/status projection used by agents, IPC and the renderer. */
+export interface AutonomousSwarmCapacity {
+  readonly activeTurns: number;
+  readonly activeTurnLimit: number;
+  readonly ownedWorkerChats: number;
+  readonly workerChatLimit: number;
+  readonly ownerWorkerLimit: number;
+  readonly queuedTasks: number;
+  readonly cooldownUntil: number | null;
+}
+
+/** A computer can lead a fleet, join one, or operate without any fleet relationship. */
+export type DeviceRole = 'coordinator' | 'node' | 'independent';
+
+export interface DeviceModeSettings {
+  role: DeviceRole;
+  /** Explicit private-network address used only when this computer is the coordinator. */
+  coordinatorHost: string;
+  coordinatorPort: number;
+}
+
 export interface Config {
   roots: Root[];
   capabilities: Capabilities;
@@ -225,6 +262,7 @@ export interface Config {
   compaction: CompactionSettings;
   multiAgent: MultiAgentSettings;
   goal: GoalSettings;
+  device: DeviceModeSettings;
   allComputer?: boolean;
   previousRoots?: Root[];
 }
@@ -411,6 +449,21 @@ export interface UpdateStatus {
 /** Where this fork publishes the builds its updater is allowed to install. */
 export const RELEASES_PAGE = 'https://github.com/Inmerson/chat-on-steroids/releases/latest';
 
+/** Safe-to-display coordinator inventory. Pairing secrets never travel in AppState. */
+export interface ManagedDeviceSummary {
+  deviceId: string;
+  friendlyName: string;
+  provider: 'local' | 'remote';
+  status: 'UNENROLLED' | 'CONNECTING' | 'ONLINE' | 'DEGRADED' | 'OFFLINE' | 'REVOKED';
+  capabilities: string[];
+  lastSeenAt: string | null;
+}
+
+export interface DeviceOverview {
+  local: ManagedDeviceSummary;
+  remotes: ManagedDeviceSummary[];
+}
+
 export interface AppState {
   config: Config;
   status: ConnectionStatus;
@@ -426,6 +479,7 @@ export interface AppState {
   bundledTunnelVersion: string | null;
   bridge: BridgeStatus;
   update: UpdateStatus;
+  devices?: DeviceOverview;
 }
 
 export const DEFAULT_CAPABILITIES: Capabilities = {

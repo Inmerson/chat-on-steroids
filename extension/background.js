@@ -25,7 +25,7 @@ const HELLO_TIMEOUT_MS = 1200;
 const REQUEST_TIMEOUT_MS = 10_000;
 /** Bumped only when the request/response shape changes; the app compares it. */
 const BRIDGE_PROTOCOL = 10;
-const AGENT_TAB_BUDGET = 5;
+const AGENT_TAB_BUDGET = 6;
 const MAX_AGENT_TAB_QUEUE = 400;
 
 /**
@@ -1227,14 +1227,15 @@ async function routeOwnedCommandTab(tabId, commandId, commandType) {
   return ensureManagedWindow(kind, tabId);
 }
 
-function commandAckPayload(id, status, error, conversationId, agent, client) {
+function commandAckPayload(id, status, error, conversationId, agent, client, browserEpoch) {
   return {
     id,
     status,
     error: error || undefined,
     conversationId: conversationId || undefined,
     agent: agent || undefined,
-    client: client || undefined
+    client: client || undefined,
+    browserEpoch: Number.isInteger(browserEpoch) && browserEpoch >= 0 ? browserEpoch : undefined
   };
 }
 
@@ -1315,7 +1316,8 @@ async function drainCommandAcks(targetId = null) {
         entry.error,
         entry.conversationId,
         entry.agent,
-        entry.client
+        entry.client,
+        entry.browserEpoch
       );
       const result = await call('/commands/ack', { method: 'POST', body: JSON.stringify(payload) });
       if (entry.id === targetId) targetResult = result;
@@ -1361,7 +1363,7 @@ async function drainCommandAcks(targetId = null) {
 async function ackCommand(id, status, error, conversationId, agent, client, source = null) {
   await load();
   if (!id) return { ok: false, status: 400, error: 'bad_command_id' };
-  const payload = commandAckPayload(id, status, error, conversationId, agent, client);
+  const payload = commandAckPayload(id, status, error, conversationId, agent, client, source?.navigationEpoch);
   const queued = {
     ...payload,
     provisional: payload.conversationId ? null : tabKey(source),
@@ -1910,7 +1912,7 @@ function isChatGptUrl(value) {
 
 function parseLoopSnapshot(value) {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
-  if (value.mode !== 'standard' && value.mode !== 'infinite') return null;
+  if (!['standard', 'infinite', 'autonomous_swarm', 'ralph'].includes(value.mode)) return null;
   const turns = Number.isInteger(value.turns) && value.turns >= 0 ? Math.min(value.turns, 10_000) : null;
   if (turns === null) return null;
   return {
@@ -2171,6 +2173,59 @@ async function activeLoopTransferForSource(source, recoveryId, rolloverConversat
 
 /** Serializes every ownership transition and owned side effect for one browser tab. */
 const tabOperationQueues = new Map();
+
+/**
+ * One app status read and catalog-delivery attempt across the extension.
+ *
+ * Activity polls from several live documents can overlap while the app has one pending request.
+ * The first already-authorized document is the only candidate for that request; a replacement
+ * page never inherits its authority because the work retains the exact source document.
+ */
+let pendingModelCatalogWork = null;
+
+function pendingModelCatalogRequest(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const nonce = typeof value.nonce === 'string' ? value.nonce : '';
+  const expiresAt = value.expiresAt;
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(nonce)) return null;
+  if (!Number.isSafeInteger(expiresAt) || expiresAt <= Date.now()) return null;
+  return { nonce, expiresAt };
+}
+
+/**
+ * The app may ask a live ChatGPT document to enumerate its available models.  This is a
+ * document-owned capability: never re-target it to a replacement page, and never make a tab
+ * appear, navigate, focus, or close just to satisfy the request.
+ */
+function forwardPendingModelCatalog(source) {
+  if (!ownsDocument(source)) return Promise.resolve({ ok: false, error: 'stale_document' });
+  if (pendingModelCatalogWork) return pendingModelCatalogWork;
+  const work = (async () => {
+    const status = await call('/status');
+    if (!ownsDocument(source)) return { ok: false, error: 'stale_document' };
+    if (!status.ok) return status;
+    const request = pendingModelCatalogRequest(status.data?.modelCatalogRequest);
+    if (!request) return { ok: false, error: 'no_pending_model_catalog' };
+    // Do not hand a request to a document after its app-issued deadline, even if it was valid
+    // when /status answered.
+    if (request.expiresAt <= Date.now()) return { ok: false, error: 'expired_model_catalog_request' };
+    try {
+      const result = await chrome.tabs.sendMessage(
+        source.tab,
+        { type: 'clf-model-catalog', nonce: request.nonce, expiresAt: request.expiresAt },
+        { documentId: source.documentId }
+      );
+      return ownsDocument(source) ? result || { ok: false, error: 'model_catalog_not_accepted' } : { ok: false, error: 'stale_document' };
+    } catch {
+      return { ok: false, error: 'model_catalog_send_failed' };
+    }
+  })();
+  const tracked = work.finally(() => {
+    if (pendingModelCatalogWork === tracked) pendingModelCatalogWork = null;
+  });
+  pendingModelCatalogWork = tracked;
+  return tracked;
+}
 
 function serializeTab(tab, operation) {
   if (!Number.isInteger(tab)) return operation();
@@ -2449,6 +2504,11 @@ const HANDLERS = {
       `&goalClient=${encodeURIComponent(String(source.tab))}`;
     const result = await call(`/activity${query}`);
     if (!ownsDocument(source)) return { ok: false, error: 'stale_document' };
+    if (result.ok) {
+      // The request is strictly best-effort: activity remains usable if ChatGPT's model picker
+      // is not available, while the document-scoped helper fails closed on every identity race.
+      void forwardPendingModelCatalog(source).catch(() => undefined);
+    }
     if (result.ok && result.data?.placement?.background === true) {
       await placeBackgroundWorker(result.data.placement, source.tab);
     }

@@ -255,17 +255,26 @@ export function registerCoreTools(reg: SurfaceRegistrar): void {
               .optional()
               .describe(
                 `Per-text-file payload cap. Default ${formatBytes(DEFAULT_READ_BYTES)}; maximum ${formatBytes(MAX_READ_BYTES)}. Omit it for ordinary source files.`
-              )
+              ),
+            device_id: z.string().min(8).max(80).regex(/^[A-Za-z0-9_-]+$/).optional().describe('Explicit managed device ID. Omit for this computer.')
           })
           .strict(),
         annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false }
       },
-      async ({ paths, start_line, end_line, max_bytes }) =>
+      async ({ paths, start_line, end_line, max_bytes, device_id }) =>
         guard('read', async () => {
           if (!caps.read && !caps.browse && !caps.metadata) {
             return fail(
               'TOOL_DISABLED: read is disabled by the current Chat On Steroids permissions. Ask the user to enable reading in the app.'
             );
+          }
+          if (device_id) {
+            if (!ctx.multiDevice) return fail('DEVICE_NOT_FOUND: multi-device transport is unavailable');
+            if (paths.length !== 1 || hasGlob(paths[0]!)) return fail('INVALID_REQUEST: remote read accepts one concrete path');
+            try {
+              const result = await ctx.multiDevice.execute(device_id, 'filesystem.read', { path: paths[0] });
+              return ok(JSON.stringify(result));
+            } catch (error) { return fail(error instanceof Error ? error.message : 'Remote read failed'); }
           }
           const targets: ReadTarget[] = [];
           const notes: string[] = [];
@@ -556,16 +565,25 @@ export function registerCoreTools(reg: SurfaceRegistrar): void {
         description: APPLY_PATCH_DESCRIPTION,
         inputSchema: z
           .object({
-            patch: z.string().describe(APPLY_PATCH_ARGUMENT_DESCRIPTION)
+            patch: z.string().describe(APPLY_PATCH_ARGUMENT_DESCRIPTION),
+            device_id: z.string().min(8).max(80).regex(/^[A-Za-z0-9_-]+$/).optional().describe('Explicit managed device ID. Omit for this computer.'),
+            workdir: z.string().optional().describe('Remote agent working directory inside its approved roots.')
           })
           .strict()
       },
-      async ({ patch }) =>
+      async ({ patch, device_id, workdir }) =>
         guard('apply_patch', async () => {
           if (!caps.create && !caps.edit && !caps.move && !caps.deleteFile) {
             return fail(
               'TOOL_DISABLED: apply_patch is disabled by the current Chat On Steroids permissions. Ask the user to enable changing files in the app.'
             );
+          }
+          if (device_id) {
+            if (!ctx.multiDevice) return fail('DEVICE_NOT_FOUND: multi-device transport is unavailable');
+            try {
+              const result = await ctx.multiDevice.execute(device_id, 'filesystem.apply_patch', { patch, cwd: workdir });
+              return ok(JSON.stringify(result));
+            } catch (error) { return fail(error instanceof Error ? error.message : 'Remote patch failed'); }
           }
 
           let args: { patch: string; hunks: Hunk[]; workdir: string | null; environmentId: string | null };
@@ -609,6 +627,7 @@ export function registerCoreTools(reg: SurfaceRegistrar): void {
             max_output_tokens: unsignedIntegerNumber.optional().describe(MAX_OUTPUT_TOKENS_DESCRIPTION),
             shell: z.string().optional().describe(EXEC_COMMAND_SHELL_DESCRIPTION),
             login: z.boolean().optional().describe(EXEC_COMMAND_LOGIN_DESCRIPTION)
+            ,device_id: z.string().min(8).max(80).regex(/^[A-Za-z0-9_-]+$/).optional().describe('Explicit managed device ID. Omit for this computer.')
           })
           .strict()
           .superRefine((input, refinement) => {
@@ -624,6 +643,14 @@ export function registerCoreTools(reg: SurfaceRegistrar): void {
       },
       async (input) =>
         reg.guarded('command', 'exec_command', async () => {
+          if (input.device_id) {
+            if (!ctx.multiDevice) return fail('DEVICE_NOT_FOUND: multi-device transport is unavailable');
+            if (input.cmd === undefined || input.tty === true) return fail('INVALID_REQUEST: remote exec requires one non-interactive cmd');
+            try {
+              const result = await ctx.multiDevice.execute(input.device_id, 'terminal.exec', { command: input.cmd, cwd: input.workdir ?? ctx.roots[0]?.path, tty: false });
+              return ok(JSON.stringify(result));
+            } catch (error) { return fail(error instanceof Error ? error.message : 'Remote command failed'); }
+          }
           const dir = await resolveCwd(ctx, input.workdir);
           const rawCommands = input.cmd === undefined ? input.cmds! : [input.cmd];
           const isBatch = input.cmd === undefined;

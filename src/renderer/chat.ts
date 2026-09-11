@@ -29,7 +29,12 @@ import {
   DEFAULT_GOAL_SYSTEM_PROMPT,
   MAX_GOAL_SYSTEM_PROMPT_CHARS
 } from '../shared/goal.js';
-import { browserExtensionRequired, type AppState, type Config } from '../shared/types.js';
+import {
+  AUTONOMOUS_SWARM_LIMITS,
+  browserExtensionRequired,
+  type AppState,
+  type Config
+} from '../shared/types.js';
 import { $, ago, clockTime, compactNumber, el, icon, run, toast } from './dom.js';
 
 const api = window.api;
@@ -322,11 +327,56 @@ function maybePageSessions(): void {
   }
 }
 
+function sidebarChatRow(summary: SessionSummary): HTMLElement {
+  const item = el('div', `rail-item rail-chat-item${summary.id === selectedId ? ' is-sel' : ''}`);
+  item.dataset.sessionId = summary.id;
+  item.title = summary.title || 'Untitled chat';
+
+  const ico = icon('i-chat');
+  const text = el('span', 'rail-item-text', summary.title || 'Untitled chat');
+  const time = el('span', 'rail-item-meta', ago(summary.updatedAt));
+  item.append(ico, text, time);
+
+  item.addEventListener('click', () => {
+    document.querySelector<HTMLButtonElement>('nav button[data-tab="chat"]')?.click();
+    if (summary.id !== selectedId) {
+      selectedId = summary.id;
+      detailFor = null;
+      detailCursor = null;
+      openTools.clear();
+      handoff = null;
+      handoffFor = null;
+      paintSessions();
+      void loadDetail();
+    }
+  });
+  return item;
+}
+
+let lastSidebarSig = '';
+
 function paintSessions(): void {
   const list = $('sessionList');
   list.replaceChildren(...sessions.map(sessionRow));
   badgeKey = badgeSignature();
   $('sessionsEmpty').hidden = sessions.length > 0;
+
+  const sidebarChats = document.getElementById('sidebarChatsList');
+  if (sidebarChats) {
+    if (sessions.length === 0) {
+      if (lastSidebarSig !== 'empty') {
+        lastSidebarSig = 'empty';
+        const empty = el('div', 'rail-empty-hint', 'No chats recorded');
+        sidebarChats.replaceChildren(empty);
+      }
+    } else {
+      const sig = sessions.slice(0, 30).map((s) => `${s.id}:${s.title}:${s.updatedAt}:${s.id === selectedId}`).join(';');
+      if (sig !== lastSidebarSig) {
+        lastSidebarSig = sig;
+        sidebarChats.replaceChildren(...sessions.slice(0, 30).map(sidebarChatRow));
+      }
+    }
+  }
 
   const recording = deps.state()?.config.sessions.record === true;
   const retained = `${sessionTotal} retained session${sessionTotal === 1 ? '' : 's'}`;
@@ -803,6 +853,104 @@ function paintDetail(): void {
   }
   $('chatFoot').textContent = facts.join(' · ');
   $('chatFoot').classList.toggle('is-warn', pressureOf(selectedId ?? '')?.level === 'huge');
+  paintOutputsAndSources(filtered, summary);
+}
+
+function paintOutputsAndSources(filtered: SessionEvent[], _summary: SessionSummary | null): void {
+  const outputsList = document.getElementById('osOutputsList');
+  const sourcesList = document.getElementById('osSourcesList');
+  if (!outputsList || !sourcesList) return;
+
+  // 1. Collect outputs (artifacts, files created/edited via tool_call)
+  const outputs: { name: string; path?: string }[] = [];
+  for (const ev of filtered) {
+    if (ev.kind === 'tool_call') {
+      const call = ev as any;
+      const toolName = call.name || call.tool || '';
+      const args = call.args;
+      if (toolName === 'apply_patch' || toolName === 'write_file' || toolName === 'edit_file') {
+        const filePath = (args && (args.path || args.TargetFile || args.target_file)) || '';
+        if (filePath) {
+          const fileName = filePath.split(/[/\\]/).pop() || filePath;
+          if (!outputs.some((o) => o.name === fileName)) {
+            outputs.push({ name: fileName, path: filePath });
+          }
+        }
+      }
+    }
+  }
+
+  if (outputs.length > 0) {
+    outputsList.innerHTML = outputs.map((o) => `
+      <div class="os-item os-output-item" title="${o.path || o.name}">
+        <svg class="ico" viewBox="0 0 24 24"><use href="#i-mark" /></svg>
+        <span class="os-item-name">${o.name}</span>
+      </div>
+    `).join('');
+  } else {
+    outputsList.innerHTML = `
+      <button class="os-item os-action-item" id="osCreateOutputAction" type="button">
+        <svg class="ico" viewBox="0 0 24 24"><use href="#i-pencil" /></svg>
+        <span>Create a file or site</span>
+      </button>
+    `;
+    const actBtn = document.getElementById('osCreateOutputAction');
+    if (actBtn) {
+      actBtn.addEventListener('click', () => {
+        const composer = document.getElementById('chatComposerInput') as HTMLTextAreaElement | null;
+        if (composer) {
+          composer.value = 'Please create a new file or site: ';
+          composer.focus();
+        }
+      });
+    }
+  }
+
+  // 2. Collect sources & MCPs
+  const roots = deps?.state()?.config.roots || [];
+  const sourcesHtml: string[] = [];
+
+  // Workspace folder sources
+  if (roots.length > 0) {
+    for (const r of roots.slice(0, 2)) {
+      const folderName = r.name || r.path.split(/[/\\]/).pop() || 'Workspace Root';
+      sourcesHtml.push(`
+        <div class="os-item os-source-item" title="${r.path}">
+          <svg class="ico" viewBox="0 0 24 24"><use href="#i-folder" /></svg>
+          <span class="os-item-name">${folderName}</span>
+          <span class="os-item-badge">Root</span>
+        </div>
+      `);
+    }
+  }
+
+  // Core & Desktop MCP Sources
+  sourcesHtml.push(`
+    <div class="os-item os-source-item" title="Core MCP Server (Files, Terminal, Processes)">
+      <svg class="ico" viewBox="0 0 24 24"><use href="#i-bolt" /></svg>
+      <span class="os-item-name">chat-on-steroids-core</span>
+      <span class="os-item-badge is-green">MCP</span>
+    </div>
+  `);
+
+  sourcesHtml.push(`
+    <div class="os-item os-source-item" title="Desktop Automation MCP (Screen, Mouse, Keyboard)">
+      <svg class="ico" viewBox="0 0 24 24"><use href="#i-monitor" /></svg>
+      <span class="os-item-name">chat-on-steroids-desktop</span>
+      <span class="os-item-badge is-green">MCP</span>
+    </div>
+  `);
+
+  // Web search source
+  sourcesHtml.push(`
+    <div class="os-item os-source-item" title="Web search & documentation fetch">
+      <svg class="ico" viewBox="0 0 24 24"><use href="#i-search" /></svg>
+      <span class="os-item-name">Web search</span>
+      <span class="os-item-badge">Active</span>
+    </div>
+  `);
+
+  sourcesList.innerHTML = sourcesHtml.join('');
 }
 
 // -------------------------------------------------------------------- handoff
@@ -1024,8 +1172,6 @@ export function chatSettingsPatch(current: Config): {
       autoTokens: threshold
     },
     multiAgent: {
-      // The exposure switch lives with every other ChatGPT tool switch, on Home. This
-      // panel keeps only the worker count, so it reads the one control that exists.
       enabled: $<HTMLInputElement>('homeMaEnabled').checked,
       maxWorkers: number('maWorkers', current.multiAgent.maxWorkers, 1, 8)
     },
@@ -1319,6 +1465,11 @@ export function chatApply(state: AppState, previous?: Config): void {
 
   applyChatValue($<HTMLInputElement>('maWorkers'), String(config.multiAgent.maxWorkers), previous?.multiAgent.maxWorkers);
 
+  $('autonomousSwarmCapacityCopy').textContent =
+    `${AUTONOMOUS_SWARM_LIMITS.activeTurns} active ChatGPT turns · ` +
+    `${AUTONOMOUS_SWARM_LIMITS.totalWorkerChats} total worker chats · ` +
+    `${AUTONOMOUS_SWARM_LIMITS.workersPerPrime} worker chats per conversation`;
+
   applyGoal(state, previous);
 
   // Extension bridge. Connecting is automatic, so this reports rather than asks.
@@ -1476,6 +1627,111 @@ export function initChat(next: Deps): void {
     if (dir) toast('Extension folder opened');
   });
 
+  document.getElementById('sidebarNewChatBtn')?.addEventListener('click', () => {
+    startNewChat();
+  });
+
+  document.getElementById('sidebarPrimaryNewChatBtn')?.addEventListener('click', () => {
+    startNewChat();
+  });
+
+  const composerInput = document.getElementById('chatComposerInput') as HTMLTextAreaElement | null;
+  const composerSend = document.getElementById('chatComposerSend') as HTMLButtonElement | null;
+  const composerHint = document.getElementById('chatComposerHint') as HTMLElement | null;
+
+  async function handleSend(): Promise<void> {
+    if (!composerInput) return;
+    const text = composerInput.value.trim();
+    if (!text) return;
+
+    if (composerHint) composerHint.textContent = 'Sending…';
+    composerInput.disabled = true;
+    if (composerSend) composerSend.disabled = true;
+
+    try {
+      const nextSeq = (events[events.length - 1]?.seq ?? 0) + 1;
+      const userEvent: SessionEvent = {
+        kind: 'user_message',
+        seq: nextSeq,
+        time: Date.now(),
+        source: 'app',
+        messageId: `msg-${Date.now()}`,
+        message: {
+          text,
+          truncated: false,
+          chars: text.length
+        }
+      };
+
+      events.push(userEvent);
+      totalEvents++;
+      $('timelineEmpty').hidden = true;
+      paintDetail();
+
+      if (!selectedId) {
+        $('chatTitle').textContent = text.slice(0, 48) + (text.length > 48 ? '…' : '');
+      }
+
+      composerInput.value = '';
+      if (composerHint) composerHint.textContent = 'Message added';
+      setTimeout(() => {
+        if (composerHint) composerHint.textContent = 'Ready';
+      }, 2500);
+
+      const body = $('chatBody');
+      if (body) body.scrollTop = body.scrollHeight;
+      toast('Message added to session');
+    } finally {
+      composerInput.disabled = false;
+      if (composerSend) composerSend.disabled = false;
+      composerInput.focus();
+    }
+  }
+
+  composerSend?.addEventListener('click', () => void handleSend());
+  composerInput?.addEventListener('keydown', (event) => {
+    if (event.key === 'Enter' && !event.shiftKey) {
+      event.preventDefault();
+      void handleSend();
+    }
+  });
+
+  document.getElementById('osViewAllSourcesBtn')?.addEventListener('click', () => {
+    document.querySelector<HTMLButtonElement>('nav button[data-tab="plugins"]')?.click();
+  });
+
+  document.getElementById('osAddSourceBtn')?.addEventListener('click', () => {
+    document.getElementById('sidebarNewProjectBtn')?.click();
+  });
+
+  document.getElementById('osNewOutputBtn')?.addEventListener('click', () => {
+    if (composerInput) {
+      composerInput.value = 'Please create a new file or site: ';
+      composerInput.focus();
+    }
+  });
+
   api.onSessionChanged(scheduleReload);
   api.onSwarmChanged(paintSwarm);
+}
+
+export function startNewChat(): void {
+  document.querySelector<HTMLButtonElement>('nav button[data-tab="chat"]')?.click();
+  selectedId = null;
+  detailFor = null;
+  detailCursor = null;
+  events = [];
+  totalEvents = 0;
+  handoff = null;
+  handoffFor = null;
+  paintSessions();
+  paintDetail();
+  $('chatTitle').textContent = 'New Conversation';
+  $('timelineEmpty').textContent = 'Start your conversation below. Messages and tool calls will be recorded in this session.';
+  $('timelineEmpty').hidden = false;
+  const input = document.getElementById('chatComposerInput') as HTMLTextAreaElement | null;
+  if (input) {
+    input.value = '';
+    input.focus();
+  }
 }

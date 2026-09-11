@@ -187,6 +187,16 @@ it('does not overwrite a focused dirty settings field on an unsolicited state pu
   expect(w.document.activeElement).toBe(multiAgent);
   expect(multiAgent.checked).toBe(true);
 
+  const capacityCopy = w.document.getElementById('autonomousSwarmCapacityCopy');
+  expect(capacityCopy?.textContent).toContain('2 active ChatGPT turns');
+  expect(capacityCopy?.textContent).toContain('6 total worker chats');
+  expect(capacityCopy?.textContent).toContain('2 worker chats per conversation');
+  const legacyWorkers = w.document.getElementById('maWorkers') as HTMLInputElement;
+  expect(legacyWorkers).toBeTruthy();
+  expect(legacyWorkers.min).toBe('1');
+  expect(legacyWorkers.max).toBe('8');
+  expect(legacyWorkers.value).toBe('2');
+
   // The settings sheet used to bypass the dirty-field guard used by Home. An unrelated
   // status push therefore erased this value while the user was still typing it.
   const compactionThreshold = w.document.getElementById('autoCompactTokens') as HTMLInputElement;
@@ -482,6 +492,43 @@ async function mountChat(
 }
 
 const settle = () => new Promise((resolve) => setTimeout(resolve, 0));
+
+it('opens a normal workspace page at its top instead of retaining a previous bottom scroll', async () => {
+  const mounted = await mountChat();
+  const doc = mounted.window.document;
+  const pluginsPage = doc.querySelector<HTMLElement>('[data-panel="plugins"]')!;
+  Object.defineProperty(pluginsPage, 'scrollTop', { value: 640, writable: true, configurable: true });
+
+  doc.querySelector<HTMLButtonElement>('nav button[data-tab="plugins"]')!.click();
+
+  expect(pluginsPage.scrollTop).toBe(0);
+});
+
+it('accepts only one connection transition while its UI request is still in flight', async () => {
+  let releaseConnect!: (reply: any) => void;
+  const connect = vi.fn(
+    () => new Promise<any>((resolve) => {
+      releaseConnect = resolve;
+    })
+  );
+  const mounted = await mountChat({ hasApiKey: true }, [], { connect });
+  const doc = mounted.window.document;
+
+  (doc.getElementById('connectBtn') as HTMLButtonElement).click();
+  (doc.getElementById('railConnect') as HTMLButtonElement).click();
+  (doc.getElementById('wizConnect') as HTMLButtonElement).click();
+  (doc.getElementById('coordinatorConnect') as HTMLButtonElement).click();
+
+  expect(connect).toHaveBeenCalledTimes(1);
+  for (const id of ['connectBtn', 'railConnect', 'wizConnect', 'coordinatorConnect']) {
+    expect((doc.getElementById(id) as HTMLButtonElement).disabled).toBe(true);
+  }
+
+  releaseConnect({ ok: true, data: mounted.state });
+  await settle();
+  await settle();
+  expect((doc.getElementById('connectBtn') as HTMLButtonElement).disabled).toBe(false);
+});
 
 it('shows a verified staged update without breaking the shell and installs only from the ready state', async () => {
   const installUpdate = vi.fn(() => Promise.resolve({ ok: true as const, data: true }));

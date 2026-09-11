@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="en">
+<html lang="en" data-theme="dark">
   <head>
     <meta charset="utf-8" />
     <title>Chat On Steroids</title>
@@ -65,17 +65,43 @@
             d="M12 3.5h0a1 1 0 0 1 1 1v.9a7 7 0 0 1 1.9.8l.6-.6a1 1 0 0 1 1.4 0l.5.5a1 1 0 0 1 0 1.4l-.6.6a7 7 0 0 1 .8 1.9h.9a1 1 0 0 1 1 1v.7a1 1 0 0 1-1 1h-.9a7 7 0 0 1-.8 1.9l.6.6a1 1 0 0 1 0 1.4l-.5.5a1 1 0 0 1-1.4 0l-.6-.6a7 7 0 0 1-1.9.8v.9a1 1 0 0 1-1 1h-.7a1 1 0 0 1-1-1v-.9a7 7 0 0 1-1.9-.8l-.6.6a1 1 0 0 1-1.4 0l-.5-.5a1 1 0 0 1 0-1.4l.6-.6a7 7 0 0 1-.8-1.9h-.9a1 1 0 0 1-1-1v-.7a1 1 0 0 1 1-1h.9a7 7 0 0 1 .8-1.9l-.6-.6a1 1 0 0 1 0-1.4l.5-.5a1 1 0 0 1 1.4 0l.6.6a7 7 0 0 1 1.9-.8v-.9a1 1 0 0 1 1-1Z"
           />
         </g>
+        <g id="i-sparkle">
+          <path d="m12 3-1.9 5.8a2 2 0 0 1-1.3 1.3L3 12l5.8 1.9a2 2 0 0 1 1.3 1.3L12 21l1.9-5.8a2 2 0 0 1 1.3-1.3L21 12l-5.8-1.9a2 2 0 0 1-1.3-1.3Z" />
+        </g>
+        <g id="i-puzzle">
+          <path d="M4 11V7a2 2 0 0 1 2-2h4a2 2 0 0 0 4 0h4a2 2 0 0 1 2 2v4a2 2 0 0 0 0 4v4a2 2 0 0 1-2 2h-4a2 2 0 0 1-4 0h-4a2 2 0 0 1-2-2v-4a2 2 0 0 1 0-4" />
+        </g>
+        <g id="i-sidebar">
+          <rect x="3.5" y="3.5" width="17" height="17" rx="2.5" />
+          <path d="M9 3.5v17" />
+        </g>
+        <g id="i-dots"><circle cx="5" cy="12" r="1.5" /><circle cx="12" cy="12" r="1.5" /><circle cx="19" cy="12" r="1.5" /></g>
+        <g id="i-plus-circle"><circle cx="12" cy="12" r="9" /><path d="M12 8v8M8 12h8" /></g>
       </defs>
     </svg>
 
     <div class="app">
       <!-- ------------------------------------------------------------ header -->
       <header>
-        <span class="mark"><svg class="ico" viewBox="0 0 24 24"><use href="#i-mark" /></svg></span>
-        <span class="title">
-          Chat On Steroids
-          <span id="headerSub">Not set up yet</span>
-        </span>
+        <div class="header-context">
+          <div class="topbar-brand" aria-label="Chat On Steroids">
+            <span class="mark"><svg class="ico" viewBox="0 0 24 24"><use href="#i-mark" /></svg></span>
+            <strong class="topbar-brand-name">Chat On Steroids</strong>
+          </div>
+          <button class="btn btn-icon rail-collapse-btn" id="sidebarCollapseBtn" type="button" title="Toggle sidebar">
+            <svg class="ico" viewBox="0 0 24 24"><use href="#i-sidebar" /></svg>
+          </button>
+          <div class="topbar-divider" aria-hidden="true"></div>
+          <nav class="header-breadcrumb" id="headerBreadcrumb" aria-label="Current location">
+            <span class="header-section" id="headerSection" style="display: none;">Workspace</span>
+            <span class="header-sep" style="display: none;" aria-hidden="true">/</span>
+            <strong class="header-active-view" id="headerViewName">Dashboard</strong>
+          </nav>
+          <div class="header-tunnel-chip" id="headerTunnelChip" title="Bridge endpoint identifier" style="display: none;">
+            <svg class="ico" viewBox="0 0 24 24"><use href="#i-bolt" /></svg>
+            <span id="headerSub">Not set up yet</span>
+          </div>
+        </div>
         <span class="state">
           <button class="btn btn-icon" id="themeBtn" type="button" title="Switch to dark mode">
             <svg class="ico" viewBox="0 0 24 24"><use href="#i-moon" id="themeIcon" /></svg>
@@ -106,6 +132,59 @@
       <main>
         <!-- ============================================================ Home -->
         <section class="panel is-active" data-panel="home">
+          <section class="overview-deck" aria-label="Computer control overview">
+            <div class="overview-intro">
+              <span class="overview-eyebrow">Coordinator workspace</span>
+              <h1>One control plane.<br /><em>Your computers in view.</em></h1>
+              <p>Keep this computer in command, then add other approved computers when the device registry is ready.</p>
+            </div>
+            <section class="coordinator-card" id="coordinatorCard">
+              <div class="coordinator-card-head"><span class="coordinator-mark"><svg class="ico" viewBox="0 0 24 24"><use href="#i-monitor" /></svg></span><span><small>Coordinator</small><strong id="coordinatorName">This computer</strong></span><span class="coordinator-state" id="coordinatorState">Checking</span></div>
+              <p class="coordinator-detail" id="coordinatorDetail">Reading local control status…</p>
+              <div class="coordinator-facts"><span id="coordinatorScope">Local permissions</span><span id="coordinatorFolders">No approved folders</span></div>
+              <div class="coordinator-work-context" aria-label="Current work context"><small>Current work</small><strong id="coordinatorActiveFile">No active file reported</strong><code id="coordinatorLocation">No approved workspace</code></div>
+              <button class="coordinator-connect" id="coordinatorConnect" type="button"><svg class="ico" viewBox="0 0 24 24"><use href="#i-power" /></svg><span id="coordinatorConnectLabel">Connect coordinator</span></button>
+            </section>
+            <section class="fleet-card" aria-label="Managed computers">
+              <div class="fleet-head"><span><small>Managed computers</small><strong id="fleetCount">1 local computer</strong></span><span class="fleet-live"><i></i>Live view</span></div>
+              <div class="fleet-local"><span class="fleet-node-mark"><svg class="ico" viewBox="0 0 24 24"><use href="#i-monitor" /></svg></span><span><b>This computer</b><em id="fleetLocalDetail">Local coordinator</em></span><span class="fleet-role">PRIMARY</span></div>
+              <div id="fleetRemoteList"></div>
+              <p class="fleet-empty" id="fleetEmpty">No remote computers are paired yet. Add one from Setup; each computer will appear here with its exact online state and permitted surface.</p>
+            </section>
+            <section class="overview-hud card" id="overviewHud" aria-label="Operational launchpad">
+              <div class="overview-hud-head">
+                <span class="overview-hud-mark"><svg class="ico" viewBox="0 0 24 24"><use href="#i-bolt" /></svg></span>
+                <div>
+                  <small>Launchpad</small>
+                  <strong>Quick Actions &amp; Vitals</strong>
+                </div>
+                <span class="overview-hud-badge">READY</span>
+              </div>
+              <div class="overview-hud-grid">
+                <button class="overview-hud-tile" id="quickAddFolder" type="button">
+                  <svg class="ico" viewBox="0 0 24 24"><use href="#i-folder" /></svg>
+                  <span><b>Add Folder</b><small>Approve project root</small></span>
+                </button>
+                <button class="overview-hud-tile" id="quickPermissions" type="button">
+                  <svg class="ico" viewBox="0 0 24 24"><use href="#i-lock" /></svg>
+                  <span><b>Permissions</b><small>Review local caps</small></span>
+                </button>
+                <button class="overview-hud-tile" id="quickRunChecks" type="button">
+                  <svg class="ico" viewBox="0 0 24 24"><use href="#i-pulse" /></svg>
+                  <span><b>Health Check</b><small>Run system diagnostics</small></span>
+                </button>
+                <button class="overview-hud-tile" id="quickControlCanvas" type="button">
+                  <svg class="ico" viewBox="0 0 24 24"><use href="#i-control" /></svg>
+                  <span><b>Control Map</b><small>Inspect multi-agent DAG</small></span>
+                </button>
+              </div>
+              <div class="overview-hud-foot">
+                <span class="hud-vitals-item"><span>Bridge</span><b>8765-8769</b></span>
+                <span class="hud-vitals-item"><span>Surfaces</span><b>Core + Desktop</b></span>
+                <span class="hud-vitals-item"><span>Local State</span><b id="hudStatePill">Active</b></span>
+              </div>
+            </section>
+          </section>
           <div class="top">
             <!-- ------------------------------------------------- permissions -->
             <section class="card">
@@ -188,9 +267,42 @@
           </section>
         </section>
 
+        <!-- ========================================================= Devices -->
+        <section class="panel section-panel" data-panel="devices">
+          <div class="section-page">
+            <header class="section-heading"><span class="overview-eyebrow">Fleet control</span><h1>Computers</h1><p>See each approved computer, its live state and what it is allowed to do.</p></header>
+            <div class="section-stack" id="deviceFleetMount"></div>
+            <div class="section-stack" id="deviceSetupMount"></div>
+          </div>
+        </section>
+
+        <!-- ===================================================== Permissions -->
+        <section class="panel section-panel" data-panel="permissions">
+          <div class="section-page">
+            <header class="section-heading"><span class="overview-eyebrow">Local authority</span><h1>Permissions &amp; folders</h1><p>Choose what this computer shares before any device or MCP can use it.</p></header>
+            <div class="section-grid" id="permissionsMount"></div>
+          </div>
+        </section>
+
+        <!-- =========================================================== Health -->
+        <section class="panel section-panel" data-panel="health">
+          <div class="section-page">
+            <header class="section-heading"><span class="overview-eyebrow">System status</span><h1>Health</h1><p>Run a connection check and inspect the live local service status.</p></header>
+            <div class="section-stack" id="healthMount"></div>
+          </div>
+        </section>
+
         <!-- =========================================================== Setup -->
         <section class="panel scroll" data-panel="setup">
           <div class="sheet">
+            <section class="pairing-setup" aria-labelledby="pairingSetupTitle">
+              <div><span class="overview-eyebrow">Multi-computer</span><h2 id="pairingSetupTitle">Add a computer</h2><p>Install the Node Agent package on the other Windows computer, then enter a one-time pairing code. The code expires after 10 minutes and can be used once.</p></div>
+              <div class="pairing-actions"><button class="btn btn-solid" id="createPairingTicket" type="button"><svg class="ico" viewBox="0 0 24 24"><use href="#i-plus" /></svg>Create pairing code</button><div id="pairingTicket" hidden><code id="pairingCode"></code><span id="pairingExpiry"></span></div></div>
+            </section>
+            <section class="pairing-setup" aria-labelledby="deviceRoleTitle">
+              <div><span class="overview-eyebrow">This computer</span><h2 id="deviceRoleTitle">Choose its role</h2><p>Every installation is identical. A coordinator manages paired computers; a node can join a coordinator; independent keeps its own local MCP only.</p></div>
+              <div class="pairing-actions"><label>Role <select id="deviceRole"><option value="independent">Independent</option><option value="coordinator">Coordinator</option><option value="node">Node</option></select></label><label id="coordinatorAddressField">Tailscale IP <input id="coordinatorHost" placeholder="100.x.x.x" /></label><label id="coordinatorPortField">Port <input id="coordinatorPort" type="number" min="1024" max="65535" value="8788" /></label></div>
+            </section>
             <div class="lede">
               <p>
                 Six steps, once. Custom MCP apps need ChatGPT <strong>Developer mode</strong> on the
@@ -198,6 +310,15 @@
                 Pro custom MCP is limited to read/fetch access.
               </p>
               <button class="btn" id="wizExpand" type="button" hidden>Show all steps</button>
+            </div>
+
+            <div class="wizard-stepper" id="wizardStepper" aria-label="Setup steps progress">
+              <button type="button" class="stepper-pill is-active" data-step-nav="folder"><span class="stepper-num">1</span><span>Folder</span></button>
+              <button type="button" class="stepper-pill" data-step-nav="tunnel"><span class="stepper-num">2</span><span>Tunnel</span></button>
+              <button type="button" class="stepper-pill" data-step-nav="key"><span class="stepper-num">3</span><span>API Key</span></button>
+              <button type="button" class="stepper-pill" data-step-nav="connect"><span class="stepper-num">4</span><span>Connect</span></button>
+              <button type="button" class="stepper-pill" data-step-nav="chatgpt"><span class="stepper-num">5</span><span>ChatGPT</span></button>
+              <button type="button" class="stepper-pill" data-step-nav="browser"><span class="stepper-num">6</span><span>Extension</span></button>
             </div>
 
             <ol class="wizard" id="wizard">
@@ -459,6 +580,15 @@
             <h2>
               Sessions
               <span class="acts">
+                <input
+                  id="chatSearch"
+                  class="control-search chat-search-input"
+                  type="text"
+                  placeholder="Filter sessions…"
+                  aria-label="Filter sessions"
+                  autocomplete="off"
+                  spellcheck="false"
+                />
                 <button class="btn" id="chatRefresh" type="button">
                   <svg class="ico" viewBox="0 0 24 24"><use href="#i-pulse" /></svg>Refresh
                 </button>
@@ -517,11 +647,71 @@
               <div class="view" data-view="timeline">
                 <!-- Only shown while a multi-agent run has agents in this session. -->
                 <div class="seg" id="chatAgentFilter" hidden></div>
+
+                <!-- Outputs & Sources Indicator Widget (Floating Top-Right) -->
+                <aside class="chat-outputs-sources-widget" id="chatOutputsSourcesWidget" aria-label="Outputs and Sources">
+                  <div class="os-card">
+                    <!-- Outputs Section -->
+                    <div class="os-section os-outputs-section">
+                      <div class="os-section-head">
+                        <span class="os-section-title">Outputs</span>
+                        <button class="os-add-btn" id="osNewOutputBtn" type="button" title="Create a file or site">
+                          <svg class="ico" viewBox="0 0 24 24"><use href="#i-plus" /></svg>
+                        </button>
+                      </div>
+                      <div class="os-items-list" id="osOutputsList">
+                        <button class="os-item os-action-item" id="osCreateOutputAction" type="button">
+                          <svg class="ico" viewBox="0 0 24 24"><use href="#i-pencil" /></svg>
+                          <span>Create a file or site</span>
+                        </button>
+                      </div>
+                    </div>
+
+                    <!-- Sources Section -->
+                    <div class="os-section os-sources-section">
+                      <div class="os-section-head">
+                        <span class="os-section-title">Sources</span>
+                        <button class="os-add-btn" id="osAddSourceBtn" type="button" title="Add source or MCP">
+                          <svg class="ico" viewBox="0 0 24 24"><use href="#i-plus" /></svg>
+                        </button>
+                      </div>
+                      <div class="os-items-list" id="osSourcesList"></div>
+                      <div class="os-view-all">
+                        <button class="os-view-all-btn" id="osViewAllSourcesBtn" type="button">
+                          <svg class="ico" viewBox="0 0 24 24"><use href="#i-out" /></svg>
+                          <span>View all</span>
+                        </button>
+                      </div>
+                    </div>
+                  </div>
+                </aside>
+
                 <div id="timeline"></div>
                 <p class="empty" id="timelineEmpty">
                   No events for this session yet. Tool calls are recorded here as they happen;
                   what ChatGPT shows on screen arrives from the browser extension.
                 </p>
+
+                <!-- In-app Message Composer -->
+                <div class="chat-composer" id="chatComposer">
+                  <div class="chat-composer-inner">
+                    <textarea
+                      id="chatComposerInput"
+                      class="chat-composer-textarea"
+                      rows="2"
+                      placeholder="Type a message or instruction for this session…"
+                      aria-label="Chat message composer"
+                      spellcheck="false"
+                    ></textarea>
+                    <div class="chat-composer-actions">
+                      <span class="chat-composer-hint" id="chatComposerHint">Ready</span>
+                      <button class="btn btn-primary" id="chatComposerSend" type="button" title="Send message (Enter)">
+                        <svg class="ico" viewBox="0 0 24 24"><use href="#i-bolt" /></svg>
+                        <span>Send</span>
+                      </button>
+                    </div>
+                  </div>
+                </div>
               </div>
 
               <!-- the brief the last compaction left behind -->
@@ -674,10 +864,18 @@
                   <div class="setting">
                     <span class="setting-text">
                       <b>Sub-agent workers</b>
-                      <em>Requires the Chrome extension to be loaded and connected. This sets the most worker chats one run may open.</em>
+                      <em>Ordinary multi-agent runs only. Sets the most worker chats one legacy run may open.</em>
                     </span>
                     <input id="maWorkers" class="num" type="number" min="1" max="8" step="1" />
                     <span class="unit">max</span>
+                  </div>
+
+                  <div class="setting">
+                    <span class="setting-text">
+                      <b>Autonomous swarm capacity</b>
+                      <em id="autonomousSwarmCapacityCopy">2 active ChatGPT turns · 6 total worker chats · 2 worker chats per conversation</em>
+                    </span>
+                    <span class="unit">fixed</span>
                   </div>
 
                   <div id="swarmList"></div>
@@ -696,8 +894,8 @@
           <div class="control-summary" id="controlSummary" aria-label="Run summary"></div>
           <div class="control-body">
             <section class="card control-canvas-card">
-              <h2>
-                <span>Agent system</span>
+              <h2 class="control-canvas-heading">
+                <span class="canvas-heading-copy"><small>Live workspace map</small><strong>Agent canvas</strong></span>
                 <span class="acts">
                   <input
                     id="controlSearch"
@@ -716,6 +914,7 @@
                 </span>
               </h2>
               <div class="control-canvas-scroll" id="controlGraph">
+                <div class="canvas-corner-note"><span>ORCHESTRATION</span><b>Click a node to trace its work</b></div>
                 <div class="control-legend" id="controlLegend" aria-label="Task state legend">
                   <button type="button" class="is-good" data-control-filter="verified" aria-pressed="false">
                     Verified <b class="control-filter-count">0</b>
@@ -756,6 +955,15 @@
                   <button class="is-sel" data-filter="all" type="button">All</button>
                   <button data-filter="bad" type="button">Problems</button>
                 </span>
+                <input
+                  id="logSearch"
+                  class="control-search log-search-input"
+                  type="text"
+                  placeholder="Filter log…"
+                  aria-label="Filter activity log"
+                  autocomplete="off"
+                  spellcheck="false"
+                />
                 <span class="problems" id="logProblems" hidden></span>
                 <button class="btn" id="copyLogJson" type="button">
                   <svg class="ico" viewBox="0 0 24 24"><use href="#i-copy" /></svg>JSON
@@ -769,26 +977,152 @@
             <p class="foot" id="versionLine"></p>
           </section>
         </section>
+
+        <!-- ================================================= Release Notes -->
+        <section class="panel section-panel scroll" data-panel="releases" id="releasesPanel">
+          <div class="section-page" id="releasesMount"></div>
+        </section>
+
+        <!-- ================================================= Plugins & MCPs -->
+        <section class="panel section-panel scroll" data-panel="plugins" id="pluginsPanel">
+          <div class="section-page" id="pluginsMount"></div>
+        </section>
       </main>
 
       <!-- --------------------------------------------------------------- nav -->
-      <nav id="tabs">
-        <button class="is-sel" data-tab="home" type="button">
-          <svg class="ico" viewBox="0 0 24 24"><use href="#i-home" /></svg>Home
+      <nav id="tabs" aria-label="Workspace navigation">
+        <button class="rail-new-chat-hero" id="sidebarPrimaryNewChatBtn" type="button" title="Start fresh conversation">
+          <span class="rail-new-chat-hero-left">
+            <svg class="ico" viewBox="0 0 24 24"><use href="#i-pencil" /></svg>
+            <span>New chat</span>
+          </span>
+          <span class="rail-new-chat-hero-right">
+            <svg class="ico" viewBox="0 0 24 24"><use href="#i-plus-circle" /></svg>
+          </span>
         </button>
-        <button data-tab="setup" type="button">
-          <svg class="ico" viewBox="0 0 24 24"><use href="#i-steps" /></svg>Setup
-          <span class="badge" id="setupBadge" hidden></span>
+
+        <button class="is-sel" data-tab="home" type="button" title="Dashboard">
+          <svg class="ico" viewBox="0 0 24 24"><use href="#i-home" /></svg><span>Dashboard</span>
         </button>
-        <button data-tab="chat" type="button">
-          <svg class="ico" viewBox="0 0 24 24"><use href="#i-chat" /></svg>Chat
+        <button data-tab="control" type="button" title="Agents">
+          <svg class="ico" viewBox="0 0 24 24"><use href="#i-control" /></svg><span>Agents</span><span class="visually-hidden">Control</span>
         </button>
-        <button data-tab="control" type="button">
-          <svg class="ico" viewBox="0 0 24 24"><use href="#i-control" /></svg>Control
+        <button data-tab="devices" type="button" title="Devices">
+          <svg class="ico" viewBox="0 0 24 24"><use href="#i-monitor" /></svg><span>Devices</span>
         </button>
-        <button data-tab="activity" type="button">
-          <svg class="ico" viewBox="0 0 24 24"><use href="#i-pulse" /></svg>Activity
+        <button data-tab="chat" type="button" title="Conversations">
+          <svg class="ico" viewBox="0 0 24 24"><use href="#i-chat" /></svg><span>Conversations</span>
         </button>
+        <button data-tab="plugins" type="button" title="Plugins &amp; MCPs">
+          <svg class="ico" viewBox="0 0 24 24"><use href="#i-puzzle" /></svg><span>Plugins</span>
+        </button>
+
+        <!-- Projects and Chats Sections -->
+        <div class="rail-scroll-content scroll">
+          <!-- Pinned Section -->
+          <div class="rail-section is-collapsed" id="railPinnedSection">
+            <div class="rail-section-head" id="railPinnedHead" title="Toggle Pinned">
+              <span class="rail-section-head-title">
+                <span class="rail-section-title">Pinned</span>
+                <svg class="ico rail-chev-icon" viewBox="0 0 24 24"><use href="#i-chev" /></svg>
+              </span>
+            </div>
+            <div class="rail-items-list" id="sidebarPinnedList" aria-label="Pinned items">
+              <div class="rail-empty-hint">No pinned items</div>
+            </div>
+          </div>
+
+          <!-- Projects Section -->
+          <div class="rail-section" id="railProjectsSection">
+            <div class="rail-section-head" id="railProjectsHead" title="Toggle Projects">
+              <span class="rail-section-head-title">
+                <span class="rail-section-title">Projects</span>
+                <svg class="ico rail-chev-icon" viewBox="0 0 24 24"><use href="#i-chev" /></svg>
+              </span>
+              <div class="rail-section-head-tools">
+                <button class="rail-ghost-icon-btn" id="sidebarNewProjectBtn" type="button" title="Add folder (New project)">
+                  <svg class="ico" viewBox="0 0 24 24"><use href="#i-plus" /></svg>
+                </button>
+                <span class="rail-purple-dot" title="Workspace Active"></span>
+              </div>
+            </div>
+            <div class="rail-items-list" id="sidebarProjectsList" aria-label="Approved projects"></div>
+          </div>
+
+          <!-- Chats / Recents Section -->
+          <div class="rail-section" id="railChatsSection">
+            <div class="rail-section-head" id="railChatsHead" title="Toggle Recents">
+              <span class="rail-section-head-title">
+                <span class="rail-section-title">Recents</span>
+                <svg class="ico rail-chev-icon" viewBox="0 0 24 24"><use href="#i-chev" /></svg>
+              </span>
+              <div class="rail-section-head-tools">
+                <button class="rail-ghost-icon-btn" id="sidebarChatsMoreBtn" type="button" title="Conversations">
+                  <svg class="ico" viewBox="0 0 24 24"><use href="#i-dots" /></svg>
+                </button>
+                <button class="rail-ghost-icon-btn" id="sidebarNewChatBtn" type="button" title="Start fresh conversation">
+                  <svg class="ico" viewBox="0 0 24 24"><use href="#i-pencil" /></svg>
+                </button>
+                <span class="rail-purple-dot" title="Recent Chats"></span>
+              </div>
+            </div>
+            <div class="rail-items-list rail-chats-scroll" id="sidebarChatsList" aria-label="Recent chats"></div>
+          </div>
+        </div>
+
+        <!-- System Settings Drawer / Group -->
+        <div class="rail-settings-group" id="railSettingsGroup" hidden>
+          <div class="rail-settings-header">
+            <span>System Settings</span>
+            <button type="button" class="btn btn-icon btn-tiny" id="closeSettingsDrawer" title="Close Settings">
+              <svg class="ico" viewBox="0 0 24 24"><use href="#i-x" /></svg>
+            </button>
+          </div>
+          <button data-tab="setup" type="button" title="Connection Setup">
+            <svg class="ico" viewBox="0 0 24 24"><use href="#i-steps" /></svg><span>Connection</span>
+            <span class="badge" id="setupBadge" hidden></span>
+          </button>
+          <button data-tab="permissions" type="button" title="Local Permissions">
+            <svg class="ico" viewBox="0 0 24 24"><use href="#i-lock" /></svg><span>Permissions</span>
+          </button>
+          <button data-tab="health" type="button" title="System Health">
+            <svg class="ico" viewBox="0 0 24 24"><use href="#i-pulse" /></svg><span>Health</span>
+          </button>
+          <button data-tab="activity" type="button" title="Activity Log">
+            <svg class="ico" viewBox="0 0 24 24"><use href="#i-pulse" /></svg><span>Activity log</span>
+          </button>
+          <button data-tab="releases" type="button" title="Release Notes">
+            <svg class="ico" viewBox="0 0 24 24"><use href="#i-sparkle" /></svg><span>Release notes</span>
+          </button>
+
+          <!-- System Controls / Rail Dock inside Settings -->
+          <div class="rail-dock">
+            <section class="rail-pulse" id="railPulse" aria-live="polite">
+              <span class="rail-status-dot" id="railStatusDot"></span>
+              <span class="rail-pulse-copy"><small>Connection</small><strong id="railConnectionState">Checking status</strong></span>
+              <span class="rail-connection-detail" id="railConnectionDetail">Local-first control</span>
+            </section>
+            <div class="rail-actions" aria-label="Workspace actions">
+              <button class="rail-action rail-connect" id="railConnect" type="button">
+                <svg class="ico" viewBox="0 0 24 24"><use href="#i-power" /></svg><span id="railConnectLabel">Connect</span>
+              </button>
+              <button class="rail-action" id="railRunChecks" type="button">
+                <svg class="ico" viewBox="0 0 24 24"><use href="#i-pulse" /></svg><span>System check</span>
+              </button>
+            </div>
+            <div class="rail-footer">
+              <svg class="ico" viewBox="0 0 24 24"><use href="#i-lock" /></svg>
+              <span>Permissions stay local</span>
+            </div>
+          </div>
+        </div>
+
+        <div class="rail-bottom-bar" id="railBottomBar">
+          <button class="rail-bottom-btn" id="sidebarSettingsBtn" type="button" title="System Settings">
+            <svg class="ico" viewBox="0 0 24 24"><use href="#i-gear" /></svg>
+            <span>Settings</span>
+          </button>
+        </div>
       </nav>
     </div>
 

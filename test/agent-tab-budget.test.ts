@@ -150,12 +150,24 @@ function makeHarness(
 }
 
 describe('agent tab hard budget', () => {
+  it('admits six system-owned worker chats and queues only the seventh', async () => {
+    const h = makeHarness();
+    for (let i = 1; i <= 7; i++) await h.register(i, `autonomous-cmd-${i}`);
+
+    expect(Object.keys(h.sessionState.agentTabLeases ?? {})).toHaveLength(6);
+    expect((h.sessionState.agentTabLeaseQueue ?? []).map((entry: any) => entry.commandId)).toEqual([
+      'autonomous-cmd-7'
+    ]);
+    expect(h.removed).toContain(7);
+    expect(h.removed).not.toContain(6);
+  });
+
   it('publishes zero browser lease telemetry on a cold service-worker start', async () => {
     const h = makeHarness();
     await h.settle();
 
     expect(h.sessionState.agentTabLeaseTelemetry).toMatchObject({
-      budget: 5,
+      budget: 6,
       used: 0,
       queued: 0
     });
@@ -165,26 +177,26 @@ describe('agent tab hard budget', () => {
   it('persists exact browser lease telemetry from marker-owned leases and the durable queue', async () => {
     const h = makeHarness();
     h.browserTabs.set(90, 'https://chatgpt.com/c/user-owned-conversation');
-    for (let i = 1; i <= 6; i++) await h.register(i, `cmd-${i}`);
+    for (let i = 1; i <= 7; i++) await h.register(i, `cmd-${i}`);
 
     expect(h.sessionState.agentTabLeaseTelemetry).toMatchObject({
-      budget: 5,
-      used: 5,
+      budget: 6,
+      used: 6,
       queued: 1
     });
     expect(Number.isFinite(h.sessionState.agentTabLeaseTelemetry?.observedAt)).toBe(true);
     expect(h.browserTabs.has(90)).toBe(true);
   });
 
-  it('keeps at most five system-owned agent leases and queues the sixth until capacity is released', async () => {
+  it('keeps at most six system-owned agent leases and queues the seventh until capacity is released', async () => {
     const h = makeHarness();
-    for (let i = 1; i <= 6; i++) await h.register(i, `cmd-${i}`);
+    for (let i = 1; i <= 7; i++) await h.register(i, `cmd-${i}`);
 
-    expect(Object.keys(h.sessionState.agentTabLeases ?? {})).toHaveLength(5);
+    expect(Object.keys(h.sessionState.agentTabLeases ?? {})).toHaveLength(6);
     expect(h.sessionState.agentTabLeaseQueue).toEqual([
-      expect.objectContaining({ commandId: 'cmd-6' })
+      expect.objectContaining({ commandId: 'cmd-7' })
     ]);
-    expect(h.removed).toContain(6);
+    expect(h.removed).toContain(7);
     expect(h.created).toEqual([]);
 
     await h.ack('cmd-1', 'worker-1');
@@ -192,45 +204,45 @@ describe('agent tab hard budget', () => {
     await h.release(1);
 
     expect(h.created).toHaveLength(1);
-    expect(h.created[0]?.url).toContain('clf=cmd-6');
+    expect(h.created[0]?.url).toContain('clf=cmd-7');
     expect(h.sessionState.agentTabLeaseQueue ?? []).toEqual([]);
   });
 
-  it('does not count or close unmarked user ChatGPT tabs against the five-tab budget', async () => {
+  it('does not count or close unmarked user ChatGPT tabs against the six-tab budget', async () => {
     const h = makeHarness();
     h.browserTabs.set(90, 'https://chatgpt.com/c/user-owned-conversation');
-    for (let i = 1; i <= 5; i++) await h.register(i, `cmd-${i}`);
+    for (let i = 1; i <= 6; i++) await h.register(i, `cmd-${i}`);
 
-    expect(Object.keys(h.sessionState.agentTabLeases ?? {})).toHaveLength(5);
+    expect(Object.keys(h.sessionState.agentTabLeases ?? {})).toHaveLength(6);
     expect(h.browserTabs.has(90)).toBe(true);
     expect(h.removed).not.toContain(90);
   });
 
   it('releases the queue-drain lock after one drain so a later freed lease can drain again', async () => {
     const h = makeHarness();
-    for (let i = 1; i <= 7; i++) await h.register(i, `cmd-${i}`);
+    for (let i = 1; i <= 8; i++) await h.register(i, `cmd-${i}`);
 
-    expect((h.sessionState.agentTabLeaseQueue ?? []).map((entry: any) => entry.commandId)).toEqual(['cmd-6', 'cmd-7']);
+    expect((h.sessionState.agentTabLeaseQueue ?? []).map((entry: any) => entry.commandId)).toEqual(['cmd-7', 'cmd-8']);
 
     await h.ack('cmd-1', 'worker-1');
     await h.release(1);
-    expect(h.created.map((tab) => tab.url)).toEqual([expect.stringContaining('clf=cmd-6')]);
-    expect((h.sessionState.agentTabLeaseQueue ?? []).map((entry: any) => entry.commandId)).toEqual(['cmd-7']);
+    expect(h.created.map((tab) => tab.url)).toEqual([expect.stringContaining('clf=cmd-7')]);
+    expect((h.sessionState.agentTabLeaseQueue ?? []).map((entry: any) => entry.commandId)).toEqual(['cmd-8']);
 
     await h.ack('cmd-2', 'worker-2');
     await h.release(2);
     expect(h.created.map((tab) => tab.url)).toEqual([
-      expect.stringContaining('clf=cmd-6'),
-      expect.stringContaining('clf=cmd-7')
+      expect.stringContaining('clf=cmd-7'),
+      expect.stringContaining('clf=cmd-8')
     ]);
     expect(h.sessionState.agentTabLeaseQueue ?? []).toEqual([]);
-    expect(Object.keys(h.sessionState.agentTabLeases ?? {})).toHaveLength(5);
+    expect(Object.keys(h.sessionState.agentTabLeases ?? {})).toHaveLength(6);
   });
 
   it('reconciles stale persisted leases after service-worker restart before draining queued work', async () => {
     const sessionState: Record<string, any> = {
       agentTabLeases: Object.fromEntries(
-        Array.from({ length: 5 }, (_, index) => {
+        Array.from({ length: 6 }, (_, index) => {
           const tabId = index + 1;
           return [String(tabId), {
             commandId: `cmd-${tabId}`,
@@ -242,13 +254,13 @@ describe('agent tab hard budget', () => {
         })
       ),
       agentTabLeaseQueue: [{
-        commandId: 'cmd-6',
-        url: 'https://chatgpt.com/?clf=cmd-6#clf=cmd-6',
+        commandId: 'cmd-7',
+        url: 'https://chatgpt.com/?clf=cmd-7#clf=cmd-7',
         queuedAt: 2
       }]
     };
     const browserTabs = new Map<number, string>(
-      Array.from({ length: 4 }, (_, index) => {
+      Array.from({ length: 5 }, (_, index) => {
         const tabId = index + 1;
         return [tabId, `https://chatgpt.com/?clf=cmd-${tabId}#clf=cmd-${tabId}`];
       })
@@ -257,35 +269,35 @@ describe('agent tab hard budget', () => {
     const restarted = makeHarness(sessionState, browserTabs);
     await restarted.settle();
 
-    expect(sessionState.agentTabLeases?.['5']).toBeUndefined();
+    expect(sessionState.agentTabLeases?.['6']).toBeUndefined();
     expect(restarted.created).toHaveLength(1);
-    expect(restarted.created[0]?.url).toContain('clf=cmd-6');
+    expect(restarted.created[0]?.url).toContain('clf=cmd-7');
     expect(sessionState.agentTabLeaseQueue ?? []).toEqual([]);
-    expect(Object.keys(sessionState.agentTabLeases ?? {})).toHaveLength(5);
-    expect(restarted.removed).not.toContain(5);
+    expect(Object.keys(sessionState.agentTabLeases ?? {})).toHaveLength(6);
+    expect(restarted.removed).not.toContain(6);
   });
 
-  it('reserves capacity before an async queued tab create so a concurrent registration cannot exceed five leases', async () => {
+  it('reserves capacity before an async queued tab create so a concurrent registration cannot exceed six leases', async () => {
     const h = makeHarness();
-    for (let i = 1; i <= 6; i++) await h.register(i, `cmd-${i}`);
+    for (let i = 1; i <= 7; i++) await h.register(i, `cmd-${i}`);
 
     const gate = h.pauseNextCreate();
     await h.ack('cmd-1', 'worker-1');
     const releaseFirstLease = h.release(1);
     await gate.started;
 
-    await h.register(8, 'cmd-8');
+    await h.register(9, 'cmd-9');
     gate.resume();
     await releaseFirstLease;
     await h.settle();
 
-    expect(Object.keys(h.sessionState.agentTabLeases ?? {})).toHaveLength(5);
-    expect((h.sessionState.agentTabLeaseQueue ?? []).map((entry: any) => entry.commandId)).toContain('cmd-8');
+    expect(Object.keys(h.sessionState.agentTabLeases ?? {})).toHaveLength(6);
+    expect((h.sessionState.agentTabLeaseQueue ?? []).map((entry: any) => entry.commandId)).toContain('cmd-9');
   });
 
   it('does not lose the next queued command when its bootstrap ACK arrives during tabs.create', async () => {
     const h = makeHarness();
-    for (let i = 1; i <= 7; i++) await h.register(i, `cmd-${i}`);
+    for (let i = 1; i <= 8; i++) await h.register(i, `cmd-${i}`);
 
     const firstCreate = h.pauseNextCreate();
     await h.ack('cmd-1', 'worker-1');
@@ -294,16 +306,16 @@ describe('agent tab hard budget', () => {
 
     // Chrome may let the newly created page ACK before tabs.create resolves back to this worker.
     // That marks the future lease bootstrapSent but must not close it or free another slot yet.
-    const ackCreatingCommand = h.ack('cmd-6', 'worker-6');
+    const ackCreatingCommand = h.ack('cmd-7', 'worker-7');
     await h.settle();
     firstCreate.resume();
     await Promise.all([releaseFirstLease, ackCreatingCommand]);
     await h.settle(100);
 
-    expect(h.createRequests.map((url) => new URL(url).searchParams.get('clf'))).toEqual(['cmd-6']);
-    expect((h.sessionState.agentTabLeaseQueue ?? []).map((entry: any) => entry.commandId)).toEqual(['cmd-7']);
+    expect(h.createRequests.map((url) => new URL(url).searchParams.get('clf'))).toEqual(['cmd-7']);
+    expect((h.sessionState.agentTabLeaseQueue ?? []).map((entry: any) => entry.commandId)).toEqual(['cmd-8']);
     expect(h.sessionState.agentTabLeases?.['100']).toMatchObject({
-      commandId: 'cmd-6',
+      commandId: 'cmd-7',
       bootstrapSent: true,
       releasable: false
     });
@@ -314,21 +326,21 @@ describe('agent tab hard budget', () => {
     secondCreate.resume();
     await releaseCreatingCommand;
     await h.settle();
-    expect(h.createRequests.map((url) => new URL(url).searchParams.get('clf'))).toEqual(['cmd-6', 'cmd-7']);
+    expect(h.createRequests.map((url) => new URL(url).searchParams.get('clf'))).toEqual(['cmd-7', 'cmd-8']);
     expect(h.sessionState.agentTabLeaseQueue ?? []).toEqual([]);
-    expect(Object.keys(h.sessionState.agentTabLeases ?? {})).toHaveLength(5);
+    expect(Object.keys(h.sessionState.agentTabLeases ?? {})).toHaveLength(6);
   });
 
   it('fails closed instead of closing an overflow tab that navigated away after registration proof', async () => {
     const h = makeHarness();
-    for (let i = 1; i <= 5; i++) await h.register(i, `cmd-${i}`);
+    for (let i = 1; i <= 6; i++) await h.register(i, `cmd-${i}`);
 
     const userUrl = 'https://chatgpt.com/c/user-owned-after-register';
-    h.afterNextPersist(() => h.navigate(6, userUrl));
-    await h.register(6, 'cmd-6');
+    h.afterNextPersist(() => h.navigate(7, userUrl));
+    await h.register(7, 'cmd-7');
 
-    expect(h.removed).not.toContain(6);
-    expect(h.browserTabs.get(6)).toBe(userUrl);
-    expect((h.sessionState.agentTabLeaseQueue ?? []).map((entry: any) => entry.commandId)).toEqual(['cmd-6']);
+    expect(h.removed).not.toContain(7);
+    expect(h.browserTabs.get(7)).toBe(userUrl);
+    expect((h.sessionState.agentTabLeaseQueue ?? []).map((entry: any) => entry.commandId)).toEqual(['cmd-7']);
   });
 });

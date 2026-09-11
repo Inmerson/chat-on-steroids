@@ -35,6 +35,43 @@ describe('durable autonomous execution runs', () => {
     expect(stored?.runs.find((row) => row.id === run.id)?.plan).toBe(plan);
   });
 
+  it('persists autonomous_swarm only when it is explicitly selected', async () => {
+    const run = await execution.createExecution({
+      plan: 'Complete every verified task in the accepted swarm objective.',
+      mode: 'autonomous_swarm'
+    });
+
+    expect(run.mode).toBe('autonomous_swarm');
+    const snapshot = execution.snapshotExecutions();
+    execution.resetExecutionsForTests();
+    execution.restoreExecutions(snapshot);
+    expect(execution.executionRun(run.id)?.mode).toBe('autonomous_swarm');
+  });
+
+  it('persists GSD planning, Ralph looping and explicit external coding/review selections', async () => {
+    const run = await execution.createExecution({
+      plan: 'Implement the approved agent workflow integration.',
+      mode: 'ralph',
+      method: 'gsd',
+      codingBackend: 'codex',
+      reviewBackend: 'coderabbit',
+      workspace: { real: 'C:\\repo', virtual: '/repo' }
+    });
+
+    const snapshot = execution.snapshotExecutions();
+    execution.resetExecutionsForTests();
+    execution.restoreExecutions(snapshot);
+
+    expect(execution.executionRun(run.id)).toMatchObject({
+      mode: 'ralph',
+      method: 'gsd',
+      codingBackend: 'codex',
+      reviewBackend: 'coderabbit',
+      workspaceReal: 'C:\\repo',
+      workspaceVirtual: '/repo'
+    });
+  });
+
   it('rejects empty and oversized plans before creating a run', async () => {
     await expect(execution.createExecution({ plan: '   ', mode: 'standard' })).rejects.toThrow(/plan/i);
     await expect(
@@ -115,5 +152,36 @@ describe('execution bootstrap framing', () => {
     expect(execution.executionBootstrapText(run.id)).toContain(
       'Only after this milestone is verified complete, you may select the next highest-value improvement and continue.'
     );
+  });
+
+  it('keeps autonomous_swarm inside the accepted objective instead of enabling infinite expansion', async () => {
+    const run = await execution.createExecution({
+      plan: 'Complete every in-scope task and record its verification evidence.',
+      mode: 'autonomous_swarm'
+    });
+
+    const text = execution.executionBootstrapText(run.id);
+    expect(text).toContain('Do not expand into unrelated feature work.');
+    expect(text).not.toContain('select the next highest-value improvement');
+  });
+
+  it('frames GSD + Ralph + multi-model + CodeRabbit as executable Core workflow policy', async () => {
+    const run = await execution.createExecution({
+      plan: 'Implement task A, then task B.',
+      mode: 'ralph',
+      method: 'gsd',
+      codingBackend: 'codex',
+      reviewBackend: 'coderabbit',
+      workspace: { real: 'C:\\repo', virtual: '/repo' }
+    });
+
+    const text = execution.executionBootstrapText(run.id);
+    expect(text).toContain('GSD-style');
+    expect(text).toContain('Discuss → Plan → Execute → Verify → Ship');
+    expect(text).toContain('one highest-priority incomplete task per iteration');
+    expect(text).toContain('session action=execution_delegate');
+    expect(text).toContain('Codex');
+    expect(text).toContain('session action=execution_review');
+    expect(text).toContain('CodeRabbit');
   });
 });

@@ -85,9 +85,13 @@ async function main() {
   say(`tunnel-client ${tag} ${platform}-${arch} staged`);
 
   if (platform === process.platform && arch === process.arch) {
-    await rm(devOutDir, { recursive: true, force: true });
-    await cp(outDir, devOutDir, { recursive: true });
-    say(`resources/tunnel mirrors ${platform}-${arch} for development`);
+    try {
+      await rm(devOutDir, { recursive: true, force: true });
+      await cp(outDir, devOutDir, { recursive: true });
+      say(`resources/tunnel mirrors ${platform}-${arch} for development`);
+    } catch {
+      say(`resources/tunnel in-use; keeping existing files`);
+    }
   }
 }
 

@@ -86,7 +86,10 @@ export type CoreUiOperation =
   | 'swarm-clear-agent'
   | 'control-center-status'
   | 'goal-models'
-  | 'diagnostics-run';
+  | 'diagnostics-run'
+  | 'devices-overview'
+  | 'devices-pairing-create'
+  | 'devices-revoke';
 
 export type CoreCommandName =
   | 'hello'

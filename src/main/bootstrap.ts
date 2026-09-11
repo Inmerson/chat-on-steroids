@@ -18,14 +18,19 @@ async function bootstrap(): Promise<void> {
   // Helper processes must share the exact installed profile with the UI. Set it before any
   // config/secrets/session module is initialized.
   app.setPath('userData', mode.userDataDir);
-  await app.whenReady();
 
   if (mode.kind === 'core-host') {
+    // The Core Host takes its IPC endpoint before Electron readiness. On a busy Windows
+    // desktop `app.whenReady()` can take longer than the watchdog's first probe window;
+    // waiting here used to make the supervisor start several Core Hosts for one profile.
+    // `runCoreHost` publishes a starting IPC status and waits for Electron only before it
+    // initializes the runtime that needs Electron services.
     const { runCoreHost } = await import('./core/host-entry.js');
     await runCoreHost({ userDataDir: mode.userDataDir });
     return;
   }
 
+  await app.whenReady();
   const { runCoreSupervisorEntry } = await import('./core/supervisor-entry.js');
   await runCoreSupervisorEntry({ userDataDir: mode.userDataDir });
 }

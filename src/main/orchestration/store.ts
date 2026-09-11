@@ -1,5 +1,6 @@
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
+import { isDeepStrictEqual } from 'node:util';
 
 export type OrchestrationEventType =
   | 'RUN_CREATED'
@@ -24,7 +25,17 @@ export type OrchestrationEventType =
   | 'TASK_VERIFIED'
   | 'TASK_FAILED'
   | 'TASK_CANCELLED'
-  | 'TASK_SUPERSEDED';
+  | 'TASK_SUPERSEDED'
+  | 'SWARM_RUN_STARTED'
+  | 'DISPATCH_QUEUED'
+  | 'DISPATCH_LEASED'
+  | 'DISPATCH_BROWSER_COMMITTED'
+  | 'DISPATCH_SETTLED'
+  | 'DISPATCH_BACKOFF'
+  | 'DISPATCH_BLOCKED'
+  | 'SWARM_RUN_COMPLETED'
+  | 'SWARM_RUN_PAUSED'
+  | 'SWARM_RUN_STOPPED';
 
 export interface OrchestrationEvent<Payload extends Record<string, unknown> = Record<string, unknown>> {
   seq: number;
@@ -51,6 +62,8 @@ export interface OrchestrationSnapshot<State = unknown> {
 let root = '';
 let writes: Promise<void> = Promise.resolve();
 let nextSeq: number | null = null;
+
+export const MAX_ORCHESTRATION_EVENT_BYTES = 65_536;
 
 export function initOrchestrationStore(userDataDir: string): void {
   root = path.join(userDataDir, 'state', 'orchestration');
@@ -156,11 +169,38 @@ export function appendOrchestrationEvents(
   if (inputs.length === 0) return Promise.resolve([]);
   return enqueue(async () => {
     const base = await currentSequence();
-    const events = inputs.map((input, index) => ({ ...input, seq: base + index + 1 })) as OrchestrationEvent[];
+    const existing = await readEventsFromDisk();
+    const byId = new Map(existing.map((event) => [event.eventId, event]));
+    const pending = new Map<string, OrchestrationEvent>();
+    const events: OrchestrationEvent[] = [];
+    const results: OrchestrationEvent[] = [];
+    let seq = base;
+
+    for (const input of inputs) {
+      const encoded = JSON.stringify({ ...input, seq: 0 });
+      if (Buffer.byteLength(encoded, 'utf8') > MAX_ORCHESTRATION_EVENT_BYTES) {
+        throw new Error(`Orchestration event is too large; durable events are bounded to ${MAX_ORCHESTRATION_EVENT_BYTES} bytes`);
+      }
+      const prior = byId.get(input.eventId) ?? pending.get(input.eventId);
+      if (prior) {
+        const { seq: _priorSeq, ...priorLogical } = prior;
+        if (!isDeepStrictEqual(priorLogical, input)) {
+          throw new Error(`Orchestration event id conflict: ${input.eventId}`);
+        }
+        results.push(prior);
+        continue;
+      }
+      const event = { ...input, seq: ++seq } as OrchestrationEvent;
+      pending.set(event.eventId, event);
+      events.push(event);
+      results.push(event);
+    }
+
+    if (events.length === 0) return results;
     await fs.mkdir(requireRoot(), { recursive: true });
     await fs.appendFile(journalFile(), events.map((event) => `${JSON.stringify(event)}\n`).join(''), 'utf8');
-    nextSeq = events.at(-1)?.seq ?? base;
-    return events;
+    nextSeq = seq;
+    return results;
   });
 }
 

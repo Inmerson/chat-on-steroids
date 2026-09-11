@@ -11,7 +11,10 @@ import {
   resetOrchestrationStoreForTests
 } from '../src/main/orchestration/store.js';
 import { formatTaskContract, MAX_TASK_CONTRACT_CHARS } from '../src/main/orchestration/task-contract.js';
-import { selectWorkerAllocation } from '../src/main/orchestration/worker-allocation.js';
+import {
+  selectWorkerAllocation,
+  selectWorkerAllocationForPrime
+} from '../src/main/orchestration/worker-allocation.js';
 import type { TaskRecord } from '../src/main/orchestration/types.js';
 import type { AgentInfo } from '../src/shared/session.js';
 
@@ -154,5 +157,59 @@ describe('V3 Task Contracts and worker allocation', () => {
       managerAgentId: 'worker-1'
     });
     expect(decision).toEqual({ strategy: 'spawn', workerId: null, conversationId: null });
+  });
+
+  it('autonomous allocation may reuse an owner sleeper even when all six worker chats are already owned', () => {
+    const decision = selectWorkerAllocationForPrime({
+      task: task('T2'),
+      state: stateWith([task('T1', 'VERIFIED', 'worker-2')]),
+      brokerWorkers: [worker('worker-2')],
+      managerAgentId: 'worker-1',
+      ownedWorkerChatsForPrime: 2,
+      totalOwnedWorkerChats: 6,
+      fairNewWorkerGrant: false
+    });
+
+    expect(decision).toMatchObject({ strategy: 'reuse', workerId: 'worker-2', conversationId: 'chat-worker-2' });
+  });
+
+  it('autonomous allocation waits instead of asking the broker for a third worker or a seventh global worker', () => {
+    const common = {
+      task: task('T2'),
+      state: stateWith([]),
+      brokerWorkers: [] as AgentInfo[],
+      managerAgentId: 'worker-1',
+      fairNewWorkerGrant: true
+    };
+
+    expect(selectWorkerAllocationForPrime({ ...common, ownedWorkerChatsForPrime: 2, totalOwnedWorkerChats: 2 })).toEqual({
+      strategy: 'wait',
+      reason: 'per_prime_worker_limit'
+    });
+    expect(selectWorkerAllocationForPrime({ ...common, ownedWorkerChatsForPrime: 1, totalOwnedWorkerChats: 6 })).toEqual({
+      strategy: 'wait',
+      reason: 'global_worker_limit'
+    });
+  });
+
+  it('autonomous fresh-worker allocation requires the scheduler fairness grant', () => {
+    const input = {
+      task: task('T2'),
+      state: stateWith([]),
+      brokerWorkers: [] as AgentInfo[],
+      managerAgentId: 'worker-1',
+      ownedWorkerChatsForPrime: 0,
+      totalOwnedWorkerChats: 0
+    };
+
+    expect(selectWorkerAllocationForPrime({ ...input, fairNewWorkerGrant: false })).toEqual({
+      strategy: 'wait',
+      reason: 'fairness_wait'
+    });
+    expect(selectWorkerAllocationForPrime({ ...input, fairNewWorkerGrant: true })).toEqual({
+      strategy: 'spawn',
+      workerId: null,
+      conversationId: null
+    });
   });
 });

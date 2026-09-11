@@ -109,22 +109,40 @@ let showAllSteps = false;
 
 // ------------------------------------------------------------------- tabs
 
+let currentTab = '';
 function showTab(name: string): void {
+  if (currentTab === name) return;
+  currentTab = name;
   for (const tab of document.querySelectorAll<HTMLElement>('nav button')) {
     tab.classList.toggle('is-sel', tab.dataset.tab === name);
   }
   for (const panel of document.querySelectorAll<HTMLElement>('.panel')) {
     panel.classList.toggle('is-active', panel.dataset.panel === name);
   }
+  const activePanel = document.querySelector<HTMLElement>(`.panel[data-panel="${name}"]`);
+  if (activePanel && (activePanel.classList.contains('section-panel') || name === 'setup')) {
+    activePanel.scrollTop = 0;
+  }
   // Live panels only poll while they are on screen. Their modules own the cadence and
   // stale-result guards; the tab switcher owns visibility only.
   chatVisible(name === 'chat');
   controlCenterVisible(name === 'control');
-  // A feed that was appended to while its panel was hidden could not be scrolled then —
-  // a hidden element has no scroll height. Pin it now that it has one, so a panel always
-  // opens on the newest line rather than on whatever was oldest in the buffer.
-  for (const id of FEEDS) stickToNewest(id);
+  // Only scroll the active feed to bottom if that specific panel is open
+  if (name === 'home') stickToNewest('homeFeed');
+  else if (name === 'activity') stickToNewest('fullFeed');
 }
+
+let windowResizeTimer: number | null = null;
+window.addEventListener('resize', () => {
+  if (!document.body.classList.contains('is-resizing')) {
+    document.body.classList.add('is-resizing');
+  }
+  if (windowResizeTimer !== null) window.clearTimeout(windowResizeTimer);
+  windowResizeTimer = window.setTimeout(() => {
+    document.body.classList.remove('is-resizing');
+    windowResizeTimer = null;
+  }, 100);
+});
 
 $('tabs').addEventListener('click', (event) => {
   const button = (event.target as HTMLElement).closest<HTMLButtonElement>('[data-tab]');
@@ -381,6 +399,7 @@ function save(over: { readOnly?: boolean; theme?: 'light' | 'dark' } = {}): Prom
       privacyScreenshots: $<HTMLInputElement>('privacyScreenshots').checked,
       theme: over.theme ?? previous.ui.theme
     },
+    device: previous.device,
     ...chatPatch
   };
   requestedSettings = patch;
@@ -413,6 +432,7 @@ async function saveSnapshot(patch: SettingsPatch, previous: AppState['config']):
     sessions: previous.sessions,
     compaction: previous.compaction,
     multiAgent: previous.multiAgent,
+    device: previous.device,
     goal: previous.goal
   };
   const next = await run(api.saveSettings(patch, base));
@@ -634,6 +654,24 @@ function rootRow(root: AppState['config']['roots'][number]): HTMLElement {
   return row;
 }
 
+function sidebarProjectRow(root: AppState['config']['roots'][number]): HTMLElement {
+  const isDrive = isEntireDrivePath(root.path);
+  const row = el('div', 'rail-item rail-project-item');
+  row.title = `${root.name} · ${root.path}`;
+
+  const ico = icon(isDrive ? 'i-monitor' : 'i-folder');
+  const name = el('span', 'rail-item-text', root.name);
+  const dot = el('span', 'rail-item-dot');
+  row.append(ico, name, dot);
+
+  row.addEventListener('click', () => {
+    showTab('home');
+    $('foldersCard')?.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+  });
+
+  return row;
+}
+
 function paintRoots(roots: AppState['config']['roots']): void {
   const active = document.querySelector<HTMLInputElement>('.root-rename');
   if (active && rootRename) captureRootRenameInput(active, rootRename);
@@ -648,6 +686,15 @@ function paintRoots(roots: AppState['config']['roots']): void {
   repaintingRoots = true;
   try {
     $('rootList').replaceChildren(...roots.map(rootRow));
+    const sidebarProjects = document.getElementById('sidebarProjectsList');
+    if (sidebarProjects) {
+      if (roots.length === 0) {
+        const empty = el('div', 'rail-empty-hint', 'No projects added');
+        sidebarProjects.replaceChildren(empty);
+      } else {
+        sidebarProjects.replaceChildren(...roots.map(sidebarProjectRow));
+      }
+    }
   } finally {
     repaintingRoots = false;
   }
@@ -1364,11 +1411,25 @@ async function toggleAllComputer(): Promise<void> {
   }
 }
 
+let connectionInFlight = false;
+function setConnectionButtonsDisabled(disabled: boolean): void {
+  for (const id of ['connectBtn', 'railConnect', 'wizConnect', 'coordinatorConnect']) {
+    const btn = document.getElementById(id) as HTMLButtonElement | null;
+    if (btn) btn.disabled = disabled;
+  }
+}
+
 async function toggleConnection(): Promise<void> {
-  if (!state) return;
-  // Mirrors the button label exactly, so a click always does what it says.
-  const next = await run(isRunning(state.status.state) ? api.disconnect() : api.connect());
-  if (next) apply(next);
+  if (!state || connectionInFlight) return;
+  connectionInFlight = true;
+  setConnectionButtonsDisabled(true);
+  try {
+    const next = await run(isRunning(state.status.state) ? api.disconnect() : api.connect());
+    if (next) apply(next);
+  } finally {
+    connectionInFlight = false;
+    setConnectionButtonsDisabled(false);
+  }
 }
 
 /** Runs the main-process self-test and lists a line per link in the chain. */
@@ -1433,6 +1494,15 @@ $('readOnlyBtn').addEventListener('click', () => {
 });
 
 $('addFolder').addEventListener('click', () => void addFolder());
+document.getElementById('sidebarNewProjectBtn')?.addEventListener('click', () => void addFolder());
+document.getElementById('railProjectsHead')?.addEventListener('click', (e) => {
+  if ((e.target as HTMLElement).closest('#sidebarNewProjectBtn')) return;
+  document.getElementById('railProjectsSection')?.classList.toggle('is-collapsed');
+});
+document.getElementById('railChatsHead')?.addEventListener('click', (e) => {
+  if ((e.target as HTMLElement).closest('#sidebarNewChatBtn')) return;
+  document.getElementById('railChatsSection')?.classList.toggle('is-collapsed');
+});
 $('wizAddFolder').addEventListener('click', () => void addFolder());
 $('wizManageFolders').addEventListener('click', () => {
   showTab('home');
@@ -1458,6 +1528,9 @@ $('updateInstall').addEventListener('click', installUpdate);
 $('installUpdate').addEventListener('click', installUpdate);
 $('connectBtn').addEventListener('click', () => void toggleConnection());
 $('wizConnect').addEventListener('click', () => void toggleConnection());
+$('railConnect').addEventListener('click', () => void toggleConnection());
+$('coordinatorConnect').addEventListener('click', () => void toggleConnection());
+$('railRunChecks').addEventListener('click', () => $<HTMLButtonElement>('runChecks').click());
 
 $('pickBinary').addEventListener('click', async () => {
   const next = await run(api.pickBinary());

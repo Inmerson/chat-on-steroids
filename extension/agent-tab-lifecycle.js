@@ -4,7 +4,7 @@
   const LEASE_KEY = 'agentTabLeases';
   const QUEUE_KEY = 'agentTabLeaseQueue';
   const TELEMETRY_KEY = 'agentTabLeaseTelemetry';
-  const MAX_AGENT_TABS = 5;
+  const MAX_AGENT_TABS = 6;
   const MAX_QUEUE = 400;
   const MAX_CLOSE_ATTEMPTS = 3;
   const MAX_DURABLE_COMMANDS = 400;
