@@ -267,7 +267,7 @@ jobs:
           XDG_CACHE_HOME="$deb_smoke_root/cache" \
           XDG_DATA_HOME="$deb_smoke_root/data" \
           XDG_STATE_HOME="$deb_smoke_root/state" \
-          CLF_DEBUG=1 timeout --signal=TERM --kill-after=5s 12s xvfb-run -a /usr/bin/chat-on-steroids >deb-gui.log 2>&1
+          CLF_DEBUG=1 timeout --signal=TERM --kill-after=5s 30s xvfb-run -a /usr/bin/chat-on-steroids >deb-gui.log 2>&1
           status=$?
           set -e
           cat deb-gui.log
@@ -325,7 +325,7 @@ jobs:
             XDG_DATA_HOME="$smoke_root/data" \
             XDG_STATE_HOME="$smoke_root/state" \
             PATH="$launch_path" \
-            CLF_DEBUG=1 timeout --signal=TERM --kill-after=5s 12s xvfb-run -a "$appimage" >"$log" 2>&1
+            CLF_DEBUG=1 timeout --signal=TERM --kill-after=5s 30s xvfb-run -a "$appimage" >"$log" 2>&1
             status=$?
             set -e
             cat "$log"
