@@ -3583,6 +3583,143 @@ describe('exec session attribution and authenticated continuation', () => {
     }
   });
 
+  it('ACKs a successful background publication before same-session exec admission checks the unread bound', async () => {
+    const conversationId = 'conv-background-admission-ack-boundary';
+    const localSessionId = 'session-background-admission-ack-boundary';
+    const sessionIds: number[] = [];
+
+    try {
+      for (let index = 0; index < MAX_UNREAD_EXEC_RESULTS_PER_CONVERSATION; index++) {
+        const requestId = `wfr_background_admission_ack_boundary_${index}`;
+        expect(prove(requestId, conversationId, localSessionId)).toBe('stored');
+        const started = await asChat(requestId, 'exec_command', {
+          cmd: IS_WINDOWS
+            ? `Start-Sleep -Milliseconds 2000; Write-Output 'boundary-owed-${index}'; exit ${index + 1}`
+            : `sleep 2; printf '%s\\n' boundary-owed-${index}; exit ${index + 1}`,
+          workdir: '/workspace',
+          yield_time_ms: 100
+        });
+        const sessionId = Number(textOf(started).match(/Process running with session ID (\d+)/)?.[1]);
+        expect(Number.isInteger(sessionId), textOf(started)).toBe(true);
+        sessionIds.push(sessionId);
+      }
+
+      await vi.waitFor(
+        () => expect(backgroundExecObligations(localSessionId).exitedUnread).toHaveLength(
+          MAX_UNREAD_EXEC_RESULTS_PER_CONVERSATION
+        ),
+        { timeout: 8_000, interval: 25 }
+      );
+
+      const publishRequest = 'wfr_background_admission_ack_boundary_publish';
+      expect(prove(publishRequest, conversationId, localSessionId)).toBe('stored');
+      const published = await asChat(publishRequest, 'read', { paths: ['/workspace/src/app.ts'] });
+      expect(failed(published), textOf(published)).toBe(false);
+      expect(textOf(published)).toContain('--- Background command results ---');
+      const publishedId = Number(textOf(published).match(/Background session (\d+) completed/)?.[1]);
+      expect(sessionIds).toContain(publishedId);
+      // Offering is not receipt: the full unread set remains until a later call begins.
+      expect(backgroundExecObligations(localSessionId).exitedUnread).toHaveLength(
+        MAX_UNREAD_EXEC_RESULTS_PER_CONVERSATION
+      );
+
+      const admitRequest = 'wfr_background_admission_ack_boundary_admit';
+      expect(prove(admitRequest, conversationId, localSessionId)).toBe('stored');
+      const admitted = await asChat(admitRequest, 'exec_command', {
+        cmd: IS_WINDOWS ? "Write-Output 'admitted-at-boundary'" : "printf '%s\\n' admitted-at-boundary",
+        workdir: '/workspace',
+        yield_time_ms: 5_000
+      });
+      expect(failed(admitted), textOf(admitted)).toBe(false);
+      expect(textOf(admitted)).toContain('admitted-at-boundary');
+    } finally {
+      await unifiedExecManager.terminateAllProcesses();
+      resetExecOwnershipForTests();
+    }
+  });
+
+  it('explicit write_stdin ACKs only its target when a sibling has an outstanding publication', async () => {
+    const conversationId = 'conv-background-explicit-poll-sibling';
+    const localSessionId = 'session-background-explicit-poll-sibling';
+    const sessionIds: number[] = [];
+    const barrier = path.join(approved, 'background-explicit-poll-offer-barrier.txt');
+
+    try {
+      for (let index = 0; index < 2; index++) {
+        const requestId = `wfr_background_explicit_poll_sibling_start_${index}`;
+        expect(prove(requestId, conversationId, localSessionId)).toBe('stored');
+        const started = await asChat(requestId, 'exec_command', {
+          cmd: IS_WINDOWS
+            ? `Start-Sleep -Milliseconds 1200; Write-Output 'sibling-owed-${index}'; exit ${index + 11}`
+            : `sleep 1.2; printf '%s\\n' sibling-owed-${index}; exit ${index + 11}`,
+          workdir: '/workspace',
+          yield_time_ms: 100
+        });
+        const sessionId = Number(textOf(started).match(/Process running with session ID (\d+)/)?.[1]);
+        expect(Number.isInteger(sessionId), textOf(started)).toBe(true);
+        sessionIds.push(sessionId);
+      }
+
+      await vi.waitFor(
+        () => expect(backgroundExecObligations(localSessionId).exitedUnread).toHaveLength(2),
+        { timeout: 6_000, interval: 25 }
+      );
+
+      const slowOfferRequest = 'wfr_background_explicit_poll_sibling_slow_offer';
+      const fastOfferRequest = 'wfr_background_explicit_poll_sibling_fast_offer';
+      expect(prove(slowOfferRequest, conversationId, localSessionId)).toBe('stored');
+      expect(prove(fastOfferRequest, conversationId, localSessionId)).toBe('stored');
+      const slowOffer = asChat(slowOfferRequest, 'exec_command', {
+        cmd: IS_WINDOWS
+          ? "Set-Content -Path 'background-explicit-poll-offer-barrier.txt' -Value ready; Start-Sleep -Milliseconds 1200; Write-Output 'slow-offer-call'"
+          : "printf ready > background-explicit-poll-offer-barrier.txt; sleep 1.2; printf '%s\\n' slow-offer-call",
+        workdir: '/workspace',
+        yield_time_ms: 5_000
+      });
+      await vi.waitFor(() => expect(fs.stat(barrier)).resolves.toBeTruthy(), { timeout: 5_000, interval: 20 });
+      const fastOffer = await asChat(fastOfferRequest, 'exec_command', {
+        cmd: IS_WINDOWS ? "Write-Output 'fast-offer-call'" : "printf '%s\\n' fast-offer-call",
+        workdir: '/workspace',
+        yield_time_ms: 5_000
+      });
+      const slowOffered = await slowOffer;
+      expect(failed(fastOffer), textOf(fastOffer)).toBe(false);
+      expect(failed(slowOffered), textOf(slowOffered)).toBe(false);
+
+      const fastOfferedId = Number(textOf(fastOffer).match(/Background session (\d+) completed/)?.[1]);
+      const slowOfferedId = Number(textOf(slowOffered).match(/Background session (\d+) completed/)?.[1]);
+      expect(sessionIds).toContain(fastOfferedId);
+      expect(sessionIds).toContain(slowOfferedId);
+      expect(slowOfferedId).not.toBe(fastOfferedId);
+      expect(backgroundExecObligations(localSessionId).exitedUnread.map((row) => row.processId).sort((a, b) => a - b)).toEqual(
+        [...sessionIds].sort((a, b) => a - b)
+      );
+
+      const pollRequest = 'wfr_background_explicit_poll_sibling_target';
+      expect(prove(pollRequest, conversationId, localSessionId)).toBe('stored');
+      const target = await asChat(pollRequest, 'write_stdin', { session_id: fastOfferedId, chars: '' });
+      expect(failed(target), textOf(target)).toBe(false);
+      expect(textOf(target)).not.toContain(`sibling-owed-${sessionIds.indexOf(fastOfferedId)}`);
+
+      // The direct poll is exact-process custody. Its sibling's separately published result must
+      // remain retained until that sibling itself is acknowledged or a later generic owner call.
+      expect(backgroundExecObligations(localSessionId).exitedUnread).toEqual([
+        { processId: slowOfferedId, exitCode: sessionIds.indexOf(slowOfferedId) + 11 }
+      ]);
+
+      const siblingRequest = 'wfr_background_explicit_poll_sibling_verify';
+      expect(prove(siblingRequest, conversationId, localSessionId)).toBe('stored');
+      const sibling = await asChat(siblingRequest, 'write_stdin', { session_id: slowOfferedId, chars: '' });
+      expect(failed(sibling), textOf(sibling)).toBe(false);
+      expect(textOf(sibling)).not.toContain(`sibling-owed-${sessionIds.indexOf(slowOfferedId)}`);
+      expect(textOf(sibling)).toContain(`Process exited with code ${sessionIds.indexOf(slowOfferedId) + 11}`);
+    } finally {
+      await fs.rm(barrier, { force: true });
+      await unifiedExecManager.terminateAllProcesses();
+      resetExecOwnershipForTests();
+    }
+  });
+
   it('publishes completed output only to its durable session and ACKs it only on a later owner call', async () => {
     const ownerSession = 'session-background-owner';
     const otherSession = 'session-background-other';

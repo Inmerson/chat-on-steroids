@@ -556,6 +556,14 @@ async function dispatchTracked(
   if (!context.agent) {
     context.agent = isFinish ? agentForFinishCaller(context.caller) : agentForCaller(context.caller);
   }
+  // Starting a later outer call proves receipt of any successful completed-output publication
+  // that predates this call. Retire that custody before the handler runs so exec_command's
+  // unread-result admission sees the post-receipt count. Direct write_stdin is deliberately
+  // excluded: its handler ACKs only the explicitly polled process before draining it, and must
+  // not use a generic session ACK that could retire a separately published sibling.
+  if (!nested && !blockedChat && name !== 'write_stdin') {
+    await acknowledgeBackgroundExecOutput(context.caller.sessionId, startedAt);
+  }
   // Authentication happens at the secret MCP endpoint. Conversation identity is retained for
   // attribution, workspaces and agent routing, but it is not an authorization gate for Core
   // capabilities: every authenticated chat receives the permissions the user enabled in-app.
@@ -572,13 +580,6 @@ async function dispatchTracked(
       const bound = bindTransportConversation(transportKey, resolved);
       setCallerConversation(context, transportKey ? bound : resolved);
     }
-  }
-  if (!nested && !blockedChat) {
-    const explicitPoll =
-      name === 'write_stdin' && args && typeof args === 'object'
-        ? (args as { session_id?: number }).session_id
-        : undefined;
-    await acknowledgeBackgroundExecOutput(context.caller.sessionId, startedAt, explicitPoll);
   }
   const inputCorrelation = nested ? null : requestCorrelation(context.caller.requestId);
   const exactInputCaller = inputCorrelation && context.caller.conversationId === inputCorrelation.conversationId
