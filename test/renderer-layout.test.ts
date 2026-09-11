@@ -54,6 +54,27 @@ describe('setup authority copy', () => {
   });
 });
 
+describe('upstream-style application shell', () => {
+  it('starts with a conversation sidebar and keeps settings navigation separate', () => {
+    const sidebar = document.getElementById('sidebar');
+    expect(sidebar).not.toBeNull();
+    expect(sidebar!.querySelector('#newChat')).not.toBeNull();
+    expect(sidebar!.querySelector('#sessionList')).not.toBeNull();
+    expect(sidebar!.querySelector('#sidebarSettings')).not.toBeNull();
+    expect(sidebar!.querySelector('#settingsNav')).not.toBeNull();
+    expect(sidebar!.querySelector('#backToChat')).not.toBeNull();
+    expect(sidebar!.querySelector('#sidebarToggle')).not.toBeNull();
+    expect(sidebar!.querySelector('#sidebarResize')).not.toBeNull();
+    expect(document.querySelector('[data-panel="chat"]')).not.toBeNull();
+  });
+
+  it('retains every current 2.2.0 destination in the document', () => {
+    for (const panel of ['home', 'control', 'chat', 'plugins', 'setup', 'activity']) {
+      expect(document.querySelector(`[data-panel="${panel}"]`), panel).not.toBeNull();
+    }
+  });
+});
+
 describe('the session card header', () => {
   /**
    * A gear, and nothing that starts work. Compact & resume is pressed in the ChatGPT tab,
@@ -166,10 +187,11 @@ describe('the chat panel cards', () => {
     return match![1]!.trim().replace(/minmax\([^)]*\)/g, 'minmax').split(/\s+/);
   }
 
-  it('gives the sessions card one row per child', () => {
-    const card = document.getElementById('sessionList')!.closest('.card')!;
-    expect(card.classList.contains('is-session')).toBe(false);
-    expect(tracks("[data-panel='chat'] .card")).toHaveLength(card.children.length);
+  it('keeps the session catalogue in the conversation sidebar rather than duplicating it in the main chat panel', () => {
+    const list = document.getElementById('sessionList')!;
+    expect(list.closest('.sidebar-sessions')).not.toBeNull();
+    expect(list.closest('[data-panel="chat"]')).toBeNull();
+    expect(document.querySelectorAll('#sessionList')).toHaveLength(1);
   });
 
   it('gives the session card one row per child, including its navigation row', () => {
@@ -385,9 +407,11 @@ describe('the window as a whole', () => {
     expect(app).toContain("$<HTMLButtonElement>('runChecks').click()");
   });
 
-  it('adds Plugins as a normal workspace destination without removing existing destinations', () => {
+  it('keeps every settings destination while Chat remains the default shell rather than a settings tab', () => {
     const names = [...document.querySelectorAll<HTMLButtonElement>('nav button[data-tab]')].map((button) => button.dataset.tab);
-    for (const required of ['home', 'control', 'chat', 'plugins', 'setup', 'activity']) expect(names).toContain(required);
+    for (const required of ['home', 'control', 'plugins', 'setup', 'activity']) expect(names).toContain(required);
+    expect(names).not.toContain('chat');
+    expect(document.querySelectorAll('.panel[data-panel="chat"]')).toHaveLength(1);
     expect(document.querySelectorAll('nav button[data-tab="plugins"]')).toHaveLength(1);
     expect(document.querySelectorAll('.panel[data-panel="plugins"]')).toHaveLength(1);
     expect(document.getElementById('pluginsInstalled')).not.toBeNull();
@@ -395,11 +419,11 @@ describe('the window as a whole', () => {
     expect(document.getElementById('pluginsSetupLink')).not.toBeNull();
   });
 
-  it('exposes Control as a normal fifth destination with one bounded canvas panel', () => {
+  it('keeps the Control Center behind the Agents & automation settings destination with one bounded canvas panel', () => {
     const controlTab = document.querySelector<HTMLButtonElement>('nav button[data-tab="control"]');
     const controlPanel = document.querySelector<HTMLElement>('.panel[data-panel="control"]');
     expect(controlTab).not.toBeNull();
-    expect(controlTab?.textContent).toContain('Control');
+    expect(controlTab?.textContent).toContain('Agents & automation');
     expect(controlPanel).not.toBeNull();
     expect(document.querySelectorAll('.panel[data-panel="control"]')).toHaveLength(1);
     expect(document.getElementById('controlSummary')).not.toBeNull();

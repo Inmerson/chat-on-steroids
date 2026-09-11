@@ -520,26 +520,6 @@
 
         <!-- ============================================================ Chat -->
         <section class="panel" data-panel="chat">
-          <!-- --------------------------------------------------- sessions -->
-          <section class="card">
-            <h2>
-              Sessions
-              <span class="acts">
-                <button class="btn" id="chatRefresh" type="button">
-                  <svg class="ico" viewBox="0 0 24 24"><use href="#i-pulse" /></svg>Refresh
-                </button>
-              </span>
-            </h2>
-            <div class="scroll">
-              <div id="sessionList"></div>
-              <p class="empty" id="sessionsEmpty" hidden>
-                Nothing recorded yet. Turn on recording in Settings, pair the Chrome extension,
-                and this fills up as you work in ChatGPT.
-              </p>
-            </div>
-            <p class="foot" id="sessionsFoot"></p>
-          </section>
-
           <!-- ------------------------------------------------ session body -->
           <!--
             `is-session` is load-bearing, not decoration. This card has four children
@@ -847,50 +827,83 @@
         </section>
       </main>
 
-      <!-- --------------------------------------------------------------- nav -->
-      <nav id="tabs" aria-label="Workspace navigation">
-        <div class="rail-brand" aria-label="Chat On Steroids">
+      <!-- ----------------------------------------------------------- sidebar -->
+      <aside class="sidebar" id="sidebar" aria-label="Chat On Steroids navigation">
+        <div class="sidebar-brand" aria-label="Chat On Steroids">
           <span class="mark"><svg class="ico" viewBox="0 0 24 24"><use href="#i-mark" /></svg></span>
-          <span><strong>Chat On Steroids</strong><small>LOCAL AGENT WORKSPACE</small></span>
+          <span><strong>Chat On Steroids</strong></span>
           <button class="sidebar-toggle" id="sidebarToggle" type="button" aria-expanded="true" aria-label="Collapse workspace sidebar" title="Collapse sidebar (Ctrl+B)">?</button>
         </div>
         <div id="sidebarResize" class="sidebar-resize" role="separator" aria-label="Resize workspace sidebar" aria-orientation="vertical" tabindex="0"></div>
-        <p class="rail-label">Workspace</p>
-        <button class="is-sel" data-tab="home" type="button">
-          <svg class="ico" viewBox="0 0 24 24"><use href="#i-home" /></svg><span>Overview</span>
+
+        <button class="btn" id="backToChat" type="button" hidden>← Back to chat</button>
+        <button class="btn new-chat" id="newChat" type="button">
+          <svg class="ico" viewBox="0 0 24 24"><use href="#i-plus" /></svg>New chat
         </button>
-        <button data-tab="control" type="button">
-          <svg class="ico" viewBox="0 0 24 24"><use href="#i-control" /></svg><span>Control canvas</span>
-        </button>
-        <button data-tab="chat" type="button">
-          <svg class="ico" viewBox="0 0 24 24"><use href="#i-chat" /></svg><span>Conversations</span>
-        </button>
-        <button data-tab="plugins" type="button">
-          <svg class="ico" viewBox="0 0 24 24"><use href="#i-plus" /></svg><span>Plugins</span>
-        </button>
-        <p class="rail-label rail-label-secondary">System</p>
-        <button data-tab="setup" type="button">
-          <svg class="ico" viewBox="0 0 24 24"><use href="#i-steps" /></svg><span>Connection</span>
-          <span class="badge" id="setupBadge" hidden></span>
-        </button>
-        <button data-tab="activity" type="button">
-          <svg class="ico" viewBox="0 0 24 24"><use href="#i-pulse" /></svg><span>Activity log</span>
-        </button>
-        <section class="rail-pulse" id="railPulse" aria-live="polite">
-          <span class="rail-status-dot" id="railStatusDot"></span>
-          <span class="rail-pulse-copy"><small>Connection</small><strong id="railConnectionState">Checking status</strong></span>
-          <span class="rail-connection-detail" id="railConnectionDetail">Local-first control</span>
+
+        <section class="sidebar-sessions" id="sidebarSessions">
+          <h2>
+            Conversations
+            <span class="acts">
+              <button class="btn" id="chatRefresh" type="button">
+                <svg class="ico" viewBox="0 0 24 24"><use href="#i-pulse" /></svg>Refresh
+              </button>
+            </span>
+          </h2>
+          <div class="scroll">
+            <div id="sessionList"></div>
+            <p class="empty" id="sessionsEmpty" hidden>
+              Nothing recorded yet. Turn on recording in Settings, pair the Chrome extension,
+              and this fills up as you work in ChatGPT.
+            </p>
+          </div>
+          <p class="foot" id="sessionsFoot"></p>
         </section>
-        <div class="rail-actions" aria-label="Workspace actions">
-          <button class="rail-action rail-connect" id="railConnect" type="button">
-            <svg class="ico" viewBox="0 0 24 24"><use href="#i-power" /></svg><span id="railConnectLabel">Connect</span>
-          </button>
-          <button class="rail-action" id="railRunChecks" type="button">
-            <svg class="ico" viewBox="0 0 24 24"><use href="#i-pulse" /></svg><span>System check</span>
+
+        <div id="settingsNav" hidden>
+          <!-- Keep #tabs as the existing panel-router authority while the shell gains a separate mode. -->
+          <nav id="tabs" aria-label="Settings navigation">
+            <p class="rail-label">Workspace</p>
+            <button class="is-sel" data-tab="home" type="button">
+              <svg class="ico" viewBox="0 0 24 24"><use href="#i-home" /></svg><span>Workspace</span>
+            </button>
+            <button data-tab="control" type="button">
+              <svg class="ico" viewBox="0 0 24 24"><use href="#i-control" /></svg><span>Agents &amp; automation</span>
+            </button>
+            <button data-tab="plugins" type="button">
+              <svg class="ico" viewBox="0 0 24 24"><use href="#i-plus" /></svg><span>Plugins</span>
+            </button>
+            <p class="rail-label rail-label-secondary">System</p>
+            <button data-tab="setup" type="button">
+              <svg class="ico" viewBox="0 0 24 24"><use href="#i-steps" /></svg><span>Setup</span>
+              <span class="badge" id="setupBadge" hidden></span>
+            </button>
+            <button data-tab="activity" type="button">
+              <svg class="ico" viewBox="0 0 24 24"><use href="#i-pulse" /></svg><span>Activity</span>
+            </button>
+            <section class="rail-pulse" id="railPulse" aria-live="polite">
+              <span class="rail-status-dot" id="railStatusDot"></span>
+              <span class="rail-pulse-copy"><small>Connection</small><strong id="railConnectionState">Checking status</strong></span>
+              <span class="rail-connection-detail" id="railConnectionDetail">Local-first control</span>
+            </section>
+            <div class="rail-actions" aria-label="Workspace actions">
+              <button class="rail-action rail-connect" id="railConnect" type="button">
+                <svg class="ico" viewBox="0 0 24 24"><use href="#i-power" /></svg><span id="railConnectLabel">Connect</span>
+              </button>
+              <button class="rail-action" id="railRunChecks" type="button">
+                <svg class="ico" viewBox="0 0 24 24"><use href="#i-pulse" /></svg><span>System check</span>
+              </button>
+            </div>
+            <div class="rail-footer"><span>Permissions stay local</span></div>
+          </nav>
+        </div>
+
+        <div class="sidebar-bottom">
+          <button class="btn" id="sidebarSettings" type="button">
+            <svg class="ico" viewBox="0 0 24 24"><use href="#i-gear" /></svg>Settings
           </button>
         </div>
-        <div class="rail-footer"><span>Permissions stay local</span></div>
-      </nav>
+      </aside>
     </div>
 
     <script type="module" src="./main.ts"></script>
