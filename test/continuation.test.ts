@@ -25,6 +25,14 @@ vi.mock('electron', () => ({
 }));
 
 const { defaultConfig, initConfigPath, saveConfig } = await import('../src/main/config.js');
+const { unifiedExecManager } = await import('../src/main/codex/manager.js');
+const {
+  backgroundExecObligations,
+  execOwner,
+  noteExecOwner,
+  resetExecOwnershipForTests
+} = await import('../src/main/codex/ownership.js');
+const { applyUnifiedExecEnv } = await import('../src/main/codex/unified-exec.js');
 const {
   TRANSFER_TTL_MS,
   beginPrimeTransfer,
@@ -130,6 +138,26 @@ async function readyContinuation(): Promise<{ sessionId: string; token: string }
   const opened = await openContinuationNow(summary.id, CHAT_A);
   await attachSummary(opened.token, SAMPLE_BRIEF);
   return { sessionId: summary.id, token: opened.token };
+}
+
+async function retainedExec(conversationId: string, sessionId: string): Promise<number> {
+  const processId = unifiedExecManager.allocateProcessId();
+  const initial = await unifiedExecManager.execCommand({
+    command: [process.execPath, '-e', 'setTimeout(() => {}, 10_000)'],
+    shellType: process.platform === 'win32' ? 'powershell' : 'bash',
+    hookCommand: 'continuation ownership fixture',
+    processId,
+    yieldTimeMs: 250,
+    maxOutputTokens: undefined,
+    truncationPolicy: { kind: 'tokens', tokens: 1_000 },
+    cwd: process.cwd(),
+    displayCwd: process.cwd(),
+    env: applyUnifiedExecEnv(process.env),
+    tty: false
+  });
+  expect(initial.processId).toBe(processId);
+  noteExecOwner(processId, conversationId, sessionId);
+  return processId;
 }
 
 describe('capturing the brief', () => {
@@ -318,6 +346,50 @@ describe('claiming', () => {
 });
 
 describe('committing', () => {
+  it('moves exec conversation attribution A→B while keeping the exact session principal stable', async () => {
+    resetExecOwnershipForTests();
+    const { sessionId, token } = await readyContinuation();
+    const processId = await retainedExec(CHAT_A, sessionId);
+    try {
+      expect(execOwner(processId)).toBe(CHAT_A);
+      expect(backgroundExecObligations(sessionId).running).toContain(processId);
+
+      await claimContinuationNow(token, 'tab-1');
+      expect(await commitContinuation(token, CHAT_B)).toBe(true);
+
+      expect(execOwner(processId)).toBe(CHAT_B);
+      expect(backgroundExecObligations(sessionId).running).toContain(processId);
+      expect(backgroundExecObligations(CHAT_B).running).not.toContain(processId);
+    } finally {
+      await unifiedExecManager.terminateAllProcesses();
+      resetExecOwnershipForTests();
+    }
+  });
+
+  it('repairs exec conversation attribution after a durable continuation commit without moving the session principal', async () => {
+    resetExecOwnershipForTests();
+    const { sessionId, token } = await readyContinuation();
+    const processId = await retainedExec(CHAT_A, sessionId);
+    try {
+      await claimContinuationNow(token, 'tab-1');
+      const snapshot = snapshotContinuations();
+      const saved = snapshot.entries.find((entry) => entry.token === token)!;
+      saved.state = 'committing';
+      saved.to = CHAT_B;
+      expect(await store.rebindSession(sessionId, CHAT_A, CHAT_B)).toBe(true);
+
+      resetContinuationsForTests();
+      await restoreContinuations(snapshot);
+
+      expect(execOwner(processId)).toBe(CHAT_B);
+      expect(backgroundExecObligations(sessionId).running).toContain(processId);
+      expect(backgroundExecObligations(CHAT_B).running).not.toContain(processId);
+    } finally {
+      await unifiedExecManager.terminateAllProcesses();
+      resetExecOwnershipForTests();
+    }
+  });
+
   it('moves the session, its history, workspace and saved Goal objective together', async () => {
     const { sessionId, token } = await readyContinuation();
     const before = await sessionForConversation(CHAT_A);

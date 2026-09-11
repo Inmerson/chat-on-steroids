@@ -65,6 +65,7 @@ import {
 import { clearChatWorkspace, moveChatWorkspace, workspaceForChat } from '../workspace.js';
 import { clearGoalObjective, goalObjectiveFor, moveGoalObjective } from '../goal.js';
 import { writeDurableNow, writeDurableSoon } from '../durable.js';
+import { moveExecConversationOwners } from '../codex/ownership.js';
 import { prepareHandoff, resumeBootstrapMatches } from './handoff.js';
 import { ensureHandoffRecorded, recordHandoff, rebindConversation } from './recorder.js';
 import { endResumeClaim, noteResumeClaim, resetResumeGate } from './resume-gate.js';
@@ -673,6 +674,7 @@ function publishCommittedProjection(
   swarm: 'absent' | 'frozen' | 'recovery'
 ): void {
   rebindConversation(entry.sessionId, entry.from, toConversationId);
+  moveExecConversationOwners(entry.from, toConversationId);
   moveChatWorkspace(entry.from, toConversationId);
   moveGoalObjective(entry.from, toConversationId);
   if (swarm === 'frozen') {
@@ -1063,11 +1065,7 @@ export async function restoreContinuations(snapshot: ContinuationSnapshot | null
             );
           }
         }
-        rebindConversation(entry.sessionId, entry.from, entry.to);
-        moveChatWorkspace(entry.from, entry.to);
-        moveGoalObjective(entry.from, entry.to);
-        const repaired = recoveryHooks.repairPrimeTransfer?.(entry.from, entry.to) ?? false;
-        if (!repaired) commitPrimeTransfer(entry.from, entry.to);
+        publishCommittedProjection(entry, entry.to, 'recovery');
         entry.state = 'committed';
         entry.error = null;
         logInfo(`continuation ${entry.token.slice(0, 8)} recovered after durable commit`);
