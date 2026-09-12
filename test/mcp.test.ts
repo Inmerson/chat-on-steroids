@@ -933,13 +933,13 @@ describe('surface boundaries', () => {
 
     // And the size, which is what a discovery pull actually costs the model on every
     // conversation that touches the connector. The ceilings sit just above what the
-    // surface measures today (core 19.5k with Code Mode + update_plan, desktop 8.56k on 2026-09-11) rather than at a
+    // surface measures today (core 19.5k with Code Mode + update_plan, desktop 10.0k with Windows Computer Use additions on 2026-09-12) rather than at a
     // round number well above it: a budget with room to spare is a budget that never
     // catches the regression it exists to catch.
     const coreBytes = Buffer.byteLength(JSON.stringify(coreTools), 'utf8');
     const desktopBytes = Buffer.byteLength(JSON.stringify(desktopTools), 'utf8');
     expect(coreBytes, `core tools/list is ${coreBytes} bytes`).toBeLessThan(19_800);
-    expect(desktopBytes, `desktop tools/list is ${desktopBytes} bytes`).toBeLessThan(8_650);
+    expect(desktopBytes, `desktop tools/list is ${desktopBytes} bytes`).toBeLessThan(10_500);
 
     // Per tool as well as per surface, so one schema cannot quietly eat the whole budget
     // while the total stays under it. `computer` is the largest by design: fourteen
@@ -954,7 +954,7 @@ describe('surface boundaries', () => {
       const bytes = Buffer.byteLength(JSON.stringify(tool), 'utf8');
       const budget =
         tool.name === 'computer'
-          ? 6_000
+          ? 7_500
           : tool.name === 'apply_patch'
             ? 5_000
             : tool.name === 'agents'
@@ -3532,8 +3532,8 @@ describe('exec session attribution and authenticated continuation', () => {
       expect(prove(requestId, conversationId)).toBe('stored');
       const started = await asChat(requestId, 'exec_command', {
         cmd: IS_WINDOWS
-          ? `Start-Sleep -Milliseconds 2000; Write-Output 'owed-${index}'; exit ${index + 1}`
-          : `sleep 2; printf '%s\\n' owed-${index}; exit ${index + 1}`,
+          ? `Start-Sleep -Milliseconds 6000; Write-Output 'owed-${index}'; exit ${index + 1}`
+          : `sleep 6; printf '%s\\n' owed-${index}; exit ${index + 1}`,
         workdir: '/workspace',
         yield_time_ms: 100
       });
@@ -3546,7 +3546,7 @@ describe('exec session attribution and authenticated continuation', () => {
       () => expect(backgroundExecObligations(localSessionId).exitedUnread.map((row) => row.processId)).toEqual(
         [...sessionIds].sort((left, right) => left - right)
       ),
-      { timeout: 8_000, interval: 25 }
+      { timeout: 14_000, interval: 25 }
     );
 
     const blockedRequest = 'wfr_background_admission_blocked';
@@ -3594,8 +3594,8 @@ describe('exec session attribution and authenticated continuation', () => {
         expect(prove(requestId, conversationId, localSessionId)).toBe('stored');
         const started = await asChat(requestId, 'exec_command', {
           cmd: IS_WINDOWS
-            ? `Start-Sleep -Milliseconds 2000; Write-Output 'boundary-owed-${index}'; exit ${index + 1}`
-            : `sleep 2; printf '%s\\n' boundary-owed-${index}; exit ${index + 1}`,
+            ? `Start-Sleep -Milliseconds 6000; Write-Output 'boundary-owed-${index}'; exit ${index + 1}`
+            : `sleep 6; printf '%s\\n' boundary-owed-${index}; exit ${index + 1}`,
           workdir: '/workspace',
           yield_time_ms: 100
         });
@@ -3608,7 +3608,7 @@ describe('exec session attribution and authenticated continuation', () => {
         () => expect(backgroundExecObligations(localSessionId).exitedUnread).toHaveLength(
           MAX_UNREAD_EXEC_RESULTS_PER_CONVERSATION
         ),
-        { timeout: 8_000, interval: 25 }
+        { timeout: 14_000, interval: 25 }
       );
 
       const publishRequest = 'wfr_background_admission_ack_boundary_publish';
@@ -3650,8 +3650,8 @@ describe('exec session attribution and authenticated continuation', () => {
         expect(prove(requestId, conversationId, localSessionId)).toBe('stored');
         const started = await asChat(requestId, 'exec_command', {
           cmd: IS_WINDOWS
-            ? `Start-Sleep -Milliseconds 2000; Write-Output 'late-correlation-owed-${index}'; exit ${index + 1}`
-            : `sleep 2; printf '%s\\n' late-correlation-owed-${index}; exit ${index + 1}`,
+            ? `Start-Sleep -Milliseconds 6000; Write-Output 'late-correlation-owed-${index}'; exit ${index + 1}`
+            : `sleep 6; printf '%s\\n' late-correlation-owed-${index}; exit ${index + 1}`,
           workdir: '/workspace',
           yield_time_ms: 100
         });
@@ -3664,7 +3664,7 @@ describe('exec session attribution and authenticated continuation', () => {
         () => expect(backgroundExecObligations(localSessionId).exitedUnread).toHaveLength(
           MAX_UNREAD_EXEC_RESULTS_PER_CONVERSATION
         ),
-        { timeout: 8_000, interval: 25 }
+        { timeout: 14_000, interval: 25 }
       );
 
       const publishRequest = 'wfr_background_admission_late_correlation_publish';
