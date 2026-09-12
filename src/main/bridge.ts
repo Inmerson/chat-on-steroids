@@ -61,6 +61,7 @@ import { inFlightMcpRequests, runningToolCalls, settlingToolCalls } from './mcp/
 import type { AgentFiniteWaitEvidence } from '../shared/agent-health.js';
 import { nativeHandoffPrompt } from './session/handoff-prompt.js';
 import { briefShortfall, resumeBootstrapText } from './session/handoff.js';
+import { copyHandoffBootstrapToClipboard } from './session/handoff-clipboard.js';
 import {
   PRIME_ID,
   agentForConversation,
@@ -1923,6 +1924,13 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
           origin
         );
       }
+      const bootstrap = resumeBootstrapText(handoff.text);
+      const clipboard = await copyHandoffBootstrapToClipboard(bootstrap);
+      if (!clipboard.copied) {
+        logWarn(
+          `bridge: fresh-chat handoff for ${sessionId} was stored but clipboard copy failed — ${clipboard.error ?? 'unknown error'}`
+        );
+      }
       const command = queueResumeCommand(sessionId, token);
       // The command's leased phase is a crash boundary: do not tell the page capture is fully
       // accepted until the attempt we are about to open is durable. This also makes the HTTP
@@ -2173,7 +2181,7 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
         409,
         {
           error: 'worker_compaction_disabled',
-          message: 'Worker chats never auto-compact and cannot change Compact & Resume from their composer.'
+          message: 'Worker chats never auto-compact and cannot use Continue in New Chat from their composer.'
         },
         origin
       );

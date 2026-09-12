@@ -6540,7 +6540,7 @@ describe('the Compact & resume control', () => {
       'autoCompact',
       'goal'
     ]);
-    expect(menu.querySelector('.clf-menu-action')!.textContent).toBe('Compact & resume now');
+    expect(menu.querySelector('.clf-menu-action')!.textContent).toBe('Continue in New Chat');
 
     live.hook.closeMenu();
     expect((live.document.querySelector('.clf-menu') as HTMLElement).hidden).toBe(true);
@@ -6584,8 +6584,8 @@ describe('the Compact & resume control', () => {
 
     const action = live.document.querySelector('.clf-menu-action') as HTMLButtonElement;
     expect(action.disabled).toBe(true);
-    expect(action.textContent).toBe('Compact & resume unavailable');
-    expect(action.getAttribute('data-clf-tip')).toMatch(/never manually compacted or resumed/i);
+    expect(action.textContent).toBe('Continue in New Chat unavailable');
+    expect(action.getAttribute('data-clf-tip')).toMatch(/stay in their existing conversation/i);
     action.click();
     await settle();
     expect(live.sent.filter((message) => message.type === 'compact')).toEqual([]);
@@ -7203,7 +7203,7 @@ describe('the Compact & resume control', () => {
     // The impatient second press. The sheet's action row is now a cancel, so it must not
     // start another compaction — this is the click that used to fan out into several tabs.
     (live.document.querySelector('.clf-compact-btn') as HTMLButtonElement).click();
-    expect(live.document.querySelector('.clf-menu-action')!.textContent).toBe('Cancel compaction');
+    expect(live.document.querySelector('.clf-menu-action')!.textContent).toBe('Cancel new-chat continuation');
     (live.document.querySelector('.clf-menu-action') as HTMLButtonElement).click();
     await settle();
     const compacts = live.sent.filter((message) => message.type === 'compact');

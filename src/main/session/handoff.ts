@@ -37,8 +37,8 @@ export function handoffPlanNotice(sessionId: string): string {
  */
 export function resumeBootstrapText(summary: string): string {
   return (
-    'Continuing a Chat On Steroids session that was compacted. This is the brief the previous chat wrote about ' +
-    'its own work; carry on from it rather than starting again.\n\n' +
+    'Continue the same unfinished Chat On Steroids work in this fresh conversation. ' +
+    'Treat the continuation prompt below as authoritative operational context; do not restart completed work.\n\n' +
     summary
   );
 }

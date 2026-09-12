@@ -5150,13 +5150,13 @@
       action: {
         label:
           blocked === 'worker'
-            ? 'Compact & resume unavailable'
+            ? 'Continue in New Chat unavailable'
             : compact.action === 'cancel'
-              ? 'Cancel compaction'
-              : 'Compact & resume now',
+              ? 'Cancel new-chat continuation'
+              : 'Continue in New Chat',
         hint:
           blocked === 'worker'
-            ? 'Worker chats stay in their existing conversation and are never manually compacted or resumed.'
+            ? 'Worker chats stay in their existing conversation and cannot use Continue in New Chat.'
             : compact.hint,
         action: blocked === 'worker' ? 'none' : compact.action
       }
@@ -6107,7 +6107,7 @@
     cancel.type = 'button';
     cancel.className = 'clf-cancel';
     cancel.textContent = '×';
-    cancel.setAttribute('aria-label', 'Cancel Compact & resume');
+    cancel.setAttribute('aria-label', 'Cancel new-chat continuation');
     pill.append(spinner, text, cancel);
 
     const button = document.createElement('button');
@@ -7563,7 +7563,7 @@
         return;
       }
       return void (await abandonCapture(
-        'This tab reloaded while ChatGPT was writing the brief, so the app can no longer tell which answer was it. Nothing was compacted — press Compact & Resume again.'
+        'This tab reloaded while ChatGPT was writing the continuation prompt, so the app can no longer tell which answer was it. Nothing moved — press Continue in New Chat again.'
       ));
     }
 
@@ -7586,7 +7586,7 @@
       return;
     }
     await abandonCapture(
-      'This tab reloaded before ChatGPT started answering the compaction request, so the app cannot tell which answer would have been it. Nothing was compacted — press Compact & Resume again.'
+      'This tab reloaded before ChatGPT started answering the continuation request, so the app cannot tell which answer would have been it. Nothing moved — press Continue in New Chat again.'
     );
   }
 
@@ -7695,7 +7695,7 @@
     await abandonCapture(
       'The compaction turn was still going long after it looked finished — still writing, still running ' +
         'tools, or the app could not be reached to ask — so the app stopped waiting rather than hand over ' +
-        'half a brief. Nothing was compacted; this chat still has its session. Press Compact & Resume again.'
+        'half a continuation prompt. Nothing moved; this chat still has its session. Press Continue in New Chat again.'
     );
   }
 

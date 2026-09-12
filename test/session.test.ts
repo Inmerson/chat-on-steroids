@@ -1484,6 +1484,9 @@ describe('handoff storage', () => {
     expect(prompt).toMatch(/FAILED \/ UNRESOLVED/i);
     expect(prompt).toMatch(/VERIFICATION/i);
     expect(prompt).toMatch(/completed and verified/i);
+    expect(prompt).toMatch(/continuation prompt/i);
+    expect(prompt).toMatch(/first user message/i);
+    expect(prompt).toMatch(/end with.*concrete next action/i);
   });
 });
 

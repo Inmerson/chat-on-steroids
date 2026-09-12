@@ -25,6 +25,7 @@ export const HANDOFF_BRIEF_RULES = `Rules:
 - Spend extra space on concrete continuation value: exact changed files and symbols, dirty-tree caveats, test/build commands and outcomes, live-session evidence, current hypotheses with confidence, rejected approaches and why, pending worker ownership, release/install state, and the precise next actions. Do not spend that space repeating prose or narrating obvious chronology.
 - Be dense and operational even when long. No preamble, no praise, no restating these instructions, no "in this session we". Use compact sections, bullets and short lines so a 10k–30k-token brief remains navigable rather than repetitive.
 - If the recording is incomplete or ambiguous, say so in one line rather than inventing detail.
+- End with the concrete next action the new chat should take. The artifact must be directly executable, not merely descriptive.
 
 Structure the brief with these headings, omitting any that would be empty:
 
@@ -57,12 +58,12 @@ export function nativeHandoffPrompt(): string {
   return (
     'Chat On Steroids is compacting this conversation so a fresh chat can continue the work. ' +
     'Stop whatever you were doing and do only this.\n\n' +
-    'Write a handoff brief so a different coding agent can continue this unfinished task in a brand-new ' +
-    "conversation, with no memory of anything here. Everything you know about this session — the user's " +
+    'Write a continuation prompt that can be used directly as the first user message in a brand-new ' +
+    "conversation so a different coding agent can continue this unfinished task with no memory of anything here. Everything you know about this session — the user's " +
     'messages, your own replies, and every tool call you made against this machine with its result — is the ' +
-    'material. Write it so an agent who reads only your brief can carry on correctly.\n\n' +
+    'material. Write it so an agent who reads only this continuation prompt can carry on correctly.\n\n' +
     `${HANDOFF_BRIEF_RULES}\n\n` +
-    'Your reply to this message must be the brief itself and nothing else: no preamble, no closing remark, no ' +
-    'question back, and no tool calls. The app reads this reply, stores it, and opens the fresh chat with it.'
+    'End with the concrete next action the fresh chat should take. Your reply to this message must be the continuation prompt itself and nothing else: no preamble, no closing remark, no ' +
+    'question back, and no tool calls. The app reads this reply, stores it, and uses it as the first user message in the fresh chat.'
   );
 }

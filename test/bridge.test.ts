@@ -23,10 +23,10 @@ vi.mock('electron', () => ({
     encryptStringAsync: vi.fn(async (value: string) => Buffer.from(value, 'utf8')),
     decryptStringAsync: vi.fn(async (buffer: Buffer) => ({ result: buffer.toString('utf8'), shouldReEncrypt: false }))
   },
-  clipboard: {},
+  clipboard: { writeText: vi.fn() },
   shell: {}
 }));
-const { safeStorage } = await import('electron');
+const { clipboard, safeStorage } = await import('electron');
 
 const { defaultConfig, getConfig, initConfigPath, saveConfig } = await import('../src/main/config.js');
 const { initSecretsPath, resetSecretsCacheForTests, setSecret } = await import('../src/main/secrets.js');
@@ -62,7 +62,7 @@ const {
   resetGoalStateForTests,
   setGoalObjective
 } = await import('../src/main/goal.js');
-const { createSession, deleteSession, getSession, initSessionStore, readEvents, resetSessionStoreForTests, updateSessionPlan } = await import(
+const { createSession, deleteSession, getSession, initSessionStore, readEvents, readHandoff, resetSessionStoreForTests, updateSessionPlan } = await import(
   '../src/main/session/store.js'
 );
 const { closeConversation, liveConversations, noteChatOrigin, recordChatObservations, recordToolCall, resetRecorderForTests } = await import('../src/main/session/recorder.js');
@@ -299,6 +299,7 @@ afterAll(async () => {
 
 beforeEach(async () => {
   vi.mocked(safeStorage.isAsyncEncryptionAvailable).mockResolvedValue(true);
+  vi.mocked(clipboard.writeText).mockReset();
   // The swarm goes first: ending a run queues stop notices into the chats of any workers
   // still live, and those would otherwise be dropped into the queue the bridge reset had
   // just emptied — the previous test's cleanup showing up as the next test's first command.
@@ -318,6 +319,110 @@ beforeEach(async () => {
   await flushDurable();
   await setSecret('bridgeToken', '');
   token = null;
+});
+
+describe('continue in a new chat', () => {
+  async function capture(from: string, suffix: string): Promise<{ sessionId: string; token: string; captured: Reply }> {
+    const recorded = await request('POST', '/events', {
+      body: {
+        conversationId: from,
+        events: [{ kind: 'user_message', time: Date.now(), text: 'continue the runtime port', messageId: `m-${suffix}` }]
+      }
+    });
+    const sessionId = recorded.body.sessionId as string;
+    const openedContinuation = await request('POST', '/compact', { body: { conversationId: from } });
+    expect(openedContinuation.status).toBe(202);
+    const token = openedContinuation.body.token as string;
+    const captured = await request('POST', '/compact', {
+      body: { conversationId: from, token, summary: `${SAMPLE_BRIEF}\n\nNEXT\nRun Task 7.` }
+    });
+    return { sessionId, token, captured };
+  }
+
+  it('stores the handoff, copies the exact fresh-chat bootstrap, then queues one replacement chat', async () => {
+    await pair();
+    const from = 'a1a1a1a1-0000-4000-8000-00000000cf01';
+    const { sessionId, captured } = await capture(from, 'continue-new-chat');
+
+    expect(captured.status).toBe(200);
+    const handoff = await readHandoff(sessionId, captured.body.handoffId);
+    expect(handoff).not.toBeNull();
+    expect(clipboard.writeText).toHaveBeenCalledTimes(1);
+    expect(clipboard.writeText).toHaveBeenCalledWith(resumeBootstrapText(handoff!.text));
+    expect(pendingCommands().filter((command) => command.what === `resume:${sessionId}`)).toHaveLength(1);
+
+    // Durable capture and browser delivery do not move authority. Only the exact fresh-chat
+    // sent ACK commits the A→B session rebind.
+    expect((await getSession(sessionId))?.conversationId).toBe(from);
+    const commandId = captured.body.commandId as string;
+    const client = 'fresh-chat-exact-owner';
+    const redeemed = await redeem(commandId, client);
+    expect(redeemed.text).toBe(resumeBootstrapText(handoff!.text));
+    const destination = 'a1a1a1a1-0000-4000-8000-00000000cf11';
+    const ack = await request('POST', '/commands/ack', {
+      body: { id: commandId, status: 'sent', conversationId: destination, client }
+    });
+    expect(ack.body).toMatchObject({ committed: true, conversationId: destination });
+    expect((await getSession(sessionId))?.conversationId).toBe(destination);
+  });
+
+  it('continues to one fresh chat when clipboard copy fails after durable handoff storage', async () => {
+    await pair();
+    vi.mocked(clipboard.writeText).mockImplementationOnce(() => {
+      throw new Error('clipboard unavailable');
+    });
+    const from = 'a1a1a1a1-0000-4000-8000-00000000cf02';
+    const { sessionId, captured } = await capture(from, 'clipboard-failure');
+
+    expect(captured.status).toBe(200);
+    expect(await readHandoff(sessionId, captured.body.handoffId)).not.toBeNull();
+    expect(pendingCommands().filter((command) => command.what === `resume:${sessionId}`)).toHaveLength(1);
+    expect((await getSession(sessionId))?.conversationId).toBe(from);
+  });
+
+  it('does not create a second replacement chat when capture is retried', async () => {
+    await pair();
+    const from = 'a1a1a1a1-0000-4000-8000-00000000cf03';
+    const first = await capture(from, 'capture-retry');
+    const before = pendingCommands().filter((command) => command.what === `resume:${first.sessionId}`);
+    expect(before).toHaveLength(1);
+    await waitForOpened(1);
+
+    const retried = await request('POST', '/compact', {
+      body: { conversationId: from, token: first.token, summary: `${SAMPLE_BRIEF}\n\nNEXT\nRun Task 7.` }
+    });
+
+    expect(retried.status).toBe(200);
+    expect(retried.body.commandId).toBe(first.captured.body.commandId);
+    expect(pendingCommands().filter((command) => command.what === `resume:${first.sessionId}`)).toHaveLength(1);
+    expect(opened).toHaveLength(1);
+  });
+
+  it('rejects a stale replacement conversation without moving session ownership', async () => {
+    await pair();
+    const from = 'a1a1a1a1-0000-4000-8000-00000000cf04';
+    const { sessionId, captured } = await capture(from, 'stale-destination');
+    const commandId = captured.body.commandId as string;
+    const client = 'fresh-chat-stale-owner';
+    await redeem(commandId, client);
+
+    const staleDestination = 'a1a1a1a1-0000-4000-8000-00000000cf14';
+    const stale = await request('POST', '/events', {
+      body: {
+        conversationId: staleDestination,
+        events: [{ kind: 'user_message', time: Date.now(), text: 'unrelated chat', messageId: 'm-stale-destination-owner' }]
+      }
+    });
+    expect(stale.body.sessionId).not.toBe(sessionId);
+
+    const ack = await request('POST', '/commands/ack', {
+      body: { id: commandId, status: 'sent', conversationId: staleDestination, client }
+    });
+
+    expect(ack.body.committed).toBe(false);
+    expect((await getSession(sessionId))?.conversationId).toBe(from);
+    expect((await getSession(stale.body.sessionId))?.conversationId).toBe(staleDestination);
+  });
 });
 
 describe('agent health evidence', () => {
