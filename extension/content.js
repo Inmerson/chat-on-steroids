@@ -1822,7 +1822,7 @@
     // not answer it; there is nothing to watch and nothing to wait for, so the transaction
     // is withdrawn rather than left open for whatever the user types next.
     if (compactCapture && compactCapture.generation === null && Date.now() - compactCapture.armedAt > COMPACT_ARM_MS) {
-      void abandonCapture('ChatGPT never started answering the compaction request. Nothing was compacted.');
+      void abandonCapture('ChatGPT never started answering the continuation request. Nothing moved — this chat still owns the session.');
     }
 
     // Which generation an error first came into view during, recorded before anything reads
@@ -5096,12 +5096,12 @@
 
     if (job && job.busy) {
       if (job.stage === 'opening') {
-        return { mode: 'busy', label: 'Opening…', hint: 'Handoff saved, opening the fresh chat', action: 'cancel' };
+        return { mode: 'busy', label: 'Opening new chat', hint: 'Handoff saved, opening the fresh chat', action: 'cancel' };
       }
       if (job.stage === 'waiting-for-browser') {
         return {
           mode: 'waiting',
-          label: 'Waiting…',
+          label: 'Opening new chat',
           hint: job.error || 'The app is trying to open the fresh chat.',
           action: 'cancel'
         };
@@ -5111,8 +5111,8 @@
       // right now; `handoff-pending` is the app saying it has asked and is waiting.
       return {
         mode: 'busy',
-        label: NATIVE_PHASE_LABELS[phase] || 'Asking…',
-        hint: 'ChatGPT is writing the handoff',
+        label: NATIVE_PHASE_LABELS[phase] || 'Preparing continuation',
+        hint: 'ChatGPT is writing the continuation prompt',
         action: 'cancel'
       };
     }
@@ -5124,13 +5124,13 @@
      * is a button that is missing whenever it is wanted.
      */
     if (job && job.stage === 'done') {
-      return { mode: 'done', label: 'Opened', hint: 'The fresh chat is open', action: 'start' };
+      return { mode: 'done', label: 'Continuing', hint: 'The fresh chat is open', action: 'start' };
     }
     if (job && job.stage === 'failed') {
       if (job.error === 'cancelled') {
-        return { mode: 'idle', label: 'Compact', hint: 'Resume cancelled', action: 'start' };
+        return { mode: 'idle', label: 'Continue', hint: 'Continuation cancelled', action: 'start' };
       }
-      return { mode: 'error', label: 'Failed', hint: job.error || 'Compaction failed', action: 'start' };
+      return { mode: 'error', label: 'Failed', hint: job.error || 'Context rollover failed', action: 'start' };
     }
     if (pressedAt > 0 && now - pressedAt < PRESS_GRACE_MS) {
       return { mode: 'busy', label: 'Starting…', hint: '', action: 'none' };
@@ -5139,7 +5139,7 @@
     if (disconnected) {
       return {
         mode: 'off',
-        label: 'Compact',
+        label: 'Continue',
         hint: 'Browser connection is disconnected in Chat On Steroids.',
         action: 'none'
       };
@@ -5147,7 +5147,7 @@
     if (!connected) {
       return {
         mode: 'off',
-        label: 'Compact',
+        label: 'Continue',
         hint: 'Chat On Steroids is not running on this PC.',
         action: 'none'
       };
@@ -5155,12 +5155,12 @@
     if (!conversationId) {
       return {
         mode: 'off',
-        label: 'Compact',
-        hint: 'Nothing to compact yet — send a message, or set a goal and it writes one.',
+        label: 'Continue',
+        hint: 'Nothing to continue yet — send a message, or set a goal and it writes one.',
         action: 'none'
       };
     }
-    return { mode: 'idle', label: 'Compact', hint: '', action: 'start' };
+    return { mode: 'idle', label: 'Continue', hint: '', action: 'start' };
   }
 
   /** Pure projection for the gear sheet: app-owned settings plus chat-specific Goal state. */
@@ -5175,7 +5175,7 @@
     const from = threshold > 0 ? `from ${roundK(threshold)} tokens` : '';
     return {
       tip: [
-        auto ? `Auto-compaction on${from ? `, ${from}` : ''}` : 'Auto-compaction off',
+        auto ? `Automatic Context Rollover on${from ? `, ${from}` : ''}` : 'Automatic Context Rollover off',
         blocked === 'worker'
           ? 'Goal off — the prime writes this chat'
           : objective
@@ -5189,13 +5189,13 @@
       rows: [
         {
           key: 'autoCompact',
-          label: 'Auto-compaction',
+          label: 'Automatic Context Rollover',
           note:
             blocked === 'worker'
-              ? 'off here: worker chats never auto-compact'
+              ? 'off here: worker chats never roll over automatically'
               : auto
                 ? from || 'threshold set in the app'
-                : 'compact this chat by hand',
+                : 'continue in a new chat by hand',
           on: auto,
           warn: false,
           disabled: blocked === 'worker'
@@ -5406,7 +5406,7 @@
           ? 'near'
           : 'ok';
     // One compact line is enough in the composer. The meter itself already conveys the rest.
-    const status = `${roundK(tokens)}/${roundK(ceiling)} · autocompact ${context.auto ? 'on' : 'off'}`;
+    const status = `${roundK(tokens)}/${roundK(ceiling)} · rollover ${context.auto ? 'on' : 'off'}`;
     return { filled, level, status, tip: status };
   }
 
@@ -5476,12 +5476,12 @@
 
   /** Local phases of a ChatGPT-native compaction, as the button says them. */
   const NATIVE_PHASE_LABELS = {
-    requested: 'Starting…',
-    interrupting: 'Stopping…',
-    settling: 'Settling…',
-    prompting: 'Asking…',
-    waiting: 'Writing…',
-    delivering: 'Saving…'
+    requested: 'Preparing continuation',
+    interrupting: 'Preparing continuation',
+    settling: 'Preparing continuation',
+    prompting: 'Preparing continuation',
+    waiting: 'Preparing continuation',
+    delivering: 'Preparing continuation'
   };
 
   const ICON =
@@ -7371,7 +7371,7 @@
       nativePhase = compactCapture ? 'waiting' : '';
       if (!compactCapture) {
         pressedAt = 0;
-        localError = 'A compaction is already under way in this chat. Wait for it, or cancel it.';
+        localError = 'A context rollover is already in progress in this chat. Wait for it, or cancel it.';
       }
       renderControl();
       void pullActivity();
@@ -7393,7 +7393,7 @@
    * the time the fresh chat reads it.
    */
   async function stopAndSettle(current = () => true, toolConversation = conversationId) {
-    if (!current()) return 'The conversation changed before compaction could start.';
+    if (!current()) return 'The conversation changed before continuation could start.';
     // INTERRUPTING — stop the turn rather than wait it out. That is the whole request, by
     // hand or automatically: this happens because the turn is long, not because it is
     // nearly done.
@@ -7404,7 +7404,7 @@
       if (stop) stop.click();
       userStopped = true;
       const stopped = await waitUntil(() => !CLF_DOM.generating(), INTERRUPT_WAIT_MS);
-      if (!stopped) return 'ChatGPT would not stop the current turn. Nothing was compacted.';
+      if (!stopped) return 'ChatGPT would not stop the current turn. Nothing moved — this chat still owns the session.';
       if (!current()) return 'The conversation changed while stopping the current turn.';
     }
 
@@ -7443,7 +7443,7 @@
       return count === 0;
     }, TOOL_SETTLE_MS);
     if (settleFailure) return settleFailure;
-    if (!settled || lastCount !== 0) return 'Local tools are still running. Nothing was compacted.';
+    if (!settled || lastCount !== 0) return 'Local tools are still running. Nothing moved — this chat still owns the session.';
     if (!current()) return 'The conversation changed while local tools were settling.';
     return '';
   }
@@ -7483,10 +7483,10 @@
     };
 
     if (!prompt) return void (await abandon('The app did not send the handoff instruction.'));
-    if (!token) return void (await abandon('The app did not send a compaction token, so nothing could be tracked.'));
+    if (!token) return void (await abandon('The app did not send a continuation token, so nothing could be tracked.'));
     if (!current()) return void (await abandon('The conversation changed before the handoff instruction could be sent.'));
     if (!acquireAutonomousSend('compact')) {
-      return void (await abandon('Another autonomous browser write already owns the composer. Nothing was compacted.'));
+      return void (await abandon('Another autonomous browser write already owns the composer. Nothing moved — this chat still owns the session.'));
     }
 
     try {
@@ -7537,7 +7537,7 @@
       rememberCapture();
       if (!CLF_DOM.send()) {
         releaseCapture();
-        return void (await abandon('ChatGPT would not send the handoff instruction. Nothing was compacted.'));
+        return void (await abandon('ChatGPT would not send the handoff instruction. Nothing moved — this chat still owns the session.'));
       }
 
       // WAITING — for one generation, the one this send starts, and for nothing else.
@@ -7780,7 +7780,7 @@
       if (Date.now() - stableSince >= BRIEF_STABLE_MS) return void (await deliverBrief(text, outcome));
     }
     await abandonCapture(
-      'The compaction turn was still going long after it looked finished — still writing, still running ' +
+      'The continuation turn was still going long after it looked finished — still writing, still running ' +
         'tools, or the app could not be reached to ask — so the app stopped waiting rather than hand over ' +
         'half a continuation prompt. Nothing moved; this chat still has its session. Press Continue in New Chat again.'
     );
@@ -7870,10 +7870,10 @@
       releaseCapture();
       const why =
         outcome === 'stopped'
-          ? 'The compaction turn was stopped, so nothing was compacted.'
+          ? 'The continuation turn was stopped, so nothing moved — this chat still owns the session.'
           : outcome === 'interrupted' || outcome === 'failed'
-            ? 'ChatGPT did not finish writing the brief, so nothing was compacted.'
-            : 'ChatGPT answered the compaction request with nothing, so nothing was compacted.';
+            ? 'ChatGPT did not finish writing the continuation prompt, so nothing moved — this chat still owns the session.'
+            : 'ChatGPT answered the continuation request with nothing, so nothing moved — this chat still owns the session.';
       nativeBusy = false;
       nativePhase = '';
       pressedAt = 0;
@@ -7954,7 +7954,7 @@
     const data = reply.data || {};
     if (data.message) return String(data.message).slice(0, 160);
     if (data.error === 'session_not_recorded') return 'This chat has no recorded local session yet.';
-    if (data.error === 'compaction_running') return 'Another chat is compacting right now.';
+    if (data.error === 'compaction_running') return 'Another context rollover is already in progress.';
     if (data.error === 'turn_still_generating') return 'Wait for this ChatGPT turn to finish first.';
     if (data.error) return String(data.error).slice(0, 160);
     if (reply.error === 'app_not_found') return 'Chat On Steroids is not running on this PC.';

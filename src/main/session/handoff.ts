@@ -88,9 +88,9 @@ const MIN_SUBSTANTIAL_BRIEF_CHARS = 1_000;
  */
 export function briefShortfall(text: string, sourceTokens: number): string | null {
   const brief = text.trim();
-  if (!brief) return 'ChatGPT answered the compaction request with nothing.';
+  if (!brief) return 'ChatGPT answered the continuation request with nothing.';
   if (brief.length < MIN_BRIEF_CHARS) {
-    return `ChatGPT wrote only ${brief.length} characters before its compaction turn looked finished, which is too little to continue any session from.`;
+    return `ChatGPT wrote only ${brief.length} characters before its continuation turn looked finished, which is too little to continue any session from.`;
   }
   if (sourceTokens >= SUBSTANTIAL_SESSION_TOKENS && brief.length < MIN_SUBSTANTIAL_BRIEF_CHARS) {
     return `The brief is ${brief.length} characters for a session carrying about ${Math.round(sourceTokens / 1000)}k tokens of work, so it cannot be the whole handoff.`;

@@ -1776,7 +1776,7 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
         409,
         {
           error: 'worker_compaction_disabled',
-          message: 'Worker chats stay in their existing conversation so the prime can revive them safely.'
+          message: 'Worker chats stay in their existing conversation and never use automatic context rollover.'
         },
         origin
       );
@@ -1788,7 +1788,7 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
       return json(
         res,
         409,
-        { error: 'session_not_recorded', message: 'This chat has no recorded local session to compact.' },
+        { error: 'session_not_recorded', message: 'This chat has no recorded local session to continue in a new chat yet.' },
         origin
       );
     }
@@ -1833,7 +1833,7 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
         409,
         {
           error: 'worker_compaction_disabled',
-          message: 'Worker chats stay in their existing conversation so the prime can revive them safely.'
+          message: 'Worker chats stay in their existing conversation and never use automatic context rollover.'
         },
         origin
       );
@@ -1845,7 +1845,7 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
       return json(
         res,
         409,
-        { error: 'session_not_recorded', message: 'This chat has no recorded local session to compact.' },
+        { error: 'session_not_recorded', message: 'This chat has no recorded local session to continue in a new chat yet.' },
         origin
       );
     }
@@ -1899,7 +1899,7 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
             {
               error: 'resume_cancel_not_durable',
               retryable: true,
-              message: 'The handoff was incomplete, but cancelling this compaction was not stored yet. Retrying…',
+              message: 'The handoff was incomplete, but cancelling this context rollover was not stored yet. Retrying…',
               sessionId,
               job: resumeJobFor(sessionId)
             },
@@ -1911,7 +1911,7 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
           409,
           {
             error: 'brief_incomplete',
-            message: `${shortfall} Nothing was compacted — this chat still has its session.`,
+            message: `${shortfall} Nothing moved — this chat still owns the session.`,
             sessionId,
             job: resumeJobFor(sessionId)
           },
@@ -2196,7 +2196,7 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
         409,
         {
           error: 'worker_compaction_disabled',
-          message: 'Worker chats never auto-compact and cannot use Continue in New Chat from their composer.'
+          message: 'Worker chats never roll over automatically and cannot use Continue in New Chat from their composer.'
         },
         origin
       );

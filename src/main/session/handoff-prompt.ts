@@ -43,20 +43,20 @@ NEXT — the concrete next actions, in order.
 DO NOT — what the next agent should not redo or undo.`;
 
 /**
- * The instruction typed into the ChatGPT conversation being compacted.
+ * The instruction typed into the ChatGPT conversation preparing a context rollover.
  *
  * The model is already the participant rather than a reader of a transcript, so there is no
  * recording to hand it and "the tool evidence" is its own call history.
  *
  * The brief leaves as the answer, deliberately. A tool call is a thing the model can retry,
  * skip, or make three different versions of, and every one of those was a way for a
- * compaction to end with the wrong brief or none. An answer cannot be retried: the page
+ * continuation turn to end with the wrong brief or none. An answer cannot be retried: the page
  * watches this exact generation, and whatever it finally wrote is what gets carried across.
  * So there is nothing here to call, and nothing to get right except the writing.
  */
 export function nativeHandoffPrompt(): string {
   return (
-    'Chat On Steroids is compacting this conversation so a fresh chat can continue the work. ' +
+    'Chat On Steroids is preparing a context rollover so a fresh chat can continue the work. ' +
     'Stop whatever you were doing and do only this.\n\n' +
     'Write a continuation prompt that can be used directly as the first user message in a brand-new ' +
     "conversation so a different coding agent can continue this unfinished task with no memory of anything here. Everything you know about this session — the user's " +

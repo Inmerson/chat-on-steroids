@@ -339,6 +339,33 @@ describe('continue in a new chat', () => {
     return { sessionId, token, captured };
   }
 
+  it('uses continuation language in human-readable rollover failures while keeping the legacy route', async () => {
+    await pair();
+    const missing = await request('POST', '/compact', {
+      body: { conversationId: 'a1a1a1a1-0000-4000-8000-00000000cf00' }
+    });
+    expect(missing.status).toBe(409);
+    expect(missing.body.error).toBe('session_not_recorded');
+    expect(missing.body.message).toBe('This chat has no recorded local session to continue in a new chat yet.');
+
+    const from = 'a1a1a1a1-0000-4000-8000-00000000cf09';
+    await request('POST', '/events', {
+      body: {
+        conversationId: from,
+        events: [{ kind: 'user_message', time: Date.now(), text: 'continue the runtime port', messageId: 'm-terminology' }]
+      }
+    });
+    const openedContinuation = await request('POST', '/compact', { body: { conversationId: from } });
+    expect(openedContinuation.status).toBe(202);
+    const refused = await request('POST', '/compact', {
+      body: { conversationId: from, token: openedContinuation.body.token, summary: 'too short' }
+    });
+    expect(refused.status).toBe(409);
+    expect(refused.body.error).toBe('brief_incomplete');
+    expect(refused.body.message).toMatch(/Nothing moved — this chat still owns the session\.$/);
+    expect(refused.body.message).not.toMatch(/compact/i);
+  });
+
   it('stores the handoff, copies the exact fresh-chat bootstrap, then queues one replacement chat', async () => {
     await pair();
     const from = 'a1a1a1a1-0000-4000-8000-00000000cf01';
@@ -1506,6 +1533,7 @@ describe('automatic compaction', () => {
     });
     expect(reply.status).toBe(409);
     expect(reply.body.error).toBe('session_not_recorded');
+    expect(reply.body.message).toBe('This chat has no recorded local session to continue in a new chat yet.');
   });
 
   it('never compacts a worker out of the conversation that is its agent identity', async () => {
@@ -1530,6 +1558,9 @@ describe('automatic compaction', () => {
       const automatic = await request('POST', '/compact/claim-auto', { body: { conversationId } });
       expect(automatic.status).toBe(409);
       expect(automatic.body.error).toBe('worker_compaction_disabled');
+      expect(automatic.body.message).toBe(
+        'Worker chats stay in their existing conversation and never use automatic context rollover.'
+      );
 
       const manual = await request('POST', '/compact', { body: { conversationId } });
       expect(manual.status).toBe(409);
@@ -1539,6 +1570,9 @@ describe('automatic compaction', () => {
       });
       expect(settings.status).toBe(409);
       expect(settings.body.error).toBe('worker_compaction_disabled');
+      expect(settings.body.message).toBe(
+        'Worker chats never roll over automatically and cannot use Continue in New Chat from their composer.'
+      );
       expect(getConfig().compaction.auto).toBe(true);
       // Neither an accidental auto claim nor the manual endpoint may create the replacement-chat
       // transport a worker is forbidden to use. Its conversation remains its agent identity.

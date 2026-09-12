@@ -56,6 +56,7 @@ import {
 } from '../src/main/session/store.js';
 import { summarizeToolCall } from '../src/main/session/summarize.js';
 import { HANDOFF_BRIEF_RULES, nativeHandoffPrompt } from '../src/main/session/handoff-prompt.js';
+import { briefShortfall } from '../src/main/session/handoff.js';
 import {
   estimateTokens,
   eventTokens,
@@ -1485,8 +1486,15 @@ describe('handoff storage', () => {
     expect(prompt).toMatch(/VERIFICATION/i);
     expect(prompt).toMatch(/completed and verified/i);
     expect(prompt).toMatch(/continuation prompt/i);
+    expect(prompt).toMatch(/context rollover/i);
     expect(prompt).toMatch(/first user message/i);
     expect(prompt).toMatch(/end with.*concrete next action/i);
+    expect(prompt).not.toMatch(/\bcompacting\b|\bcompaction\b/i);
+  });
+
+  it('describes rejected handoffs as failed continuation, not compaction', () => {
+    expect(briefShortfall('', 0)).toBe('ChatGPT answered the continuation request with nothing.');
+    expect(briefShortfall('too short', 0)).toMatch(/continuation turn looked finished/i);
   });
 });
 

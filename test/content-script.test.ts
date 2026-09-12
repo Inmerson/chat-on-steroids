@@ -6768,14 +6768,14 @@ describe('the activity feed', () => {
   });
 });
 
-describe('the Compact & resume control', () => {
+describe('the Continue in New Chat control', () => {
   /**
    * It used to remove itself here, and that was right while compaction was all it did: a
    * disabled "send a message first" button is not worth half a composer. A goal changed that.
    * A goal written into a New Chat is what writes that chat's first message, so the sheet has
    * to be reachable before there is a chat — and the one thing that still needs a chat says so.
    */
-  it('exists on a brand-new chat, with compaction unavailable and a reason', async () => {
+  it('exists on a brand-new chat, with continuation unavailable and a reason', async () => {
     live = await harness('https://chatgpt.com/');
     live.hook.injectControl();
 
@@ -6784,7 +6784,7 @@ describe('the Compact & resume control', () => {
     expect(control.dataset.clfMode).toBe('off');
     expect(live.hook.controlState({ connected: true, conversationId: null, now: Date.now() })).toMatchObject({
       action: 'none',
-      hint: 'Nothing to compact yet — send a message, or set a goal and it writes one.'
+      hint: 'Nothing to continue yet — send a message, or set a goal and it writes one.'
     });
   });
 
@@ -6808,7 +6808,7 @@ describe('the Compact & resume control', () => {
     // The button is a gear now, so the hover answers the question a gear raises — what are
     // the settings — rather than naming one action it no longer performs on its own.
     expect(control.querySelector('.clf-compact-btn')!.getAttribute('data-clf-tip')).toBe(
-      'Auto-compaction off\nGoal off'
+      'Automatic Context Rollover off\nGoal off'
     );
   });
 
@@ -6820,7 +6820,7 @@ describe('the Compact & resume control', () => {
    * old action is the last row of the sheet, so nothing that used to be reachable stopped
    * being reachable.
    */
-  it('opens a settings sheet with both switches and the compaction action', async () => {
+  it('opens a settings sheet with both switches and the fresh-chat continuation action', async () => {
     live = await harness();
     live.hook.injectControl();
     live.hook.toggleMenu();
@@ -6838,7 +6838,7 @@ describe('the Compact & resume control', () => {
     expect((live.document.querySelector('.clf-menu') as HTMLElement).hidden).toBe(true);
   });
 
-  it('locks every compaction affordance in a worker chat and emits no settings write when clicked', async () => {
+  it('locks every rollover affordance in a worker chat and emits no settings write when clicked', async () => {
     live = await harness(undefined, {
       activity: () => ({
         ok: true,
@@ -6869,7 +6869,7 @@ describe('the Compact & resume control', () => {
     const auto = live.document.querySelector('[data-clf-row="autoCompact"]') as HTMLButtonElement;
     expect(auto.disabled).toBe(true);
     expect(auto.getAttribute('aria-checked')).toBe('false');
-    expect(auto.querySelector('.clf-menu-note')?.textContent).toMatch(/worker chats never auto-compact/i);
+    expect(auto.querySelector('.clf-menu-note')?.textContent).toMatch(/worker chats never roll over automatically/i);
     auto.click();
     await settle();
     expect(live.sent.filter((message) => message.type === 'settings_set')).toEqual([]);
@@ -7078,7 +7078,7 @@ describe('the Compact & resume control', () => {
         ...over
       });
 
-    expect(state({})).toMatchObject({ mode: 'idle', label: 'Compact', action: 'start' });
+    expect(state({})).toMatchObject({ mode: 'idle', label: 'Continue', action: 'start' });
     expect(state({ disconnected: true })).toMatchObject({
       mode: 'off',
       hint: 'Browser connection is disconnected in Chat On Steroids.',
@@ -7091,26 +7091,26 @@ describe('the Compact & resume control', () => {
     const pending = { sessionId: 's1', stage: 'handoff-pending', busy: true, error: null, handoffId: null };
     expect(state({ job: pending, phase: 'interrupting' })).toMatchObject({
       mode: 'busy',
-      label: 'Stopping…',
+      label: 'Preparing continuation',
       action: 'cancel'
     });
-    expect(state({ job: pending, phase: 'settling' })).toMatchObject({ mode: 'busy', label: 'Settling…' });
-    expect(state({ job: pending, phase: 'waiting' })).toMatchObject({ mode: 'busy', label: 'Writing…' });
+    expect(state({ job: pending, phase: 'settling' })).toMatchObject({ mode: 'busy', label: 'Preparing continuation' });
+    expect(state({ job: pending, phase: 'waiting' })).toMatchObject({ mode: 'busy', label: 'Preparing continuation' });
     // An unknown phase — a tab that reloaded mid-run and lost its local state — still says
     // something true rather than nothing.
-    expect(state({ job: pending, phase: '' })).toMatchObject({ mode: 'busy', label: 'Asking…' });
+    expect(state({ job: pending, phase: '' })).toMatchObject({ mode: 'busy', label: 'Preparing continuation' });
 
     expect(state({ job: { stage: 'opening', busy: true, error: null, handoffId: 'h1' } })).toMatchObject({
       mode: 'busy',
-      label: 'Opening…',
+      label: 'Opening new chat',
       action: 'cancel'
     });
     expect(
       state({ job: { stage: 'waiting-for-browser', busy: true, error: 'could not open your browser', handoffId: 'h1' } })
-    ).toMatchObject({ mode: 'waiting', label: 'Waiting…', action: 'cancel' });
+    ).toMatchObject({ mode: 'waiting', label: 'Opening new chat', action: 'cancel' });
     expect(state({ job: { stage: 'done', busy: false, error: null, handoffId: 'h1' } })).toMatchObject({
       mode: 'done',
-      label: 'Opened'
+      label: 'Continuing'
     });
     expect(
       state({ job: { stage: 'failed', busy: false, error: 'ChatGPT never wrote the brief', handoffId: null } })
@@ -7128,7 +7128,7 @@ describe('the Compact & resume control', () => {
     expect(state({ connected: false })).toMatchObject({ mode: 'off', action: 'none' });
     expect(state({ conversationId: null })).toMatchObject({
       mode: 'off',
-      hint: 'Nothing to compact yet — send a message, or set a goal and it writes one.'
+      hint: 'Nothing to continue yet — send a message, or set a goal and it writes one.'
     });
   });
 
@@ -7158,7 +7158,7 @@ describe('the Compact & resume control', () => {
     // passes it cannot suppress the button by accident.
     expect(state({ generating: true })).toMatchObject({
       mode: 'idle',
-      label: 'Compact',
+      label: 'Continue',
       action: 'start'
     });
     expect(state({ generating: true, job: { stage: 'handoff-pending', busy: true, error: null, handoffId: null } })).toMatchObject({
@@ -7378,7 +7378,9 @@ describe('the Compact & resume control', () => {
     expect(composerText(live.document)).toBe('');
     expect(sends()).toBe(0);
     expect(live.sent.filter((message) => message.type === 'compact')).toEqual([]);
-    expect(live.document.querySelector('.clf-pill-text')!.textContent).toContain('would not stop');
+    expect(live.document.querySelector('.clf-pill-text')!.textContent).toBe(
+      'ChatGPT would not stop the current turn. Nothing moved — this chat still owns the session.'
+    );
   });
 
   it('never overwrites a draft the user is writing', async () => {
@@ -7511,7 +7513,10 @@ describe('the Compact & resume control', () => {
     live.reply.set('compact', () => ({
       ok: false,
       status: 409,
-      data: { error: 'session_not_recorded', message: 'This chat has no recorded local session to compact.' }
+      data: {
+        error: 'session_not_recorded',
+        message: 'This chat has no recorded local session to continue in a new chat yet.'
+      }
     }));
     live.hook.injectControl();
 
@@ -7522,7 +7527,7 @@ describe('the Compact & resume control', () => {
     expect((live.document.querySelector('.clf-composer') as HTMLElement).dataset.clfMode).toBe('error');
     // The pill is one word everywhere except a failure, where the detail is the message.
     expect(live.document.querySelector('.clf-pill-text')!.textContent).toBe(
-      'This chat has no recorded local session to compact.'
+      'This chat has no recorded local session to continue in a new chat yet.'
     );
   });
 });
@@ -9306,14 +9311,14 @@ describe('the fresh chat the app opened', () => {
 });
 
 /**
- * The context meter, and compaction that starts itself.
+ * The context meter, and context rollover that starts itself.
  *
  * Both read the same two numbers out of `/activity` — what the recording holds, and the
  * lines it is measured against. That is the point of sending them together: a bar that
  * filled against a figure of its own would show a full bar and do nothing, or compact a
  * conversation that still looked half empty.
  */
-describe('the context meter and automatic compaction', () => {
+describe('the context meter and automatic context rollover', () => {
   let live: Harness | null = null;
 
   afterEach(() => {
@@ -9381,7 +9386,7 @@ describe('the context meter and automatic compaction', () => {
    * where something will actually happen. A bar filling towards a limit while the chat was
    * being compacted at half of it would be measuring the wrong thing.
    */
-  it('fills towards the threshold instead once automatic compaction is on', async () => {
+  it('fills towards the threshold instead once automatic context rollover is on', async () => {
     live = await harness(undefined, {
       activity: () => withContext(100_000, settings({ auto: true, threshold: 200_000 }))
     });
@@ -9390,14 +9395,14 @@ describe('the context meter and automatic compaction', () => {
 
     const meter = live.hook.meterView()!;
     expect(meter.filled).toBeCloseTo(0.5, 5);
-    expect(meter.tip).toBe('100k/200k · autocompact on');
+    expect(meter.tip).toBe('100k/200k · rollover on');
   });
 
   /**
    * The count, the ceiling and the switch on one line.
    *
    * The tooltip already said all three in prose, and prose is what nobody reads while they
-   * are working. `283k/400k · autocompact on` is the same three facts in the shape the user
+   * are working. `283k/400k · rollover on` is the same three facts in the shape the user
    * asked for: whether the thing is armed is as much part of the reading as the number is,
    * because 283k out of 400k means something quite different depending on the answer.
    */
@@ -9407,16 +9412,16 @@ describe('the context meter and automatic compaction', () => {
     await live.hook.pullActivity();
 
     const meter = live.hook.meterView()!;
-    expect(meter.status).toBe('283k/400k · autocompact on');
+    expect(meter.status).toBe('283k/400k · rollover on');
     // And the line leads the tooltip, so hovering says the short thing before the long one.
     expect(meter.tip.startsWith(meter.status)).toBe(true);
   });
 
-  it('says so on the same line when automatic compaction is off', async () => {
+  it('says so on the same line when automatic context rollover is off', async () => {
     live = await harness(undefined, { activity: () => withContext(283_000, settings({ auto: false })) });
     live.hook.injectControl();
     await live.hook.pullActivity();
-    expect(live.hook.meterView()!.status).toBe('283k/400k · autocompact off');
+    expect(live.hook.meterView()!.status).toBe('283k/400k · rollover off');
   });
 
   it('counts towards the threshold in the status line too, once one is set', async () => {
@@ -9425,7 +9430,7 @@ describe('the context meter and automatic compaction', () => {
     });
     live.hook.injectControl();
     await live.hook.pullActivity();
-    expect(live.hook.meterView()!.status).toBe('100k/200k · autocompact on');
+    expect(live.hook.meterView()!.status).toBe('100k/200k · rollover on');
   });
 
   it('draws nothing when the app has sent no numbers to draw', async () => {
