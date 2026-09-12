@@ -370,6 +370,13 @@ describe('the settings sheet', () => {
     }
   });
 
+  it('presents the automatic setting as Context Rollover, not compaction', () => {
+    const auto = document.getElementById('autoCompact')!.closest('.setting')!;
+    expect(auto.querySelector('.setting-text b')!.textContent).toBe('Automatic Context Rollover');
+    expect(chatSource).toContain('Off — use Continue in New Chat manually from the ChatGPT tab.');
+    expect(chatSource).not.toContain('Compact & resume button');
+  });
+
   /**
    * Every input on the sheet has to be in the change-listener list or it silently does not
    * save. `autoCompactTokens` was missing from it, so the one number the automatic trigger

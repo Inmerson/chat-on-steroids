@@ -15,6 +15,7 @@
 
 import { randomUUID } from 'node:crypto';
 import { userTitle } from './title.js';
+import { sanitizeRecordedArgs } from './redaction.js';
 import type {
   ActivitySummary,
   AgentMessage,
@@ -42,7 +43,6 @@ import {
   MAX_ASSET_BYTES,
   appendEvent,
   observeSessionModel,
-  conversationAttachment,
   createSession,
   conversationWasSuperseded,
   endSession,
@@ -282,16 +282,6 @@ async function initializeSessionForConversation(
       return moved.sessionId;
     }
     known = await findSessionByConversation(conversationId);
-  }
-  if (!known && (await conversationWasSuperseded(conversationId))) {
-    // Compact & Resume moved this chat's session onto its replacement. Whatever the old page
-    // still reports — the brief re-rendered with its HTML, a lingering turn, the user typing
-    // into it — is history of that one session, never a chat of its own: on 2026-09-02 the
-    // brief's late re-render minted a second session holding nothing but the summary.
-    // recordChatObservationsNow() files such messages into the lineage; nothing else may
-    // mint a session for a conversation this app has already replaced.
-    logInfo(`conversation ${conversationId} was replaced by Compact & Resume; its late observation gets no session of its own`);
-    return null;
   }
   // A chat this app opened is named for the command that opened it. The alternative —
   // the first thing said in the chat — is this app's own bootstrap prompt.
@@ -1049,45 +1039,8 @@ async function storeText(
  * agent identity. Writing one into events.jsonl would publish it to session_history, to the
  * Activity feed the extension is sent, and to anything built from the raw log.
  */
-const CREDENTIAL_FIELDS = new Set(['secret']);
-
-/**
- * Removes the argument values that must never be written to disk.
- *
- * Environment overrides can carry credentials, a base64 blob is megabytes of noise,
- * and clipboard text is the one input the user may not have meant to hand over.
- * Everything else is stored verbatim: the point of the record is exact recovery.
- */
 function redactArgs(tool: string, args: unknown): unknown {
-  if (!args || typeof args !== 'object') return args;
-  const copy: Record<string, unknown> = { ...(args as Record<string, unknown>) };
-  // Native file values carry download credentials, not reproducible tool input.
-  // Keep the destination and result for recovery without persisting the URL or file token.
-  if (tool === 'download_artifact' && Object.hasOwn(copy, 'file')) copy['file'] = '<native file credentials not stored>';
-  if (copy['env'] && typeof copy['env'] === 'object') {
-    copy['env'] = Object.fromEntries(Object.keys(copy['env'] as object).map((key) => [key, '***']));
-  }
-  if (typeof copy['dataBase64'] === 'string') {
-    copy['dataBase64'] = `<${(copy['dataBase64'] as string).length} base64 characters not stored>`;
-  }
-  if (tool === 'write_clipboard' && typeof copy['text'] === 'string') {
-    copy['text'] = `<${copy['text'].length} characters not stored>`;
-  }
-  // Clipboard text arrives inside computer's action list, so the redaction follows the
-  // action rather than the tool name: the text the user copied is theirs, and one of these
-  // steps buried in a batch of clicks must not be the thing that writes it to disk.
-  if (tool === 'computer' && Array.isArray(copy['actions'])) {
-    copy['actions'] = (copy['actions'] as unknown[]).map((action) => {
-      if (!action || typeof action !== 'object') return action;
-      const step = action as Record<string, unknown>;
-      if (step['type'] !== 'write_clipboard' || typeof step['text'] !== 'string') return action;
-      return { ...step, text: `<${(step['text'] as string).length} characters not stored>` };
-    });
-  }
-  for (const field of Object.keys(copy)) {
-    if (CREDENTIAL_FIELDS.has(field)) copy[field] = '<removed>';
-  }
-  return copy;
+  return sanitizeRecordedArgs(tool, args);
 }
 
 function redactResult(tool: string, text: string): string {
@@ -1208,29 +1161,19 @@ export function recordToolCall(input: ToolCallInput): Promise<ToolCallRecord | n
     attributing = Promise.resolve(target);
   } else {
     // Open the evidence wait before entering this workflow's queue, so sequential calls never
-    // restart its deadline. No other request or page state can satisfy this exact join.
-    attributing = input.requestId
-      ? awaitRequestCorrelation(input.requestId, REQUEST_ID_GRACE_MS).then((correlation) => {
-          const conversationId = correlation?.conversationId ?? null;
-          // Say which request id gave up, not just that something did. `unattributed` is the
-          // one outcome whose cause always lives in the browser half of the join, so the log
-          // has to carry the id that the page never confirmed — it is the only handle anyone
-          // has for matching this against what the extension believed it sent.
-          if (!conversationId) {
-            logWarn(
-              `request attribution: no page evidence for ${input.requestId} within ` +
-                `${REQUEST_ID_GRACE_MS}ms; filing ${input.tool} under Unattributed activity`
-            );
-          }
-          if (input.bind && conversationId) bindAgentConversation(input.bind, conversationId);
-          return {
-            conversationId,
-            sessionId: correlation?.sessionId ?? null,
-            attribution: conversationId ? ('request_id' as const) : ('unattributed' as const),
-            turnId: conversationId ? conversations.get(conversationId)?.turnId ?? null : null
-          };
-        })
-      : Promise.resolve<Target>({ conversationId: null, sessionId: null, attribution: 'unattributed', turnId: null });
+    // Use exact evidence only when it already exists. Missing page evidence is expected for
+    // phone/browserless MCP clients, so it is never an authorization gate and never a 15s wait.
+    // If the browser reports the exact request later, noteCallEvidence() schedules deterministic
+    // repair of this Unattributed record.
+    const correlation = input.requestId ? requestCorrelation(input.requestId) : null;
+    const conversationId = correlation?.conversationId ?? null;
+    if (input.bind && conversationId) bindAgentConversation(input.bind, conversationId);
+    attributing = Promise.resolve<Target>({
+      conversationId,
+      sessionId: correlation?.sessionId ?? null,
+      attribution: conversationId ? ('request_id' as const) : ('unattributed' as const),
+      turnId: conversationId ? conversations.get(conversationId)?.turnId ?? null : null
+    });
   }
   const file = async (): Promise<ToolCallRecord | null> => {
     const target = await attributing;
@@ -1263,17 +1206,6 @@ export async function flushRecorder(): Promise<void> {
 async function fileToolCall(input: ToolCallInput, target: Target): Promise<ToolCallRecord | null> {
   if (!recordingEnabled()) return null;
   try {
-    // Exact request evidence proves who called; it does not keep a replaced frontend
-    // executable. A remains part of the durable transcript after A -> B, but any *new* call
-    // from A is an incident, not new history in B's live context. Preserve the proof on the
-    // row while routing it to the one non-chat stream, and make that verdict terminal so the
-    // ordinary late-correlation repair cannot put it back later.
-    if (
-      target.conversationId &&
-      (await conversationAttachment(target.conversationId, target.sessionId)) === 'superseded'
-    ) {
-      target = { ...target, attribution: 'superseded', turnId: null };
-    }
     const evidence = input.evidence ?? currentCall()?.evidence ?? emptyEvidence();
     const sessionId = await targetSession(target);
     if (!sessionId) return null;
@@ -1782,64 +1714,6 @@ async function supersededLineage(conversationId: string): Promise<string | null>
   return lineage && lineage.conversationId !== conversationId ? lineage.id : null;
 }
 
-/**
- * What a replaced chat may still add to its session: its messages, and nothing else.
- *
- * The session's live turn, activity clock, Goal obligations and title belong to the chat
- * that replaced it, so a lingering page on the old chat records prose only — the brief's
- * final rendering arriving after the commit, or the user carrying on in the old tab — and
- * moves none of the projections the replacement now owns.
- */
-async function recordSupersededMessages(
-  sessionId: string,
-  observations: readonly ChatObservation[]
-): Promise<number> {
-  let stored = 0;
-  for (const item of observations) {
-    if (!item.messageId) continue;
-    const base = {
-      time: item.time,
-      source: 'extension' as const,
-      ...(item.turnId ? { turnId: item.turnId } : {})
-    };
-    let written: { changed: boolean } | null = null;
-    if (item.kind === 'user_message') {
-      written = await upsertMessageEvent(
-        sessionId,
-        {
-          ...base,
-          kind: 'user_message',
-          message: await storeText(sessionId, item.text ?? '', MAX_USER_MESSAGE_CHARS),
-          ...(item.attachments?.length ? { attachments: item.attachments } : {}),
-          messageId: item.messageId
-        },
-        { preferTime: item.authoredTime === true }
-      );
-    } else if (item.kind === 'assistant_message') {
-      const state = item.state ?? (item.final === true ? 'final' : 'streaming');
-      written = await upsertMessageEvent(
-        sessionId,
-        {
-          ...base,
-          kind: 'assistant_message',
-          message: await storeText(sessionId, item.text ?? '', 256_000),
-          ...(item.renderedHtml
-            ? { renderedHtml: await storeText(sessionId, item.renderedHtml, 120_000) }
-            : {}),
-          messageId: item.messageId,
-          state,
-          ...(item.providerMessageId ? { providerMessageId: item.providerMessageId } : {}),
-          final: state === 'final'
-        },
-        { preferTime: item.authoredTime === true }
-      );
-    }
-    if (written?.changed) stored++;
-  }
-  if (stored > 0) notifyChanged();
-  return stored;
-}
-
 async function recordChatObservationsNow(
   conversationId: string,
   observations: readonly ChatObservation[],
@@ -1852,13 +1726,6 @@ async function recordChatObservationsNow(
 }> {
   const activity: { meaningful: boolean; working: boolean; terminal: boolean; at?: number; toolStartedAt?: number; endedTurnId?: string } = { meaningful: false, working: false, terminal: false };
   if (!recordingEnabled()) return { sessionId: null, stored: 0, activity, goalCandidates: [] };
-  if (!conversations.has(conversationId)) {
-    const lineage = await supersededLineage(conversationId);
-    if (lineage) {
-      const stored = await recordSupersededMessages(lineage, observations);
-      return { sessionId: lineage, stored, activity, goalCandidates: [] };
-    }
-  }
   let firstUser: ChatObservation | undefined;
   let pageTitle: ChatObservation | undefined;
   const explicitEnds = new Set<string>();

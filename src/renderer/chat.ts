@@ -1322,7 +1322,7 @@ function wireGoal(save: () => Promise<void>): void {
 function applyAutoCompactHint(config: Config): void {
   $('autoCompactHint').textContent = config.compaction.auto
     ? 'Interrupts the answer at this many tokens, writes a handoff, opens a fresh chat. Once per chat.'
-    : 'Off — only the Compact & resume button in the ChatGPT tab compacts.';
+    : 'Off — use Continue in New Chat manually from the ChatGPT tab.';
 }
 
 /**

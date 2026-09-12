@@ -60,6 +60,9 @@ export function sanitizeRecordedArgs(tool: string, args: unknown): unknown {
   if (typeof copy['dataBase64'] === 'string') {
     copy['dataBase64'] = `<${copy['dataBase64'].length} base64 characters not stored>`;
   }
+  if (tool === 'write_clipboard' && typeof copy['text'] === 'string') {
+    copy['text'] = `<${copy['text'].length} characters not stored>`;
+  }
   if (tool === 'computer') copy['actions'] = sanitizeComputerActions(copy['actions']);
   return copy;
 }

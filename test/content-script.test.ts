@@ -4046,7 +4046,7 @@ describe('navigating from one chat to another', () => {
         error: '',
         now: Date.now()
       }).label
-    ).toBe('Compact');
+    ).toBe('Continue');
   });
 });
 
@@ -7122,7 +7122,7 @@ describe('the Continue in New Chat control', () => {
     });
     expect(state({ job: { stage: 'failed', busy: false, error: 'cancelled', handoffId: null } })).toMatchObject({
       mode: 'idle',
-      hint: 'Resume cancelled',
+      hint: 'Continuation cancelled',
       action: 'start'
     });
     expect(state({ connected: false })).toMatchObject({ mode: 'off', action: 'none' });
