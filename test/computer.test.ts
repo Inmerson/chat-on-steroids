@@ -250,15 +250,22 @@ describe.runIf(IS_WINDOWS)('desktop helper', () => {
       checked++;
       // Recompute the mapping from the screenshot that came back with these elements.
       // Any other frame's region or scale gives different numbers.
-      expect(element.imageBounds.x).toBe(Math.round((element.bounds.x - shot.region.x) * shot.scale));
-      expect(element.imageBounds.y).toBe(Math.round((element.bounds.y - shot.region.y) * shot.scale));
-      const expectedRight = Math.round((element.bounds.x + element.bounds.width - shot.region.x) * shot.scale);
-      const expectedBottom = Math.round((element.bounds.y + element.bounds.height - shot.region.y) * shot.scale);
-      expect(element.imageBounds.width).toBe(expectedRight - element.imageBounds.x);
-      expect(element.imageBounds.height).toBe(expectedBottom - element.imageBounds.y);
-      expect(element.imageCenter.x).toBe(
-        Math.round(element.imageBounds.x + element.imageBounds.width / 2)
-      );
+      const expectedLeft = Math.round(((element.bounds.x - shot.region.x) * shot.width) / shot.region.width);
+      const expectedTop = Math.round(((element.bounds.y - shot.region.y) * shot.height) / shot.region.height);
+      const expectedRight = Math.round(((element.bounds.x + element.bounds.width - shot.region.x) * shot.width) / shot.region.width);
+      const expectedBottom = Math.round(((element.bounds.y + element.bounds.height - shot.region.y) * shot.height) / shot.region.height);
+      expect(element.imageBounds.x).toBe(expectedLeft);
+      expect(element.imageBounds.y).toBe(expectedTop);
+      expect(element.imageBounds.width).toBe(expectedRight - expectedLeft);
+      expect(element.imageBounds.height).toBe(expectedBottom - expectedTop);
+      if (expectedRight > expectedLeft && expectedBottom > expectedTop) {
+        expect(element.imageCenter.x).toBe(
+          Math.min(expectedRight - 1, Math.round((expectedLeft + expectedRight) / 2))
+        );
+        expect(element.imageCenter.y).toBe(
+          Math.min(expectedBottom - 1, Math.round((expectedTop + expectedBottom) / 2))
+        );
+      }
       expect(element.imageBounds.x + element.imageBounds.width).toBeLessThanOrEqual(shot.width);
       expect(element.imageBounds.y + element.imageBounds.height).toBeLessThanOrEqual(shot.height);
     }
