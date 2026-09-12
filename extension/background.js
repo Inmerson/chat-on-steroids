@@ -228,6 +228,10 @@ let revivalPreferences = {};
 let freshInputAssignments = {};
 /** Elections created or re-proven during this service-worker lifetime. */
 const freshInputRuntimeAssignments = new Set();
+/** One absolute-lifetime browser election per app-owned Stop command. */
+let stopOpenings = {};
+/** At most one Stop offer flight per command in this worker lifetime. */
+const stopOffers = new Set();
 let freshInputMaintenance = null;
 let freshInputMaintenanceAgain = false;
 
@@ -253,7 +257,8 @@ async function loadOnce() {
     'commandAckOutbox',
     'inputAckOutbox',
     'loopRecoveryCounters',
-    'freshInputAssignments'
+    'freshInputAssignments',
+    'stopOpenings'
   ]);
   port = typeof stored.port === 'number' ? stored.port : null;
   token = typeof stored.token === 'string' ? stored.token : null;
@@ -329,6 +334,7 @@ async function loadOnce() {
   // native-send opportunity for the same durable Core input. Accept the session copy only
   // as an in-development migration fallback.
   freshInputAssignments = parseFreshInputAssignments(stored.freshInputAssignments ?? live.freshInputAssignments);
+  stopOpenings = parseStopOpenings(stored.stopOpenings);
   agentTabLeaseTelemetry = parseAgentTabLeaseTelemetry(live.agentTabLeaseTelemetry);
   await cleanupLoopTransferState({ checkTabs: true });
   loaded = true;
@@ -411,6 +417,22 @@ function parseFreshInputAssignments(value) {
   return out;
 }
 
+function parseStopOpenings(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return {};
+  const now = Date.now();
+  const out = {};
+  for (const [id, raw] of Object.entries(value)) {
+    if (typeof id !== 'string' || !id || id.length > 128 || !raw || typeof raw !== 'object' || Array.isArray(raw)) continue;
+    const conversationId = cleanConversationId(raw.conversationId);
+    const turnId = typeof raw.turnId === 'string' && raw.turnId.length > 0 && raw.turnId.length <= 256 ? raw.turnId : null;
+    const expiresAt = Number.isFinite(raw.expiresAt) ? Number(raw.expiresAt) : null;
+    if (!conversationId || !turnId || expiresAt === null || expiresAt <= now) continue;
+    const tab = raw.tab === null || Number.isInteger(raw.tab) ? raw.tab : null;
+    out[id] = { tab, conversationId, turnId, expiresAt, offered: raw.offered === true };
+  }
+  return out;
+}
+
 function agentTabTelemetryHeaders() {
   const telemetry = agentTabLeaseTelemetry;
   if (!telemetry) return {};
@@ -456,7 +478,8 @@ function persistLive() {
         commandAckOutbox: commandAckOutbox.slice(-200),
         inputAckOutbox: inputAckOutbox.slice(-200),
         deferredRevivals: deferredRevivals.slice(-100),
-        freshInputAssignments
+        freshInputAssignments,
+        stopOpenings
       })
     ])
   );
@@ -1340,14 +1363,15 @@ async function routeOwnedCommandTab(tabId, commandId, commandType) {
   return ensureManagedWindow(kind, tabId);
 }
 
-function commandAckPayload(id, status, error, conversationId, agent, client) {
+function commandAckPayload(id, status, error, conversationId, agent, client, turnId) {
   return {
     id,
     status,
     error: error || undefined,
     conversationId: conversationId || undefined,
     agent: agent || undefined,
-    client: client || undefined
+    client: client || undefined,
+    turnId: turnId || undefined
   };
 }
 
@@ -1522,10 +1546,10 @@ async function drainInputAcks(targetId = null) {
   }
 }
 
-async function ackCommand(id, status, error, conversationId, agent, client, source = null) {
+async function ackCommand(id, status, error, conversationId, agent, client, source = null, turnId) {
   await load();
   if (!id) return { ok: false, status: 400, error: 'bad_command_id' };
-  const payload = commandAckPayload(id, status, error, conversationId, agent, client);
+  const payload = commandAckPayload(id, status, error, conversationId, agent, client, turnId);
   const queued = {
     ...payload,
     provisional: payload.conversationId ? null : tabKey(source),
@@ -2551,6 +2575,111 @@ async function applyRequestedBrowserPreferences(request) {
   await call('/browser/preferences', { method: 'POST', body: JSON.stringify(receipt) });
 }
 
+/**
+ * Offers one app-owned Stop to one exact registered conversation document.
+ *
+ * `stopOpenings` is durable across MV3/browser restart because opening/delivery is one-shot:
+ * once Chrome may have created a tab or delivered a state-changing click request, loss of the
+ * reply is not permission to try another tab/document. Core remains the semantic authority and
+ * expires the command on its original absolute deadline.
+ */
+async function offerStopTurns(requests) {
+  if (!Array.isArray(requests)) return;
+  await load();
+  const now = Date.now();
+  let pruned = false;
+  for (const [id, row] of Object.entries(stopOpenings)) {
+    if (!row || row.expiresAt <= now) {
+      delete stopOpenings[id];
+      pruned = true;
+    }
+  }
+  if (pruned) await persistLive();
+
+  for (const request of requests.slice(0, 40)) {
+    const id = typeof request?.id === 'string' && request.id.length > 0 && request.id.length <= 128 ? request.id : null;
+    const conversationId = cleanConversationId(request?.conversationId);
+    const turnId = typeof request?.turnId === 'string' && request.turnId.length > 0 && request.turnId.length <= 256
+      ? request.turnId
+      : null;
+    const expiresAt = Number.isFinite(request?.expiresAt) ? Number(request.expiresAt) : null;
+    if (!id || !conversationId || !turnId || expiresAt === null || expiresAt <= Date.now() || stopOffers.has(id)) continue;
+    stopOffers.add(id);
+    try {
+      let tabs = [];
+      try { tabs = await chrome.tabs.query({ url: CHATGPT_TAB_URLS }); } catch { tabs = []; }
+      if (expiresAt <= Date.now()) continue;
+
+      let election = stopOpenings[id] || null;
+      if (election && (election.conversationId !== conversationId || election.turnId !== turnId || election.expiresAt !== expiresAt)) {
+        // The same command id changing target is never a valid retry.
+        continue;
+      }
+      const matches = (tab) => conversationFromUrl(tab?.pendingUrl || tab?.url) === conversationId;
+      let tab = election && Number.isInteger(election.tab)
+        ? tabs.find((candidate) => candidate?.id === election.tab && matches(candidate)) || null
+        : tabs.find(matches) || null;
+
+      if (!election) {
+        election = { tab: tab?.id ?? null, conversationId, turnId, expiresAt, offered: false };
+        stopOpenings[id] = election;
+        // Spend placement custody before any Chrome await. If create() succeeds but its reply is
+        // lost, the durable null-tab election deliberately prevents another opening attempt.
+        await persistLive();
+        if (expiresAt <= Date.now()) continue;
+        if (!tab) {
+          try {
+            const created = await chrome.tabs.create({
+              url: `https://chatgpt.com/c/${encodeURIComponent(conversationId)}`,
+              active: false
+            });
+            if (created && Number.isInteger(created.id)) {
+              election.tab = created.id;
+              await persistLive();
+            }
+          } catch {
+            // Ambiguous create failure remains spent. A new user Stop request mints a new id.
+          }
+          continue;
+        }
+      }
+
+      if (!tab || election.offered === true || expiresAt <= Date.now()) continue;
+      const key = String(tab.id);
+      const documentId = typeof tabDocuments[key] === 'string' ? tabDocuments[key] : null;
+      const navigationEpoch = Number.isSafeInteger(tabEpochs[key]) ? tabEpochs[key] : 0;
+      const source = documentId ? { tab: tab.id, documentId, navigationEpoch } : null;
+      if (!source || tabConversations[key] !== conversationId || !ownsDocument(source)) continue;
+      let current = null;
+      try { current = await chrome.tabs.get(tab.id); } catch { current = null; }
+      if (
+        !current ||
+        current.pendingUrl ||
+        conversationFromUrl(current.url) !== conversationId ||
+        !ownsDocument(source) ||
+        expiresAt <= Date.now()
+      ) continue;
+
+      // Spend the one state-changing offer before sendMessage. A lost response cannot authorize
+      // another click attempt against a later turn/document.
+      election.offered = true;
+      await persistLive();
+      if (!ownsDocument(source) || expiresAt <= Date.now()) continue;
+      try {
+        await chrome.tabs.sendMessage(
+          tab.id,
+          { type: 'clf-stop-turn', id, conversationId, turnId },
+          { documentId }
+        );
+      } catch {
+        // Fail closed. The user may issue another Stop, which receives a new Core command id.
+      }
+    } finally {
+      stopOffers.delete(id);
+    }
+  }
+}
+
 async function maintainFreshInputDelivery() {
   if (freshInputMaintenance) {
     // Registration/status can arrive while the current pass is already beyond the point
@@ -2564,6 +2693,7 @@ async function maintainFreshInputDelivery() {
     await load();
     const result = await call('/status');
     if (!result.ok || !result.data) return result;
+    await offerStopTurns(result.data.stopTurns);
     await applyRequestedBrowserPreferences(result.data.browserPreferenceRequest);
     void inspectRequestedModels(result.data.modelCatalogRequest);
     const publishedInputs = Array.isArray(result.data.inputs) ? result.data.inputs : [];
@@ -3370,6 +3500,23 @@ const HANDLERS = {
     const result = await call('/settings', { method: 'POST', body: JSON.stringify(body) });
     return ownsDocument(source) ? result : { ok: false, error: 'stale_document' };
   },
+  async stop_redeem(message, _sender, source) {
+    await load();
+    if (!ownsDocument(source)) return { ok: false, error: 'stale_document' };
+    const tab = await chrome.tabs.get(source.tab);
+    if (!ownsDocument(source) || conversationFromUrl(tab.url) !== message.conversationId) return { ok: false, error: 'wrong_conversation' };
+    const result = await redeemCommand(String(message.id || ''), String(message.client || ''), message.conversationId);
+    return ownsDocument(source) ? result : { ok: false, error: 'stale_document' };
+  },
+  async stop_ack(message, _sender, source) {
+    await load();
+    if (!ownsDocument(source)) return { ok: false, error: 'stale_document' };
+    const tab = await chrome.tabs.get(source.tab);
+    if (!ownsDocument(source) || conversationFromUrl(tab.url) !== message.conversationId ||
+        typeof message.turnId !== 'string' || !message.turnId || message.turnId.length > 256) return { ok: false, error: 'wrong_turn' };
+    return ackCommand(String(message.id || ''), message.status === 'sent' ? 'sent' : 'failed', message.error,
+      message.conversationId, null, message.client, source, message.turnId);
+  },
   /** The marked page asking for the one command it was opened for. */
   async redeem(message, _sender, source) {
     const result = await redeemCommand(
@@ -3728,7 +3875,10 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     'close_agent_tab',
     'recover_conversation_tab',
     'recovery_ready',
-    'recovery_progress'
+    'recovery_progress',
+    'bind',
+    'stop_redeem',
+    'stop_ack'
   ]);
   const run = async () => {
     let source = null;

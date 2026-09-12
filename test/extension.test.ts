@@ -1567,6 +1567,45 @@ describe('extension command delivery', () => {
     expect(backgroundSource).not.toContain("call('/commands'");
   });
 
+  it('offers an app-owned Stop only to the exact registered conversation document', async () => {
+    const local = new FakeStorageArea(paired);
+    const session = new FakeStorageArea();
+    const conversationId = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee';
+    const tab = { id: 205, url: `https://chatgpt.com/c/${conversationId}`, status: 'complete', windowId: 7 };
+    const expiresAt = Date.now() + 120_000;
+    const fetch = vi.fn(async (input: string) => {
+      const url = new URL(input);
+      if (url.pathname === '/hello') return response(200, { app: 'chat-on-steroids', paired: true });
+      if (url.pathname === '/status') return response(200, {
+        ok: true,
+        inputs: [],
+        stopTurns: [{ id: 'stop-command-1', conversationId, turnId: 'turn-1', expiresAt }]
+      });
+      return response(404, {});
+    });
+    const worker = loadWorker({
+      local,
+      session,
+      fetch,
+      tabsQuery: async () => [tab],
+      tabsGet: async () => tab
+    });
+    const documentId = 'stop-document-1';
+    await worker.registerDocument(tab, documentId);
+    await worker.sendFrom({ type: 'bind', conversationId }, tab, documentId);
+
+    await worker.send({ type: 'status' });
+
+    expect(worker.tabsSendMessage).toHaveBeenCalledWith(
+      tab.id,
+      { type: 'clf-stop-turn', id: 'stop-command-1', conversationId, turnId: 'turn-1' },
+      { documentId }
+    );
+    await worker.send({ type: 'status' });
+    expect(worker.tabsSendMessage.mock.calls.filter(([, message]) => message?.type === 'clf-stop-turn')).toHaveLength(1);
+    expect(worker.tabsCreate).not.toHaveBeenCalled();
+  });
+
   it('status maintenance opens at most one marked fresh-input tab for one UUID', async () => {
     const local = new FakeStorageArea(paired);
     const session = new FakeStorageArea();

@@ -365,6 +365,181 @@ describe('one synchronous page snapshot per observer turn', () => {
   });
 });
 
+describe('native composer control ownership', () => {
+  it.each(['hidden', 'historical'])('ignores a %s stale Stop control', async (kind) => {
+    live = await harness();
+    const api = (live.window as any).CLF_DOM;
+    const stop = live.document.createElement('button');
+    stop.setAttribute('data-testid', 'stop-button');
+    if (kind === 'hidden') {
+      const wrapper = live.document.createElement('div');
+      wrapper.setAttribute('aria-hidden', 'true');
+      wrapper.append(stop);
+      live.document.body.prepend(wrapper);
+    } else {
+      const turn = assistantTurn(live.document, 'historical-stop-turn', []);
+      turn.append(stop);
+    }
+
+    expect(api.generating()).toBe(false);
+    expect(api.stopButton()).toBeNull();
+  });
+
+  it('never clicks a hidden stale Send control ahead of the live composer Send', async () => {
+    live = await harness();
+    const api = (live.window as any).CLF_DOM;
+    const visible = live.document.querySelector<HTMLButtonElement>('[data-testid="send-button"]')!;
+    const hidden = live.document.createElement('button');
+    hidden.type = 'button';
+    hidden.setAttribute('data-testid', 'send-button');
+    const wrapper = live.document.createElement('div');
+    wrapper.setAttribute('aria-hidden', 'true');
+    wrapper.append(hidden);
+    live.document.body.prepend(wrapper);
+
+    let hiddenClicks = 0;
+    let visibleClicks = 0;
+    const accept = () => {
+      live!.document.querySelector('#prompt-textarea')!.replaceChildren();
+    };
+    hidden.addEventListener('click', () => { hiddenClicks++; accept(); });
+    visible.addEventListener('click', () => { visibleClicks++; accept(); });
+    expect(api.insertPrompt('send only through the live composer', true)).toBe(true);
+
+    expect(await api.send()).toBe(true);
+    expect(hiddenClicks).toBe(0);
+    expect(visibleClicks).toBe(1);
+  });
+});
+
+describe('app-owned Stop command custody', () => {
+  it.each(['original', 'newer'])('stops only the exact live turn whose native question is %s', async (question) => {
+    const conversationId = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee';
+    let expectedTurnId = '';
+    live = await harness(`https://chatgpt.com/c/${conversationId}`, {
+      redeem: (message) => ({
+        ok: true,
+        command: {
+          id: message.id,
+          kind: 'stop-turn',
+          type: 'stop',
+          conversationId,
+          turnId: expectedTurnId,
+          userMessageId: 'm-original-question'
+        }
+      }),
+      ack: () => ({ ok: true, committed: true })
+    });
+    userTurn(live.document, 'original-question', 'Original work');
+    startGenerating(live.document);
+    assistantTurn(live.document, 'live-stop-answer', []);
+    live.hook.observe();
+    await live.hook.flush();
+    const page = await live.runtimeMessage({ type: 'clf-page-status' }) as Record<string, any>;
+    expectedTurnId = String(page.turnId || '');
+    expect(expectedTurnId).not.toBe('');
+
+    const stop = live.document.querySelector<HTMLButtonElement>('[data-testid="stop-button"]')!;
+    let clicks = 0;
+    stop.addEventListener('click', () => { clicks++; });
+    if (question === 'newer') userTurn(live.document, 'newer-question', 'Do something else now');
+
+    const result = await live.runtimeMessage({
+      type: 'clf-stop-turn',
+      id: 'stop-command-1',
+      conversationId,
+      turnId: expectedTurnId
+    });
+    expect(result).toEqual({ ok: question === 'original' });
+    expect(clicks).toBe(question === 'original' ? 1 : 0);
+    // If the page has already advanced to a newer user turn before redemption, this document
+    // never acquires Core ownership of the stale Stop at all. Once redeemed, every later
+    // authority loss is instead closed with an explicit failed ACK (covered below).
+    expect(live.sent.filter((message) => message.type === 'redeem')).toHaveLength(question === 'original' ? 1 : 0);
+    expect(live.sent.filter((message) => message.type === 'ack')).toHaveLength(question === 'original' ? 1 : 0);
+    if (question === 'original') {
+      expect(live.sent.find((message) => message.type === 'ack')).toMatchObject({
+        status: 'sent',
+        conversationId
+      });
+    }
+  });
+
+  it('does not click a replacement Stop control that appeared while Core authorized the command', async () => {
+    const conversationId = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee';
+    let expectedTurnId = '';
+    let replacementClicks = 0;
+    live = await harness(`https://chatgpt.com/c/${conversationId}`, {
+      redeem: (message) => {
+        live!.document.querySelector('[data-testid="stop-button"]')?.remove();
+        const replacement = live!.document.createElement('button');
+        replacement.setAttribute('data-testid', 'stop-button');
+        replacement.addEventListener('click', () => { replacementClicks++; });
+        live!.document.querySelector('[data-testid="composer-trailing-actions"]')!.append(replacement);
+        return {
+          ok: true,
+          command: {
+            id: message.id,
+            kind: 'stop-turn',
+            type: 'stop',
+            conversationId,
+            turnId: expectedTurnId,
+            userMessageId: 'm-original-question'
+          }
+        };
+      },
+      ack: () => ({ ok: true, committed: false })
+    });
+    userTurn(live.document, 'original-question', 'Original work');
+    startGenerating(live.document);
+    assistantTurn(live.document, 'live-stop-answer', []);
+    live.hook.observe();
+    await live.hook.flush();
+    expectedTurnId = String((await live.runtimeMessage({ type: 'clf-page-status' }) as Record<string, any>).turnId || '');
+
+    expect(await live.runtimeMessage({ type: 'clf-stop-turn', id: 'stop-replaced', conversationId, turnId: expectedTurnId }))
+      .toEqual({ ok: false });
+    expect(replacementClicks).toBe(0);
+    expect(live.sent.find((message) => message.type === 'ack')).toMatchObject({ status: 'failed', conversationId });
+  });
+
+  it('durably fails without clicking when the SPA route changes during Stop redemption', async () => {
+    const conversationId = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee';
+    const otherConversation = 'ffffffff-bbbb-cccc-dddd-eeeeeeeeeeee';
+    let expectedTurnId = '';
+    let clicks = 0;
+    live = await harness(`https://chatgpt.com/c/${conversationId}`, {
+      redeem: (message) => {
+        live!.window.history.replaceState({}, '', `/c/${otherConversation}`);
+        return {
+          ok: true,
+          command: {
+            id: message.id,
+            kind: 'stop-turn',
+            type: 'stop',
+            conversationId,
+            turnId: expectedTurnId,
+            userMessageId: 'm-original-question'
+          }
+        };
+      },
+      ack: () => ({ ok: true, committed: false })
+    });
+    userTurn(live.document, 'original-question', 'Original work');
+    startGenerating(live.document);
+    assistantTurn(live.document, 'live-stop-answer', []);
+    live.hook.observe();
+    await live.hook.flush();
+    expectedTurnId = String((await live.runtimeMessage({ type: 'clf-page-status' }) as Record<string, any>).turnId || '');
+    live.document.querySelector('[data-testid="stop-button"]')!.addEventListener('click', () => { clicks++; });
+
+    expect(await live.runtimeMessage({ type: 'clf-stop-turn', id: 'stop-route-change', conversationId, turnId: expectedTurnId }))
+      .toEqual({ ok: false });
+    expect(clicks).toBe(0);
+    expect(live.sent.find((message) => message.type === 'ack')).toMatchObject({ status: 'failed', conversationId });
+  });
+});
+
 // ------------------------------------------------------------------ markup
 
 function assistantTurn(document: Document, id: string, labels: string[]): HTMLElement {

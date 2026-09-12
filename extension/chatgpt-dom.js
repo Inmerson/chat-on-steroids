@@ -464,13 +464,48 @@ var CLF_DOM = (() => {
     }, null);
   }
 
-  /** True while ChatGPT is producing a turn. The stop button is the honest signal. */
+  /**
+   * One live native composer control.
+   *
+   * React can leave old/hidden composer controls mounted elsewhere in the document while a
+   * replacement composer is already authoritative. A state-changing click must therefore be
+   * scoped to the form that owns the current editor, and must reject controls hidden by an
+   * ancestor rather than trusting the first document-global selector match.
+   */
+  function composerControl(selector) {
+    return safe(() => {
+      const host = composerBox();
+      if (!host) return null;
+      for (const control of host.querySelectorAll(selector)) {
+        if (!control.isConnected) continue;
+        if (control.closest('[hidden],[aria-hidden="true"],[inert]')) continue;
+        const style = getComputedStyle(control);
+        if (style.display === 'none' || style.visibility === 'hidden') continue;
+        return control;
+      }
+      return null;
+    }, null);
+  }
+
+  /** True while ChatGPT is producing a turn. The live composer Stop control is the signal. */
   function generating() {
-    return safe(() => document.querySelector(STOP) !== null, false);
+    return stopButton() !== null;
   }
 
   function stopButton() {
-    return safe(() => document.querySelector(STOP), null);
+    return composerControl(STOP);
+  }
+
+  /** Only a visible, enabled native Stop control may end a proven turn. */
+  function stopGeneration(stillCurrent) {
+    if (typeof stillCurrent !== 'function' || !stillCurrent()) return false;
+    const button = stopButton();
+    if (!button || !button.isConnected || button.disabled || button.getAttribute('aria-disabled') === 'true' ||
+        button.hidden || button.closest('[hidden],[inert]')) return false;
+    const style = getComputedStyle(button);
+    if (style.display === 'none' || style.visibility === 'hidden' || !stillCurrent()) return false;
+    button.click();
+    return true;
   }
 
   /**
@@ -1233,8 +1268,10 @@ var CLF_DOM = (() => {
    */
   function composerActions() {
     return safe(() => {
-      const anchor = document.querySelector(SEND) || document.querySelector(STOP) || document.querySelector(SPEECH);
-      const explicit = anchor ? anchor.closest(TRAILING) : document.querySelector(TRAILING);
+      const box = composerBox();
+      if (!box) return null;
+      const anchor = composerControl(SEND) || stopButton() || box.querySelector(SPEECH);
+      const explicit = anchor ? anchor.closest(TRAILING) : box.querySelector(TRAILING);
       if (!anchor) return explicit ? { host: explicit, before: null } : null;
 
       // The row that holds several controls, not the wrapper around this one button.
@@ -1688,7 +1725,7 @@ var CLF_DOM = (() => {
         timer = setTimeout(() => finish(false), 3000);
 
         try {
-          const button = document.querySelector(SEND);
+          const button = composerControl(SEND);
           if (button && !button.disabled) {
             button.click();
           } else {
@@ -1726,6 +1763,7 @@ var CLF_DOM = (() => {
     sectionSignature,
     generating,
     stopButton,
+    stopGeneration,
     progressLine,
     progressItems,
     interrupted,

@@ -23,7 +23,7 @@
 import { randomBytes, timingSafeEqual } from 'node:crypto';
 import http from 'node:http';
 import type { BridgeStatus } from '../shared/types.js';
-import type { SessionOrigin } from '../shared/session.js';
+import type { SessionEvent, SessionOrigin } from '../shared/session.js';
 import { getConfig, updateConfig } from './config.js';
 import { getSecret, secureStorageStatus, setSecret } from './secrets.js';
 import {
@@ -188,6 +188,8 @@ export interface BrowserAgentTabTelemetry {
  * after everybody had stopped expecting them.
  */
 const COMMAND_DEADLINE_MS = 90_000;
+/** One absolute budget for app-owned Stop, including any browser placement and redemption. */
+export const STOP_COMMAND_TIMEOUT_MS = 120_000;
 /**
  * Past this age an ordinary bootstrap/restored command is stale, not pending. An exact-chat
  * revival that already opened its target and is still waiting for page submit-readiness is the
@@ -307,7 +309,15 @@ type CommandSpec =
   /** Re-arm one already-bound execution conversation without re-sending the approved plan. */
   | { type: 'execution-resume'; executionRunId: string; conversationId: string }
   /** Last-resort clean-chat continuation after exact-chat recovery can no longer proceed safely. */
-  | { type: 'execution-rollover'; executionRunId: string; fromConversationId: string; reason: string };
+  | { type: 'execution-rollover'; executionRunId: string; fromConversationId: string; reason: string }
+  /** One exact live browser turn the user/app asked to interrupt. */
+  | {
+      type: 'stop';
+      sessionId: string;
+      conversationId: string;
+      turnId: string;
+      userMessageId?: string;
+    };
 
 interface Command {
   id: string;
@@ -379,7 +389,7 @@ interface DurableCommandSnapshot {
 /** The wire form the extension receives. */
 export interface BridgeCommand {
   id: string;
-  kind: 'open-chat';
+  kind: 'open-chat' | 'stop-turn';
   /**
    * Why this chat is being opened.
    *
@@ -402,6 +412,10 @@ export interface BridgeCommand {
    * the opposite precondition — a chat with no conversation of its own yet.
    */
   conversationId: string | null;
+  /** Exact live generation targeted by an app-owned Stop command. */
+  turnId?: string;
+  /** Native user-message identity immediately preceding that generation, when proven. */
+  userMessageId?: string;
   /** Durable Core execution identity when this command belongs to a managed autonomous run. */
   executionRunId: string | null;
   /** Loop mode is projected from the durable run rather than trusted from the browser. */
@@ -1119,6 +1133,7 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
       ok: true,
       conversations: live,
       commands: commands.length,
+      stopTurns: await pendingStopCommands(),
       modelCatalogRequest: pendingChatModelRequest(),
       browserPreferenceRequest: pendingBrowserPreferenceRequest(),
       inputs: await pendingBrowserInputs()
@@ -2304,10 +2319,22 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
       }
     }
     if (
+      command.spec.type === 'stop' &&
+      (
+        !reportedConversation ||
+        reportedConversation !== command.spec.conversationId ||
+        Date.now() >= command.createdAt + STOP_COMMAND_TIMEOUT_MS ||
+        !(await stopCommandCurrent(command.spec))
+      )
+    ) {
+      return json(res, 409, { error: 'stop_turn_changed' }, origin);
+    }
+    if (
       reportedConversation &&
       !(
         (command.spec.type === 'revive' && command.spec.conversationId === reportedConversation) ||
-        (command.spec.type === 'execution-resume' && command.spec.conversationId === reportedConversation)
+        (command.spec.type === 'execution-resume' && command.spec.conversationId === reportedConversation) ||
+        (command.spec.type === 'stop' && command.spec.conversationId === reportedConversation)
       )
     ) {
       // An existing ChatGPT page is allowed to claim exactly one kind of command: a revival
@@ -2355,6 +2382,15 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
         return json(res, 409, { error: 'command_taken' }, origin);
       }
       return json(res, 503, { error: 'command_lease_not_durable', retryable: true }, origin);
+    }
+    if (
+      command.spec.type === 'stop' &&
+      (
+        Date.now() >= command.createdAt + STOP_COMMAND_TIMEOUT_MS ||
+        !(await stopCommandCurrent(command.spec))
+      )
+    ) {
+      return json(res, 409, { error: 'stop_turn_changed' }, origin);
     }
     clearWorkerPlacement(command.id);
     // `claim()` armed the original browser-open deadline. A page can legitimately spend a
@@ -2477,7 +2513,20 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
         // went into the worker's own conversation and not into some other tab.
         return json(res, 503, { error: 'conversation_required', retryable: true }, origin);
       }
-      if (
+      if (command.spec.type === 'stop') {
+        if (conversation !== command.spec.conversationId) {
+          return json(res, 409, { error: 'stop_wrong_conversation' }, origin);
+        }
+        receipt = {
+          id,
+          client: client || command.owner,
+          conversationId: conversation,
+          outcome: 'committed',
+          committed: true,
+          error: null,
+          completedAt: Date.now()
+        };
+      } else if (
         command.spec.type === 'execution' ||
         command.spec.type === 'execution-resume' ||
         command.spec.type === 'execution-rollover'
@@ -2681,6 +2730,17 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
         }
         }
       }
+    } else if (command.spec.type === 'stop') {
+      const why = error ? `the browser could not stop the requested turn — ${error}` : 'the browser could not stop the requested turn';
+      receipt = {
+        id,
+        client: client || command.owner,
+        conversationId: conversation,
+        outcome: 'terminal-failure',
+        committed: false,
+        error: why,
+        completedAt: Date.now()
+      };
     } else if (
       command.spec.type === 'execution' ||
       command.spec.type === 'execution-resume' ||
@@ -3280,10 +3340,106 @@ export function shutdownBridge(): Promise<void> {
 
 // ------------------------------------------------------------------ commands
 
+/** Native user-message identity immediately preceding one exact browser generation. */
+async function stopUserAnchor(sessionId: string, turnId: string): Promise<string | undefined> {
+  const rows = await readRecentEvents(sessionId, 64, { kinds: ['user_message', 'turn_start', 'turn_end'] });
+  const order = (event: SessionEvent): number => ('origin' in event ? event.origin : undefined) ?? event.seq;
+  const chronological = [...rows].sort((a, b) => order(a) - order(b));
+  let userMessageId: string | undefined;
+  for (const event of chronological) {
+    if (event.kind === 'user_message') {
+      userMessageId = event.source === 'extension' && event.messageId ? event.messageId : undefined;
+      continue;
+    }
+    if (event.kind === 'turn_start' && event.turnId === turnId) return userMessageId;
+    userMessageId = undefined;
+  }
+  return undefined;
+}
+
+/** Re-proves that a Stop command still names the same durable/live browser turn. */
+async function stopCommandCurrent(spec: Extract<CommandSpec, { type: 'stop' }>): Promise<boolean> {
+  const session = await getSession(spec.sessionId);
+  if (!session || session.conversationId !== spec.conversationId || session.activeTurnId !== spec.turnId) return false;
+  return liveConversations().some(
+    (row) =>
+      row.sessionId === spec.sessionId &&
+      row.conversationId === spec.conversationId &&
+      row.activeTurnId === spec.turnId
+  );
+}
+
+/**
+ * Queues one exact Stop without granting a second turn/browser attempt.
+ *
+ * The current browser turn is re-read before and after the only awaited history lookup. If it
+ * changed in between, no command is created. Repeated calls for the same session/turn collapse
+ * through the normal command key.
+ */
+export async function stopSessionTurn(
+  sessionId: string,
+  expectedTurnId: string
+): Promise<{ id: string; conversationId: string; turnId: string; expiresAt: number }> {
+  const session = await getSession(sessionId);
+  const conversationId = session?.conversationId ?? null;
+  if (!conversationId || !expectedTurnId || session?.activeTurnId !== expectedTurnId) {
+    throw new Error('active_turn_changed');
+  }
+  const initial = liveConversations().find(
+    (row) => row.sessionId === sessionId && row.conversationId === conversationId
+  );
+  if (!initial || initial.activeTurnId !== expectedTurnId) throw new Error('active_turn_changed');
+  const userMessageId = await stopUserAnchor(sessionId, expectedTurnId);
+  const after = await getSession(sessionId);
+  const live = liveConversations().find(
+    (row) => row.sessionId === sessionId && row.conversationId === conversationId
+  );
+  if (after?.conversationId !== conversationId || after.activeTurnId !== expectedTurnId || live?.activeTurnId !== expectedTurnId) {
+    throw new Error('active_turn_changed');
+  }
+  const command = queue({
+    type: 'stop',
+    sessionId,
+    conversationId,
+    turnId: expectedTurnId,
+    ...(userMessageId ? { userMessageId } : {})
+  });
+  return {
+    id: command.id,
+    conversationId,
+    turnId: expectedTurnId,
+    expiresAt: command.createdAt + STOP_COMMAND_TIMEOUT_MS
+  };
+}
+
+async function pendingStopCommands(): Promise<
+  Array<{ id: string; conversationId: string; turnId: string; expiresAt: number }>
+> {
+  const pending: Array<{ id: string; conversationId: string; turnId: string; expiresAt: number }> = [];
+  for (const command of [...commands]) {
+    if (command.spec.type !== 'stop') continue;
+    const expiresAt = command.createdAt + STOP_COMMAND_TIMEOUT_MS;
+    if (expiresAt <= Date.now() || !(await stopCommandCurrent(command.spec))) {
+      retire(command, 'the requested browser turn is no longer stoppable');
+      continue;
+    }
+    if (commands.includes(command)) {
+      pending.push({
+        id: command.id,
+        conversationId: command.spec.conversationId,
+        turnId: command.spec.turnId,
+        expiresAt
+      });
+    }
+  }
+  return pending;
+}
+
 function specKey(spec: CommandSpec): string {
   if (spec.type === 'worker') return `worker:${spec.agent}`;
   if (spec.type === 'revive') return `revive:${spec.agent}`;
   if (spec.type === 'resume') return `resume:${spec.sessionId}`;
+  if (spec.type === 'stop') return `stop:${spec.sessionId}:${spec.turnId}`;
   if (spec.type === 'execution') return `execution:${spec.executionRunId}`;
   if (spec.type === 'execution-resume') return `execution-resume:${spec.executionRunId}`;
   return `execution-rollover:${spec.executionRunId}`;
@@ -4059,6 +4215,7 @@ function waitingForRevivalReadiness(command: Command): boolean {
 }
 
 function commandDeadlineDelay(command: Command, now = Date.now()): number | null {
+  if (command.spec.type === 'stop') return command.createdAt + STOP_COMMAND_TIMEOUT_MS - now;
   // A revival's first lease belongs to the *browser-open attempt*, not yet to a document. The
   // exact worker chat may still be rendering the assistant message that contains agents.finish,
   // so the content script deliberately refuses to redeem until that page is submit-ready. That
@@ -4117,6 +4274,10 @@ function rearmRetainedCommandDeadlines(): void {
 function expire(command: Command): void {
   if (!commands.includes(command)) return;
   const spec = command.spec;
+  if (spec.type === 'stop') {
+    retire(command, 'the requested browser turn was not stopped before its absolute deadline');
+    return;
+  }
   if (spec.type === 'execution' || spec.type === 'execution-resume' || spec.type === 'execution-rollover') {
     const run = executionRun(spec.executionRunId);
     if (!run || run.status === 'stopped' || run.status === 'failed' || run.status === 'completed') {
@@ -4202,6 +4363,7 @@ function retire(command: Command, why: string): void {
  * anything at all.
  */
 function bootstrapText(spec: CommandSpec, summary: string): string {
+  if (spec.type === 'stop') return '';
   if (spec.type === 'execution') return executionBootstrapText(spec.executionRunId);
   if (spec.type === 'execution-resume' || spec.type === 'execution-rollover') return '';
   if (spec.type === 'revive') {
@@ -4327,14 +4489,15 @@ function describe(
   const execution = executionRunId ? executionRun(executionRunId) : null;
   return {
     id: command.id,
-    kind: 'open-chat',
+    kind: spec.type === 'stop' ? 'stop-turn' : 'open-chat',
     type: spec.type,
     text,
     agent: spec.type === 'worker' || spec.type === 'revive' ? spec.agent : null,
     // The fence the page enforces before it types. Only a revival has one: the other two
     // kinds open a chat that does not exist yet, so there is nothing to compare against.
     conversationId:
-      spec.type === 'revive' || spec.type === 'execution-resume' ? spec.conversationId : null,
+      spec.type === 'revive' || spec.type === 'execution-resume' || spec.type === 'stop' ? spec.conversationId : null,
+    ...(spec.type === 'stop' ? { turnId: spec.turnId, ...(spec.userMessageId ? { userMessageId: spec.userMessageId } : {}) } : {}),
     executionRunId,
     loopMode: execution?.mode ?? null
   };
@@ -4411,6 +4574,12 @@ function tidyCommands(): void {
   const pendingWorkers = new Set(pendingWorkerSpawns().map((worker) => worker.id));
   const wakingWorkers = new Set(pendingWorkerRevivals().map((revival) => revival.id));
   for (const command of [...commands]) {
+    if (command.spec.type === 'stop') {
+      if (now >= command.createdAt + STOP_COMMAND_TIMEOUT_MS) {
+        retire(command, 'the requested browser turn passed its absolute Stop deadline');
+      }
+      continue;
+    }
     const workerAgent = command.spec.type === 'worker' ? command.spec.agent : null;
     if (
       (command.spec.type === 'worker' || command.spec.type === 'revive') &&
@@ -4478,6 +4647,7 @@ function tidyCommands(): void {
 /** Whether a page is already working on this command, with time still on its deadline. */
 const isLeased = (command: Command): boolean => {
   if (command.claimedAt === null) return false;
+  if (command.spec.type === 'stop') return Date.now() < command.createdAt + STOP_COMMAND_TIMEOUT_MS;
   if (waitingForRevivalReadiness(command)) return true;
   if (Date.now() - command.claimedAt < COMMAND_DEADLINE_MS) return true;
   if (command.spec.type !== 'resume') return false;
@@ -4499,8 +4669,14 @@ function nextDeliverable(): Command | null {
   // open attempt. It must stay durable without monopolising the global browser-delivery slot:
   // unrelated workers/resumes can still open their own marker-addressed pages while this one
   // waits. A document-owned lease remains exclusive and still blocks the next irreversible send.
-  if (commands.some((command) => isLeased(command) && !waitingForRevivalReadiness(command))) return null;
-  return commands.find((command) => !waitingForRevivalReadiness(command)) ?? null;
+  if (
+    commands.some(
+      (command) => command.spec.type !== 'stop' && isLeased(command) && !waitingForRevivalReadiness(command)
+    )
+  ) return null;
+  return commands.find(
+    (command) => command.spec.type !== 'stop' && !waitingForRevivalReadiness(command)
+  ) ?? null;
 }
 
 /**
@@ -4525,6 +4701,7 @@ function commandOrigin(id: string): SessionOrigin | null {
   // the task this worker was actually created for with whatever it is being asked next.
   if (spec.type === 'revive') return null;
   if (spec.type === 'resume') return { kind: 'resume', fromSessionId: spec.sessionId, agentId: null, task: '' };
+  if (spec.type === 'stop') return null;
   return null;
 }
 
@@ -4613,6 +4790,27 @@ function restoredReceipt(raw: Partial<CommandReceipt>, now: number): CommandRece
  * continuation WAL. Returning null is therefore a retirement decision, not a parse fallback.
  */
 function restoredCommandSpec(version: number, raw: Partial<CommandSpec>): CommandSpec | null {
+  if (
+    raw.type === 'stop' &&
+    typeof (raw as Partial<Extract<CommandSpec, { type: 'stop' }>>).sessionId === 'string' &&
+    typeof (raw as Partial<Extract<CommandSpec, { type: 'stop' }>>).conversationId === 'string' &&
+    typeof (raw as Partial<Extract<CommandSpec, { type: 'stop' }>>).turnId === 'string'
+  ) {
+    const stop = raw as Extract<CommandSpec, { type: 'stop' }>;
+    const conversation = conversationId(stop.conversationId);
+    if (!conversation || !stop.sessionId || !stop.turnId || stop.turnId.length > 256) return null;
+    const userMessageId =
+      typeof stop.userMessageId === 'string' && stop.userMessageId.length > 0 && stop.userMessageId.length <= 256
+        ? stop.userMessageId
+        : undefined;
+    return {
+      type: 'stop',
+      sessionId: stop.sessionId,
+      conversationId: conversation,
+      turnId: stop.turnId,
+      ...(userMessageId ? { userMessageId } : {})
+    };
+  }
   if (
     raw.type === 'execution' &&
     typeof (raw as Partial<Extract<CommandSpec, { type: 'execution' }>>).executionRunId === 'string'
@@ -4789,6 +4987,7 @@ function planCommandRestore(
 
   for (const { raw, spec, createdAt } of durableCandidates.values()) {
     if (spec.type === 'resume') resumeTokens.push({ sessionId: spec.sessionId, token: spec.token });
+    if (spec.type === 'stop' && now >= createdAt + STOP_COMMAND_TIMEOUT_MS) continue;
     const persistedLeased = version !== 1 && raw.phase === 'leased';
     const persistedWaitingRevival =
       spec.type === 'revive' && persistedLeased && (raw.owner === null || raw.owner === undefined);

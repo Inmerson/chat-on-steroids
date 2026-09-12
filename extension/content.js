@@ -1199,6 +1199,39 @@
     fiberPresent = false;
   }
 
+  const stoppedAppCommands = new Set();
+  function stopQuestionMatches(userMessageId) {
+    const users = CLF_DOM.messages().filter((message) => message.role === 'user' && message.id);
+    return typeof userMessageId === 'string' && !!userMessageId && users.at(-1)?.id === userMessageId;
+  }
+  async function stopAppTurn(request) {
+    const expected = request?.turnId, target = request?.conversationId, commandId = request?.id;
+    const heldEpoch = epoch;
+    if (typeof expected !== 'string' || !expected || typeof commandId !== 'string' || !commandId) return false;
+    observe();
+    const current = () => alive && epoch === heldEpoch && conversationId === target && CLF_DOM.conversationId() === target && turnId === expected;
+    if (!current()) return false;
+    if (stoppedAppCommands.has(commandId)) {
+      await ask({ type: 'ack', id: commandId, client: RUN_ID, conversationId: target, turnId: expected, status: 'sent' });
+      return true;
+    }
+    const initialStop = CLF_DOM.stopButton();
+    const reply = await ask({ type: 'redeem', id: commandId, client: RUN_ID, conversationId: target });
+    observe();
+    const command = reply?.command;
+    if (!reply?.ok || command?.type !== 'stop' || command.turnId !== expected || command.conversationId !== target) return false;
+    const canStop = () => current() && generating && (!command.userMessageId || stopQuestionMatches(command.userMessageId)) && CLF_DOM.stopButton() === initialStop;
+    // Concurrent redemptions may finish after the first click, before ChatGPT removes Stop.
+    const stopped = stoppedAppCommands.has(commandId) || (canStop() && CLF_DOM.stopGeneration(canStop));
+    if (stopped) {
+      stoppedAppCommands.add(commandId);
+      if (stoppedAppCommands.size > 100) stoppedAppCommands.delete(stoppedAppCommands.values().next().value);
+    }
+    await ask({ type: 'ack', id: commandId, client: RUN_ID, conversationId: target, turnId: expected,
+      status: stopped ? 'sent' : 'failed', error: stopped ? undefined : 'native_stop_unavailable_or_turn_changed' });
+    return stopped;
+  }
+
   function currentAssistantTurn(turns = CLF_DOM.turns()) {
     for (let index = turns.length - 1; index >= 0; index--) {
       if (turns[index].role === 'assistant') return turns[index];
@@ -8477,6 +8510,103 @@
     }
   }
 
+  function latestNativeUserMessageId() {
+    const rows = CLF_DOM.messages();
+    for (let index = rows.length - 1; index >= 0; index--) {
+      const row = rows[index];
+      if (row?.role === 'user' && typeof row.id === 'string' && row.id) return row.id;
+    }
+    return null;
+  }
+
+  /**
+   * Executes one app-owned Stop only against the exact live turn/question Core authorized.
+   *
+   * The worker offer contains correlation only. Authority is redeemed from Core by this exact
+   * registered document, then route/epoch/turn/question/native-control identity are re-proved at
+   * the click boundary. Any ambiguity is terminal for this command; a later Stop is a new id.
+   */
+  async function runStopCommand(message) {
+    const id = typeof message?.id === 'string' && message.id.length > 0 && message.id.length <= 128 ? message.id : '';
+    const target = typeof message?.conversationId === 'string' ? message.conversationId : '';
+    const expectedTurnId = typeof message?.turnId === 'string' ? message.turnId : '';
+    const expectedEpoch = epoch;
+    if (
+      !id ||
+      !target ||
+      !expectedTurnId ||
+      commandsHandled.has(id) ||
+      conversationId !== target ||
+      CLF_DOM.conversationId() !== target ||
+      turnId !== expectedTurnId
+    ) return false;
+    const ownedStop = CLF_DOM.stopButton();
+    if (!ownedStop || !ownedStop.isConnected) return false;
+
+    const routeTurnCurrent = () =>
+      alive &&
+      epoch === expectedEpoch &&
+      conversationId === target &&
+      CLF_DOM.conversationId() === target &&
+      turnId === expectedTurnId &&
+      pendingTools === 0 &&
+      generating &&
+      CLF_DOM.generating();
+    const clickCurrent = () =>
+      routeTurnCurrent() &&
+      ownedStop.isConnected &&
+      CLF_DOM.stopButton() === ownedStop;
+    if (!routeTurnCurrent()) return false;
+    commandsHandled.add(id);
+
+    const redeemed = await ask(
+      { type: 'redeem', id, client: RUN_ID, conversationId: target },
+      routeTurnCurrent
+    );
+    if (!redeemed || redeemed.ok !== true) return false;
+    const boot = redeemed.command;
+    const fail = async (why) => {
+      if (alive) {
+        await ask({
+          type: 'ack',
+          id,
+          status: 'failed',
+          error: why,
+          conversationId: target,
+          client: RUN_ID
+        });
+      }
+      return false;
+    };
+    if (!routeTurnCurrent()) return fail('the requested browser turn changed after Stop redemption');
+    if (
+      !boot ||
+      boot.id !== id ||
+      boot.kind !== 'stop-turn' ||
+      boot.type !== 'stop' ||
+      boot.conversationId !== target ||
+      boot.turnId !== expectedTurnId
+    ) return fail('the redeemed Stop no longer matches the offered browser turn');
+    if (boot.userMessageId && latestNativeUserMessageId() !== boot.userMessageId) {
+      return fail('the user question owning the requested Stop changed before the native click');
+    }
+    if (!clickCurrent()) return fail('the live native Stop control or requested turn changed before the click');
+
+    try {
+      ownedStop.click();
+    } catch {
+      return fail('the live native Stop control could not be clicked');
+    }
+    const ack = await ask({
+      type: 'ack',
+      id,
+      status: 'sent',
+      conversationId: target,
+      client: RUN_ID
+    });
+    return ack?.ok === true;
+  }
+
   async function deliverCommand(id, fromUrl = true, reportClaim = () => undefined, attempt = null) {
     const expectedEpoch = epoch;
     const openedConversation = fromUrl ? OPENED_CONVERSATION : CLF_DOM.conversationId();
@@ -8883,6 +9013,12 @@
       // background.js uses this only to distinguish a live isolated-world recorder from the
       // dead context Chrome leaves behind when an unpacked extension is reloaded while the
       // ChatGPT document stays open. No page/session data crosses in this health check.
+      if (message.type === 'clf-stop-turn') {
+        void stopAppTurn(message)
+          .then((ok) => sendResponse({ ok }))
+          .catch(() => sendResponse({ ok: false }));
+        return true;
+      }
       if (message.type === 'clf-model-catalog') {
         void inspectAppModelCatalog(message)
           .then(ok => sendResponse({ ok }))
@@ -8945,6 +9081,12 @@
         renderStreams();
         sendResponse({ ok: true, enabled: RENDER_STREAM });
         return false;
+      }
+      if (message.type === 'clf-stop-turn') {
+        void runStopCommand(message)
+          .then((stopped) => sendResponse({ ok: stopped === true }))
+          .catch(() => sendResponse({ ok: false }));
+        return true;
       }
       if (message.type === 'clf-run-command') {
         const wanted = typeof message.id === 'string' ? message.id : '';

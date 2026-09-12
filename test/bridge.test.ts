@@ -4747,6 +4747,50 @@ describe('the goal loop over the bridge', () => {
   });
 });
 
+describe('app-owned Stop command custody', () => {
+  it('publishes one exact live-turn Stop with its original native question anchor', async () => {
+    await pair();
+    const conversationId = 'e6666666-aaaa-4bbb-8ccc-111111111111';
+    const recorded = await request('POST', '/events', { body: { conversationId, events: [
+      { kind: 'user_message', time: Date.now(), messageId: 'original-question', text: 'Original work' },
+      { kind: 'turn_start', time: Date.now() + 1, turnId: 'original-turn' }
+    ] } });
+    const stopSessionTurn = (await import('../src/main/bridge.js') as any).stopSessionTurn;
+    expect(stopSessionTurn).toBeTypeOf('function');
+
+    await stopSessionTurn(recorded.body.sessionId, 'original-turn');
+    const status = await request('GET', '/status');
+    expect(status.body.stopTurns).toEqual([
+      expect.objectContaining({ conversationId, turnId: 'original-turn', expiresAt: expect.any(Number) })
+    ]);
+    const stop = status.body.stopTurns[0];
+    const wrong = await request('POST', '/commands/redeem', {
+      body: { id: stop.id, client: 'wrong-chat-page', conversationId: 'ffffffff-aaaa-4bbb-8ccc-111111111111' }
+    });
+    expect(wrong.status).toBe(409);
+
+    const redeemed = await request('POST', '/commands/redeem', {
+      body: { id: stop.id, client: 'exact-stop-page', conversationId }
+    });
+    expect(redeemed.status).toBe(200);
+    expect(redeemed.body.command).toMatchObject({
+      kind: 'stop-turn', type: 'stop', conversationId, turnId: 'original-turn', userMessageId: 'original-question'
+    });
+
+    const afterRedeem = await request('GET', '/status');
+    expect(afterRedeem.body.stopTurns).toEqual([
+      expect.objectContaining({ id: stop.id, expiresAt: stop.expiresAt })
+    ]);
+
+    const ack = await request('POST', '/commands/ack', {
+      body: { id: stop.id, status: 'sent', conversationId, client: 'exact-stop-page' }
+    });
+    expect(ack.status).toBe(200);
+    expect(ack.body.committed).toBe(true);
+    expect((await request('GET', '/status')).body.stopTurns).toEqual([]);
+  });
+});
+
 // ------------------------------------------------------------------ shutdown
 
 describe('shutting the listener down', () => {
