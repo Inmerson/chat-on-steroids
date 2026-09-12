@@ -5667,6 +5667,123 @@ describe('evidence from the page context', () => {
     expect(live.sent.filter((message) => message.type === 'correlate')).toHaveLength(1);
   });
 
+  it('confirms an exact request from the live response stream before Fiber publishes it', async () => {
+    live = await harness();
+    const conversationId = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee';
+    const requestId = 'wfr_stream_early_exact';
+    live.reply.set('correlate', () => ({
+      ok: true,
+      status: 200,
+      data: { ok: true, conversationId, confirmed: [requestId], complete: true }
+    }));
+
+    live.window.dispatchEvent(new live.window.MessageEvent('message', {
+      source: live.window as unknown as Window,
+      origin: 'https://chatgpt.com',
+      data: { type: 'cos-request-origin', conversationId, requestIds: [requestId], observedAt: 1_700_000_001_000 }
+    }));
+    await settle();
+
+    expect(live.sent.filter((message) => message.type === 'correlate')).toEqual([
+      expect.objectContaining({
+        conversationId,
+        calls: [{ requestId, messageId: null, createTime: 1_700_000_001 }]
+      })
+    ]);
+  });
+
+  it('keeps a fresh-chat stream identity until the address bar publishes its exact route', async () => {
+    live = await harness('https://chatgpt.com/?cos-input=aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee');
+    const conversationId = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee';
+    const requestId = 'wfr_fresh_route_convergence';
+    live.reply.set('correlate', () => ({
+      ok: true,
+      status: 200,
+      data: { ok: true, conversationId, confirmed: [requestId], complete: true }
+    }));
+
+    live.window.dispatchEvent(new live.window.MessageEvent('message', {
+      source: live.window as unknown as Window,
+      origin: 'https://chatgpt.com',
+      data: { type: 'cos-request-origin', conversationId, requestIds: [requestId], observedAt: 1_700_000_001_000 }
+    }));
+    await settle();
+    expect(live.sent.filter((message) => message.type === 'correlate')).toEqual([]);
+
+    live.window.history.replaceState({}, '', `/c/${conversationId}`);
+    live.hook.observe();
+    await settle();
+
+    expect(live.sent.filter((message) => message.type === 'correlate')).toEqual([
+      expect.objectContaining({
+        conversationId,
+        calls: [{ requestId, messageId: null, createTime: 1_700_000_001 }]
+      })
+    ]);
+  });
+
+  it('retires fresh-chat stream proof when another concrete route wins first', async () => {
+    live = await harness('https://chatgpt.com/');
+    const conversationId = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee';
+    live.window.dispatchEvent(new live.window.MessageEvent('message', {
+      source: live.window as unknown as Window,
+      origin: 'https://chatgpt.com',
+      data: { type: 'cos-request-origin', conversationId, requestIds: ['wfr_retired_route'] }
+    }));
+    live.window.history.replaceState({}, '', '/c/11111111-2222-3333-4444-555555555555');
+    live.hook.observe();
+    live.window.history.replaceState({}, '', `/c/${conversationId}`);
+    live.hook.observe();
+    await settle();
+    expect(live.sent.filter((message) => message.type === 'correlate')).toEqual([]);
+  });
+
+  it('does not grant stream identity from another route or malformed requests', async () => {
+    live = await harness();
+    const conversationId = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee';
+    for (const data of [
+      { type: 'cos-request-origin', conversationId: '11111111-2222-3333-4444-555555555555', requestIds: ['wfr_foreign'] },
+      { type: 'cos-request-origin', conversationId, requestIds: ['not-a-workflow'] },
+      { type: 'cos-request-origin', conversationId, requestIds: Array.from({ length: 17 }, (_, i) => `wfr_${i}`) }
+    ]) {
+      live.window.dispatchEvent(new live.window.MessageEvent('message', {
+        source: live.window as unknown as Window,
+        origin: 'https://chatgpt.com',
+        data
+      }));
+    }
+    await settle();
+    expect(live.sent.filter((message) => message.type === 'correlate')).toEqual([]);
+  });
+
+  it('drops a stream ownership handshake if document registration resolves after the route changed', async () => {
+    let release!: (value: unknown) => void;
+    const registration = new Promise((resolve) => { release = resolve; });
+    const conversationId = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee';
+    live = await harness(`https://chatgpt.com/c/${conversationId}`, {
+      register_document: () => registration
+    });
+
+    live.window.dispatchEvent(new live.window.MessageEvent('message', {
+      source: live.window as unknown as Window,
+      origin: 'https://chatgpt.com',
+      data: {
+        type: 'cos-request-origin',
+        conversationId,
+        requestIds: ['wfr_stale_after_register'],
+        observedAt: 1_700_000_001_000
+      }
+    }));
+    await settle();
+    expect(live.sent.filter((message) => message.type === 'register_document')).toHaveLength(1);
+
+    live.window.history.replaceState({}, '', '/c/11111111-2222-4333-8444-555555555555');
+    release({ ok: true });
+    await settle();
+
+    expect(live.sent.filter((message) => message.type === 'correlate')).toEqual([]);
+  });
+
   it('confirms a live request when the virtualized renderer published no data-turn-id', async () => {
     live = await harness();
     const conversationId = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee';

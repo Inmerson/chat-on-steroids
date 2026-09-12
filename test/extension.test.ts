@@ -42,27 +42,21 @@ describe('extension release metadata', () => {
     expect(backgroundSource).toContain('const BRIDGE_PROTOCOL = 10;');
   });
 
-  /**
-   * The Fiber helper is the one piece of this extension that runs in ChatGPT's own
-   * JavaScript context, and it only does so because the manifest says `"world": "MAIN"`.
-   * Lose that one word and the file still loads, still finds nothing — `__reactFiber$` is
-   * invisible from an isolated world — and fails closed, so every collapsed row silently
-   * goes back to standing for one call. That is a regression with no symptom, which is
-   * why it is pinned here.
-   */
-  it('runs the fiber helper in the page context, and nothing else there', async () => {
+  /** MAIN-world helpers are passive evidence only; recorder/bridge authority stays isolated. */
+  it('runs only the bounded Fiber and request-origin helpers in the page context', async () => {
     const manifest = JSON.parse(
       await fs.readFile(path.join(process.cwd(), 'extension', 'manifest.json'), 'utf8')
     ) as { content_scripts: Array<{ js: string[]; world?: string }> };
 
     const main = manifest.content_scripts.filter((entry) => entry.world === 'MAIN');
-    expect(main).toHaveLength(1);
-    expect(main[0]!.js).toEqual(['fiber.js']);
+    expect(main).toHaveLength(2);
+    expect(main.map((entry) => entry.js)).toEqual([['fiber.js'], ['usage.js']]);
     // The rest stays isolated: the page must not be able to reach the code that talks to
     // the service worker, holds the bridge token, or decides what gets recorded.
     for (const entry of manifest.content_scripts) {
       if (entry.world === 'MAIN') continue;
       expect(entry.js).not.toContain('fiber.js');
+      expect(entry.js).not.toContain('usage.js');
       expect(entry.world ?? 'ISOLATED').toBe('ISOLATED');
     }
   });

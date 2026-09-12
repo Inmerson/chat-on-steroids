@@ -751,7 +751,7 @@
   }
 
   /** Talks to the service worker. Returns null once the extension is reloaded. */
-  async function ask(message) {
+  async function ask(message, current = null) {
     // A new/reloaded document claims its browser-supplied MessageSender.documentId before
     // any observation or mutation. This is what lets the worker retain a terminal tombstone
     // across external navigation and still admit the genuinely new page, without accepting
@@ -768,6 +768,7 @@
     if (!startupLoopTransfer && registered.recovery && typeof registered.recovery === 'object') {
       startupLoopTransfer = registered.recovery;
     }
+    if (current && !current()) return null;
     observed.blocked = null;
     return sendToWorker({ ...message, navigationEpoch: epoch });
   }
@@ -1184,6 +1185,7 @@
     pageToolsReported.clear();
     callsReported.clear();
     requestOwnersConfirmed.clear();
+    pendingStreamOrigins.clear();
     requestOwnersPending.clear();
     requestOwnerRetryAt.clear();
     requestOwnerAttempts.clear();
@@ -1674,6 +1676,8 @@
         });
       }
     }
+
+    flushStreamRequestOrigins();
 
     // `/c/A` -> `/` is ambiguous by itself: ChatGPT uses that shape both for transient
     // router churn in A and while opening a genuinely fresh chat B. What is never safe is
@@ -2254,6 +2258,8 @@
   const callsReported = new Map();
   /** Exact request ids the app has ACKed as owned by a concrete conversation. */
   const requestOwnersConfirmed = new Map();
+  /** Bounded response-stream identities waiting for the exact /c/<id> route to appear. */
+  const pendingStreamOrigins = new Map();
   /** One in-flight ownership handshake per conversation/request id. */
   const requestOwnersPending = new Set();
   /** Failed handshakes back off briefly instead of retrying on every Fiber mutation. */
@@ -2623,7 +2629,8 @@
     return found;
   }
 
-  function confirmLiveRequestOwners(calls, ownerConversation) {
+  function confirmLiveRequestOwners(calls, ownerConversation, current = null) {
+    if (current && !current()) return;
     if (!Array.isArray(calls) || calls.length === 0 || !ownerConversation) return;
     const byRequest = new Map();
     for (const call of calls) {
@@ -2640,7 +2647,8 @@
       type: 'correlate',
       conversationId: ownerConversation,
       calls: batch
-    }).then((reply) => {
+    }, current).then((reply) => {
+      if (current && !current()) return;
       const data = reply && reply.ok === true && reply.data && typeof reply.data === 'object' ? reply.data : null;
       const confirmed = new Set(data && Array.isArray(data.confirmed) ? data.confirmed : []);
       for (const call of batch) {
@@ -2667,6 +2675,52 @@
       for (const call of batch) requestOwnersPending.delete(`${ownerConversation}\u0000${call.requestId}`);
     });
   }
+
+  function flushStreamRequestOrigins() {
+    const route = CLF_DOM.conversationId();
+    for (const [requestId, pending] of pendingStreamOrigins) {
+      if (!alive || pending.epoch !== epoch || Date.now() >= pending.deadline || (route && route !== pending.conversationId)) {
+        pendingStreamOrigins.delete(requestId);
+        continue;
+      }
+      if (route !== pending.conversationId || conversationId !== route) continue;
+      pendingStreamOrigins.delete(requestId);
+      const current = () => alive && epoch === pending.epoch && CLF_DOM.conversationId() === route;
+      void confirmLiveRequestOwners([
+        { requestId, messageId: null, createTime: pending.observedAt / 1000 }
+      ], route, current);
+    }
+  }
+
+  function confirmStreamRequestOrigin(claimed, requestIds, observedAt) {
+    const route = CLF_DOM.conversationId();
+    if (route && route !== claimed) return;
+    // A brand-new conversation can emit exact stream identity before ChatGPT publishes /c/<id>.
+    // Keep only a tiny epoch-scoped set and retire it if another concrete route wins first.
+    for (const requestId of requestIds) {
+      if (pendingStreamOrigins.has(requestId) || pendingStreamOrigins.size >= 16) continue;
+      pendingStreamOrigins.set(requestId, {
+        conversationId: claimed,
+        observedAt,
+        epoch,
+        deadline: Date.now() + 30_000
+      });
+    }
+    flushStreamRequestOrigins();
+  }
+
+  window.addEventListener('message', (event) => {
+    if (!alive || event.source !== window || event.origin !== location.origin || event.data?.type !== 'cos-request-origin') return;
+    const claimed = typeof event.data.conversationId === 'string' ? event.data.conversationId : '';
+    if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(claimed)) return;
+    const raw = Array.isArray(event.data.requestIds) ? event.data.requestIds : [];
+    if (raw.length === 0 || raw.length > 16) return;
+    const requestIds = [...new Set(raw.filter((id) => typeof id === 'string' && /^wfr_[a-zA-Z0-9_-]{1,96}$/.test(id)))];
+    if (requestIds.length === 0) return;
+    const observedAt = Number.isFinite(event.data.observedAt) ? event.data.observedAt : Date.now();
+    confirmStreamRequestOrigin(claimed, requestIds, observedAt);
+  });
+
   async function refreshFiber(settled = null) {
     // A bound chat can briefly lose its /c/<id> route during React/router churn, and a real
     // navigation to a fresh composer has the exact same pathname until ChatGPT assigns the
