@@ -186,9 +186,11 @@ describe('the whole move, when it works', () => {
     await connect();
     const sessionId = await record();
     const { token: continuation, prompt } = await press();
-    // The instruction asks for the brief as the answer. There is no tool for the model to
-    // call, which is the point: an answer cannot be retried into three different briefs.
-    expect(prompt).toMatch(/handoff brief/i);
+    // The instruction asks for the executable continuation prompt as the answer. There is no
+    // tool for the model to call, which is the point: an answer cannot be retried into three
+    // different handoffs.
+    expect(prompt).toMatch(/continuation prompt/i);
+    expect(prompt).toMatch(/first user message/i);
     expect(prompt).not.toMatch(/save_handoff/);
 
     const stored = await capture(continuation);

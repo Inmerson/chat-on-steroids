@@ -117,7 +117,10 @@ it('reports dispatched side effects and stops new admission after timeout', asyn
     'await tools.lookup({}); await tools.lookup({});',
     tools,
     invoke,
-    { ...limits, wallMs: 500 }
+    // The wall clock intentionally includes cold Worker + QuickJS startup. Under the full
+    // protected suite that startup can exceed 500 ms before the first call is dispatched,
+    // which tests machine contention rather than the post-dispatch timeout contract below.
+    { ...limits, wallMs: 2_000 }
   );
   expect(rendered(output)).toContain('TIME_LIMIT');
   expect(rendered(output)).toContain('UNAWAITED_CALLS');

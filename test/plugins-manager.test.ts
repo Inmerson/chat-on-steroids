@@ -679,6 +679,12 @@ if(m.method==='tools/call'&&m.params.arguments.value==='hold'){
 }
 
 describe('enabled plugin process ownership', () => {
+  // Windows retirement uses taskkill /T /F with its own 1 s helper bound before falling back
+  // to direct process termination. A successful taskkill can itself close just over 1 s on a
+  // loaded machine, so a 1 s assertion deadline races the production helper instead of testing
+  // whether revocation is independent of the blocked replacement/startup operation.
+  const retirementWaitMs = process.platform === 'win32' ? 2_500 : 1_000;
+
   it.each(['disable', 'uninstall'] as const)('%s retires its live process while a replacement download is pending', async action => {
     const h = await trackedFixture();
     const active = (await h.pids())[0]!;
@@ -691,7 +697,7 @@ describe('enabled plugin process ownership', () => {
     const replacing = manager.update(h.row.id);
     await vi.waitFor(() => expect(installing).toHaveBeenCalledTimes(1));
     const revoke = action === 'disable' ? manager.setEnabled(h.row.id, false) : manager.uninstall(h.row.id);
-    try { await vi.waitFor(() => expect(alive(active.pid)).toBe(false), { timeout: 1000 }); }
+    try { await vi.waitFor(() => expect(alive(active.pid)).toBe(false), { timeout: retirementWaitMs }); }
     finally { release(); await replacing; await revoke; }
     expect(await h.pids()).toHaveLength(1);
     expect(manager.tools()).toEqual([]);
@@ -728,7 +734,7 @@ describe('enabled plugin process ownership', () => {
       expect(result).not.toBe('blocked');
       const active = (await h.pids()).at(-1)!;
       const closing = manager.close();
-      await vi.waitFor(() => expect(alive(active.pid)).toBe(false), { timeout: 1000 });
+      await vi.waitFor(() => expect(alive(active.pid)).toBe(false), { timeout: retirementWaitMs });
       await closing;
     } finally { release?.('slow'); }
   });
