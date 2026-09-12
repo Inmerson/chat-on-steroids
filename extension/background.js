@@ -114,8 +114,13 @@ const PORT_TRUST_MS = 30_000;
  * app is unreachable would otherwise file A's messages into B's history.
  */
 let journal = [];
-/** The one journal flush currently talking to the app, if any. */
-let drainWork = null;
+/** Two transport slots, with at most one in-flight batch per conversation. */
+const JOURNAL_CONCURRENCY = 2;
+const journalWorkers = new Set();
+const journalInFlight = new Map();
+const journalFailed = new Set();
+const journalServed = new Set();
+const journalPreferences = new Set();
 
 /**
  * What the last /events delivery did, kept only so the popup can show it.
@@ -807,9 +812,12 @@ function noteDelivery(result, count, conversationId) {
 }
 
 /** Finds the next deliverable conversation and its first batch in one journal pass. */
-function nextJournalBatch(preferredConversationId = null) {
-  const blocked = new Set();
+function nextJournalBatch(preferredConversationId = null, excluded = []) {
+  const blocked = new Set(excluded);
   for (const ack of commandAckOutbox) {
+    if (ack && ack.conversationId) blocked.add(ack.conversationId);
+  }
+  for (const ack of inputAckOutbox) {
     if (ack && ack.conversationId) blocked.add(ack.conversationId);
   }
   const preferred = cleanConversationId(preferredConversationId);
@@ -839,124 +847,165 @@ function nextJournalBatch(preferredConversationId = null) {
   return conversationId ? { conversationId, mine, agent, agentCommandId } : null;
 }
 
-async function drainOnce(preferredConversationId = null) {
-  await load();
-  if (journal.length === 0 || !token) return { ok: true, pending: journal.length };
-  let guard = 0;
-  while (journal.length > 0 && guard++ < 20) {
-    // A command page deliberately holds its page-local observations until its final ACK is
-    // handed to this worker. Preserve the same ordering after that hand-off: if transport
-    // leaves the ACK in the durable outbox, do not let observations from that command's
-    // concrete conversation overtake it. Other conversations remain independent.
-    const batch = nextJournalBatch(preferredConversationId);
-    if (!batch) break;
-    const { conversationId, mine, agent, agentCommandId } = batch;
-    const result = await call('/events', {
+async function deliverJournalBatch(batch) {
+  const { conversationId, mine, agent, agentCommandId } = batch;
+  const result = await call('/events', {
+    method: 'POST',
+    body: JSON.stringify({
+      conversationId,
+      agent,
+      agentCommandId,
+      events: mine.map((entry) => entry.event)
+    })
+  });
+  noteDelivery(result, mine.length, conversationId);
+  if (result.status === 413 && mine.length > 1) {
+    const half = mine.slice(0, Math.floor(mine.length / 2));
+    const retry = await call('/events', {
       method: 'POST',
-      body: JSON.stringify({
-        conversationId,
-        agent,
-        agentCommandId,
-        events: mine.map((entry) => entry.event)
-      })
+      body: JSON.stringify({ conversationId, agent, agentCommandId, events: half.map((entry) => entry.event) })
     });
-    noteDelivery(result, mine.length, conversationId);
-    if (result.status === 413 && mine.length > 1) {
-      // Too big for the app to accept. Send half; the remainder stays queued.
-      const half = mine.slice(0, Math.floor(mine.length / 2));
-      const retry = await call('/events', {
-        method: 'POST',
-        body: JSON.stringify({ conversationId, agent, agentCommandId, events: half.map((entry) => entry.event) })
-      });
-      noteDelivery(retry, half.length, conversationId);
-      if (!retry.ok) break;
-      const sent = new Set(half);
-      journal = journal.filter((entry) => !sent.has(entry));
-      continue;
-    }
-    if (result.status === 413 && mine.length === 1) {
+    noteDelivery(retry, half.length, conversationId);
+    if (!retry.ok) return false;
+    const sent = new Set(half);
+    journal = journal.filter((entry) => !sent.has(entry));
+    return true;
+  }
+  if (result.status === 413 && mine.length === 1) {
+    const rejected = mine[0];
+    journal = journal.filter((entry) => entry !== rejected);
+    journal.unshift(
+      gapEntry(
+        rejected,
+        'chat_error',
+        '⚠ One browser observation was too large for the local bridge and was replaced by this explicit gap.'
+      )
+    );
+    return true;
+  }
+  if (!result.ok) {
+    if (result.status >= 400 && result.status < 500 && ![401, 408, 409, 426, 429].includes(result.status)) {
       const rejected = mine[0];
       journal = journal.filter((entry) => entry !== rejected);
-      journal.unshift(
-        gapEntry(
-          rejected,
-          'chat_error',
-          '⚠ One browser observation was too large for the local bridge and was replaced by this explicit gap.'
-        )
-      );
-      continue;
-    }
-    if (!result.ok) {
-      // A permanently malformed/authenticated item must not hold every later
-      // conversation hostage. Replace it with an explicit gap and continue; transport,
-      // auth, throttling and server failures remain retryable.
-      if (result.status >= 400 && result.status < 500 && ![401, 408, 409, 426, 429].includes(result.status)) {
-        const rejected = mine[0];
-        journal = journal.filter((entry) => entry !== rejected);
-        if (!rejected.gap) {
-          journal.unshift(
-            gapEntry(
-              rejected,
-              'chat_error',
-              `⚠ One browser observation was rejected by the local bridge (HTTP ${result.status}) and was replaced by this explicit gap.`
-            )
-          );
-        }
-        continue;
+      if (!rejected.gap) {
+        journal.unshift(
+          gapEntry(
+            rejected,
+            'chat_error',
+            `⚠ One browser observation was rejected by the local bridge (HTTP ${result.status}) and was replaced by this explicit gap.`
+          )
+        );
       }
-      scheduleRetry();
-      break;
+      return true;
     }
-    const sent = new Set(mine);
-    journal = journal.filter((entry) => !sent.has(entry));
+    scheduleRetry();
+    return false;
   }
-  await persistJournal();
-  if (journal.length > 0) scheduleRetry();
-  else clearRetryIfIdle();
-  return { ok: true, pending: journal.length };
+  const sent = new Set(mine);
+  journal = journal.filter((entry) => !sent.has(entry));
+  return true;
 }
 
-/**
- * Starts a journal drain if one is not already running.
- *
- * Normal observation delivery deliberately keeps the old contention semantics: once an entry
- * is durable in storage.session, a second tab should not have to wait for another chat's slow
- * /events request merely because that request is already in flight. Goal joins explicitly in
- * deliverConversationJournal(), because its correctness depends on the delivery boundary.
- */
-function drain(preferredConversationId = null) {
-  if (drainWork) return Promise.resolve({ ok: true, pending: journal.length });
-  const work = drainOnce(preferredConversationId);
-  const tracked = work.finally(() => {
-    if (drainWork === tracked) drainWork = null;
-  });
-  drainWork = tracked;
-  return tracked;
+function selectJournalBatch() {
+  const excluded = new Set([...journalInFlight.keys(), ...journalFailed]);
+  for (const preference of journalPreferences) {
+    const batch = nextJournalBatch(preference.conversationId, excluded);
+    if (batch?.conversationId === preference.conversationId) return batch;
+  }
+  // A hot conversation yields to an unserved ready conversation between batches.
+  let batch = nextJournalBatch(null, [...excluded, ...journalServed]);
+  if (!batch) {
+    batch = nextJournalBatch(null, excluded);
+    if (batch) journalServed.clear();
+  }
+  return batch;
+}
+
+async function runJournalWorker(batch) {
+  try {
+    for (let attempt = 0; batch && attempt < 20; attempt++) {
+      const id = batch.conversationId;
+      journalServed.add(id);
+      const work = deliverJournalBatch(batch);
+      journalInFlight.set(id, work);
+      try {
+        if (!(await work)) journalFailed.add(id);
+      } catch {
+        journalFailed.add(id);
+      } finally {
+        if (journalInFlight.get(id) === work) journalInFlight.delete(id);
+      }
+      batch = selectJournalBatch();
+    }
+  } finally {
+    // ACKed rows may replay if the worker is suspended before this snapshot, but pending rows
+    // are never lost. persistJournal() itself serializes concurrent storage.session writes.
+    await persistJournal();
+  }
+}
+
+function startJournalWorkers() {
+  if (!token) return [];
+  if (journalWorkers.size === 0) {
+    journalFailed.clear();
+    journalServed.clear();
+  }
+  const started = [];
+  while (journalWorkers.size < JOURNAL_CONCURRENCY) {
+    const batch = selectJournalBatch();
+    if (!batch) break;
+    const work = runJournalWorker(batch).finally(() => {
+      journalWorkers.delete(work);
+      if (journal.length > 0) scheduleRetry();
+      else clearRetryIfIdle();
+    });
+    journalWorkers.add(work);
+    started.push(work);
+  }
+  if (journal.length > 0) scheduleRetry();
+  return started;
+}
+
+/** Normal callers acknowledge durable journal custody without joining another chat's slot. */
+async function drain() {
+  await load();
+  const alreadyRunning = journalWorkers.size > 0;
+  const started = startJournalWorkers();
+  if (!alreadyRunning) await Promise.all(started);
+  return { ok: true, pending: journal.length };
 }
 
 function journalCountForConversation(conversationId) {
   return journal.reduce((count, entry) => count + (entry.conversationId === conversationId ? 1 : 0), 0);
 }
 
-/** Proves this conversation has no accepted-but-undelivered transcript before Goal reads it. */
+/** Goal joins only its own batches; an unrelated slow chat is not its transcript barrier. */
 async function deliverConversationJournal(conversationId) {
-  // One pass can carry 2,000 rows (20 × BATCH). Three attempts cover the full 4,000-row
-  // journal even if the first merely joins a flush that was already serving another chat.
-  for (let attempt = 0; attempt < 3; attempt++) {
-    const before = journalCountForConversation(conversationId);
-    if (before === 0) return true;
-    // Unlike ordinary journal callers, Goal must join a flush already in flight. Only after
-    // it ends can a targeted pass prove whether this conversation reached the app.
-    if (drainWork) await drainWork;
-    if (journalCountForConversation(conversationId) === 0) return true;
-    await drain(conversationId);
-    const after = journalCountForConversation(conversationId);
-    if (after === 0) return true;
-    // The first pass may only have joined somebody else's in-flight drain. Once a targeted
-    // pass itself makes no progress, transport/ACK ordering prevents us proving the context.
-    if (attempt > 0 && after >= before) return false;
+  const preference = { conversationId };
+  journalPreferences.add(preference);
+  try {
+    for (let attempt = 0; attempt < 120; attempt++) {
+      if (journalCountForConversation(conversationId) === 0) {
+        if (attempt > 0) await persistJournal();
+        return true;
+      }
+      startJournalWorkers();
+      if (journalFailed.has(conversationId)) return false;
+      const own = journalInFlight.get(conversationId);
+      if (own) {
+        if (!(await own)) return false;
+      } else {
+        const ackBlocked =
+          commandAckOutbox.some((ack) => ack?.conversationId === conversationId) ||
+          inputAckOutbox.some((ack) => ack?.conversationId === conversationId);
+        if (ackBlocked || journalWorkers.size === 0) return false;
+        await Promise.race([...journalInFlight.values(), ...journalWorkers]);
+      }
+    }
+    return journalCountForConversation(conversationId) === 0;
+  } finally {
+    journalPreferences.delete(preference);
   }
-  return journalCountForConversation(conversationId) === 0;
 }
 
 // -------------------------------------------------------------------- transport
