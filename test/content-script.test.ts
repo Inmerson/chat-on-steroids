@@ -7746,6 +7746,102 @@ describe('the fresh chat the app opened', () => {
     expect(acks).toBe(2);
   });
 
+  it('uses canonical Fiber Markdown for a fast fresh-input receipt after generation already ended', async () => {
+    const inputId = '74747474-8585-4c6c-8d7d-c8c8c8c8c8c8';
+    const conversationId = '75757575-8686-4d7d-8e8e-d9d9d9d9d9d9';
+    const prompt = 'Inspect `src/main/bridge.ts` and reply briefly.';
+    let sends = 0;
+    let fiberAsks = 0;
+    live = await harness(
+      'https://chatgpt.com/',
+      {
+        input_claim: () => ({
+          ok: true,
+          input: {
+            id: inputId,
+            sessionId: null,
+            text: prompt,
+            attachments: [],
+            images: [],
+            state: 'browser',
+            owner: 'worker-derived-owner',
+            createdAt: 1,
+            conversationId: null
+          }
+        }),
+        input_send_started: () => ({ ok: true }),
+        input_ack: () => ({ ok: true, durable: true })
+      },
+      (document, dom) => {
+        const view = dom.window as any;
+        view.addEventListener('message', (event: MessageEvent) => {
+          if (!event.data || event.data.source !== 'clf-fiber-ask') return;
+          fiberAsks += 1;
+          const section = document.querySelector('[data-turn-id="fast-markdown-user"]') as HTMLElement | null;
+          if (!section) return;
+          const scanToken = event.data.nonce;
+          section.setAttribute('data-clf-fiber-turn', `${scanToken}:0`);
+          view.dispatchEvent(new view.MessageEvent('message', {
+            source: view,
+            data: {
+              source: 'clf-fiber-reply',
+              nonce: event.data.nonce,
+              scanToken,
+              v: 10,
+              scanOk: true,
+              rows: [],
+              turns: [{
+                index: 0,
+                turnId: 'fast-markdown-user',
+                conversationId,
+                calls: [],
+                messages: [{
+                  role: 'user',
+                  stable: true,
+                  messageId: 'm-fast-markdown-user',
+                  rawMessageId: 'm-fast-markdown-user',
+                  rawText: prompt
+                }]
+              }]
+            }
+          }));
+        });
+        document.querySelector('[data-testid="send-button"]')!.addEventListener('click', () => {
+          sends += 1;
+          dom.reconfigure({ url: `https://chatgpt.com/c/${conversationId}?cos-input=${inputId}` });
+          userTurn(document, 'fast-markdown-user', prompt.replaceAll('`', ''));
+          document.querySelector('#prompt-textarea')!.textContent = '';
+          // Deliberately do not mount Stop: the provider answered before the first observation.
+        });
+      }
+    );
+
+    // Start the real native delivery after the harness exists so its production-triggered
+    // Fiber request can be observed. Only this exact delivery uses real timers: the normal
+    // harness makes timers instant, which would fire askFiber's 1500 ms timeout before jsdom
+    // can deliver window.postMessage.
+    live.dom.reconfigure({ url: `https://chatgpt.com/?cos-input=${inputId}` });
+    const view = live.window as any;
+    const instantTimeout = view.setTimeout;
+    view.setTimeout = (fn: () => void, ms: number) => globalThis.setTimeout(fn, ms);
+    try {
+      const delivered = await live.runtimeMessage({ type: 'clf-run-input', id: inputId });
+      expect(delivered).toEqual({ ok: true, sent: true });
+    } finally {
+      view.setTimeout = instantTimeout;
+    }
+    await settle(100);
+    expect(sends).toBe(1);
+    expect(fiberAsks).toBeGreaterThan(0);
+    expect(live.sent.filter((message) => message.type === 'input_ack')).toEqual([
+      expect.objectContaining({
+        id: inputId,
+        conversationId,
+        messageId: 'm-fast-markdown-user'
+      })
+    ]);
+  });
+
   it('fetches claimed attachment chunks before the native input send', async () => {
     const inputId = '81818181-9292-4a4a-8b5b-a6a6a6a6a6a6';
     const attachmentId = '91919191-a3a3-4b5b-8c6c-b7b7b7b7b7b7';

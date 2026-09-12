@@ -8081,14 +8081,39 @@
     return files;
   }
 
+  const nativeInputText = (value) => String(value || '').replace(/\s+/g, '');
+
+  /**
+   * Exact authored text for one rendered user message.
+   *
+   * ChatGPT's rendered bubble is presentation: inline Markdown can remove literal bytes such
+   * as backticks. When the current Fiber frame carries the same stable website message id,
+   * use its provider-authored rawText — the same source the recorder publishes — and only fall
+   * back to DOM text when no canonical provider object exists yet.
+   */
+  function nativeUserMessageSource(message) {
+    if (!message || message.role !== 'user' || !message.id || !message.node?.isConnected) return null;
+    const route = CLF_DOM.conversationId();
+    const turn = stampedFiberTurn({ node: message.node }, [...fiberTurns.values()], fiberScanToken);
+    if (turn?.conversationConflict === true) return null;
+    if (turn?.conversationId && route && turn.conversationId !== route) return null;
+    const authored = (turn?.messages || []).filter((candidate) =>
+      candidate?.role === 'user' &&
+      candidate.stable === true &&
+      (candidate.rawMessageId === message.id || candidate.messageId === message.id)
+    );
+    if (authored.length > 1) return null;
+    const text = authored.length === 1 ? authored[0].rawText : message.text;
+    return typeof text === 'string' && text.length <= 256_000 ? text : null;
+  }
+
   function nativeInputMessageId(text) {
-    const compact = (value) => String(value || '').replace(/\s+/g, '');
-    const expected = compact(text);
+    const expected = nativeInputText(text);
     try {
       const messages = CLF_DOM.messages();
       for (let at = messages.length - 1; at >= 0; at--) {
         const message = messages[at];
-        if (message?.role !== 'user' || compact(message.text) !== expected) continue;
+        if (message?.role !== 'user' || nativeInputText(nativeUserMessageSource(message)) !== expected) continue;
         if (typeof message.id === 'string' && message.id) return message.id;
       }
     } catch {}
@@ -8185,11 +8210,25 @@
         releaseAutonomousSend('input');
       }
 
+      let receiptFiberRead = false;
       for (let tries = 0; tries < 80; tries++) {
         if (attempt.cancelled || !ownsInputDocument(expectedEpoch)) return false;
         const conversation = CLF_DOM.conversationId();
         if (conversation) {
-          const messageId = nativeInputMessageId(input.text);
+          let messageId = nativeInputMessageId(input.text);
+          // A fast reply can finish before the first normal observation. If rendered Markdown
+          // has already transformed the submitted bubble, ask MAIN-world Fiber for the exact
+          // provider-authored user object while this exact send receipt is still pending.
+          if (!messageId && !receiptFiberRead) {
+            receiptFiberRead = true;
+            await refreshFiber();
+            if (
+              attempt.cancelled ||
+              !ownsInputDocument(expectedEpoch) ||
+              CLF_DOM.conversationId() !== conversation
+            ) return false;
+            messageId = nativeInputMessageId(input.text);
+          }
           for (let ackTry = 0; ackTry < 3; ackTry++) {
             const receipt = await ask({
               type: 'input_ack',
