@@ -546,3 +546,11 @@ export const CAPABILITY_TOOLS: Record<Capability, readonly string[]> = {
   clipboardRead: ['computer'],
   clipboardWrite: ['computer']
 };
+
+export type MacOSPermissionState = 'granted' | 'missing' | 'unknown';
+export interface MacOSDesktopAccessStatus {
+  screen: MacOSPermissionState;
+  accessibility: MacOSPermissionState;
+  checkedAt: number;
+  error: string | null;
+}

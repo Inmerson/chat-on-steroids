@@ -23,6 +23,7 @@ import {
   activeWindow,
   findUi,
   getWindowState,
+  listDesktopApps,
   listWindows,
   screenshot,
   waitForWindow,
@@ -77,13 +78,61 @@ const MAX_CLIPBOARD_LINE_CHARS = 16_000;
 const MAX_CLIPBOARD_OUTPUT_CHARS = 64_000;
 
 const computerActionArg = z.discriminatedUnion('type', [
-  z.object({ type: z.literal('click_ref'), ref: z.string().min(1).max(64) }).strict().describe('Click a control by ref from observe.'),
+  z
+    .object({
+      type: z.literal('click_ref'),
+      ref: z.string().min(1).max(64),
+      button: mouseButtonArg.optional(),
+      count: z.number().int().min(1).max(10).optional()
+    })
+    .strict()
+    .describe('Click a control by ref from observe.'),
   z
     .object({ type: z.literal('set_value'), ref: z.string().min(1).max(64), text: z.string().max(20_000) })
     .strict()
     .describe('Set a text control’s value directly by ref.'),
   z
-    .object({ type: z.literal('click'), x: imageCoordinateArg, y: imageCoordinateArg, button: mouseButtonArg.optional() })
+    .object({
+      type: z.literal('ui_action'),
+      ref: z.string().min(1).max(64),
+      action: z.enum([
+        'invoke',
+        'toggle',
+        'select',
+        'expand',
+        'collapse',
+        'focus',
+        'scroll_up',
+        'scroll_down',
+        'scroll_left',
+        'scroll_right',
+        'scroll_into_view'
+      ])
+    })
+    .strict()
+    .describe('Execute an accessibility action advertised on this control by observe.'),
+  z
+    .object({
+      type: z.literal('launch_app'),
+      app: z.string().min(1).max(500)
+    })
+    .strict()
+    .describe('Launch an installed application by exact AUMID or executable path with no arguments.'),
+  z
+    .object({
+      type: z.literal('paste'),
+      text: z.string().max(100_000)
+    })
+    .strict()
+    .describe('Paste text via clipboard and Ctrl+V.'),
+  z
+    .object({
+      type: z.literal('click'),
+      x: imageCoordinateArg,
+      y: imageCoordinateArg,
+      button: mouseButtonArg.optional(),
+      count: z.number().int().min(1).max(10).optional()
+    })
     .strict()
     .describe('Click at image coordinates.'),
   z
@@ -97,7 +146,12 @@ const computerActionArg = z.discriminatedUnion('type', [
     .describe('Double-click at image coordinates.'),
   z.object({ type: z.literal('move'), x: imageCoordinateArg, y: imageCoordinateArg }).strict().describe('Move the pointer.'),
   z
-    .object({ type: z.literal('drag'), path: z.array(pointArg).min(2).max(64), button: mouseButtonArg.optional() })
+    .object({
+      type: z.literal('drag'),
+      path: z.array(pointArg).min(2).max(64),
+      button: mouseButtonArg.optional(),
+      duration_ms: z.number().int().min(0).max(10_000).optional()
+    })
     .strict()
     .describe('Press, follow the path, release.'),
   z
@@ -106,7 +160,8 @@ const computerActionArg = z.discriminatedUnion('type', [
       x: imageCoordinateArg,
       y: imageCoordinateArg,
       scroll_x: z.number().int().min(-10_000).max(10_000).optional(),
-      scroll_y: z.number().int().min(-10_000).max(10_000).optional()
+      scroll_y: z.number().int().min(-10_000).max(10_000).optional(),
+      scroll_unit: z.literal('wheel').optional()
     })
     .strict()
     .describe('Scroll at a point.'),
@@ -147,17 +202,17 @@ export function registerDesktopTools(reg: SurfaceRegistrar): void {
         title: 'Look at the desktop',
         description:
           'Look at Windows without touching it. With no arguments, returns the foreground window, its picture and snapshot-scoped UI controls. ' +
-          'what=windows lists windows; what=window inspects one; what=ui returns controls; wait_for waits for a title. ' +
-          'Pass refs to computer click_ref/set_value and screenshot frameId with pixel coordinates. ' +
+          'what=windows lists windows; what=apps lists installed applications; what=window inspects one; what=ui returns controls; wait_for waits for a title. ' +
+          'Pass refs to computer click_ref/set_value/ui_action and screenshot frameId with pixel coordinates. ' +
           'Window capture never focuses; a labeled visible-screen fallback may be occluded.',
         inputSchema: z
           .object({
             what: z
-              .enum(['active', 'windows', 'window', 'ui'])
+              .enum(['active', 'windows', 'window', 'ui', 'apps'])
               .optional()
-              .describe('Default active: the foreground window, its screenshot and its controls.'),
+              .describe('Default active: the foreground window, its screenshot and its controls. what=apps lists installed applications.'),
             window: windowIdArg.optional().describe('Window id for what=window or what=ui.'),
-            match: z.string().max(300).optional().describe('Filter: title/process for windows, control name/role for ui.'),
+            match: z.string().max(300).optional().describe('Filter: title/process for windows, control name/role for ui, name for apps.'),
             wait_for: z.string().min(1).max(300).optional().describe('Wait until a window with this title substring exists.'),
             timeout_ms: z.number().int().min(0).max(60_000).optional().describe('With wait_for. Default 10000.'),
             screenshot: z.boolean().optional().describe('Include a picture. Default true for active and window.'),
@@ -186,13 +241,13 @@ export function registerDesktopTools(reg: SurfaceRegistrar): void {
             } else if (input.window !== undefined && what !== 'window' && what !== 'ui') {
               ctx.addIssue({ code: 'custom', path: ['window'], message: `window is not used with what=${what}` });
             }
-            if (input.match !== undefined && what !== 'windows' && what !== 'ui') {
-              ctx.addIssue({ code: 'custom', path: ['match'], message: 'match is only used with what=windows or what=ui' });
+            if (input.match !== undefined && what !== 'windows' && what !== 'ui' && what !== 'apps') {
+              ctx.addIssue({ code: 'custom', path: ['match'], message: 'match is only used with what=windows, what=ui, or what=apps' });
             }
-            if ((what === 'windows' || what === 'ui') && input.screenshot === true) {
+            if ((what === 'windows' || what === 'ui' || what === 'apps') && input.screenshot === true) {
               ctx.addIssue({ code: 'custom', path: ['screenshot'], message: `screenshot=true is not used with what=${what}` });
             }
-            const capturesImage = what !== 'windows' && what !== 'ui' && input.screenshot !== false;
+            const capturesImage = what !== 'windows' && what !== 'ui' && what !== 'apps' && input.screenshot !== false;
             if (input.max_width !== undefined && !capturesImage) {
               ctx.addIssue({ code: 'custom', path: ['max_width'], message: 'max_width requires a screenshot-producing observation' });
             }
@@ -246,6 +301,25 @@ export function registerDesktopTools(reg: SurfaceRegistrar): void {
             );
           }
 
+          if (what === 'apps') {
+            const limit = Math.min(MAX_WINDOW_RESULTS, Math.max(1, Math.floor(input.max_elements ?? DEFAULT_WINDOW_RESULTS)));
+            const { apps, truncated } = await listDesktopApps({ match: input.match, limit });
+            noteCount(apps.length);
+            logInfo(`tool observe apps (${apps.length} apps returned, truncated=${truncated})`);
+            if (apps.length === 0) {
+              return ok(prefix(waited, input.match ? `No installed apps match "${input.match}".` : 'No installed apps found.'));
+            }
+            const lines = apps.map((app) => {
+              const running = app.isRunning ? ' [running]' : '';
+              const winCount = app.windows && app.windows.length > 0 ? ` (${app.windows.length} window${app.windows.length > 1 ? 's' : ''})` : '';
+              return `${app.id}  ${JSON.stringify(app.displayName)}${running}${winCount}`;
+            });
+            if (truncated) {
+              lines.push(`… showing ${apps.length} matching apps; narrow match or raise max_elements`);
+            }
+            return ok(prefix(waited, `Installed applications:\nid  name\n${lines.join('\n')}`));
+          }
+
           if (what === 'ui' && input.match) {
             const result = await findUi({ window: target, query: input.match, maxResults: input.max_elements });
             noteCount(result.elements.length);
@@ -257,8 +331,16 @@ export function registerDesktopTools(reg: SurfaceRegistrar): void {
               const image = element.imageCenter ? ` image_center=${element.imageCenter.x},${element.imageCenter.y}` : '';
               const id = element.automationId ? ` id=${JSON.stringify(element.automationId)}` : '';
               const flags = `${element.enabled ? '' : ' disabled'}${element.offscreen ? ' offscreen' : ''}`;
-              return `${index + 1}. ${element.ref} ${element.role} ${JSON.stringify(element.name)}${id} desktop=${desktop}${image}${flags}`;
+              const actions = element.actions && element.actions.length > 0 ? ` actions=${element.actions.join(',')}` : '';
+              const focus = element.focused ? ' focused' : '';
+              const sel = element.selected ? ' selected' : '';
+              return `${index + 1}. ${element.ref} ${element.role} ${JSON.stringify(element.name)}${id} desktop=${desktop}${image}${flags}${focus}${sel}${actions}`;
             });
+            if (result.accessibility) {
+              if (result.accessibility.focusedElement) lines.push(`focused_element: ${result.accessibility.focusedElement}`);
+              if (result.accessibility.selectedText) lines.push(`selected_text: ${JSON.stringify(result.accessibility.selectedText)}`);
+              if (result.accessibility.documentText) lines.push(`document_text: ${JSON.stringify(result.accessibility.documentText)}`);
+            }
             return ok(prefix(waited, `window: ${result.window}\nsnapshot: ${result.snapshotId}\n${lines.join('\n')}`));
           }
 
@@ -329,10 +411,18 @@ export function registerDesktopTools(reg: SurfaceRegistrar): void {
               const image = element.imageCenter ? ` image_center=${element.imageCenter.x},${element.imageCenter.y}` : '';
               const automation = element.automationId ? ` id=${JSON.stringify(element.automationId)}` : '';
               const flags = `${element.enabled ? '' : ' disabled'}${element.offscreen ? ' offscreen' : ''}`;
-              lines.push(`${element.ref}  ${element.role} ${JSON.stringify(element.name)}${automation}${image}${flags}`);
+              const actions = element.actions && element.actions.length > 0 ? ` actions=${element.actions.join(',')}` : '';
+              const focus = element.focused ? ' focused' : '';
+              const sel = element.selected ? ' selected' : '';
+              lines.push(`${element.ref}  ${element.role} ${JSON.stringify(element.name)}${automation}${image}${flags}${focus}${sel}${actions}`);
             }
           } else {
             lines.push('controls: none exposed by Windows UI Automation');
+          }
+          if (state.accessibility) {
+            if (state.accessibility.focusedElement) lines.push(`focused_element: ${state.accessibility.focusedElement}`);
+            if (state.accessibility.selectedText) lines.push(`selected_text: ${JSON.stringify(state.accessibility.selectedText)}`);
+            if (state.accessibility.documentText) lines.push(`document_text: ${JSON.stringify(state.accessibility.documentText)}`);
           }
 
           const text = prefix(waited, lines.join('\n'));
@@ -368,6 +458,7 @@ export function registerDesktopTools(reg: SurfaceRegistrar): void {
               .min(1)
               .optional()
               .describe('Required for coordinate actions or captureCrop.'),
+            window: windowIdArg.optional().describe('Target window for window-scoped actions like paste.'),
             verify: verificationArg.optional(),
             captureAfter: z.boolean().optional().describe('Return a fresh screenshot after the actions. Default false.'),
             captureWindow: windowIdArg.optional().describe('Result capture: this window.'),
@@ -428,7 +519,7 @@ export function registerDesktopTools(reg: SurfaceRegistrar): void {
           .strict(),
         annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true }
       },
-      async ({ actions, frameId, verify, captureAfter, captureWindow, captureFull, captureMaxWidth, captureCrop }) =>
+      async ({ actions, frameId, window, verify, captureAfter, captureWindow, captureFull, captureMaxWidth, captureCrop }) =>
         guard('computer', async () => {
           // Not reg.guarded: this tool covers two permissions. Pointer and keyboard steps
           // need "control", the clipboard steps need their own, and one blanket refusal
@@ -443,23 +534,37 @@ export function registerDesktopTools(reg: SurfaceRegistrar): void {
           for (const a of actions) {
             switch (a.type) {
               case 'click_ref':
-                parsed.push({ type: 'click_ref', ref: a.ref });
+                parsed.push({ type: 'click_ref', ref: a.ref, button: a.button, count: a.count });
                 break;
               case 'set_value':
                 parsed.push({ type: 'set_value', ref: a.ref, text: a.text });
                 break;
+              case 'ui_action':
+                parsed.push({ type: 'ui_action', ref: a.ref, action: a.action });
+                break;
+              case 'launch_app':
+                parsed.push({ type: 'launch_app', app: a.app });
+                break;
+              case 'paste':
+                if (!caps.clipboardWrite) {
+                  return fail('TOOL_DISABLED: paste needs the Replace clipboard text permission.');
+                }
+                parsed.push({ type: 'paste', text: a.text });
+                break;
               case 'click':
+                parsed.push({ type: 'click', x: a.x, y: a.y, button: a.button, count: a.count });
+                break;
               case 'double_click':
-                parsed.push({ type: a.type, x: a.x, y: a.y, button: a.button });
+                parsed.push({ type: 'double_click', x: a.x, y: a.y, button: a.button });
                 break;
               case 'move':
                 parsed.push({ type: 'move', x: a.x, y: a.y });
                 break;
               case 'scroll':
-                parsed.push({ type: 'scroll', x: a.x, y: a.y, scroll_x: a.scroll_x, scroll_y: a.scroll_y });
+                parsed.push({ type: 'scroll', x: a.x, y: a.y, scroll_x: a.scroll_x, scroll_y: a.scroll_y, scrollUnit: a.scroll_unit });
                 break;
               case 'drag':
-                parsed.push({ type: 'drag', path: a.path, button: a.button });
+                parsed.push({ type: 'drag', path: a.path, button: a.button, duration_ms: a.duration_ms });
                 break;
               case 'type':
                 parsed.push({ type: 'type', text: a.text });
@@ -514,8 +619,10 @@ export function registerDesktopTools(reg: SurfaceRegistrar): void {
             : undefined;
           // One lock, one operation: the picture that verifies these actions must be taken
           // before anyone else can touch the desktop.
+          const targetWindow = window ?? (actions.some((a) => a.type === 'paste') ? actions.find((a) => a.type === 'focus')?.window : undefined);
           const result = await actAndCapture(parsed, {
             frameId,
+            window: targetWindow,
             verify: parsedVerify,
             capture:
               wantsCapture

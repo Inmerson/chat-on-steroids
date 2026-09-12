@@ -5,23 +5,24 @@
  * the machine. The action vocabulary mirrors OpenAI's computer-use tool — click,
  * double_click, scroll, type, keypress, drag, move, wait, screenshot — so a model
  * that already knows how to drive a computer does not have to learn a private
- * dialect, plus the two things Windows needs and a browser viewport does not:
+ * dialect, plus the two things a native desktop needs and a browser viewport does not:
  * listing windows and bringing one to the front.
  *
- * Coordinates are always in *screenshot pixels*. The helper runs without per-monitor
- * DPI awareness, so capture and input share one coordinate space and agree with each
- * other; the scale between that space and the returned image is applied here, and
- * every screenshot states the size it was returned at.
+ * Coordinates are always in *screenshot pixels*. Each helper keeps capture and input in
+ * one native screen coordinate space; the scale between that space and the returned
+ * image is applied here, and every screenshot states the size it was returned at.
  */
 
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
-import { promises as fs } from 'node:fs';
+import { existsSync, promises as fs } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { ensureUsablePath, normalizeEnvironment, setEnvValue } from '../env.js';
+import { StringDecoder } from 'node:string_decoder';
+import { Worker } from 'node:worker_threads';
+import { ensureUsablePath, normalizeEnvironment } from '../env.js';
 import { findWindowsPowerShell, terminateProcessTree } from '../exec.js';
 import { logInfo, logWarn } from '../logger.js';
-import { Utf8ChunkDecoder } from '../utf8-stream.js';
+import type { MacOSDesktopAccessStatus, MacOSPermissionState } from '../../shared/types.js';
 import { HELPER_SCRIPT } from './helper.js';
 
 /** Width the screenshot is scaled down to, matching computer-use convention. */
@@ -30,15 +31,44 @@ export const MAX_SCREENSHOT_WIDTH = 2560;
 const HELPER_TIMEOUT_MS = 30_000;
 const HELPER_STARTUP_GRACE_MS = 10_000;
 const MAX_FRAMES = 16;
+/** Per-image ceiling; the final Desktop tool layer separately measures text + image together. */
+export const MAX_SCREENSHOT_PNG_BYTES = Math.floor((((8 * 1024 * 1024) - (64 * 1024)) * 3) / 4);
+
+let macOSDesktopAccess: MacOSDesktopAccessStatus | null = null;
+const macOSDesktopAccessListeners = new Set<(status: MacOSDesktopAccessStatus) => void>();
+let macOSDesktopAccessRefreshGeneration = 0;
+
+export function getMacOSDesktopAccess(): MacOSDesktopAccessStatus | null {
+  return macOSDesktopAccess;
+}
+
+export function onMacOSDesktopAccessChange(
+  listener: (status: MacOSDesktopAccessStatus) => void
+): () => void {
+  macOSDesktopAccessListeners.add(listener);
+  return () => macOSDesktopAccessListeners.delete(listener);
+}
+
+function publishMacOSDesktopAccess(status: MacOSDesktopAccessStatus): void {
+  macOSDesktopAccess = status;
+  for (const listener of macOSDesktopAccessListeners) listener(status);
+}
+
+export type ActionRoute = 'uia' | 'sendinput' | 'focus' | 'shell' | 'local';
 
 export class ComputerError extends Error {
   readonly completedCount: number | null;
   readonly failedIndex: number | null;
+  readonly completedRoutes: ActionRoute[] | null;
 
-  constructor(message: string, details: { completedCount?: number; failedIndex?: number } = {}) {
+  constructor(
+    message: string,
+    details: { completedCount?: number; failedIndex?: number; completedRoutes?: ActionRoute[] } = {}
+  ) {
     super(message);
     this.completedCount = details.completedCount ?? null;
     this.failedIndex = details.failedIndex ?? null;
+    this.completedRoutes = details.completedRoutes ? [...details.completedRoutes] : null;
   }
 }
 
@@ -51,6 +81,12 @@ export interface Rect {
 
 export interface WindowInfo {
   id: number;
+  /** Windows native app identity (AUMID or exact process image path). */
+  app?: string;
+  processId?: number;
+  processPath?: string;
+  appUserModelId?: string;
+  dpi?: number;
   title: string;
   process: string;
   x: number;
@@ -72,6 +108,22 @@ export interface UiElementInfo {
   /** Present when the element is fully inside the most recent screenshot frame. */
   imageBounds: Rect | null;
   imageCenter: { x: number; y: number } | null;
+  /** Native accessibility actions advertised by this control, when available. */
+  actions?: UiActionName[];
+  depth?: number;
+  focused?: boolean;
+  selected?: boolean;
+}
+
+export type UiActionName = 'invoke' | 'toggle' | 'select' | 'expand' | 'collapse' | 'focus'
+  | 'scroll_up' | 'scroll_down' | 'scroll_left' | 'scroll_right' | 'scroll_into_view';
+
+export interface DesktopApp { id: string; displayName: string; isRunning?: boolean; windows?: WindowInfo[] }
+
+export interface AccessibilityContext {
+  documentText?: string;
+  selectedText?: string;
+  focusedElement?: string;
 }
 
 export interface Screenshot {
@@ -104,7 +156,7 @@ export interface ActionResult {
   cursor: PointerResult | null;
   clipboard: string[];
   completedCount: number;
-  routes: Array<'uia' | 'sendinput' | 'focus' | 'local'>;
+  routes: ActionRoute[];
 }
 
 export type VerificationSpec =
@@ -122,13 +174,16 @@ export interface VerificationResult {
 }
 
 export type Action =
-  | { type: 'click_ref'; ref: string }
+  | { type: 'click_ref'; ref: string; button?: string; count?: number }
   | { type: 'set_value'; ref: string; text: string }
+  | { type: 'ui_action'; ref: string; action: UiActionName }
+  | { type: 'launch_app'; app: string }
+  | { type: 'paste'; text: string }
   | { type: 'move'; x: number; y: number }
-  | { type: 'click'; x: number; y: number; button?: string }
+  | { type: 'click'; x: number; y: number; button?: string; count?: number }
   | { type: 'double_click'; x: number; y: number; button?: string }
-  | { type: 'scroll'; x: number; y: number; scroll_x?: number; scroll_y?: number }
-  | { type: 'drag'; path: Array<{ x: number; y: number }>; button?: string }
+  | { type: 'scroll'; x: number; y: number; scroll_x?: number; scroll_y?: number; scrollUnit?: 'wheel' }
+  | { type: 'drag'; path: Array<{ x: number; y: number }>; button?: string; duration_ms?: number }
   | { type: 'type'; text: string }
   | { type: 'keypress'; keys: string[] }
   | { type: 'focus'; window: number }
@@ -141,12 +196,12 @@ export type Action =
   | { type: 'write_clipboard'; text: string };
 
 /**
- * One long-lived PowerShell helper process.
+ * One long-lived native backend transport.
  *
- * Add-Type compiles the Win32 C# bridge and used to run on every screenshot/click,
- * which made each desktop MCP call pay a fresh PowerShell startup + C# compilation.
- * The helper now stays alive and speaks newline-delimited JSON over stdin/stdout. Only
- * the fixed bootstrap is executable PowerShell; model-supplied request data is JSON.
+ * Windows launches the fixed PowerShell/Win32 bridge. macOS loads the Swift backend through
+ * an N-API addon on a Node Worker thread in this Electron process; the old subprocess path is
+ * retained only behind an explicit test/development override. Both speak the same JSON
+ * protocol, so frame identity, stale refs, batching and model-facing semantics remain neutral.
  */
 interface PendingHelperRequest {
   resolve: (value: Record<string, any>) => void;
@@ -162,17 +217,28 @@ interface HelperRuntime {
   pending: PendingHelperRequest | null;
   /** True after the helper has produced its first valid protocol reply. */
   ready: boolean;
+  scriptDirectory: string | null;
+  scriptCleanup: Promise<void> | null;
+}
+
+interface MacOSAddonRuntime {
+  generation: number;
+  worker: Worker;
+  pending: PendingHelperRequest | null;
+  exited: boolean;
 }
 
 let helperRuntime: HelperRuntime | null = null;
 let helperStarting: Promise<HelperRuntime> | null = null;
+let macOSAddonRuntime: MacOSAddonRuntime | null = null;
+let macOSAddonStarting: Promise<MacOSAddonRuntime> | null = null;
 let helperQueue: Promise<void> = Promise.resolve();
 let helperGeneration = 0;
 let helperStopping = false;
 const helperRetirements = new Set<Promise<void>>();
 
 // Transport-owned metadata, never accepted from the native protocol. Capture it before
-// resolving a reply: local image I/O may yield long enough for another helper to start.
+// resolving a reply: image I/O may yield long enough for another helper to start.
 const helperReplyGeneration = new WeakMap<object, number>();
 
 function stampHelperReply(reply: Record<string, any>, generation: number): Record<string, any> {
@@ -187,21 +253,27 @@ function generationOfReply(reply: Record<string, any>): number {
 }
 
 function isHelperGenerationActive(generation: number): boolean {
-  return !helperStopping && helperRuntime !== null && helperRuntime.child.exitCode === null && helperRuntime.generation === generation;
+  if (helperStopping) return false;
+  return useMacOSDesktopAddon()
+    ? macOSAddonRuntime !== null && !macOSAddonRuntime.exited && macOSAddonRuntime.generation === generation
+    : helperRuntime !== null && helperRuntime.child.exitCode === null && helperRuntime.generation === generation;
 }
 
 type ExpectedHelper = { generation: number; code: 'STALE_FRAME' | 'STALE_REF' };
 
 function assertHelperGeneration(generation: number, expected?: ExpectedHelper): void {
+  if (helperStopping) throw new ComputerError('The desktop helper is shutting down.');
   if (expected && (generation !== expected.generation || !isHelperGenerationActive(generation))) {
     throw new ComputerError(`${expected.code}: the desktop helper changed. Observe again before retrying.`, {
-      completedCount: 0,
-      failedIndex: 0
+      completedCount: 0, failedIndex: 0, completedRoutes: []
     });
   }
 }
 
-function helperTimeoutMs(request: Record<string, unknown>): number {
+export function helperTimeoutMs(
+  request: Record<string, unknown>,
+  platform: NodeJS.Platform = process.platform
+): number {
   switch (request['op']) {
     case 'windows':
     case 'active':
@@ -212,22 +284,51 @@ function helperTimeoutMs(request: Record<string, unknown>): number {
       return 8_000;
     case 'capture':
     case 'snapshot':
+      // macOS may spend 12s enumerating ScreenCaptureKit content, then up to 10s
+      // starting a pre-14 stream and 15s waiting for its first frame. Snapshot can
+      // additionally traverse the AX tree, so the parent must outlive those native
+      // budgets instead of retiring a helper that is still within its own deadline.
+      // A visible-screen fallback may then capture more than one intersecting display
+      // sequentially, so retain enough headroom for a normal multi-monitor host too.
+      return platform === 'darwin' ? 120_000 : 10_000;
     case 'warm':
       return 10_000;
     case 'act':
-      return 15_000;
+      if (platform !== 'darwin') {
+        const actions = Array.isArray(request['actions']) ? request['actions'].slice(0, 20) : [];
+        return 15_000 + actions.reduce((duration, action) => duration + (action?.type === 'drag'
+          ? Math.min(2000, Math.max(50, Number(action.durationMs) || 350)) : 0), 0);
+      }
+      // Every macOS physical mutation can now re-prove the exact AX/WindowServer input
+      // target, and an explicit focus may spend up to two seconds in its bounded poll. Size
+      // the parent deadline for the whole permitted batch so the helper can return partial
+      // completion evidence instead of being killed after earlier actions already landed.
+      return 15_000 + Math.min(20, Array.isArray(request['actions']) ? request['actions'].length : 1) * 2_100;
     default:
       return HELPER_TIMEOUT_MS;
   }
 }
 
+function cleanupHelperScript(runtime: HelperRuntime): Promise<void> {
+  return runtime.scriptCleanup ??= (async () => {
+    if (!runtime.scriptDirectory) return;
+    const directory = runtime.scriptDirectory;
+    runtime.scriptDirectory = null;
+    await fs.rm(directory, { recursive: true, force: true }).catch(error => {
+      logWarn(`desktop helper script cleanup failed: ${error instanceof Error ? error.message : String(error)}`);
+    });
+  })();
+}
+
 function retireHelper(runtime: HelperRuntime): Promise<void> {
   if (helperRuntime === runtime) helperRuntime = null;
   const task = (async () => {
-    if (runtime.child.exitCode !== null || runtime.child.pid === undefined) return;
-    const closed = new Promise<void>((resolve) => runtime.child.once('close', () => resolve()));
-    await terminateProcessTree(runtime.child.pid);
-    await Promise.race([closed, new Promise<void>((resolve) => setTimeout(resolve, 2_000))]);
+    if (runtime.child.exitCode === null && runtime.child.pid !== undefined) {
+      const closed = new Promise<void>((resolve) => runtime.child.once('close', () => resolve()));
+      await terminateProcessTree(runtime.child.pid);
+      await Promise.race([closed, new Promise<void>((resolve) => setTimeout(resolve, 2_000))]);
+    }
+    await cleanupHelperScript(runtime);
   })();
   helperRetirements.add(task);
   void task.finally(() => helperRetirements.delete(task));
@@ -262,139 +363,376 @@ async function startHelper(): Promise<HelperRuntime> {
   if (helperRuntime) return helperRuntime;
   if (helperStarting) return helperStarting;
 
-  helperStarting = new Promise<HelperRuntime>((resolve, reject) => {
-    const bootstrap = Buffer.from('Invoke-Expression $env:CLF_HELPER', 'utf16le').toString('base64');
-    // `powershell.exe` is found through the environment handed to the child, so that
-    // environment has to be sound before the spawn rather than after it: a bare
-    // `{ ...process.env }` is what turned a missing System32 entry into an unexplained
-    // `spawn powershell.exe ENOENT` with no helper and no diagnosis.
-    const env = normalizeEnvironment(process.env);
-    setEnvValue(env, 'CLF_HELPER', HELPER_SCRIPT);
-    ensureUsablePath(env);
-    // By absolute path, so starting the helper does not depend on the very thing it is
-    // often asked to diagnose. The repaired environment above is the second line of
-    // defence, not the first.
-    const host = findWindowsPowerShell() ?? 'powershell.exe';
-    const child = spawn(host, ['-NoProfile', '-NonInteractive', '-NoLogo', '-EncodedCommand', bootstrap], {
-      windowsHide: true,
-      stdio: ['pipe', 'pipe', 'pipe'],
-      env: env as NodeJS.ProcessEnv
-    });
-    const runtime: HelperRuntime = {
-      generation: 0,
-      child,
-      stdoutBuffer: '',
-      stderrTail: '',
-      pending: null,
-      ready: false
-    };
-    let started = false;
-    const stdoutDecoder = new Utf8ChunkDecoder();
-    const stderrDecoder = new Utf8ChunkDecoder();
-
-    child.stdout.on('data', (chunk: Buffer) => {
-      runtime.stdoutBuffer += stdoutDecoder.write(chunk);
-      for (;;) {
-        const newline = runtime.stdoutBuffer.indexOf('\n');
-        if (newline === -1) break;
-        const line = runtime.stdoutBuffer.slice(0, newline).trim();
-        runtime.stdoutBuffer = runtime.stdoutBuffer.slice(newline + 1);
-        if (!line) continue;
-        const pending = runtime.pending;
-        if (!pending) {
-          logWarn(`desktop helper sent unsolicited output: ${line.slice(0, 200)}`);
-          continue;
-        }
-        let parsed: unknown;
-        try {
-          parsed = JSON.parse(line) as unknown;
-        } catch {
-          rejectAfterHelperRetirement(
-            runtime,
-            pending,
-            new ComputerError('The desktop helper returned malformed JSON.')
-          );
-          continue;
-        }
-        if (
-          parsed === null ||
-          typeof parsed !== 'object' ||
-          Array.isArray(parsed) ||
-          (((parsed as Record<string, unknown>)['ok'] !== true) && (parsed as Record<string, unknown>)['ok'] !== false)
-        ) {
-          rejectAfterHelperRetirement(
-            runtime,
-            pending,
-            new ComputerError('The desktop helper returned a malformed protocol response.')
-          );
-          continue;
-        }
-        const reply = parsed as Record<string, any>;
-        runtime.ready = true;
-        clearTimeout(pending.timer);
-        runtime.pending = null;
-        if (reply['ok'] === false) {
-          const code = String(reply['error_code'] ?? 'HELPER_ERROR');
-          const message = String(reply['message'] ?? 'Desktop helper failed');
-          const completed = Number(reply['completed_count']);
-          const failed = Number(reply['failed_index']);
-          pending.reject(
-            new ComputerError(`${code}: ${message}`, {
-              ...(Number.isInteger(completed) && completed >= 0 ? { completedCount: completed } : {}),
-              ...(Number.isInteger(failed) && failed >= 0 ? { failedIndex: failed } : {})
-            })
-          );
+  helperStarting = (async () => {
+    const scriptDirectory = process.platform === 'darwin' ? null : await fs.mkdtemp(path.join(os.tmpdir(), 'cos-desktop-helper-'));
+    try {
+      const scriptFile = scriptDirectory ? path.join(scriptDirectory, 'helper.ps1') : null;
+      // Keep large native source out of inherited environment blocks and command lines.
+      // A BOM makes Windows PowerShell 5.1 read this UTF-8 source independently of ACP.
+      if (scriptFile) await fs.writeFile(scriptFile, `\uFEFF${HELPER_SCRIPT}`, 'utf8');
+      if (helperStopping) throw new ComputerError('The desktop helper is shutting down.');
+      return await new Promise<HelperRuntime>((resolve, reject) => {
+        const env = normalizeEnvironment(process.env);
+        ensureUsablePath(env);
+        let host: string;
+        let args: string[];
+        if (process.platform === 'darwin') {
+          host = locateMacOSDesktopHelper();
+          args = [];
         } else {
-          pending.resolve(stampHelperReply(reply, runtime.generation));
+          host = findWindowsPowerShell() ?? 'powershell.exe';
+          args = ['-NoProfile', '-NonInteractive', '-NoLogo', '-ExecutionPolicy', 'Bypass', '-File', scriptFile!];
         }
-      }
-    });
-    child.stderr.on('data', (chunk: Buffer) => {
-      runtime.stderrTail = `${runtime.stderrTail}${stderrDecoder.write(chunk)}`.slice(-8000);
-    });
-    child.once('spawn', () => {
-      started = true;
-      helperRuntime = runtime;
-      runtime.generation = ++helperGeneration;
-      resolve(runtime);
-    });
-    child.once('error', (error) => {
-      if (helperRuntime === runtime) helperRuntime = null;
-      if (!started) {
-        reject(new ComputerError(`Could not start PowerShell: ${error.message}`));
-        return;
-      }
-      const pending = runtime.pending;
-      if (pending) {
-        rejectAfterHelperRetirement(
-          runtime,
-          pending,
-          new ComputerError(`Desktop helper process error: ${error.message}`)
-        );
-      } else {
-        void retireHelper(runtime);
-      }
-    });
-    child.once('close', () => {
-      runtime.stdoutBuffer += stdoutDecoder.end();
-      runtime.stderrTail = `${runtime.stderrTail}${stderrDecoder.end()}`.slice(-8000);
-      if (helperRuntime === runtime) helperRuntime = null;
-      const pending = runtime.pending;
-      if (pending) {
-        clearTimeout(pending.timer);
-        runtime.pending = null;
-        pending.reject(new ComputerError(`Desktop helper failed: ${readableHelperFailure(runtime.stderrTail)}`));
-      }
-    });
-  }).finally(() => {
+        const child = spawn(host, args, {
+          windowsHide: true,
+          stdio: ['pipe', 'pipe', 'pipe'],
+          env: env as NodeJS.ProcessEnv
+        });
+        const runtime: HelperRuntime = {
+          generation: 0,
+          child,
+          stdoutBuffer: '',
+          stderrTail: '',
+          pending: null,
+          ready: false,
+          scriptDirectory,
+          scriptCleanup: null
+        };
+        let started = false;
+        const stdoutDecoder = new StringDecoder('utf8');
+        const stderrDecoder = new StringDecoder('utf8');
+
+        child.stdout.on('data', (chunk: Buffer) => {
+          runtime.stdoutBuffer += stdoutDecoder.write(chunk);
+          for (;;) {
+            const newline = runtime.stdoutBuffer.indexOf('\n');
+            if (newline === -1) break;
+            const line = runtime.stdoutBuffer.slice(0, newline).trim();
+            runtime.stdoutBuffer = runtime.stdoutBuffer.slice(newline + 1);
+            if (!line) continue;
+            const pending = runtime.pending;
+            if (!pending) {
+              logWarn(`desktop helper sent unsolicited output: ${line.slice(0, 200)}`);
+              continue;
+            }
+            let parsed: unknown;
+            try {
+              parsed = JSON.parse(line) as unknown;
+            } catch {
+              rejectAfterHelperRetirement(
+                runtime,
+                pending,
+                new ComputerError('The desktop helper returned malformed JSON.')
+              );
+              continue;
+            }
+            if (
+              parsed === null ||
+              typeof parsed !== 'object' ||
+              Array.isArray(parsed) ||
+              (((parsed as Record<string, unknown>)['ok'] !== true) && (parsed as Record<string, unknown>)['ok'] !== false)
+            ) {
+              rejectAfterHelperRetirement(
+                runtime,
+                pending,
+                new ComputerError('The desktop helper returned a malformed protocol response.')
+              );
+              continue;
+            }
+            const reply = parsed as Record<string, any>;
+            runtime.ready = true;
+            clearTimeout(pending.timer);
+            runtime.pending = null;
+            if (reply['ok'] === false) {
+              const code = String(reply['error_code'] ?? 'HELPER_ERROR');
+              const message = String(reply['message'] ?? 'Desktop helper failed');
+              const completed = Number(reply['completed_count']);
+              const failed = Number(reply['failed_index']);
+              const completedRoutes = completedHelperRoutes(reply, completed);
+              pending.reject(
+                new ComputerError(`${code}: ${message}`, {
+                  ...(Number.isInteger(completed) && completed >= 0 ? { completedCount: completed } : {}),
+                  ...(Number.isInteger(failed) && failed >= 0 ? { failedIndex: failed } : {}),
+                  ...(completedRoutes ? { completedRoutes } : {})
+                })
+              );
+            } else {
+              pending.resolve(stampHelperReply(reply, runtime.generation));
+            }
+          }
+        });
+        child.stderr.on('data', (chunk: Buffer) => {
+          runtime.stderrTail = `${runtime.stderrTail}${stderrDecoder.write(chunk)}`.slice(-8000);
+        });
+        child.once('spawn', () => {
+          started = true;
+          helperRuntime = runtime;
+          runtime.generation = ++helperGeneration;
+          resolve(runtime);
+        });
+        child.once('error', (error) => {
+          if (helperRuntime === runtime) helperRuntime = null;
+          if (!started) {
+            reject(new ComputerError(`Could not start the desktop helper: ${error.message}`));
+            return;
+          }
+          const pending = runtime.pending;
+          if (pending) {
+            rejectAfterHelperRetirement(
+              runtime,
+              pending,
+              new ComputerError(`Desktop helper process error: ${error.message}`)
+            );
+          } else {
+            void retireHelper(runtime);
+          }
+        });
+        child.once('close', () => {
+          if (helperRuntime === runtime) helperRuntime = null;
+          void cleanupHelperScript(runtime);
+          const pending = runtime.pending;
+          if (pending) {
+            clearTimeout(pending.timer);
+            runtime.pending = null;
+            pending.reject(new ComputerError(`Desktop helper failed: ${readableHelperFailure(runtime.stderrTail)}`));
+          }
+        });
+      });
+    } catch (error) {
+      if (scriptDirectory) await fs.rm(scriptDirectory, { recursive: true, force: true }).catch(() => {});
+      throw error;
+    }
+  })().finally(() => {
     helperStarting = null;
   });
 
   return helperStarting;
 }
 
+function locateMacOSDesktopHelper(): string {
+  const resourcesPath = (process as NodeJS.Process & { resourcesPath?: string }).resourcesPath;
+  const candidates = [
+    process.env['COS_MACOS_DESKTOP_HELPER'],
+    resourcesPath ? path.join(resourcesPath, 'desktop', 'macos-desktop-helper') : null,
+    path.resolve(
+      process.cwd(),
+      'resources',
+      'packaging',
+      'desktop',
+      'darwin',
+      process.arch,
+      'macos-desktop-helper'
+    )
+  ].filter((candidate): candidate is string => typeof candidate === 'string' && candidate.length > 0);
+  const helper = candidates.find((candidate) => existsSync(candidate));
+  if (helper) return helper;
+  throw new ComputerError(
+    `The macOS desktop helper is missing for ${process.arch}. Run npm run desktop:mac before development, or rebuild the macOS package.`
+  );
+}
+
+function useMacOSDesktopAddon(): boolean {
+  return process.platform === 'darwin' && !process.env['COS_MACOS_DESKTOP_HELPER'];
+}
+
+function locateMacOSDesktopAddon(): { addon: string; library: string } {
+  const resourcesPath = (process as NodeJS.Process & { resourcesPath?: string }).resourcesPath;
+  const explicitAddon = process.env['COS_MACOS_DESKTOP_ADDON'];
+  const explicitLibrary = process.env['COS_MACOS_DESKTOP_LIBRARY'];
+  const candidates = [
+    explicitAddon && explicitLibrary ? { addon: explicitAddon, library: explicitLibrary } : null,
+    resourcesPath
+      ? {
+          addon: path.join(resourcesPath, 'desktop', 'macos-desktop-addon.node'),
+          library: path.join(resourcesPath, 'desktop', 'libcos-desktop.dylib')
+        }
+      : null,
+    {
+      addon: path.resolve(
+        process.cwd(),
+        'resources',
+        'packaging',
+        'desktop',
+        'darwin',
+        process.arch,
+        'macos-desktop-addon.node'
+      ),
+      library: path.resolve(
+        process.cwd(),
+        'resources',
+        'packaging',
+        'desktop',
+        'darwin',
+        process.arch,
+        'libcos-desktop.dylib'
+      )
+    }
+  ].filter((candidate): candidate is { addon: string; library: string } => candidate !== null);
+  const found = candidates.find((candidate) => existsSync(candidate.addon) && existsSync(candidate.library));
+  if (found) return found;
+  throw new ComputerError(
+    `The in-process macOS desktop backend is missing for ${process.arch}. Run npm run desktop:mac before development, or rebuild the macOS package.`
+  );
+}
+
+const MACOS_ADDON_WORKER_SOURCE = String.raw`
+  const { parentPort, workerData } = require('node:worker_threads');
+  const { createRequire } = require('node:module');
+  try {
+    const addon = createRequire(process.execPath)(workerData.addon);
+    addon.initialize(workerData.library);
+    parentPort.postMessage({ type: 'ready' });
+    parentPort.on('message', ({ request }) => {
+      try {
+        const reply = JSON.parse(addon.handle(JSON.stringify(request)));
+        parentPort.postMessage({ type: 'reply', reply });
+      } catch (error) {
+        parentPort.postMessage({ type: 'failure', message: error instanceof Error ? error.message : String(error) });
+      }
+    });
+  } catch (error) {
+    parentPort.postMessage({ type: 'failure', message: error instanceof Error ? error.message : String(error) });
+  }
+`;
+
+function completedHelperRoutes(reply: Record<string, any>, completed: number): ActionRoute[] | undefined {
+  const raw = reply['routes'];
+  if (!Number.isInteger(completed) || completed < 0 || !Array.isArray(raw) || raw.length !== completed) {
+    return undefined;
+  }
+  const routes = raw.map(String);
+  if (!routes.every((route) => route === 'uia' || route === 'sendinput' || route === 'focus' || route === 'shell')) return undefined;
+  return routes as ActionRoute[];
+}
+
+function protocolFailure(reply: Record<string, any>): ComputerError | null {
+  if (reply['ok'] !== false) return null;
+  const completed = Number(reply['completed_count']);
+  const failed = Number(reply['failed_index']);
+  const completedRoutes = completedHelperRoutes(reply, completed);
+  return new ComputerError(
+    `${String(reply['error_code'] ?? 'HELPER_ERROR')}: ${String(reply['message'] ?? 'Desktop helper failed')}`,
+    {
+      ...(Number.isInteger(completed) && completed >= 0 ? { completedCount: completed } : {}),
+      ...(Number.isInteger(failed) && failed >= 0 ? { failedIndex: failed } : {}),
+      ...(completedRoutes ? { completedRoutes } : {})
+    }
+  );
+}
+
+async function retireMacOSAddon(runtime: MacOSAddonRuntime): Promise<void> {
+  if (macOSAddonRuntime === runtime) macOSAddonRuntime = null;
+  runtime.exited = true;
+  await runtime.worker.terminate().then(() => undefined, () => undefined);
+}
+
+async function startMacOSAddon(): Promise<MacOSAddonRuntime> {
+  if (helperStopping) throw new ComputerError('The desktop helper is shutting down.');
+  if (macOSAddonRuntime && !macOSAddonRuntime.exited) return macOSAddonRuntime;
+  if (macOSAddonStarting) return macOSAddonStarting;
+  const payload = locateMacOSDesktopAddon();
+  macOSAddonStarting = new Promise<MacOSAddonRuntime>((resolve, reject) => {
+    const worker = new Worker(MACOS_ADDON_WORKER_SOURCE, { eval: true, workerData: payload });
+    const runtime: MacOSAddonRuntime = { worker, pending: null, exited: false, generation: 0 };
+    let started = false;
+    const startupTimer = setTimeout(() => {
+      if (started) return;
+      void retireMacOSAddon(runtime);
+      reject(new ComputerError('The macOS Desktop addon did not initialize in time.'));
+    }, HELPER_STARTUP_GRACE_MS);
+    worker.on('message', (message: { type?: string; reply?: unknown; message?: string }) => {
+      if (message.type === 'ready' && !started) {
+        started = true;
+        clearTimeout(startupTimer);
+        macOSAddonRuntime = runtime;
+        runtime.generation = ++helperGeneration;
+        resolve(runtime);
+        return;
+      }
+      if (message.type === 'failure') {
+        const error = new ComputerError(`macOS Desktop addon failed: ${message.message ?? 'unknown failure'}`);
+        if (!started) {
+          clearTimeout(startupTimer);
+          reject(error);
+        }
+        const pending = runtime.pending;
+        runtime.pending = null;
+        if (pending) {
+          clearTimeout(pending.timer);
+          pending.reject(error);
+        }
+        void retireMacOSAddon(runtime);
+        return;
+      }
+      if (message.type !== 'reply') return;
+      const pending = runtime.pending;
+      runtime.pending = null;
+      if (!pending) {
+        logWarn('macOS Desktop addon sent an unsolicited reply');
+        return;
+      }
+      clearTimeout(pending.timer);
+      const reply = message.reply;
+      if (reply === null || typeof reply !== 'object' || Array.isArray(reply)) {
+        pending.reject(new ComputerError('The macOS Desktop addon returned a malformed protocol response.'));
+        return;
+      }
+      const record = reply as Record<string, any>;
+      const failure = protocolFailure(record);
+      if (failure) pending.reject(failure);
+      else pending.resolve(stampHelperReply(record, runtime.generation));
+    });
+    worker.once('error', (error) => {
+      if (!started) {
+        clearTimeout(startupTimer);
+        reject(new ComputerError(`Could not start the macOS Desktop addon: ${error.message}`));
+      }
+      const pending = runtime.pending;
+      runtime.pending = null;
+      if (pending) {
+        clearTimeout(pending.timer);
+        pending.reject(new ComputerError(`macOS Desktop addon error: ${error.message}`));
+      }
+    });
+    worker.once('exit', () => {
+      runtime.exited = true;
+      if (macOSAddonRuntime === runtime) macOSAddonRuntime = null;
+      if (!started) {
+        clearTimeout(startupTimer);
+        reject(new ComputerError('The macOS Desktop addon exited during startup.'));
+      }
+      const pending = runtime.pending;
+      runtime.pending = null;
+      if (pending) {
+        clearTimeout(pending.timer);
+        pending.reject(new ComputerError('The macOS Desktop addon exited before answering.'));
+      }
+    });
+  }).finally(() => {
+    macOSAddonStarting = null;
+  });
+  return macOSAddonStarting;
+}
+
+async function sendMacOSAddonRequest(request: Record<string, unknown>, expected?: ExpectedHelper): Promise<Record<string, any>> {
+  const runtime = await startMacOSAddon();
+  assertHelperGeneration(runtime.generation, expected);
+  if (runtime.pending) throw new ComputerError('macOS Desktop addon received overlapping requests.');
+  return new Promise<Record<string, any>>((resolve, reject) => {
+    let pending: PendingHelperRequest;
+    const timer = setTimeout(() => {
+      if (runtime.pending !== pending) return;
+      runtime.pending = null;
+      void retireMacOSAddon(runtime).then(() => reject(new ComputerError('The macOS Desktop addon did not answer in time.')));
+    }, helperTimeoutMs(request));
+    pending = { resolve, reject, timer };
+    runtime.pending = pending;
+    runtime.worker.postMessage({ request });
+  });
+}
+
 /**
- * Stops the long-lived PowerShell/Win32 helper and waits for its process tree to exit.
+ * Stops the long-lived native desktop backend and waits for its process/worker to exit.
  *
  * The helper is an app-owned process, not an implementation detail of one request: a
  * timeout or Electron shutdown must therefore retire the whole tree before the process
@@ -404,12 +742,26 @@ export async function stopComputerHelper(): Promise<void> {
   helperStopping = true;
   const starting = helperStarting;
   if (starting) await starting.catch(() => null);
+  const addonStarting = macOSAddonStarting;
+  if (addonStarting) await addonStarting.catch(() => null);
   const runtime = helperRuntime;
+  const addonRuntime = macOSAddonRuntime;
   helperRuntime = null;
   helperStarting = null;
+  macOSAddonRuntime = null;
+  macOSAddonStarting = null;
   uiRefs.clear();
   frames.clear();
   lastFrame = null;
+  if (addonRuntime) {
+    const pending = addonRuntime.pending;
+    addonRuntime.pending = null;
+    if (pending) {
+      clearTimeout(pending.timer);
+      pending.reject(new ComputerError('The desktop helper was stopped because the app is shutting down.'));
+    }
+    await retireMacOSAddon(addonRuntime);
+  }
   if (!runtime) {
     await Promise.allSettled([...helperRetirements]);
     return;
@@ -431,6 +783,7 @@ export async function stopComputerHelper(): Promise<void> {
 }
 
 async function sendHelperRequest(request: Record<string, unknown>, expected?: ExpectedHelper): Promise<Record<string, any>> {
+  if (useMacOSDesktopAddon()) return sendMacOSAddonRequest(request, expected);
   const runtime = await startHelper();
   assertHelperGeneration(runtime.generation, expected);
   if (runtime.pending) throw new ComputerError('Desktop helper received overlapping requests.');
@@ -490,6 +843,8 @@ interface Frame {
   height: number;
   windowId: number | null;
   windowGeometry: Rect | null;
+  /** Exact active-display rectangles captured with a screen frame; null for window frames. */
+  displayTopology: Rect[] | null;
   captureMode: Screenshot['captureMode'];
 }
 
@@ -530,7 +885,7 @@ const uiRefs = new Map<
 >();
 
 /**
- * Refs carry the helper generation that minted them. A UI Automation runtime id only
+ * Refs carry the helper generation that minted them. A native accessibility identity only
  * means anything to the helper process that issued it, so once the helper restarts every
  * outstanding ref is meaningless — and acting on one would click whatever now happens to
  * hold that id. Stamping the generation makes that detectable instead of silent.
@@ -546,7 +901,7 @@ function rememberUiRef(window: number, runtimeKey: string, index: number, snapsh
   return ref;
 }
 
-function uiTarget(ref: string): { window: number; runtimeKey: string; generation: number; snapshotId: number } {
+function uiTarget(ref: string): { window: number; runtimeKey: string; snapshotId: number } {
   const target = uiRefs.get(ref);
   if (!target) {
     throw new ComputerError(
@@ -584,6 +939,15 @@ export async function listWindows(): Promise<{ windows: WindowInfo[]; screen: Re
   return { windows: (reply['windows'] as WindowInfo[]) ?? [], screen: reply['screen'] as Rect };
 }
 
+/** Installed app identities come from the Windows Shell, never model-supplied paths. */
+export async function listDesktopApps(opts: { match?: string; limit?: number } = {}): Promise<{ apps: DesktopApp[]; truncated: boolean }> {
+  if (process.platform !== 'win32') throw new ComputerError('APPS_UNSUPPORTED: installed app discovery is currently Windows only.');
+  return exclusive(async () => {
+    const reply = await runHelper({ op: 'apps', match: opts.match ?? '', limit: Math.min(4096, Math.max(1, opts.limit ?? 60)) });
+    return { apps: Array.isArray(reply['apps']) ? reply['apps'] : [], truncated: reply['truncated'] === true };
+  });
+}
+
 export async function focusWindow(id: number): Promise<boolean> {
   const reply = await runHelper({ op: 'focus', id });
   return reply['focused'] === true;
@@ -601,7 +965,7 @@ export async function findUi(opts: {
   query?: string;
   role?: string;
   maxResults?: number;
-}): Promise<{ window: number; snapshotId: number; elements: UiElementInfo[] }> {
+}): Promise<{ window: number; snapshotId: number; elements: UiElementInfo[]; accessibility?: AccessibilityContext }> {
   return exclusive(() => findUiLocked(opts, lastFrame));
 }
 
@@ -618,7 +982,7 @@ async function findUiLocked(
   },
   frame: Frame | null,
   suppliedReply?: Record<string, any>
-): Promise<{ window: number; snapshotId: number; elements: UiElementInfo[] }> {
+): Promise<{ window: number; snapshotId: number; elements: UiElementInfo[]; accessibility?: AccessibilityContext }> {
   const request = {
     op: 'find_ui',
     ...(opts.window === undefined ? {} : { id: opts.window }),
@@ -634,7 +998,15 @@ async function findUiLocked(
   if (!Number.isInteger(snapshotId) || snapshotId < 1) {
     throw new ComputerError('The desktop helper returned UI elements without a valid snapshot identity.');
   }
-  const windowId = Number(reply['window']);
+  const replyWindow = reply['window'];
+  const windowId = Number(
+    replyWindow && typeof replyWindow === 'object'
+      ? (replyWindow as Record<string, unknown>)['id']
+      : replyWindow
+  );
+  if (!Number.isInteger(windowId) || windowId < 1) {
+    throw new ComputerError('The desktop helper returned UI elements without a valid window identity.');
+  }
   logInfo(
     `desktop uia window_snapshot=${snapshotId} visited=${Number(reply['visited']) || 0} returned=${raw.length} truncated=${reply['truncated'] === true}`
   );
@@ -644,20 +1016,25 @@ async function findUiLocked(
     let imageCenter: { x: number; y: number } | null = null;
     if (
       frame &&
+      // A screen fallback can contain an occluding application's pixels even though the
+      // semantic tree belongs to the requested window. Keep refs and desktop bounds, but
+      // do not claim those controls occupy pixels the screenshot may not show.
+      frame.captureMode !== 'screen_fallback' &&
       bounds.x >= frame.region.x &&
       bounds.y >= frame.region.y &&
       bounds.x + bounds.width <= frame.region.x + frame.region.width &&
       bounds.y + bounds.height <= frame.region.y + frame.region.height
     ) {
-      imageBounds = {
-        x: Math.round((bounds.x - frame.region.x) * frame.scale),
-        y: Math.round((bounds.y - frame.region.y) * frame.scale),
-        width: Math.round(bounds.width * frame.scale),
-        height: Math.round(bounds.height * frame.scale)
-      };
-      imageCenter = {
-        x: Math.round(imageBounds.x + imageBounds.width / 2),
-        y: Math.round(imageBounds.y + imageBounds.height / 2)
+      // Map both edges against the actual integer image dimensions. Rounding origin and
+      // size independently can extend a right-edge control one pixel beyond its image.
+      const left = Math.round((bounds.x - frame.region.x) * frame.width / frame.region.width);
+      const top = Math.round((bounds.y - frame.region.y) * frame.height / frame.region.height);
+      const right = Math.round((bounds.x + bounds.width - frame.region.x) * frame.width / frame.region.width);
+      const bottom = Math.round((bounds.y + bounds.height - frame.region.y) * frame.height / frame.region.height);
+      imageBounds = { x: left, y: top, width: right - left, height: bottom - top };
+      if (right > left && bottom > top) imageCenter = {
+        x: Math.min(right - 1, Math.round((left + right) / 2)),
+        y: Math.min(bottom - 1, Math.round((top + bottom) / 2))
       };
     }
     const runtimeKey = String(item['runtimeKey'] ?? '');
@@ -672,10 +1049,23 @@ async function findUiLocked(
       offscreen: item['offscreen'] === true,
       bounds,
       imageBounds,
-      imageCenter
+      imageCenter,
+      ...(Array.isArray(item['actions']) ? { actions: item['actions'] as UiActionName[] } : {}),
+      ...(Number.isInteger(item['depth']) ? { depth: Math.min(50, Math.max(0, item['depth'])) } : {}),
+      ...(typeof item['focused'] === 'boolean' ? { focused: item['focused'] } : {}),
+      ...(typeof item['selected'] === 'boolean' ? { selected: item['selected'] } : {})
     };
   });
-  return { window: windowId, snapshotId, elements };
+  const context: AccessibilityContext = {};
+  let textBudget = 8000;
+  for (const [source, target] of [['document_text', 'documentText'], ['selected_text', 'selectedText']] as const) {
+    if (typeof reply[source] !== 'string' || !reply[source]) continue;
+    context[target] = reply[source].slice(0, textBudget);
+    textBudget -= context[target]!.length;
+  }
+  const focused = raw.findIndex(item => item['runtimeKey'] === reply['focused_element']);
+  if (focused >= 0) context.focusedElement = elements[focused]!.ref;
+  return { window: windowId, snapshotId, elements, ...(Object.keys(context).length > 0 ? { accessibility: context } : {}) };
 }
 
 export async function getWindowState(opts: {
@@ -684,7 +1074,17 @@ export async function getWindowState(opts: {
   maxElements?: number;
   includeScreenshot?: boolean;
   includeUi?: boolean;
-}): Promise<{ window: WindowInfo; snapshotId: number | null; screenshot: Screenshot | null; elements: UiElementInfo[] }> {
+  includeRelated?: boolean;
+}): Promise<{
+  window: WindowInfo;
+  snapshotId: number | null;
+  screenshot: Screenshot | null;
+  elements: UiElementInfo[];
+  uiUnavailable: { code: string; message: string } | null;
+  uiTruncated?: boolean;
+  accessibility?: AccessibilityContext;
+  related?: Array<{ window: WindowInfo; screenshot: Screenshot | null; error?: string }>;
+}> {
   return exclusive(async () => {
     const includeScreenshot = opts.includeScreenshot !== false;
     const includeUi = opts.includeUi !== false;
@@ -700,6 +1100,7 @@ export async function getWindowState(opts: {
         ...(opts.window === undefined ? {} : { id: opts.window }),
         includeScreenshot,
         includeUi,
+        includeRelated: process.platform === 'win32' && opts.includeRelated === true,
         maxWidth: limit,
         maxResults: Math.min(100, Math.max(1, Math.floor(opts.maxElements ?? 60))),
         ...(file ? { file } : {})
@@ -709,14 +1110,43 @@ export async function getWindowState(opts: {
       if (!window) throw new ComputerError('WINDOW_NOT_FOUND: no matching visible window is available');
       const shot = file ? await screenshotFromReply(reply, file, window.id) : null;
       const frame = shot ? frameById(shot.frameId) : null;
-      const found = includeUi
+      const unavailableValue = reply['uiUnavailable'];
+      const uiUnavailable =
+        unavailableValue && typeof unavailableValue === 'object'
+          ? {
+              code: String((unavailableValue as Record<string, unknown>)['code'] ?? 'UI_UNAVAILABLE'),
+              message: String((unavailableValue as Record<string, unknown>)['message'] ?? 'UI controls are unavailable')
+            }
+          : null;
+      const found = includeUi && uiUnavailable === null
         ? await findUiLocked({ window: window.id, maxResults: opts.maxElements ?? 60 }, frame, reply)
-        : { window: window.id, snapshotId: null, elements: [] as UiElementInfo[] };
+        : { window: window.id, snapshotId: null, elements: [] as UiElementInfo[], accessibility: undefined };
+      const related: Array<{ window: WindowInfo; screenshot: Screenshot | null; error?: string }> = [];
+      if (process.platform === 'win32' && opts.includeRelated && Array.isArray(reply['relatedWindows'])) {
+        for (const relatedWindow of (reply['relatedWindows'] as WindowInfo[]).slice(0, 3)) {
+          if (!Number.isSafeInteger(relatedWindow.id) || relatedWindow.id <= 0 || relatedWindow.id === window.id) continue;
+          try {
+            const relatedShot = includeScreenshot
+              ? await screenshotLocked({ window: relatedWindow.id, ownerWindow: window.id, maxWidth: limit }, undefined,
+                  { generation: generationOfReply(reply), code: 'STALE_FRAME' })
+              : null;
+            related.push({ window: relatedWindow, screenshot: relatedShot });
+          } catch (err) {
+            // A disappearing popup must not discard the useful main-window observation.
+            // Capture rechecks native ownership; never substitute arbitrary screen pixels.
+            related.push({ window: relatedWindow, screenshot: null, error: (err instanceof Error ? err.message : String(err)).slice(0, 500) });
+          }
+        }
+      }
       return {
         window,
         snapshotId: found.snapshotId,
         screenshot: shot,
-        elements: found.elements
+        elements: found.elements,
+        uiUnavailable,
+        ...(includeUi && uiUnavailable === null && typeof reply['truncated'] === 'boolean' ? { uiTruncated: reply['truncated'] } : {}),
+        ...(found.accessibility ? { accessibility: found.accessibility } : {}),
+        ...(related.length > 0 ? { related } : {})
       };
     } finally {
       if (dir) await fs.rm(dir, { recursive: true, force: true }).catch(() => {});
@@ -778,8 +1208,7 @@ export async function screenshot(opts: {
 async function screenshotFromReply(
   reply: Record<string, any>,
   file: string,
-  requestedWindow: number | null,
-  inheritedWindowGeometry?: Rect | null
+  requestedWindow: number | null
 ): Promise<Screenshot> {
   const region = reply['region'] as Rect;
   const size = reply['image'] as { width: number; height: number };
@@ -800,6 +1229,14 @@ async function screenshotFromReply(
     throw new ComputerError('The desktop helper returned invalid screenshot geometry.');
   }
   const readStartedAt = Date.now();
+  const fileInfo = await fs.stat(file).catch(() => {
+    throw new ComputerError('The screen capture produced no image.');
+  });
+  if (fileInfo.size > MAX_SCREENSHOT_PNG_BYTES) {
+    throw new ComputerError(
+      `SCREENSHOT_TOO_LARGE: encoded PNG is ${fileInfo.size} bytes; limit ${MAX_SCREENSHOT_PNG_BYTES} bytes`
+    );
+  }
   const png = await fs.readFile(file).catch(() => {
     throw new ComputerError('The screen capture produced no image.');
   });
@@ -809,7 +1246,28 @@ async function screenshotFromReply(
   const rawMode = String(reply['captureMode'] ?? (requestedWindow === null ? 'screen' : 'screen_fallback'));
   const captureMode: Screenshot['captureMode'] =
     rawMode === 'window' || rawMode === 'screen_fallback' ? rawMode : 'screen';
+  // Only an actual background-window bitmap can authorize later input against that
+  // window. A screen fallback contains visible pixels (possibly an occluder), so it must
+  // retain screen topology rather than relabel those pixels with the requested window.
+  const frameWindow = captureMode === 'window' ? requestedWindow : null;
   const scale = size.width / region.width;
+  const replyWindowGeometry = reply['windowGeometry'] as Rect | undefined;
+  const rawDisplays = reply['displays'];
+  const displayTopology = Array.isArray(rawDisplays) && rawDisplays.length > 0 && rawDisplays.every((value) =>
+    value &&
+    typeof value === 'object' &&
+    Number.isFinite((value as Rect).x) &&
+    Number.isFinite((value as Rect).y) &&
+    Number.isFinite((value as Rect).width) &&
+    Number.isFinite((value as Rect).height) &&
+    (value as Rect).width > 0 &&
+    (value as Rect).height > 0
+  )
+    ? (rawDisplays as Rect[]).map((value) => ({ ...value }))
+    : null;
+  if (process.platform === 'darwin' && frameWindow === null && !displayTopology) {
+    throw new ComputerError('The macOS desktop helper returned a screen frame without exact display topology.');
+  }
   const frame: Frame = {
     id: nextFrameId++,
     helperGeneration: generationOfReply(reply),
@@ -817,13 +1275,9 @@ async function screenshotFromReply(
     scale,
     width: size.width,
     height: size.height,
-    windowId: requestedWindow,
-    windowGeometry:
-      inheritedWindowGeometry === undefined
-        ? requestedWindow === null
-          ? null
-          : { ...region }
-        : inheritedWindowGeometry,
+    windowId: frameWindow,
+    windowGeometry: frameWindow === null ? null : replyWindowGeometry ?? { ...region },
+    displayTopology: frameWindow === null ? displayTopology : null,
     captureMode
   };
   rememberFrame(frame);
@@ -841,7 +1295,7 @@ async function screenshotFromReply(
     scale: frame.scale,
     focused: requestedWindow === null ? null : reply['focused'] === true,
     captureMode,
-    windowId: requestedWindow
+    windowId: frame.windowId
   };
 }
 
@@ -853,25 +1307,25 @@ async function screenshotFromReply(
 async function screenshotLocked(
   opts: {
     window?: number;
+    /** Native capture rechecks the exact ownership of a related menu/popup. */
+    ownerWindow?: number;
     full?: boolean;
     maxWidth?: number;
     crop?: Rect;
   },
-  cropFrame?: Frame | null
+  cropFrame?: Frame | null,
+  expected?: ExpectedHelper
 ): Promise<Screenshot> {
   if (opts.crop && (opts.window !== undefined || opts.full === true)) {
     throw new ComputerError('crop cannot be combined with window or full capture');
   }
 
   let cropRegion: Rect | undefined;
-  let cropSource: Frame | null = null;
-  let expected: ExpectedHelper | undefined;
   if (opts.crop) {
     const source = cropFrame === undefined ? lastFrame : cropFrame;
     const frame = qualifiedFrame(source);
     if (source && !frame) throw new ComputerError('STALE_FRAME: take a new screenshot before cropping.');
     if (!frame) throw new ComputerError('Take a screenshot first — crop coordinates refer to the most recent frame.');
-    cropSource = frame;
     expected = { generation: frame.helperGeneration, code: 'STALE_FRAME' };
     const crop = {
       x: Math.floor(opts.crop.x),
@@ -921,14 +1375,14 @@ async function screenshotLocked(
       maxWidth: limit,
       ...(cropRegion === undefined ? {} : { region: cropRegion }),
       ...(opts.window === undefined ? {} : { id: opts.window }),
+      ...(opts.ownerWindow === undefined ? {} : { ownerWindow: opts.ownerWindow }),
       ...(opts.full === true ? { full: true } : {})
     }, expected);
-    return await screenshotFromReply(
-      reply,
-      file,
-      opts.crop ? cropSource?.windowId ?? null : opts.window ?? null,
-      opts.crop ? cropSource?.windowGeometry ?? null : undefined
-    );
+    // A crop is a fresh capture of visible display pixels, even when its coordinates came
+    // from a window-bound frame. Keeping the source window id here would let pixels from an
+    // occluding app authorize later input against the covered window. Publish the crop as
+    // screen-bound so its frame identity describes the pixels that were actually captured.
+    return await screenshotFromReply(reply, file, opts.crop ? null : opts.window ?? null);
   } finally {
     await fs.rm(dir, { recursive: true, force: true }).catch(() => {});
   }
@@ -950,7 +1404,7 @@ export interface PointerResult {
 
 export async function act(
   actions: Action[],
-  opts: { frameId?: number } = {}
+  opts: { frameId?: number; window?: number; ownerWindow?: number; app?: string; ownerApp?: string } = {}
 ): Promise<ActionResult> {
   return exclusive(() => actLocked(actions, opts));
 }
@@ -968,6 +1422,11 @@ export async function actAndCapture(
   actions: Action[],
   opts: {
     frameId?: number;
+    /** Windows physical input is activated and checked against this exact window. */
+    window?: number;
+    ownerWindow?: number;
+    app?: string;
+    ownerApp?: string;
     capture?: {
       window?: number;
       full?: boolean;
@@ -1006,23 +1465,26 @@ export async function actAndCapture(
         const message = err instanceof Error ? err.message : String(err);
         throw new ComputerError(
           `POSTCONDITION_FAILED: completed_count=${result.completedCount}. ${message}`,
-          { completedCount: result.completedCount, failedIndex: result.completedCount }
+          { completedCount: result.completedCount, failedIndex: result.completedCount, completedRoutes: result.routes }
         );
       }
     }
     if (!opts.capture) return { ...result, screenshot: null, verification };
 
-    const { preferActiveWindow, ...capture } = opts.capture;
-    // Resolved here rather than by the caller: the actions may have changed which window
-    // is in front, and resolving it outside the lock would reopen the gap this closes.
-    if (preferActiveWindow && capture.window === undefined && capture.full !== true && capture.crop === undefined) {
-      capture.window = (await activeWindow()).window?.id;
+    try {
+      const { preferActiveWindow, ...capture } = opts.capture;
+      // Resolve under the action lock. An explicit input target also owns its default result
+      // capture, even if the completed action opened a different foreground window.
+      if (capture.window === undefined && capture.full !== true && capture.crop === undefined) {
+        capture.window = opts.window ?? (preferActiveWindow ? (await activeWindow()).window?.id : undefined);
+      }
+      return { ...result, screenshot: await screenshotLocked(capture, before), verification };
+    } catch (err) {
+      throw new ComputerError(
+        `CAPTURE_AFTER_FAILED: completed_count=${result.completedCount}. ${err instanceof Error ? err.message : String(err)}. Observe again; do not repeat completed actions.`,
+        { completedCount: result.completedCount, failedIndex: result.completedCount, completedRoutes: result.routes }
+      );
     }
-    return {
-      ...result,
-      screenshot: await screenshotLocked(capture, before),
-      verification
-    };
   });
 }
 
@@ -1102,8 +1564,29 @@ async function verifyDesktopLocked(spec: VerificationSpec): Promise<Verification
 
 async function actLocked(
   actions: Action[],
-  opts: { frameId?: number }
+  opts: { frameId?: number; window?: number; ownerWindow?: number; app?: string; ownerApp?: string }
 ): Promise<ActionResult> {
+  if (process.platform !== 'win32' && actions.some(action => action.type === 'paste' || action.type === 'launch_app' || action.type === 'ui_action')) {
+    throw new ComputerError('ACTION_UNSUPPORTED: paste, launch_app and ui_action are currently Windows only.');
+  }
+  if (actions.some(action => action.type === 'paste') && opts.window === undefined) {
+    throw new ComputerError('WINDOW_REQUIRED: paste needs an explicit target window.');
+  }
+  const firstPaste = actions.findIndex(action => action.type === 'paste');
+  if (firstPaste >= 0 && actions.slice(firstPaste + 1).some(action => action.type === 'paste' || action.type === 'write_clipboard')) {
+    throw new ComputerError('PASTE_SEQUENCE: observe the first paste result before replacing clipboard text again; queued Ctrl+V does not prove the app consumed it.');
+  }
+  if (opts.window !== undefined) {
+    if (process.platform !== 'win32') throw new ComputerError('WINDOW_TARGET_UNSUPPORTED: window-scoped input is currently Windows only.');
+    if (!Number.isSafeInteger(opts.window) || opts.window <= 0) throw new ComputerError('INVALID_WINDOW: expected a window id from observe.');
+    if (actions.some(action => action.type === 'focus' && action.window !== opts.window)) {
+      throw new ComputerError('WINDOW_MISMATCH: focus must name the same window as the input target.');
+    }
+  }
+  if (opts.ownerWindow !== undefined && (process.platform !== 'win32' || opts.window === undefined ||
+      !Number.isSafeInteger(opts.ownerWindow) || opts.ownerWindow <= 0 || opts.ownerWindow === opts.window)) {
+    throw new ComputerError('INVALID_WINDOW: popup input requires distinct exact popup and owner windows.');
+  }
   const pointing = new Set(['move', 'click', 'double_click', 'scroll', 'drag']);
   const needsFrame = actions.some((a) => pointing.has(a.type));
   if (needsFrame && frames.size === 0) {
@@ -1127,6 +1610,9 @@ async function actLocked(
       `STALE_FRAME: frame ${opts.frameId} is no longer retained. Take a screenshot or call get_window_state again and point at the new frame.`
     );
   }
+  if (needsFrame && opts.window !== undefined && requestedFrame?.windowId !== opts.window) {
+    throw new ComputerError('WINDOW_MISMATCH: coordinates must come from a screenshot of the input target window. Observe that window again.');
+  }
   const frame =
     requestedFrame ?? qualifiedFrame(lastFrame) ?? {
       id: 0,
@@ -1137,6 +1623,7 @@ async function actLocked(
       height: 1,
       windowId: null,
       windowGeometry: null,
+      displayTopology: null,
       captureMode: 'screen' as const
     };
   if (needsFrame) {
@@ -1163,18 +1650,28 @@ async function actLocked(
       }
     }
   }
-  const toScreenX = (x: number): number => Math.round(frame.region.x + x / frame.scale);
-  const toScreenY = (y: number): number => Math.round(frame.region.y + y / frame.scale);
+  const clampMappedCoordinate = (mapped: number, origin: number, extent: number): number => {
+    const lower = Math.ceil(origin);
+    const upper = Math.max(lower, Math.ceil(origin + extent) - 1);
+    return Math.min(upper, Math.max(lower, mapped));
+  };
+  const toScreenX = (x: number): number =>
+    clampMappedCoordinate(Math.round(frame.region.x + x / frame.scale), frame.region.x, frame.region.width);
+  const toScreenY = (y: number): number =>
+    clampMappedCoordinate(Math.round(frame.region.y + y / frame.scale), frame.region.y, frame.region.height);
 
   // Resolve every semantic ref before the first side effect in the batch. Clipboard and wait
   // actions run locally and can occur before a later click_ref/set_value; resolving refs lazily
   // inside that loop used to let an invented/stale ref reject the call only *after* an earlier
   // clipboard write had already happened. Runtime failures can still occur after an action has
   // genuinely started, but deterministic validation errors must not create partial batches.
-  const uiTargets = new Map<string, { window: number; runtimeKey: string; generation: number; snapshotId: number }>();
+  const uiTargets = new Map<string, { window: number; runtimeKey: string; snapshotId: number }>();
   for (const action of actions) {
-    if (action.type !== 'click_ref' && action.type !== 'set_value') continue;
+    if (action.type !== 'click_ref' && action.type !== 'set_value' && action.type !== 'ui_action') continue;
     if (!uiTargets.has(action.ref)) uiTargets.set(action.ref, uiTarget(action.ref));
+    if (opts.window !== undefined && uiTargets.get(action.ref)!.window !== opts.window) {
+      throw new ComputerError('WINDOW_MISMATCH: the accessibility ref belongs to a different input target window.');
+    }
   }
 
   const mapOne = (action: Action): Record<string, unknown> => {
@@ -1186,7 +1683,9 @@ async function actLocked(
           type: 'click_ui',
           window: target.window,
           snapshotId: target.snapshotId,
-          runtimeKey: target.runtimeKey
+          runtimeKey: target.runtimeKey,
+          ...(action.button === undefined ? {} : { button: action.button }),
+          ...(action.count === undefined ? {} : { count: action.count })
         };
       }
       case 'set_value': {
@@ -1200,6 +1699,13 @@ async function actLocked(
           value: action.text
         };
       }
+      case 'ui_action': {
+        const target = uiTargets.get(action.ref);
+        if (!target) throw new ComputerError(`UNKNOWN_UI_REF: ${action.ref}`);
+        return { type: 'ui_action', window: target.window, snapshotId: target.snapshotId, runtimeKey: target.runtimeKey, action: action.action };
+      }
+      case 'launch_app':
+        return { type: 'launch_app', app: action.app };
       case 'move':
       case 'click':
       case 'double_click':
@@ -1207,7 +1713,8 @@ async function actLocked(
           type: action.type,
           x: toScreenX(action.x),
           y: toScreenY(action.y),
-          button: 'button' in action ? (action.button ?? 'left') : 'left'
+          button: 'button' in action ? (action.button ?? 'left') : 'left',
+          ...(action.type === 'click' && action.count !== undefined ? { count: action.count } : {})
         };
       case 'scroll':
         return {
@@ -1215,14 +1722,16 @@ async function actLocked(
           x: toScreenX(action.x),
           y: toScreenY(action.y),
           scroll_x: action.scroll_x ?? 0,
-          scroll_y: action.scroll_y ?? 0
+          scroll_y: action.scroll_y ?? 0,
+          ...(action.scrollUnit === 'wheel' ? { rawWheel: true } : {})
         };
       case 'drag':
         return {
           type: 'drag',
           xs: action.path.map((p) => toScreenX(p.x)),
           ys: action.path.map((p) => toScreenY(p.y)),
-          button: action.button ?? 'left'
+          button: action.button ?? 'left',
+          ...(action.duration_ms === undefined ? {} : { durationMs: action.duration_ms })
         };
       case 'type':
         return { type: 'type', text: action.text };
@@ -1242,12 +1751,10 @@ async function actLocked(
   const clipboard: string[] = [];
   const routes: ActionResult['routes'] = [];
   let completedCount = 0;
-  const firstUiTarget = uiTargets.values().next().value as { generation: number } | undefined;
-  const expected: ExpectedHelper | undefined = needsFrame || firstUiTarget
-    ? {
-        generation: needsFrame ? frame.helperGeneration : firstUiTarget!.generation,
-        code: firstUiTarget ? 'STALE_REF' : 'STALE_FRAME'
-      }
+  // Validation above is synchronous; pin its helper through every queued native segment,
+  // including a segment reached after a local wait or clipboard operation.
+  const expected: ExpectedHelper | undefined = needsFrame || uiTargets.size > 0
+    ? { generation: helperGeneration, code: uiTargets.size > 0 ? 'STALE_REF' : 'STALE_FRAME' }
     : undefined;
   let batch: ReturnType<typeof mapOne>[] = [];
   let batchIndices: number[] = [];
@@ -1263,13 +1770,21 @@ async function actLocked(
       reply = await runHelper({
         op: 'act',
         actions: sending,
+        ...(opts.window === undefined ? {} : { targetWindow: opts.window }),
+        ...(opts.ownerWindow === undefined ? {} : { ownerWindow: opts.ownerWindow }),
+        ...(opts.app === undefined ? {} : { targetApp: opts.app }),
+        ...(opts.ownerApp === undefined ? {} : { ownerApp: opts.ownerApp }),
         ...(needsFrame
           ? {
               frame: {
                 id: frame.id,
                 window: frame.windowId,
+                ...(opts.ownerWindow === undefined ? {} : { ownerWindow: opts.ownerWindow }),
+                ...(opts.app === undefined ? {} : { targetApp: opts.app }),
+                ...(opts.ownerApp === undefined ? {} : { ownerApp: opts.ownerApp }),
                 region: frame.region,
                 windowGeometry: frame.windowGeometry,
+                displays: frame.displayTopology,
                 captureMode: frame.captureMode
               }
             }
@@ -1279,26 +1794,67 @@ async function actLocked(
       const helperRoutes = Array.isArray(reply['routes']) ? reply['routes'].map(String) : [];
       for (let index = 0; index < sending.length; index++) {
         const route = helperRoutes[index];
-        routes.push(route === 'uia' || route === 'focus' ? route : 'sendinput');
+        routes.push(route === 'uia' || route === 'focus' || route === 'shell' ? route : 'sendinput');
       }
       completedCount += sending.length;
     } catch (err) {
       const partial = err instanceof ComputerError ? (err.completedCount ?? 0) : 0;
       const failedBatchIndex = err instanceof ComputerError ? (err.failedIndex ?? partial) : partial;
-      for (let index = 0; index < partial; index++) {
-        const action = sending[index];
-        routes.push(action?.['type'] === 'click_ui' || action?.['type'] === 'set_value_ui' ? 'uia' : 'sendinput');
-      }
+      const helperRoutes = err instanceof ComputerError ? err.completedRoutes : null;
+      const hasExactPartialRoutes = helperRoutes !== null && helperRoutes.length === partial;
+      if (hasExactPartialRoutes) routes.push(...helperRoutes);
       const totalCompleted = completedCount + partial;
       const originalFailed = sendingIndices[failedBatchIndex] ?? sendingIndices[partial] ?? totalCompleted;
       const message = err instanceof Error ? err.message : String(err);
+      const exactRoutes = hasExactPartialRoutes ? [...routes] : null;
+      const routeEvidence = exactRoutes
+        ? exactRoutes.length > 0
+          ? exactRoutes.join('+')
+          : 'none'
+        : 'unavailable';
       throw new ComputerError(
-        `PARTIAL_BATCH: completed_count=${totalCompleted} failed_index=${originalFailed}. ${message}`,
-        { completedCount: totalCompleted, failedIndex: originalFailed }
+        `PARTIAL_BATCH: completed_count=${totalCompleted} failed_index=${originalFailed} routes=${routeEvidence}. ${message}`,
+        {
+          completedCount: totalCompleted,
+          failedIndex: originalFailed,
+          ...(exactRoutes ? { completedRoutes: exactRoutes } : {})
+        }
       );
     }
   };
   for (const [index, action] of actions.entries()) {
+    if (action.type === 'paste') {
+      await flush();
+      try {
+        // Target activation is a precondition for publishing the user's clipboard.
+        // The physical Ctrl+V still rechecks focus immediately before injection.
+        await runHelper({ op: 'act', actions: [{ type: 'focus', window: opts.window }],
+          targetWindow: opts.window,
+          ...(opts.app === undefined ? {} : { targetApp: opts.app }),
+          ...(opts.ownerWindow === undefined ? {} : { ownerWindow: opts.ownerWindow }),
+          ...(opts.ownerApp === undefined ? {} : { ownerApp: opts.ownerApp }) }, expected);
+        // Clipboard publication remains owned by Electron. The next native action targets
+        // the explicitly selected window; it is one authored paste, not two counted steps.
+        const nativeClipboard = await electronClipboard();
+        assertHelperGeneration(helperGeneration, expected);
+        nativeClipboard.writeText(action.text);
+      } catch (err) {
+        throw localActionFailure(err, completedCount, index);
+      }
+      batch.push({ type: 'keypress', keys: ['ctrl', 'v'] });
+      batchIndices.push(index);
+      try {
+        await flush();
+      } catch (err) {
+        const partial = err instanceof ComputerError ? err : null;
+        throw new ComputerError(
+          `${err instanceof Error ? err.message : String(err)}. Clipboard text was replaced; paste delivery is not confirmed.`,
+          { completedCount: partial?.completedCount ?? completedCount, failedIndex: partial?.failedIndex ?? index,
+            ...(partial?.completedRoutes ? { completedRoutes: partial.completedRoutes } : {}) }
+        );
+      }
+      continue;
+    }
     if (action.type === 'wait') {
       await flush();
       const ms = Math.min(10_000, Math.max(0, action.ms ?? 2000));
@@ -1310,7 +1866,9 @@ async function actLocked(
     if (action.type === 'read_clipboard') {
       await flush();
       try {
-        clipboard.push((await electronClipboard()).readText());
+        const nativeClipboard = await electronClipboard();
+        assertHelperGeneration(helperGeneration, expected);
+        clipboard.push(nativeClipboard.readText());
       } catch (err) {
         throw localActionFailure(err, completedCount, index);
       }
@@ -1321,7 +1879,9 @@ async function actLocked(
     if (action.type === 'write_clipboard') {
       await flush();
       try {
-        (await electronClipboard()).writeText(action.text);
+        const nativeClipboard = await electronClipboard();
+        assertHelperGeneration(helperGeneration, expected);
+        nativeClipboard.writeText(action.text);
       } catch (err) {
         throw localActionFailure(err, completedCount, index);
       }
@@ -1332,7 +1892,7 @@ async function actLocked(
     batch.push(mapOne(action));
     batchIndices.push(index);
   }
-  // A pure clipboard/wait batch must not depend on PowerShell/UI Automation at all. This is
+  // A pure clipboard/wait batch must not depend on a native accessibility helper at all. This is
   // what makes the connector genuinely useful when the user granted only clipboard access or
   // when the desktop helper is unavailable. Mixed desktop batches still take one final cursor
   // sample after any trailing local wait/clipboard work so the pointer report remains current.
@@ -1413,11 +1973,67 @@ export async function checkAvailable(): Promise<string | null> {
  * Connection owns when Desktop becomes publishable; shutdown remains owned by
  * `stopComputerHelper`. Clipboard-only configurations deliberately never call this.
  */
-export async function prewarmComputerHelper(): Promise<void> {
+async function requestParentAccessibility(): Promise<void> {
   try {
-    await runHelper({ op: 'warm' });
+    // The native backend executes inside this Electron process, so the parent owns the
+    // one user-facing prompt. Keep Electron lazy for protocol tests outside the app.
+    const electron = await import('electron');
+    electron.systemPreferences?.isTrustedAccessibilityClient(true);
+  } catch {
+    // The subsequent backend preflight remains authoritative and fail-closed.
+  }
+}
+
+function nativePermission(value: unknown): MacOSPermissionState {
+  return value === true ? 'granted' : value === false ? 'missing' : 'unknown';
+}
+
+export async function refreshMacOSDesktopAccess(
+  options: { promptAccessibility?: boolean } = {}
+): Promise<MacOSDesktopAccessStatus | null> {
+  if (process.platform !== 'darwin') return null;
+  const generation = ++macOSDesktopAccessRefreshGeneration;
+  if (options.promptAccessibility === true) await requestParentAccessibility();
+  try {
+    const reply = await runHelper({ op: 'warm' });
+    const status: MacOSDesktopAccessStatus = {
+      screen: nativePermission(reply['screenPermission']),
+      accessibility: nativePermission(reply['accessibilityPermission']),
+      checkedAt: Date.now(),
+      error: null
+    };
+    if (generation === macOSDesktopAccessRefreshGeneration) publishMacOSDesktopAccess(status);
+    return generation === macOSDesktopAccessRefreshGeneration ? status : macOSDesktopAccess;
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
-    logWarn(`computer use prewarm failed: ${message}`);
+    const status: MacOSDesktopAccessStatus = {
+      screen: 'unknown',
+      accessibility: 'unknown',
+      checkedAt: Date.now(),
+      error: message
+    };
+    if (generation === macOSDesktopAccessRefreshGeneration) publishMacOSDesktopAccess(status);
+    return generation === macOSDesktopAccessRefreshGeneration ? status : macOSDesktopAccess;
   }
+}
+
+export async function prewarmComputerHelper(): Promise<void> {
+  if (process.platform !== 'darwin') {
+    try {
+      await runHelper({ op: 'warm' });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      logWarn(`computer use prewarm failed: ${message}`);
+    }
+    return;
+  }
+  const status = await refreshMacOSDesktopAccess();
+  if (!status) return;
+  if (status.error) {
+    logWarn(`computer use prewarm failed: ${status.error}`);
+    return;
+  }
+  logInfo(
+    `desktop macos permissions screen=${status.screen} accessibility=${status.accessibility} execution=in-process`
+  );
 }

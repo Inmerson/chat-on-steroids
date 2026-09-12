@@ -8,6 +8,7 @@ const desktop = vi.hoisted(() => {
     activeWindow: vi.fn(),
     findUi: vi.fn(),
     getWindowState: vi.fn(),
+    listDesktopApps: vi.fn(),
     listWindows: vi.fn(),
     screenshot: vi.fn(),
     waitForWindow: vi.fn(),
@@ -23,6 +24,7 @@ vi.mock('../src/main/computer/index.js', () => ({
   activeWindow: desktop.activeWindow,
   findUi: desktop.findUi,
   getWindowState: desktop.getWindowState,
+  listDesktopApps: desktop.listDesktopApps,
   listWindows: desktop.listWindows,
   screenshot: desktop.screenshot,
   waitForWindow: desktop.waitForWindow
@@ -105,6 +107,123 @@ describe('Desktop observe runtime contract', () => {
     const result = await observe.handler({});
     expect(result.content[0].text).toContain('No foreground window');
     expect(result.content[0].text).toContain('frameId 7');
+  });
+
+  it('supports what=apps and match filtering', async () => {
+    desktop.listDesktopApps.mockResolvedValueOnce({
+      apps: [
+        { id: 'Microsoft.WindowsTerminal_8wekyb3d8bbwe!App', displayName: 'Terminal', isRunning: true, windows: [{ id: 10 }] },
+        { id: 'Microsoft.Paint_8wekyb3d8bbwe!App', displayName: 'Paint', isRunning: false }
+      ],
+      truncated: false
+    });
+    const observe = desktopSurface().get('observe')!;
+    const result = await observe.handler({ what: 'apps', match: 'term' });
+    expect(result.content[0].text).toContain('Installed applications:');
+    expect(result.content[0].text).toContain('Terminal');
+    expect(result.content[0].text).toContain('[running]');
+    expect(desktop.listDesktopApps).toHaveBeenCalledWith({ match: 'term', limit: 60 });
+  });
+
+  it('renders accessibility actions, focused element, and document text', async () => {
+    desktop.getWindowState.mockResolvedValueOnce({
+      window: { id: 1, process: 'app.exe', state: 'normal', title: 'App', x: 0, y: 0, width: 800, height: 600 },
+      snapshotId: 42,
+      screenshot: { frameId: 10, width: 800, height: 600, data: 'data', captureMode: 'window' },
+      elements: [
+        {
+          ref: 'g1_s42_e1',
+          role: 'button',
+          name: 'Submit',
+          automationId: 'btn1',
+          enabled: true,
+          offscreen: false,
+          actions: ['invoke'],
+          focused: true,
+          selected: false
+        }
+      ],
+      accessibility: {
+        focusedElement: 'g1_s42_e1',
+        documentText: 'Document sample text',
+        selectedText: 'sample'
+      }
+    });
+    const observe = desktopSurface().get('observe')!;
+    const result = await observe.handler({});
+    const text = result.content[0].text;
+    expect(text).toContain('actions=invoke');
+    expect(text).toContain('focused');
+    expect(text).toContain('focused_element: g1_s42_e1');
+    expect(text).toContain('document_text: "Document sample text"');
+    expect(text).toContain('selected_text: "sample"');
+  });
+});
+
+describe('Desktop computer new actions', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  const nativeResult = () => ({
+    completedCount: 1,
+    routes: ['uia'],
+    cursor: null,
+    clipboard: [],
+    verification: null,
+    screenshot: null
+  });
+
+  it('refuses paste without clipboardWrite permission', async () => {
+    const computer = desktopSurface({ control: true, clipboardWrite: false }).get('computer')!;
+    const result = await computer.handler({ actions: [{ type: 'paste', text: 'hello' }] });
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain('TOOL_DISABLED: paste needs the Replace clipboard text permission.');
+    expect(desktop.actAndCapture).not.toHaveBeenCalled();
+  });
+
+  it('dispatches paste with clipboardWrite and passes targetWindow', async () => {
+    desktop.actAndCapture.mockResolvedValueOnce(nativeResult());
+    const computer = desktopSurface({ control: true, clipboardWrite: true }).get('computer')!;
+    const result = await computer.handler({ window: 42, actions: [{ type: 'paste', text: 'hello' }] });
+    expect(result.isError ?? false).toBe(false);
+    expect(desktop.actAndCapture).toHaveBeenCalledWith(
+      [{ type: 'paste', text: 'hello' }],
+      expect.objectContaining({ window: 42 })
+    );
+  });
+
+  it('supports launch_app, ui_action, click count, drag duration_ms, and scroll_unit', async () => {
+    desktop.actAndCapture.mockResolvedValueOnce({
+      completedCount: 5,
+      routes: ['shell', 'uia', 'sendinput', 'sendinput', 'sendinput'],
+      cursor: null,
+      clipboard: [],
+      verification: null,
+      screenshot: null
+    });
+    const computer = desktopSurface({ control: true }).get('computer')!;
+    const result = await computer.handler({
+      frameId: 1,
+      actions: [
+        { type: 'launch_app', app: 'notepad.exe' },
+        { type: 'ui_action', ref: 'g1_s1_e1', action: 'invoke' },
+        { type: 'click', x: 10, y: 10, count: 2 },
+        { type: 'drag', path: [{ x: 10, y: 10 }, { x: 20, y: 20 }], duration_ms: 150 },
+        { type: 'scroll', x: 10, y: 10, scroll_y: -120, scroll_unit: 'wheel' }
+      ]
+    });
+    expect(result.isError ?? false).toBe(false);
+    expect(desktop.actAndCapture).toHaveBeenCalledWith(
+      [
+        { type: 'launch_app', app: 'notepad.exe' },
+        { type: 'ui_action', ref: 'g1_s1_e1', action: 'invoke' },
+        { type: 'click', x: 10, y: 10, button: undefined, count: 2 },
+        { type: 'drag', path: [{ x: 10, y: 10 }, { x: 20, y: 20 }], button: undefined, duration_ms: 150 },
+        { type: 'scroll', x: 10, y: 10, scroll_x: undefined, scroll_y: -120, scrollUnit: 'wheel' }
+      ],
+      expect.objectContaining({ frameId: 1 })
+    );
   });
 });
 
