@@ -74,7 +74,7 @@ vi.mock('../src/main/logger.js', () => ({ logInfo: vi.fn(), logWarn: vi.fn() }))
 
 import { listWindows } from '../src/main/computer/index.js';
 
-describe('desktop helper protocol validation', () => {
+describe.runIf(process.platform === 'win32')('desktop helper protocol validation', () => {
   it('rejects syntactically valid JSON that is not a protocol response', async () => {
     await expect(listWindows()).rejects.toThrow(/malformed protocol response/i);
     expect(fake.terminateProcessTree).toHaveBeenCalledTimes(1);

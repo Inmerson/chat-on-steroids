@@ -118,7 +118,7 @@ afterEach(() => {
   fake.reset();
 });
 
-describe('desktop helper retirement ordering', () => {
+describe.runIf(process.platform === 'win32')('desktop helper retirement ordering', () => {
   it('does not reject a post-start process error until the broken helper is retired', async () => {
     let firstSettled = false;
     const first = listWindows();

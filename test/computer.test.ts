@@ -252,7 +252,10 @@ describe.runIf(IS_WINDOWS)('desktop helper', () => {
       // Any other frame's region or scale gives different numbers.
       expect(element.imageBounds.x).toBe(Math.round((element.bounds.x - shot.region.x) * shot.scale));
       expect(element.imageBounds.y).toBe(Math.round((element.bounds.y - shot.region.y) * shot.scale));
-      expect(element.imageBounds.width).toBe(Math.round(element.bounds.width * shot.scale));
+      const expectedRight = Math.round((element.bounds.x + element.bounds.width - shot.region.x) * shot.scale);
+      const expectedBottom = Math.round((element.bounds.y + element.bounds.height - shot.region.y) * shot.scale);
+      expect(element.imageBounds.width).toBe(expectedRight - element.imageBounds.x);
+      expect(element.imageBounds.height).toBe(expectedBottom - element.imageBounds.y);
       expect(element.imageCenter.x).toBe(
         Math.round(element.imageBounds.x + element.imageBounds.width / 2)
       );

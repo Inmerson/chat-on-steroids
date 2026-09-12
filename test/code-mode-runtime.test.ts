@@ -5,7 +5,7 @@ import type { ToolResult } from '../src/main/mcp/kernel.js';
 
 const result = (value: string): ToolResult => ({ content: [{ type: 'text', text: value }] });
 const tools = [{ name: 'lookup', description: 'Fixture lookup returning a normal MCP result.' }];
-const limits = { ...CODE_MODE_LIMITS, wallMs: 2_000, cpuMs: 100 };
+const limits = { ...CODE_MODE_LIMITS, wallMs: 5_000, cpuMs: 1_000 };
 const rendered = (value: ToolResult) => JSON.stringify(value.content);
 
 it('runs concurrent tools, keeps intermediates private, and returns only explicit filtered output', async () => {

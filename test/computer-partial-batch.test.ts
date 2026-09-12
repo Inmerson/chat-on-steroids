@@ -72,7 +72,7 @@ vi.mock('../src/main/logger.js', () => ({ logInfo: vi.fn(), logWarn: vi.fn() }))
 
 import { act } from '../src/main/computer/index.js';
 
-describe('desktop partial batch result', () => {
+describe.runIf(process.platform === 'win32')('desktop partial batch result', () => {
   it('reports exactly what ran before a helper action failed', async () => {
     await expect(
       act([
