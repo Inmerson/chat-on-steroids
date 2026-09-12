@@ -17,11 +17,11 @@ import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import { existsSync, promises as fs } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { StringDecoder } from 'node:string_decoder';
 import { Worker } from 'node:worker_threads';
 import { ensureUsablePath, normalizeEnvironment } from '../env.js';
 import { findWindowsPowerShell, terminateProcessTree } from '../exec.js';
 import { logInfo, logWarn } from '../logger.js';
+import { Utf8ChunkDecoder } from '../utf8-stream.js';
 import type { MacOSDesktopAccessStatus, MacOSPermissionState } from '../../shared/types.js';
 import { HELPER_SCRIPT } from './helper.js';
 
@@ -399,8 +399,8 @@ async function startHelper(): Promise<HelperRuntime> {
           scriptCleanup: null
         };
         let started = false;
-        const stdoutDecoder = new StringDecoder('utf8');
-        const stderrDecoder = new StringDecoder('utf8');
+        const stdoutDecoder = new Utf8ChunkDecoder();
+        const stderrDecoder = new Utf8ChunkDecoder();
 
         child.stdout.on('data', (chunk: Buffer) => {
           runtime.stdoutBuffer += stdoutDecoder.write(chunk);

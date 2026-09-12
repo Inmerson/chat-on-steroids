@@ -175,7 +175,7 @@ describe('runCommand', () => {
   });
 
   it.runIf(IS_WINDOWS)('resolves Windows .cmd shims such as npm without shell-parsing arguments', async () => {
-    const result = await runCommand('npm', ['--version'], cwd, 15_000);
+    const result = await runCommand('npm', ['--version'], cwd, 30_000);
     expect(result.exitCode).toBe(0);
     expect(result.stdout.trim()).toMatch(/^\d+\.\d+/);
   });

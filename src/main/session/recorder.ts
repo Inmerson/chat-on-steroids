@@ -51,7 +51,7 @@ import {
   readAsset,
   readEvents,
   readRecentEvents,
-  indexedSessions,
+  readEverySummary,
   renameSession,
   reopenSession,
   rewriteUnattributedToolCalls,
@@ -859,7 +859,7 @@ export async function repairDeterministicAttribution(affected?: ReadonlySet<stri
   let repairedSessions = 0;
   let repairedCalls = 0;
 
-  for (const summary of await indexedSessions()) {
+  for (const summary of await readEverySummary()) {
     if (summary.conversationId !== null || summary.title !== 'Unattributed activity') continue;
     const cached = repairBuckets.get(summary.id);
     if (affected && cached?.toolCalls === summary.toolCalls && cached.updatedAt === summary.updatedAt &&

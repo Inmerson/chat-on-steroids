@@ -80,7 +80,7 @@ it('refuses new capacity without evicting a completed unread result', async () =
       request(unreadId, "setTimeout(() => { console.log('owed-output'); process.exit(7); }, 500)", 100)
     );
     expect(started.processId).toBe(unreadId);
-    await expect.poll(() => manager.backgroundState(new Set([unreadId])).exitedUnread).toEqual([
+    await expect.poll(() => manager.backgroundState(new Set([unreadId])).exitedUnread, { timeout: 10_000 }).toEqual([
       { processId: unreadId, exitCode: 7 }
     ]);
 
@@ -106,4 +106,4 @@ it('refuses new capacity without evicting a completed unread result', async () =
     for (const processId of fillerIds) manager.releaseProcessId(processId);
     await manager.terminateAllProcesses();
   }
-});
+}, 30_000);

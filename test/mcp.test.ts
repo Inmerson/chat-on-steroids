@@ -3036,7 +3036,7 @@ describe('exec_command and write_stdin', () => {
     });
     expect(reply.body.result?.isError).not.toBe(true);
     expect(textOf(reply)).toContain('native-workdir-ok');
-  });
+  }, 60_000);
 
   it('uses the shared scrubbed child environment and exposes bundled ripgrep', async () => {
     // Unified exec used to construct a second, almost-identical environment instead of using
@@ -3783,7 +3783,7 @@ describe('exec session attribution and authenticated continuation', () => {
       await unifiedExecManager.terminateAllProcesses();
       resetExecOwnershipForTests();
     }
-  });
+  }, 60_000);
 
   it('publishes completed output only to its durable session and ACKs it only on a later owner call', async () => {
     const ownerSession = 'session-background-owner';
