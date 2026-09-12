@@ -29,11 +29,12 @@ import type {
   Handoff,
   NewSessionEvent,
   SessionEvent,
+  ReasoningEffort,
   SessionOrigin,
   SessionSummary,
   StoredText
 } from '../../shared/session.js';
-import { eventTokens, normalizedToolOutcome } from '../../shared/session.js';
+import { CONTINUATION_MARKER, eventTokens, normalizedToolOutcome } from '../../shared/session.js';
 import { chronological } from '../../shared/chronology.js';
 import {
   agentPlanSchema,
@@ -42,6 +43,7 @@ import {
   type AgentPlan,
   type AgentPlanUpdate
 } from '../../shared/agent-plan.js';
+import { automaticTitle, firstTitleMessage, refreshUserTitle } from './title.js';
 import { getConfig } from '../config.js';
 import { logError, logInfo, logWarn } from '../logger.js';
 
@@ -168,6 +170,9 @@ interface OpenSession {
   historySeq: number;
   /** Recent durable events, so incremental /activity polls do not reread the whole JSONL. */
   tail: SessionEvent[];
+  /** Earliest cursor covered by tail; reopening starts with no journal rows cached. */
+  tailFrom: number;
+  activityHydrated: boolean;
   /** Serialises appends so two events can never interleave inside one line. */
   queue: Promise<void>;
   /** Canonical ChatGPT messages. A later streaming/final snapshot replaces by stable id. */
@@ -380,10 +385,12 @@ export async function createSession(options: {
   title?: string;
   conversationId?: string | null;
   origin?: SessionOrigin | null;
+  titleSource?: SessionSummary['titleSource'];
 }): Promise<SessionSummary> {
   const id = `${new Date().toISOString().slice(0, 10)}-${randomUUID().slice(0, 8)}`;
   const summary = emptySummary(id, options.title?.trim() || 'ChatGPT session', options.conversationId ?? null);
   summary.origin = options.origin ?? null;
+  if (options.titleSource) summary.titleSource = options.titleSource;
   // Invalidate before exposing the in-flight live entry. A cached miss must never hide a
   // session that this process has started creating, even while its first durable write awaits.
   if (summary.conversationId) missingCurrentConversations.delete(summary.conversationId);
@@ -392,6 +399,8 @@ export async function createSession(options: {
     nextSeq: 1,
     historySeq: 0,
     tail: [],
+    tailFrom: 1,
+    activityHydrated: true,
     queue: Promise.resolve(),
     messages: new Map(),
     metaDirty: false,
@@ -647,6 +656,7 @@ async function rebuildSummaryFromHistory(
         agents: [...new Set([...checkpoint.agents, ...rebuilt.agents])]
       }
     : rebuilt;
+  refreshUserTitle(summary, messages.values());
   logWarn(`session ${id}: rebuilt metadata from durable event/message history`);
   await writeSummary(summary, historySeq);
   return summary;
@@ -673,9 +683,12 @@ async function readDurableSnapshot(id: string): Promise<DurableSessionSnapshot |
     const historySeq = Math.max(journalSeq, messageSeq);
     const checkpoint = await readMetaCheckpoint(id);
 
+    const titleRepaired = checkpoint ? refreshUserTitle(checkpoint.summary, messages.values()) : false;
+
     // A pre-taxonomy checkpoint can have a current watermark but stale outcome classification.
     if (checkpoint?.historySeq === historySeq && !checkpoint.outcomeCountersMissing) {
-      return { summary: checkpoint.summary, messages, historySeq, reconciled: false };
+      if (titleRepaired) await writeSummary(checkpoint.summary, historySeq);
+      return { summary: checkpoint.summary, messages, historySeq, reconciled: titleRepaired };
     }
     if (checkpoint && historySeq === 0) {
       // Nothing exists to replay, so a missing counter set can only be all zero.
@@ -735,6 +748,8 @@ async function ensureOpen(id: string): Promise<OpenSession> {
       nextSeq: snapshot.historySeq + 1,
       historySeq: snapshot.historySeq,
       tail: [],
+      tailFrom: snapshot.historySeq + 1,
+      activityHydrated: false,
       queue: Promise.resolve(),
       messages: snapshot.messages,
       metaDirty: false,
@@ -784,6 +799,7 @@ function applyToSummary(summary: SessionSummary, event: SessionEvent): void {
     summary.lastHandoffId = event.handoffId;
     summary.lastHandoffAt = event.time;
   }
+  if (event.kind === 'assistant_message' && event.final) summary.lastAssistantFinalAt = event.time;
   if (event.agent && !summary.agents.includes(event.agent)) summary.agents.push(event.agent);
 }
 
@@ -882,7 +898,10 @@ export function appendEvent(sessionId: string, event: NewSessionEvent): Promise<
       }
       entry.nextSeq += 1;
       entry.tail.push(full);
-      if (entry.tail.length > MAX_EVENT_TAIL) entry.tail.splice(0, entry.tail.length - MAX_EVENT_TAIL);
+      if (entry.tail.length > MAX_EVENT_TAIL) {
+        const removed = entry.tail.splice(0, entry.tail.length - MAX_EVENT_TAIL);
+        entry.tailFrom = removed[removed.length - 1]!.seq + 1;
+      }
       applyToSummary(entry.summary, full);
       entry.historySeq = full.seq;
       scheduleMeta(entry);
@@ -1016,6 +1035,18 @@ export function upsertMessageEvent(
       }
       const full = {
         ...nextEvent,
+        ...(nextEvent.kind === 'assistant_message' && nextEvent.final
+          ? {
+              finalContentSeq:
+                sameMessage &&
+                previous?.kind === 'assistant_message' &&
+                (previous.final === true || previous.state === 'final')
+                  // Old records do not distinguish a content revision from an HTML update.
+                  // Keep their first anchor until genuinely new final content is observed.
+                  ? previous.finalContentSeq ?? previous.origin ?? previous.seq
+                  : entry.nextSeq
+            }
+          : {}),
         // First appearance is chronology; current seq is delivery cursor/revision.
         // A page-model authored timestamp is stronger than a DOM first-sight timestamp. The
         // recorder opts into that correction explicitly; ordinary revisions still keep the
@@ -1033,6 +1064,7 @@ export function upsertMessageEvent(
 
       entry.nextSeq += 1;
       entry.messages.set(key, full);
+      if (full.kind === 'user_message') refreshUserTitle(entry.summary, entry.messages.values());
       if (!previous) {
         applyToSummary(entry.summary, full);
       } else {
@@ -1163,10 +1195,18 @@ export async function readEvents(sessionId: string, options: ReadOptions = {}): 
 export async function readRecentEvents(
   sessionId: string,
   limit: number,
-  options: Pick<ReadOptions, 'kinds' | 'agent'> & { maxBytes?: number } = {}
+  options: Pick<ReadOptions, 'kinds' | 'agent'> & { maxBytes?: number; before?: number } = {}
 ): Promise<SessionEvent[]> {
   assertSessionId(sessionId);
   await flushSession(sessionId);
+  return readRecentEventsFromDisk(sessionId, limit, options);
+}
+
+async function readRecentEventsFromDisk(
+  sessionId: string,
+  limit: number,
+  options: Pick<ReadOptions, 'kinds' | 'agent'> & { maxBytes?: number; before?: number } = {}
+): Promise<SessionEvent[]> {
   const cap = Math.max(1, Math.min(MAX_EVENT_TAIL, Math.floor(limit)));
   const active = open.get(sessionId);
   const needsMessages =
@@ -1265,6 +1305,47 @@ export async function readRecentEvents(
   return chronological(selected);
 }
 
+/** Browser projection joins committed writes without forcing the debounced metadata to disk.
+ * A cold store hydrates one bounded journal tail. Thereafter the existing append/message owners
+ * maintain it, including revisions whose origin is older than the browser cursor. */
+export async function readActivityEvents(sessionId: string, since: number, limit = 1200): Promise<{
+  events: SessionEvent[]; reset: boolean; resumeBoundary: number;
+  openingUserMessage: Extract<SessionEvent, { kind: 'user_message' }> | null;
+  resumeUserMessage: Extract<SessionEvent, { kind: 'user_message' }> | null;
+}> {
+  const entry = await ensureOpen(sessionId);
+  return enqueueSessionOperation(entry, 'activity read', async () => {
+    if (!entry.activityHydrated) {
+      const recent = await readRecentEventsFromDisk(sessionId, MAX_EVENT_TAIL);
+      entry.tail = recent.filter((event) => !((event.kind === 'user_message' || event.kind === 'assistant_message') && entry.messages.has(messageKey(event)!)));
+      // Old canonical messages do not prove that intervening journal rows fitted inside
+      // the byte budget. Only the retained journal suffix establishes cursor coverage.
+      entry.tailFrom = entry.tail.reduce((first, event) => Math.min(first, event.seq), entry.nextSeq);
+      entry.activityHydrated = true;
+    }
+    const cap = Math.max(1, Math.min(MAX_EVENT_TAIL, Math.floor(limit)));
+    const cursor = Number.isFinite(since) ? Math.max(0, since) : 0;
+    const candidates = [...entry.tail, ...entry.messages.values()].sort((a, b) => a.seq - b.seq);
+    const reset = cursor < entry.tailFrom && !(cursor === 0 && entry.tailFrom === 1);
+    const selected = reset || cursor === 0
+      ? candidates.slice(-cap)
+      : candidates.filter((event) => event.seq >= cursor).slice(0, cap);
+    // All canonical messages remain authoritative after tail eviction and message revision.
+    let openingUserMessage: Extract<SessionEvent, { kind: 'user_message' }> | null = null;
+    let resumeUserMessage: Extract<SessionEvent, { kind: 'user_message' }> | null = null;
+    for (const event of candidates) {
+      if (event.kind !== 'user_message') continue;
+      const position = event.origin ?? event.seq;
+      if (!openingUserMessage || position < (openingUserMessage.origin ?? openingUserMessage.seq)) openingUserMessage = event;
+      if (CONTINUATION_MARKER.exec(event.message.text)?.[1] === 'RESUME' &&
+          (!resumeUserMessage || position > (resumeUserMessage.origin ?? resumeUserMessage.seq))) resumeUserMessage = event;
+    }
+    const resumeBoundary = resumeUserMessage ? resumeUserMessage.origin ?? resumeUserMessage.seq : 0;
+    return { events: chronological(selected), reset: reset || (cursor === 0 && candidates.length > cap), resumeBoundary,
+      openingUserMessage, resumeUserMessage };
+  });
+}
+
 /**
  * Atomically keeps only the supplied tool calls in an Unattributed activity session.
  *
@@ -1277,10 +1358,12 @@ export async function readRecentEvents(
 export async function rewriteUnattributedToolCalls(
   sessionId: string,
   calls: readonly Extract<SessionEvent, { kind: 'tool_call' }>[],
-  scannedThroughSeq: number
-): Promise<void> {
+  scannedThroughSeq: number,
+  deleteIfEmpty: boolean = false
+): Promise<{ retained: number; deleted: boolean }> {
   assertSessionId(sessionId);
   const entry = await ensureOpen(sessionId);
+  let result = { retained: 0, deleted: false };
   const rewrite = entry.queue.then(async () => {
     if (entry.summary.conversationId !== null || entry.summary.title !== 'Unattributed activity') {
       throw new Error(`Session ${sessionId} is not an Unattributed activity bucket`);
@@ -1310,6 +1393,16 @@ export async function rewriteUnattributedToolCalls(
       if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
     }
 
+    const retainedCalls = [...calls, ...concurrentCalls].sort((left, right) => left.seq - right.seq);
+    if (deleteIfEmpty && retainedCalls.length === 0) {
+      await fs.rm(sessionDir(sessionId), { recursive: true, force: true });
+      open.delete(sessionId);
+      invalidateAssetUsage(sessionId);
+      publishAttachmentRemoval(sessionId);
+      result = { retained: 0, deleted: true };
+      return;
+    }
+
     const start: SessionEvent = {
       seq: 1,
       time: entry.summary.startedAt,
@@ -1318,7 +1411,6 @@ export async function rewriteUnattributedToolCalls(
       conversationId: null,
       title: entry.summary.title
     };
-    const retainedCalls = [...calls, ...concurrentCalls].sort((left, right) => left.seq - right.seq);
     const kept: SessionEvent[] = [start, ...retainedCalls.map((event, index) => ({ ...event, seq: index + 2 }))];
 
     const target = path.join(sessionDir(sessionId), 'events.jsonl');
@@ -1352,13 +1444,16 @@ export async function rewriteUnattributedToolCalls(
     entry.nextSeq = kept.length + 1;
     entry.historySeq = rewrittenHistorySeq;
     entry.tail = kept.slice(-MAX_EVENT_TAIL);
+    entry.tailFrom = entry.tail[0]?.seq ?? entry.nextSeq;
     entry.metaDirty = false;
+    result = { retained: retainedCalls.length, deleted: false };
   });
   entry.queue = rewrite.then(
     () => undefined,
     (err: Error) => logError(`session unattributed repair failed: ${err.message}`)
   );
   await rewrite;
+  return result;
 }
 
 function normalizeSummary(id: string, raw: string): MetaCheckpoint | null {
@@ -1623,6 +1718,11 @@ export async function readEverySummary(): Promise<SessionSummary[]> {
   return [...summaries.values()].map((summary) => ({ ...summary })).sort(compareSummariesNewestFirst);
 }
 
+/** Uncapped authoritative catalog plus live projections, without reopening every metadata file. */
+export async function indexedSessions(): Promise<SessionSummary[]> {
+  return readEverySummary();
+}
+
 export interface SessionListCursor {
   updatedAt: number;
   id: string;
@@ -1773,6 +1873,52 @@ export async function findSessionByConversation(
 }
 
 /**
+ * Has this ChatGPT conversation already been replaced inside any durable session lineage?
+ *
+ * This is intentionally independent of current attachment. Opening an old source chat after
+ * Compact & Resume may create a new recording epoch for genuinely new user activity there, but
+ * it must never restore automation authority that the successful A->B handoff retired. The
+ * lineage is the durable fact: if any retained session contains A while being attached to a
+ * different conversation, A is historical for browser recovery, Goal and Loop forever.
+ */
+export async function conversationWasSuperseded(conversationId: string): Promise<boolean> {
+  if (!conversationId) return false;
+  const catalog = await ensureAttachmentCatalog();
+  const sessionIds = new Set(catalog.historical.get(conversationId) ?? []);
+  for (const [id, entry] of open) {
+    if (entry.summary.chatIds.includes(conversationId)) sessionIds.add(id);
+  }
+  for (const id of sessionIds) {
+    const summary = open.get(id)?.summary ?? catalog.summaries.get(id) ?? null;
+    if (summary?.chatIds.includes(conversationId) && summary.conversationId !== conversationId) return true;
+  }
+  return false;
+}
+
+/**
+ * Whether one ChatGPT frontend is still the session's executable attachment.
+ *
+ * Historical `chatIds` are transcript lineage, not continuing authority. Compact & Resume
+ * deliberately keeps A there so old messages remain readable, while `conversationId` moves to
+ * B. Every caller that has to decide whether new work from A is still admissible uses this one
+ * store-owned verdict rather than reinterpreting lineage for itself.
+ */
+export async function conversationAttachment(
+  conversationId: string,
+  sessionId: string | null = null
+): Promise<'current' | 'superseded' | 'unknown'> {
+  if (!conversationId) return 'unknown';
+  if (sessionId) {
+    const exact = await getSession(sessionId);
+    if (!exact || !exact.chatIds.includes(conversationId)) return 'unknown';
+    return exact.conversationId === conversationId ? 'current' : 'superseded';
+  }
+  const current = await findSessionByConversation(conversationId, { requireUnique: true });
+  if (current) return 'current';
+  return (await conversationWasSuperseded(conversationId)) ? 'superseded' : 'unknown';
+}
+
+/**
  * Filesystem time of the newest durable mutation belonging to a session.
  *
  * Session event timestamps describe when an action happened, not when it finally reached
@@ -1892,11 +2038,45 @@ export async function reopenSession(id: string): Promise<void> {
   });
 }
 
-export async function renameSession(id: string, title: string): Promise<void> {
+export async function renameSession(
+  id: string,
+  title: string,
+  source: SessionSummary['titleSource'] = 'manual',
+  conversationId?: string
+): Promise<void> {
   const entry = await ensureOpen(id);
   await enqueueSessionOperation(entry, 'rename', async () => {
+    if (source !== 'manual') {
+      if (conversationId && entry.summary.conversationId !== conversationId) return;
+      if (!automaticTitle(entry.summary, firstTitleMessage(entry.messages.values()))) return;
+      if (source === 'fallback' && entry.summary.titleSource === 'provider') return;
+    }
+    if (entry.summary.title === title.slice(0, 120) && entry.summary.titleSource === source) return;
     entry.summary.title = title.slice(0, 120);
+    entry.summary.titleSource = source;
     await writeMeta(entry);
+  });
+}
+
+/** Persist current provider selection independently of recording/history replay. */
+export async function observeSessionModel(
+  id: string,
+  conversationId: string,
+  model: string,
+  observedAt: number,
+  reasoningEffort?: ReasoningEffort
+): Promise<void> {
+  if (!/^[a-zA-Z0-9 ._-]{1,80}$/.test(model) || !Number.isFinite(observedAt)) return;
+  const entry = await ensureOpen(id);
+  await enqueueSessionOperation(entry, 'model-selection', async () => {
+    if (entry.summary.conversationId !== conversationId ||
+        observedAt < (entry.summary.selectedModel?.observedAt ?? 0)) return;
+    const selectedModel = { conversationId, model, observedAt, ...(reasoningEffort ? { reasoningEffort } : {}) };
+    if (JSON.stringify(entry.summary.selectedModel) === JSON.stringify(selectedModel)) return;
+    const staged = { ...entry.summary, selectedModel };
+    await writeSummary(staged, entry.historySeq);
+    entry.summary = staged;
+    publishAttachmentSummary(staged);
   });
 }
 

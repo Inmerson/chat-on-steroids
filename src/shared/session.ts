@@ -122,7 +122,7 @@ export type StoredToolOutcome = ToolOutcome | 'error' | 'rejected';
  * than guessed into somebody's history. The extension refuses to rewrite ChatGPT's UI for
  * an inferred call.
  */
-export type CallAttribution = 'request_id' | 'unattributed' | 'turn' | 'agent' | 'generation' | 'inferred';
+export type CallAttribution = 'request_id' | 'unattributed' | 'turn' | 'agent' | 'generation' | 'inferred' | 'superseded';
 
 /**
  * What each grade of attribution actually rests on, in the words shown to the user.
@@ -149,7 +149,8 @@ export const ATTRIBUTION_LABELS: Record<CallAttribution, string> = {
   agent: 'agent key',
   turn: 'tool block on the page',
   generation: 'the only chat generating',
-  inferred: 'not placed in a chat'
+  inferred: 'not placed in a chat',
+  superseded: 'superseded session lineage'
 };
 
 export interface ToolCallRecord {
@@ -161,7 +162,10 @@ export interface ToolCallRecord {
   /** Conversation proven by that request id, or null when ownership was unresolved. */
   conversationId: string | null;
   /** New 1.8 calls use only these two deterministic outcomes. */
-  attributionMethod: 'request_id' | 'unattributed';
+  attributionMethod: 'request_id' | 'unattributed' | 'superseded';
+  /** Model that executed this turn, when proven by native picker observation. */
+  model?: string;
+  reasoningEffort?: ReasoningEffort;
   /** Exact arguments as JSON. Cut inline past the cap, with the whole text in an asset. */
   args: StoredText;
   result: StoredText;
@@ -243,6 +247,8 @@ export type SessionEvent =
        * positions do not participate in this identity.
        */
       messageId?: string;
+      providerMessageId?: string;
+      goalEligible?: boolean;
       /** ChatGPT's canonical rendered representation captured from the page. */
       renderedHtml?: StoredText;
       state?: MessageState;
@@ -250,6 +256,7 @@ export type SessionEvent =
       final: boolean;
       /** First sequence assigned to this logical message; later revisions keep this anchor. */
       origin?: number;
+      finalContentSeq?: number;
     })
   /**
    * One visible ChatGPT commentary item, as it stood when this snapshot was taken.
@@ -267,7 +274,19 @@ export type SessionEvent =
    * event written before this model existed, or by a page whose commentary had no readable
    * identity, is still a plain standalone caption.
    */
-  | (BaseEvent & { kind: 'progress'; message: StoredText; progressId?: string; origin?: number })
+  | (BaseEvent & {
+      kind: 'progress';
+      message: StoredText;
+      progressId?: string;
+      origin?: number;
+      finishControl?: {
+        state: 'released' | 'notified' | 'decision';
+        conversationId: string;
+        revision?: string;
+        inputRevision?: string;
+        workSeq?: number;
+      };
+    })
   /**
    * Visible ChatGPT-native tool activity that never passed through this MCP server.
    *
@@ -277,11 +296,11 @@ export type SessionEvent =
    * for readers working from a cursor that has already consumed it.
    */
   | (BaseEvent & { kind: 'page_tool'; messageId: string; label: string; origin?: number })
-  | (BaseEvent & { kind: 'turn_start' })
+  | (BaseEvent & { kind: 'turn_start'; detail?: string })
   | (BaseEvent & { kind: 'turn_end'; outcome: TurnOutcome; detail?: string })
   | (BaseEvent & { kind: 'chat_error'; message: StoredText })
   | (BaseEvent & { kind: 'tool_call'; call: ToolCallRecord })
-  | (BaseEvent & { kind: 'note'; message: StoredText })
+  | (BaseEvent & { kind: 'note'; message: StoredText; continuation?: string })
   /**
    * A message routed between agents.
    *
@@ -312,6 +331,15 @@ export type SessionEvent =
 export type SessionEventKind = SessionEvent['kind'];
 
 /**
+ * The marker Compact & Resume puts at the head of the two prompts it types itself: the brief
+ * request in the source chat and the bootstrap in its replacement. Group 1 says which, group
+ * 2 is the continuation token that ties the pair together. Mirrors `CONTINUATION_MARKER` in
+ * `extension/content.js`, which cannot import; the renderer uses this one to fold a
+ * compaction's three rows into one.
+ */
+export const CONTINUATION_MARKER = /^\s*\[\[CLF-(HANDOFF|RESUME):([A-Za-z0-9_-]{16,64})\]\](?:\s|$)/;
+
+/**
  * An event before the store assigns its sequence number.
  *
  * Written as a distributive conditional because a plain Omit over a union keeps only
@@ -332,7 +360,7 @@ export type NewSessionEvent = SessionEvent extends infer Event
  * queued to the conversation that command became.
  */
 export interface SessionOrigin {
-  kind: 'resume' | 'worker';
+  kind: 'resume' | 'worker' | 'desktop';
   /** The session this chat continues. Null when the source session no longer exists. */
   fromSessionId: string | null;
   /** Agent id for a worker chat ("worker-1"). Null for a resume. */
@@ -373,6 +401,7 @@ export function originTitle(origin: SessionOrigin, source: string | null): strin
 export interface SessionSummary {
   id: string;
   title: string;
+  titleSource?: 'fallback' | 'provider' | 'manual';
   /**
    * The ChatGPT conversation this session is attached to *right now*.
    *
@@ -448,6 +477,12 @@ export interface SessionSummary {
   agents: string[];
   /** Set only for a chat this app opened itself. Null for one the user started. */
   origin: SessionOrigin | null;
+  /** Latest proven native picker selection; scoped to its frontend, never worker creation intent. */
+  selectedModel?: { conversationId: string; model: string; observedAt: number; reasoningEffort?: ReasoningEffort };
+  /** Explicit local project; durable across frontend conversation replacement. */
+  projectId?: string;
+  /** Timestamp of the newest final assistant message in this session. */
+  lastAssistantFinalAt?: number | null;
 }
 
 export interface Handoff {
