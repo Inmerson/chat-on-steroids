@@ -34,6 +34,8 @@ import { initBrowserPreferences } from './browser-preferences.js';
 import { initChatModels } from './chat-models.js';
 import { initSidebarResize } from './sidebar-resize.js';
 import { applyPluginsState, initPlugins, refreshPlugins } from './plugins.js';
+import { initLanguage } from './i18n.js';
+import { paintPluginRefreshReminder } from './plugin-refresh-reminder.js';
 
 declare global {
   interface Window {
@@ -42,6 +44,7 @@ declare global {
 }
 
 const api = window.api;
+initLanguage();
 
 /** Same shape the platform uses; mirrored here only to grey out step 2 until it is valid. */
 const TUNNEL_ID_PATTERN = /^tunnel_[0-9a-f]{32}$/;
@@ -776,6 +779,7 @@ function paintUpdate(next: AppState): void {
 
 function apply(next: AppState): void {
   applyPluginsState(next);
+  if (next.update?.current) paintPluginRefreshReminder(next.update.current);
   const previousState = state;
   state = next;
   applying = true;

@@ -107,6 +107,12 @@
         <button class="btn btn-quiet" id="updateInstall" type="button" hidden>Install now</button>
       </div>
 
+      <div class="notice" id="pluginRefreshReminder" role="status" hidden>
+        <svg class="ico" viewBox="0 0 24 24" aria-hidden="true"><use href="#i-pulse" /></svg>
+        <span>Please remember to refresh the plugins in ChatGPT.</span>
+        <button class="btn btn-icon" id="dismissPluginRefreshReminder" type="button" title="Dismiss reminder" aria-label="Dismiss reminder"><svg class="ico" viewBox="0 0 24 24" aria-hidden="true"><use href="#i-x" /></svg></button>
+      </div>
+
       <main>
         <!-- ============================================================ Home -->
         <section class="panel is-active" data-panel="home">
@@ -238,6 +244,13 @@
         <!-- =========================================================== Setup -->
         <section class="panel scroll" data-panel="setup">
           <div class="sheet">
+            <div class="setup-heading">
+              <div class="settings-heading"><h1>Setup</h1><p>Connect your workspace to ChatGPT.</p></div>
+              <div class="language-tabs" role="group" aria-label="Language">
+                <button type="button" data-language="en" lang="en" translate="no" aria-pressed="true"><svg class="language-flag" viewBox="0 0 60 40" aria-hidden="true"><path fill="#012169" d="M0 0h60v40H0z"/><path stroke="#fff" stroke-width="8" d="m0 0 60 40M60 0 0 40"/><path stroke="#c8102e" stroke-width="3" d="m0 0 60 40M60 0 0 40"/><path stroke="#fff" stroke-width="13" d="M30 0v40M0 20h60"/><path stroke="#c8102e" stroke-width="7" d="M30 0v40M0 20h60"/></svg>English</button>
+                <button type="button" data-language="zh-CN" lang="zh-CN" translate="no" aria-pressed="false"><svg class="language-flag" viewBox="0 0 60 40" aria-hidden="true"><path fill="#de2910" d="M0 0h60v40H0z"/><g fill="#ffde00"><path d="m10 5 1.8 5.5h5.7l-4.6 3.4 1.8 5.4-4.7-3.4-4.7 3.4 1.8-5.4-4.6-3.4h5.7z"/><path id="language-star" d="m20 3 .7 2.1h2.2l-1.8 1.3.7 2.1L20 7.2l-1.8 1.3.7-2.1-1.8-1.3h2.2z"/><use href="#language-star" transform="translate(5 5)"/><use href="#language-star" transform="translate(5 12)"/><use href="#language-star" transform="translate(0 17)"/></g></svg>简体中文</button>
+              </div>
+            </div>
             <section class="pairing-setup" aria-labelledby="pairingSetupTitle">
               <div><span class="overview-eyebrow">Multi-computer</span><h2 id="pairingSetupTitle">Add a computer</h2><p>Install the Node Agent package on the other Windows computer, then enter a one-time pairing code. The code expires after 10 minutes and can be used once.</p></div>
               <div class="pairing-actions"><button class="btn btn-solid" id="createPairingTicket" type="button"><svg class="ico" viewBox="0 0 24 24"><use href="#i-plus" /></svg>Create pairing code</button><div id="pairingTicket" hidden><code id="pairingCode"></code><span id="pairingExpiry"></span></div></div>
@@ -511,6 +524,16 @@
                   <button class="btn" id="browserPreferencesRefresh" type="button">Refresh browser preferences</button>
                   <span class="chosen" id="browserPreferencesStatus" role="status">Refresh to read the browser's current preferences.</span>
                 </div>
+              </div>
+
+              <div class="field">
+                <label class="setting" for="uiLanguage">
+                  <span class="setting-text"><b>Language</b><em>Changes the app interface immediately. Your messages stay as written.</em></span>
+                  <select id="uiLanguage" class="language-select" translate="no">
+                    <option value="en" lang="en">English</option>
+                    <option value="zh-CN" lang="zh-CN">简体中文</option>
+                  </select>
+                </label>
               </div>
 
               <div class="field">

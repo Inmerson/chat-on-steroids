@@ -3425,3 +3425,16 @@ nav button.is-sel::after {
   .plugin-connection { align-items: flex-start; flex-direction: column; }
   .plugin-connection > div { flex-basis: auto; }
 }
+
+html:lang(zh-CN) body { letter-spacing: 0; line-break: strict; }
+.language-select { min-width: 8em; max-width: 100%; }
+.setup-heading { display: flex; align-items: flex-start; justify-content: space-between; flex-wrap: wrap; gap: 12px 24px; margin-bottom: 20px; }
+.setup-heading .settings-heading { margin-bottom: 0; padding: 0; }
+.setup-heading .settings-heading p { margin-bottom: 0; }
+.language-tabs { display: inline-flex; flex: none; padding: 3px; gap: 3px; border: 1px solid var(--line); border-radius: 10px; background: var(--card); }
+.language-tabs button { display: inline-flex; align-items: center; gap: 7px; padding: 7px 10px; border: 1px solid transparent; border-radius: 7px; background: transparent; color: var(--muted); font: inherit; cursor: pointer; white-space: nowrap; }
+.language-tabs button:hover { background: var(--hover); color: var(--ink); }
+.language-tabs button[aria-pressed='true'] { background: var(--hover); border-color: var(--line); color: var(--ink); }
+.language-tabs button:focus-visible { outline: 2px solid var(--ink); outline-offset: 2px; }
+.language-flag { width: 24px; height: 16px; border-radius: 2px; overflow: hidden; flex: none; }
+
