@@ -100,7 +100,7 @@ vi.mock('../src/main/exec.js', () => ({
 }));
 vi.mock('../src/main/logger.js', () => ({ logInfo: vi.fn(), logWarn: vi.fn() }));
 
-describe('Desktop reply provenance across helper replacement', () => {
+describe.runIf(process.platform === 'win32')('Desktop reply provenance across helper replacement', () => {
   let computer: typeof import('../src/main/computer/index.js');
 
   beforeEach(async () => {

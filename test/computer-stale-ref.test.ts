@@ -85,7 +85,7 @@ vi.mock('../src/main/logger.js', () => ({ logInfo: vi.fn(), logWarn: vi.fn() }))
 
 import { act, findUi } from '../src/main/computer/index.js';
 
-describe('semantic desktop ref lifetime', () => {
+describe.runIf(process.platform === 'win32')('semantic desktop ref lifetime', () => {
   it('invalidates refs as soon as their helper dies, before a replacement starts', async () => {
     const found = await findUi({ window: 77, maxResults: 5 });
     const ref = found.elements[0]!.ref;

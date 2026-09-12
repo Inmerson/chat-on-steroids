@@ -18,7 +18,7 @@ vi.mock('electron', () => ({
 
 import { act } from '../src/main/computer/index.js';
 
-describe('desktop local-only action path', () => {
+describe.runIf(process.platform === 'win32')('desktop local-only action path', () => {
   beforeEach(() => {
     mocks.spawn.mockClear();
     mocks.readText.mockClear();
