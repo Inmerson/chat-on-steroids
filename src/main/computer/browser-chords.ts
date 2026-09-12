@@ -68,6 +68,7 @@ const BROWSER_TAB_CHORDS = new Set([
   'ctrl+pageup',
   'ctrl+pagedown',
   'ctrl+shift+q',
+  'ctrl+l',
   'alt+left',
   'alt+right',
   'alt+home',
@@ -88,6 +89,7 @@ const BROWSER_TAB_CHORDS = new Set([
   'cmd+alt+right',
   'cmd+[',
   'cmd+]',
+  'cmd+l',
   ...Array.from({ length: 9 }, (_, index) => `cmd+${index + 1}`)
 ]);
 

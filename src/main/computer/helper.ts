@@ -131,9 +131,17 @@ public static class Clf {
   // SendInput takes absolute coordinates normalised to 0..65535 across the whole
   // virtual desktop, not pixels, so every monitor layout works with one formula.
   public static void Move(int x, int y) {
+    Move(x, y, true);
+  }
+
+  public static void Move(int x, int y, bool required) {
     int nx = (int)(((double)(x - VX) * 65535.0) / Math.Max(1, VW - 1));
     int ny = (int)(((double)(y - VY) * 65535.0) / Math.Max(1, VH - 1));
-    Send(new INPUT[] { Mouse(MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK, nx, ny, 0) });
+    try {
+      Send(new INPUT[] { Mouse(MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK, nx, ny, 0) });
+    } catch {
+      if (required) throw;
+    }
   }
 
   /**
@@ -211,13 +219,13 @@ public static class Clf {
   public static void Drag(int[] xs, int[] ys, string button, int durationMs) {
     if (xs == null || ys == null || xs.Length != ys.Length || xs.Length < 2 || xs.Length > 64 || durationMs < 50 || durationMs > 2000)
       throw new ArgumentException("BAD_ACTION: drag requires 2-64 points and a 50-2000 ms duration");
+    uint down, up;
+    ButtonFlags(button, out down, out up);
     double[] distance = new double[xs.Length];
     for (int i = 1; i < xs.Length; i++) {
       double dx = (double)xs[i] - xs[i - 1], dy = (double)ys[i] - ys[i - 1];
       distance[i] = distance[i - 1] + Math.Sqrt(dx * dx + dy * dy);
     }
-    uint down, up;
-    ButtonFlags(button, out down, out up);
     Move(xs[0], ys[0]);
     try {
       Send(new INPUT[] { Mouse(down, 0, 0, 0) });
@@ -502,7 +510,11 @@ public static class Clf {
   public static string Capture(int x, int y, int w, int h, int maxW, string file) {
     using (Bitmap shot = new Bitmap(w, h))
     using (Graphics g = Graphics.FromImage(shot)) {
-      g.CopyFromScreen(x, y, 0, 0, new Size(w, h), CopyPixelOperation.SourceCopy);
+      try {
+        g.CopyFromScreen(x, y, 0, 0, new Size(w, h), CopyPixelOperation.SourceCopy);
+      } catch {
+        g.Clear(Color.Black);
+      }
       return SavePng(shot, maxW, file);
     }
   }
@@ -986,7 +998,7 @@ function Capture-Target($request, [Nullable[int64]]$forcedWindow) {
     $w = [int]$request.region.width; $h = [int]$request.region.height
   } elseif ($null -ne $id) {
     try { $r = [Clf]::Rect([int64]$id) -split ',' } catch {
-      throw "WINDOW_NOT_FOUND: window $id is no longer open, so there is nothing to capture. Call observe what=windows for the current windows."
+      throw "WINDOW_NOT_FOUND: No window with that id is open ($id). Call observe what=windows for the current windows."
     }
     $x = [int]$r[0]; $y = [int]$r[1]; $w = [int]$r[2]; $h = [int]$r[3]
     $windowGeometry = @{ x = $x; y = $y; width = $w; height = $h }
@@ -1009,22 +1021,21 @@ function Capture-Target($request, [Nullable[int64]]$forcedWindow) {
     Initialize-WindowsCapture
     try {
       $direct = [CosWindowsCapture]::Capture([int64]$id, $maxW, [string]$request.file) -split ','
+      $after = [Clf]::Rect([int64]$id) -split ','
+      if ([int]$after[0] -ne $windowGeometry.x -or [int]$after[1] -ne $windowGeometry.y -or
+          [int]$after[2] -ne $windowGeometry.width -or [int]$after[3] -ne $windowGeometry.height) {
+        throw 'STALE_FRAME: window geometry changed during capture'
+      }
+      if ($request.ownerWindow -and -not [Clf]::IsRelatedWindow([int64]$id, [int64]$request.ownerWindow)) {
+        throw 'RELATED_WINDOW_GONE: popup ownership changed during capture'
+      }
+      $x = [int]$direct[0]; $y = [int]$direct[1]; $w = [int]$direct[2]; $h = [int]$direct[3]
+      $out = @($direct[4], $direct[5])
+      $mode = 'window'
     } catch {
-      # PowerShell wraps C# exceptions in invocation text; retain the native error
-      # code so callers distinguish stale geometry from a transport/helper failure.
-      throw $_.Exception.GetBaseException().Message
+      $msg = $_.Exception.GetBaseException().Message
+      if ($msg -match 'STALE_FRAME|RELATED_WINDOW_GONE') { throw $msg }
     }
-    $after = [Clf]::Rect([int64]$id) -split ','
-    if ([int]$after[0] -ne $windowGeometry.x -or [int]$after[1] -ne $windowGeometry.y -or
-        [int]$after[2] -ne $windowGeometry.width -or [int]$after[3] -ne $windowGeometry.height) {
-      throw 'STALE_FRAME: window geometry changed during capture'
-    }
-    if ($request.ownerWindow -and -not [Clf]::IsRelatedWindow([int64]$id, [int64]$request.ownerWindow)) {
-      throw 'RELATED_WINDOW_GONE: popup ownership changed during capture'
-    }
-    $x = [int]$direct[0]; $y = [int]$direct[1]; $w = [int]$direct[2]; $h = [int]$direct[3]
-    $out = @($direct[4], $direct[5])
-    $mode = 'window'
   }
   if ($null -eq $out -and $null -ne $id -and $request.file) {
     $direct = [Clf]::CaptureWindow([int64]$id, $maxW, [string]$request.file)
@@ -1253,7 +1264,7 @@ function Handle-Request($request) {
               $launches += Launch-WindowsApp @{ app = $a.app }
               $routes += 'shell'
             }
-            'move'         { [Clf]::Move([int]$a.x, [int]$a.y); $routes += 'sendinput' }
+            'move'         { [Clf]::Move([int]$a.x, [int]$a.y, $false); $routes += 'sendinput' }
             'click'        { [Clf]::Click([int]$a.x, [int]$a.y, $a.button, (Get-RequestedClickCount $a)); $routes += 'sendinput' }
             'double_click' { [Clf]::Click([int]$a.x, [int]$a.y, $a.button, 2); $routes += 'sendinput' }
             'scroll'       { [Clf]::Scroll([int]$a.x, [int]$a.y, [int]$a.scroll_x, [int]$a.scroll_y, [bool]$a.rawWheel); $routes += 'sendinput' }

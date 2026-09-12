@@ -86,6 +86,18 @@ const fake = vi.hoisted(() => {
 });
 
 vi.mock('node:child_process', () => ({ spawn: fake.spawn }));
+vi.mock('node:fs', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('node:fs')>();
+  return {
+    ...actual,
+    promises: {
+      ...actual.promises,
+      mkdtemp: vi.fn(async () => 'fake-temp-dir'),
+      writeFile: vi.fn(async () => {}),
+      rm: vi.fn(async () => {})
+    }
+  };
+});
 vi.mock('../src/main/env.js', () => ({
   ensureUsablePath: vi.fn(),
   normalizeEnvironment: (env: NodeJS.ProcessEnv) => ({ ...env }),
