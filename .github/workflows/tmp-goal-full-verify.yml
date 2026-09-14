@@ -1,4 +1,4 @@
-name: Temporary full verification
+name: Temporary clean candidate verification
 
 on:
   push:
@@ -19,14 +19,22 @@ jobs:
         with:
           node-version: '22'
           cache: npm
+      - name: Build one-commit candidate from current upstream
+        shell: bash
+        run: |
+          cp src/main/bridge.ts /tmp/bridge.ts
+          cp test/goal-access-limit-recovery.test.ts /tmp/goal-access-limit-recovery.test.ts
+          git checkout -B fix/goal-access-limit-recovery f51acbccdd734f524799ea92bb747be765fba1e4
+          cp /tmp/bridge.ts src/main/bridge.ts
+          cp /tmp/goal-access-limit-recovery.test.ts test/goal-access-limit-recovery.test.ts
+          git config user.name 'Inmerson'
+          git config user.email 'Inmerson@users.noreply.github.com'
+          git add src/main/bridge.ts test/goal-access-limit-recovery.test.ts
+          git commit -m 'fix: preserve Goal recovery across access limits'
       - run: npm ci
       - run: npm run verify
-      - name: Remove temporary workflow after successful verification
+      - name: Publish verified clean candidate
         if: success()
         shell: bash
         run: |
-          git config user.name 'Inmerson'
-          git config user.email 'Inmerson@users.noreply.github.com'
-          git rm .github/workflows/tmp-goal-full-verify.yml
-          git commit -m 'chore: remove temporary verification workflow'
-          git push origin HEAD:tmp/goal-access-limit-recovery-ci
+          git push --force-with-lease=refs/heads/fix/goal-access-limit-recovery:f51acbccdd734f524799ea92bb747be765fba1e4 origin HEAD:fix/goal-access-limit-recovery
