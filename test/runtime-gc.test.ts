@@ -57,16 +57,15 @@ function fixture(): {
   deps: AgentRuntimeGcDependencies;
   setOwner: (owner: string | null) => void;
   setAgent: (agent: AgentInfo | null) => void;
-  setSessionConversation: (conversationId: string | null) => void;
   setToolCalls: (count: number) => void;
   setAlive: (alive: boolean) => void;
   setCompleted: (completed: boolean) => void;
   terminateProcess: ReturnType<typeof vi.fn>;
   forgetExecOwner: ReturnType<typeof vi.fn>;
+  noteExecOwner: ReturnType<typeof vi.fn>;
 } {
   let owner: string | null = SESSION_ID;
   let agent: AgentInfo | null = workerInfo();
-  let sessionConversation: string | null = CONVERSATION_ID;
   let toolCalls = 0;
   let alive = true;
   let completed = false;
@@ -78,43 +77,53 @@ function fixture(): {
   const forgetExecOwner = vi.fn(() => {
     owner = null;
   });
+  const noteExecOwner = vi.fn((processId: number | null, sessionId: string | null) => {
+    if (processId === PROCESS_ID && alive) owner = sessionId;
+  });
+
+  const deps: AgentRuntimeGcDependencies = {
+    listProcesses: () => alive ? [runtime()] : [],
+    execOwner: () => owner,
+    getSession: async (sessionId) => sessionId === SESSION_ID
+      ? { id: SESSION_ID, conversationId: CONVERSATION_ID }
+      : null,
+    agentInfo: () => agent,
+    runningToolCalls: () => toolCalls,
+    backgroundState: () => ({
+      running: alive && !completed ? [PROCESS_ID] : [],
+      exitedUnread: completed ? [{ processId: PROCESS_ID, exitCode: 0 }] : []
+    }),
+    forgetExecOwner,
+    noteExecOwner,
+    terminateProcess
+  };
 
   return {
-    deps: {
-      listProcesses: () => [runtime()],
-      execOwner: () => owner,
-      getSession: async (sessionId) => sessionId === SESSION_ID
-        ? { id: SESSION_ID, conversationId: sessionConversation }
-        : null,
-      agentInfo: () => agent,
-      runningToolCalls: () => toolCalls,
-      backgroundState: () => ({
-        running: alive && !completed ? [PROCESS_ID] : [],
-        exitedUnread: completed ? [{ processId: PROCESS_ID, exitCode: 0 }] : []
-      }),
-      terminateProcess,
-      forgetExecOwner
-    },
+    deps,
     setOwner: (value) => { owner = value; },
     setAgent: (value) => { agent = value; },
-    setSessionConversation: (value) => { sessionConversation = value; },
     setToolCalls: (value) => { toolCalls = value; },
     setAlive: (value) => { alive = value; },
     setCompleted: (value) => { completed = value; },
     terminateProcess,
-    forgetExecOwner
+    forgetExecOwner,
+    noteExecOwner
   };
 }
 
 describe('sleeping worker runtime GC', () => {
-  it('terminates only the exact old sleeping worker runtime and leaves broker identity untouched', async () => {
+  it('fences exact ownership before termination and leaves durable worker identity untouched', async () => {
     const fake = fixture();
     const before = workerInfo();
     fake.setAgent(before);
+    fake.deps.terminateProcess = vi.fn(async () => {
+      expect(fake.deps.execOwner(PROCESS_ID)).toBeNull();
+      fake.setAlive(false);
+      return true;
+    });
 
     const summary = await sweepAgentRuntimeGc(NOW, fake.deps);
 
-    expect(fake.terminateProcess).toHaveBeenCalledWith(PROCESS_ID);
     expect(fake.forgetExecOwner).toHaveBeenCalledWith(PROCESS_ID);
     expect(summary).toMatchObject({ checked: 1, eligible: 1, terminated: 1 });
     expect(before).toMatchObject({
@@ -189,7 +198,7 @@ describe('sleeping worker runtime GC', () => {
     expect(summary.changed).toBe(1);
   });
 
-  it('rechecks worker lifecycle so a wake racing the sweep wins', async () => {
+  it('rechecks worker lifecycle so a wake racing the sweep wins before the claim', async () => {
     const fake = fixture();
     let reads = 0;
     fake.deps.agentInfo = () => {
@@ -199,22 +208,23 @@ describe('sleeping worker runtime GC', () => {
 
     const summary = await sweepAgentRuntimeGc(NOW, fake.deps);
 
+    expect(fake.forgetExecOwner).not.toHaveBeenCalled();
     expect(fake.terminateProcess).not.toHaveBeenCalled();
     expect(summary.changed).toBe(1);
   });
 
-  it('preserves completed unread output rather than treating it as garbage', async () => {
+  it('preserves completed unread output rather than claiming it as garbage', async () => {
     const fake = fixture();
     fake.setCompleted(true);
 
     const summary = await sweepAgentRuntimeGc(NOW, fake.deps);
 
-    expect(fake.terminateProcess).not.toHaveBeenCalled();
     expect(fake.forgetExecOwner).not.toHaveBeenCalled();
+    expect(fake.terminateProcess).not.toHaveBeenCalled();
     expect(summary.completed).toBe(1);
   });
 
-  it('rechecks exact process ownership immediately before termination', async () => {
+  it('rechecks exact process ownership immediately before the claim', async () => {
     const fake = fixture();
     let reads = 0;
     fake.deps.execOwner = () => {
@@ -224,24 +234,36 @@ describe('sleeping worker runtime GC', () => {
 
     const summary = await sweepAgentRuntimeGc(NOW, fake.deps);
 
+    expect(fake.forgetExecOwner).not.toHaveBeenCalled();
     expect(fake.terminateProcess).not.toHaveBeenCalled();
     expect(summary.changed).toBe(1);
   });
 
-  it('does not erase attribution for a replacement numeric process id after termination settles', async () => {
+  it('restores the exact owner when termination fails and the same process is still live', async () => {
     const fake = fixture();
-    let owner = SESSION_ID;
-    fake.deps.execOwner = () => owner;
     fake.deps.terminateProcess = vi.fn(async () => {
-      fake.setAlive(false);
-      owner = 'session-reused';
-      return true;
+      throw new Error('taskkill failed');
     });
 
     const summary = await sweepAgentRuntimeGc(NOW, fake.deps);
 
-    expect(summary.terminated).toBe(1);
-    expect(fake.forgetExecOwner).not.toHaveBeenCalled();
+    expect(summary.failed).toBe(1);
+    expect(fake.noteExecOwner).toHaveBeenCalledWith(PROCESS_ID, SESSION_ID);
+    expect(fake.deps.execOwner(PROCESS_ID)).toBe(SESSION_ID);
+  });
+
+  it('never overwrites a replacement owner that appears while termination is settling', async () => {
+    const fake = fixture();
+    fake.deps.terminateProcess = vi.fn(async () => {
+      fake.setOwner('session-reused');
+      throw new Error('late failure');
+    });
+
+    const summary = await sweepAgentRuntimeGc(NOW, fake.deps);
+
+    expect(summary.failed).toBe(1);
+    expect(fake.noteExecOwner).not.toHaveBeenCalled();
+    expect(fake.deps.execOwner(PROCESS_ID)).toBe('session-reused');
   });
 
   it('rechecks each live process independently, so waking after one reclaim preserves the next', async () => {
@@ -252,19 +274,22 @@ describe('sleeping worker runtime GC', () => {
     const alive = new Set([201, 202]);
     const terminated: number[] = [];
     const deps: AgentRuntimeGcDependencies = {
-      listProcesses: () => [first, second],
+      listProcesses: () => [first, second].filter((process) => alive.has(process.processId)),
       execOwner: (processId) => owners.get(processId) ?? null,
       getSession: async () => ({ id: SESSION_ID, conversationId: CONVERSATION_ID }),
       agentInfo: () => workerInfo(state),
       runningToolCalls: () => 0,
       backgroundState: () => ({ running: [...alive], exitedUnread: [] }),
+      forgetExecOwner: (processId) => { owners.delete(processId); },
+      noteExecOwner: (processId, sessionId) => {
+        if (processId !== null && sessionId !== null && alive.has(processId)) owners.set(processId, sessionId);
+      },
       terminateProcess: async (processId) => {
         alive.delete(processId);
         terminated.push(processId);
         if (processId === 201) state = 'waking';
         return true;
-      },
-      forgetExecOwner: (processId) => { owners.delete(processId); }
+      }
     };
 
     const summary = await sweepAgentRuntimeGc(NOW, deps);
