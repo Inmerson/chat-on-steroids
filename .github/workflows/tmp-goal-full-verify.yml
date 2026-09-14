@@ -1,0 +1,32 @@
+name: Temporary full verification
+
+on:
+  push:
+    branches:
+      - tmp/goal-access-limit-recovery-ci
+
+permissions:
+  contents: write
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+      - run: npm ci
+      - run: npm run verify
+      - name: Remove temporary workflow after successful verification
+        if: success()
+        shell: bash
+        run: |
+          git config user.name 'Inmerson'
+          git config user.email 'Inmerson@users.noreply.github.com'
+          git rm .github/workflows/tmp-goal-full-verify.yml
+          git commit -m 'chore: remove temporary verification workflow'
+          git push origin HEAD:tmp/goal-access-limit-recovery-ci
