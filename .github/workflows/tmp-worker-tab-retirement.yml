@@ -1,29 +1,111 @@
-name: Temporary worker tab retirement RED
+name: Temporary worker tab retirement GREEN
 
 on:
   push:
     branches:
       - tmp/worker-tab-retirement-ci
 
+permissions:
+  contents: write
+
 jobs:
-  red:
+  green:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
           cache: npm
       - run: npm ci
-      - name: Prove regression is red on current upstream
+      - name: Apply minimal post-commit retirement patch
         shell: bash
         run: |
-          set +e
+          python - <<'PY'
+          from pathlib import Path
+
+          bridge = Path('src/main/bridge.ts')
+          text = bridge.read_text(encoding='utf-8')
+          old = (
+              "  const managed = new Set(summaries.filter(row => row.origin && row.conversationId && openConversations.has(row.conversationId)).map(row => row.conversationId!));\n"
+              "  for (const id of [...supersededSourceConversations(), ...closableWorkerConversations(0)]) if (openConversations.has(id)) managed.add(id);\n"
+          )
+          new = (
+              "  const managed = new Set(summaries.filter(row => row.origin && row.conversationId && openConversations.has(row.conversationId)).map(row => row.conversationId!));\n"
+              "  const stoppedWorkers = closableWorkerConversations(0);\n"
+              "  for (const id of [...supersededSourceConversations(), ...stoppedWorkers]) if (openConversations.has(id)) managed.add(id);\n"
+          )
+          if text.count(old) != 1:
+              raise SystemExit(f'expected one managed-worker target, found {text.count(old)}')
+          text = text.replace(old, new)
+
+          old = "    closableConversations: [...new Set([...idlePages, ...idle, ...supersededSourceConversations().filter(id => openConversations.has(id) && !protectedChats.has(id))])].sort()\n"
+          new = (
+              "    closableConversations: [...new Set([\n"
+              "      ...stoppedWorkers.filter(id => openConversations.has(id) && !protectedChats.has(id)),\n"
+              "      ...idlePages,\n"
+              "      ...idle,\n"
+              "      ...supersededSourceConversations().filter(id => openConversations.has(id) && !protectedChats.has(id))\n"
+              "    ])].sort()\n"
+          )
+          if text.count(old) != 1:
+              raise SystemExit(f'expected one closable policy target, found {text.count(old)}')
+          text = text.replace(old, new)
+
+          old = "          if (staged.info.runId) releaseQuiescentRun({}, staged.info.runId);\n        }\n"
+          new = (
+              "          if (staged.info.runId) releaseQuiescentRun({}, staged.info.runId);\n"
+              "          // The durable stop is now public. Ask the browser to collect status immediately;\n"
+              "          // /status still rechecks broker state and the extension still proves exact\n"
+              "          // document ownership before any physical tab close.\n"
+              "          wakeBrowserWork();\n"
+              "        }\n"
+          )
+          if text.count(old) != 1:
+              raise SystemExit(f'expected one browser-finish wake target, found {text.count(old)}')
+          bridge.write_text(text.replace(old, new), encoding='utf-8')
+
+          tools = Path('src/main/mcp/tools-core.ts')
+          text = tools.read_text(encoding='utf-8')
+          old = "import { getConfig } from '../config.js';\n"
+          new = "import { getConfig } from '../config.js';\nimport { wakeBrowserWork } from '../browser-wake.js';\n"
+          if text.count(old) != 1:
+              raise SystemExit(f'expected one browser-wake import target, found {text.count(old)}')
+          text = text.replace(old, new)
+
+          old = "          const { info, report, repeat } = staged;\n          if (report) await recordAgentMessage(report, 'sent', info.conversationId);\n"
+          new = (
+              "          const { info, report, repeat } = staged;\n"
+              "          // A repeated finish publishes no new stop. A newly accepted one has already\n"
+              "          // crossed the critical broker barrier above, so browser maintenance cannot outrun it.\n"
+              "          if (!repeat) wakeBrowserWork();\n"
+              "          if (report) await recordAgentMessage(report, 'sent', info.conversationId);\n"
+          )
+          if text.count(old) != 1:
+              raise SystemExit(f'expected one explicit-finish wake target, found {text.count(old)}')
+          tools.write_text(text.replace(old, new), encoding='utf-8')
+          PY
+      - name: Focused regressions and typecheck
+        shell: bash
+        run: |
           npx vitest run test/worker-tab-retirement.test.ts
-          status=$?
-          set -e
-          if [ "$status" -eq 0 ]; then
-            echo 'Regression unexpectedly passes before the fix.' >&2
-            exit 1
-          fi
-          echo 'Regression failed before the fix as expected.'
+          npx vitest run test/extension.test.ts
+          npx vitest run test/agents.test.ts
+          npm run typecheck
+      - name: Publish clean one-commit candidate
+        shell: bash
+        run: |
+          cp src/main/bridge.ts /tmp/bridge.ts
+          cp src/main/mcp/tools-core.ts /tmp/tools-core.ts
+          cp test/worker-tab-retirement.test.ts /tmp/worker-tab-retirement.test.ts
+          git checkout -B fix/worker-tab-retirement f51acbccdd734f524799ea92bb747be765fba1e4
+          cp /tmp/bridge.ts src/main/bridge.ts
+          cp /tmp/tools-core.ts src/main/mcp/tools-core.ts
+          cp /tmp/worker-tab-retirement.test.ts test/worker-tab-retirement.test.ts
+          git config user.name 'Inmerson'
+          git config user.email 'Inmerson@users.noreply.github.com'
+          git add src/main/bridge.ts src/main/mcp/tools-core.ts test/worker-tab-retirement.test.ts
+          git commit -m 'fix: retire worker tabs after durable stop'
+          git push --force-with-lease=refs/heads/fix/worker-tab-retirement:f51acbccdd734f524799ea92bb747be765fba1e4 origin HEAD:fix/worker-tab-retirement
