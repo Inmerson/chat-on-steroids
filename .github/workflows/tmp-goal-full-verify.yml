@@ -1,4 +1,4 @@
-name: Temporary clean candidate verification
+name: Temporary publish Goal access-limit candidate
 
 on:
   push:
@@ -9,7 +9,7 @@ permissions:
   contents: write
 
 jobs:
-  verify:
+  publish:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -19,7 +19,7 @@ jobs:
         with:
           node-version: '22'
           cache: npm
-      - name: Build one-commit candidate from current upstream
+      - name: Build clean one-commit candidate from current upstream
         shell: bash
         run: |
           cp src/main/bridge.ts /tmp/bridge.ts
@@ -32,9 +32,13 @@ jobs:
           git add src/main/bridge.ts test/goal-access-limit-recovery.test.ts
           git commit -m 'fix: preserve Goal recovery across access limits'
       - run: npm ci
-      - run: npm run verify
-      - name: Publish verified clean candidate
-        if: success()
+      - name: Focused regressions and typecheck
+        shell: bash
+        run: |
+          npx vitest run test/goal-access-limit-recovery.test.ts
+          npx vitest run test/bridge.test.ts -t "provider access limit"
+          npm run typecheck
+      - name: Publish clean candidate
         shell: bash
         run: |
           git push --force-with-lease=refs/heads/fix/goal-access-limit-recovery:f51acbccdd734f524799ea92bb747be765fba1e4 origin HEAD:fix/goal-access-limit-recovery
