@@ -4,7 +4,8 @@ import { unifiedExecManager } from './codex/manager.js';
 import {
   backgroundExecObligations,
   execOwner,
-  forgetExecOwner
+  forgetExecOwner,
+  noteExecOwner
 } from './codex/ownership.js';
 import type { BackgroundExecState, BackgroundTerminalInfo } from './codex/unified-exec.js';
 import { runningToolCalls } from './mcp/call-context.js';
@@ -33,8 +34,9 @@ export interface AgentRuntimeGcDependencies {
   agentInfo(conversationId: string): AgentInfo | null;
   runningToolCalls(conversationId: string): number;
   backgroundState(sessionId: string): BackgroundExecState;
-  terminateProcess(processId: number): Promise<boolean>;
   forgetExecOwner(processId: number): void;
+  noteExecOwner(processId: number | null, sessionId: string | null): void;
+  terminateProcess(processId: number): Promise<boolean>;
 }
 
 export interface AgentRuntimeGcSummary {
@@ -57,8 +59,9 @@ const defaultDependencies: AgentRuntimeGcDependencies = {
   agentInfo: agentInfoForOwnedConversation,
   runningToolCalls,
   backgroundState: backgroundExecObligations,
-  terminateProcess: (processId) => unifiedExecManager.terminateProcess(processId),
-  forgetExecOwner
+  forgetExecOwner,
+  noteExecOwner,
+  terminateProcess: (processId) => unifiedExecManager.terminateProcess(processId)
 };
 
 function emptySummary(): AgentRuntimeGcSummary {
@@ -111,8 +114,17 @@ function sameProof(left: WorkerProof | null, right: WorkerProof): boolean {
   );
 }
 
-function containsProcess(state: BackgroundExecState, processId: number): boolean {
-  return state.running.includes(processId) || state.exitedUnread.some((row) => row.processId === processId);
+function processLive(dependencies: AgentRuntimeGcDependencies, processId: number): boolean {
+  return dependencies.listProcesses().some((process) => process.processId === processId);
+}
+
+function restoreClaimIfNeeded(
+  dependencies: AgentRuntimeGcDependencies,
+  processId: number,
+  sessionId: string
+): void {
+  if (dependencies.execOwner(processId) !== null || !processLive(dependencies, processId)) return;
+  dependencies.noteExecOwner(processId, sessionId);
 }
 
 /**
@@ -120,9 +132,11 @@ function containsProcess(state: BackgroundExecState, processId: number): boolean
  * same long-sleeping, revivable worker.
  *
  * Discovery is not authority. After every await, the sweep re-reads durable session attachment,
- * broker identity, current tool work, process state and process ownership before starting a
- * destructive call. No worker/history/session state is mutated here, and no timer lives here;
- * a caller may place this sweep on an existing coarse maintenance lane.
+ * broker identity, current tool work, process state and process ownership. The destructive
+ * boundary then synchronously removes the exact exec-ownership record before the first await;
+ * a later `write_stdin` therefore cannot authorize against the runtime being reclaimed.
+ * Failure restores that owner only when the same numeric process id is still live and unowned.
+ * No worker/history/session state is mutated here, and no timer lives here.
  */
 export async function sweepAgentRuntimeGc(
   now = Date.now(),
@@ -155,8 +169,8 @@ export async function sweepAgentRuntimeGc(
       continue;
     }
 
-    // Final async identity read. Everything after it is synchronous until terminateProcess()
-    // has begun against this exact process id, so a wake/owner move already in progress wins.
+    // Final async identity read. Everything after it is synchronous through the ownership
+    // fence, so a wake/tool call/owner move already in progress wins before GC claims anything.
     const currentSession = await dependencies.getSession(sessionId);
     if (!currentSession || currentSession.conversationId !== conversationId) {
       summary.changed += 1;
@@ -173,7 +187,6 @@ export async function sweepAgentRuntimeGc(
 
     const currentState = dependencies.backgroundState(sessionId);
     if (currentState.exitedUnread.some((row) => row.processId === runtime.processId)) {
-      // Completed output is an undelivered obligation, not garbage.
       summary.completed += 1;
       continue;
     }
@@ -187,23 +200,19 @@ export async function sweepAgentRuntimeGc(
     }
 
     summary.eligible += 1;
-    let terminated = false;
+    // This is the claim. Production `write_stdin` refuses a process with no exact owner, so
+    // removing ownership synchronously fences the old runtime before termination can yield.
+    dependencies.forgetExecOwner(runtime.processId);
     try {
-      terminated = await dependencies.terminateProcess(runtime.processId);
+      if (!(await dependencies.terminateProcess(runtime.processId))) {
+        restoreClaimIfNeeded(dependencies, runtime.processId, sessionId);
+        summary.missing += 1;
+        continue;
+      }
     } catch {
+      restoreClaimIfNeeded(dependencies, runtime.processId, sessionId);
       summary.failed += 1;
       continue;
-    }
-    if (!terminated) {
-      summary.missing += 1;
-      continue;
-    }
-
-    // Numeric ids are reusable. Never erase attribution for a replacement process that appeared
-    // while process-tree termination was settling.
-    const after = dependencies.backgroundState(sessionId);
-    if (dependencies.execOwner(runtime.processId) === sessionId && !containsProcess(after, runtime.processId)) {
-      dependencies.forgetExecOwner(runtime.processId);
     }
     summary.terminated += 1;
   }
