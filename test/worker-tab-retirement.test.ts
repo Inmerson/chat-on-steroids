@@ -26,6 +26,7 @@ const {
   WORKER_CONTEXT_CEILING_TOKENS,
   bindConversation,
   noteAgentContextTokens,
+  onSpawnRequest,
   resetSwarm,
   spawn,
   stageFinishAgent,
@@ -68,11 +69,19 @@ async function status(): Promise<any> {
   return reply.body;
 }
 
-function activeWorker(): { runId: string } {
-  const run = spawn({ workers: [{ task: 'Inspect the requested subsystem.' }], caller: { conversationId: PRIME } });
-  expect(bindConversation('worker-1', WORKER, run.runId)).toBe(true);
+function activeWorker(): void {
+  const drop = onSpawnRequest(() => undefined);
+  try {
+    const run = spawn({
+      workers: [{ label: 'Worker 1', task: 'Inspect the requested subsystem.' }],
+      caller: { conversationId: PRIME }
+    });
+    expect(run.agents[0]?.id).toBe('worker-1');
+    expect(bindConversation('worker-1', WORKER)).toBe(true);
+  } finally {
+    drop();
+  }
   expect(swarmState().agents.find((agent) => agent.id === 'worker-1')?.state).toBe('active');
-  return { runId: run.runId };
 }
 
 beforeAll(async () => {
