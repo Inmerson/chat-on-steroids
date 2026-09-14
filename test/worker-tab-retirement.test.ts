@@ -70,14 +70,15 @@ async function status(): Promise<any> {
 }
 
 function activeWorker(): void {
-  const drop = onSpawnRequest(() => undefined);
+  const spawned: Array<{ id: string; task: string }> = [];
+  const drop = onSpawnRequest((workers) => spawned.push(...workers));
   try {
-    const run = spawn({
+    spawn({
       workers: [{ label: 'Worker 1', task: 'Inspect the requested subsystem.' }],
       caller: { conversationId: PRIME }
     });
-    expect(run.agents[0]?.id).toBe('worker-1');
-    expect(bindConversation('worker-1', WORKER)).toBe(true);
+    expect(spawned[0]?.id).toBe('worker-1');
+    expect(bindConversation(spawned[0]!.id, WORKER)).toBe(true);
   } finally {
     drop();
   }
