@@ -1,21 +1,24 @@
 import type { AgentInfo } from '../shared/session.js';
-import { agentInfoForOwnedConversation, snapshotSwarm, type SwarmSnapshot } from './agents.js';
+import { agentInfoForOwnedConversation } from './agents.js';
 import { unifiedExecManager } from './codex/manager.js';
 import {
   backgroundExecObligations,
   execOwner,
   forgetExecOwner
 } from './codex/ownership.js';
+import type { BackgroundExecState, BackgroundTerminalInfo } from './codex/unified-exec.js';
 import { runningToolCalls } from './mcp/call-context.js';
-import { findSessionByConversation } from './session/store.js';
+import { getSession } from './session/store.js';
 
-/**
- * Runtime retention is a resource policy, not a worker-liveness deadline.
- * Sleeping workers keep their durable broker/session identity after this age.
- */
+/** Resource retention policy; this is never a worker-liveness deadline. */
 export const AGENT_RUNTIME_RETENTION_MS = 30 * 60_000;
 
-export interface AgentRuntimeGcCandidate {
+interface SessionIdentity {
+  id: string;
+  conversationId: string | null;
+}
+
+interface WorkerProof {
   runId: string;
   primeConversationId: string;
   agentId: string;
@@ -23,246 +26,187 @@ export interface AgentRuntimeGcCandidate {
   sleptAt: number;
 }
 
-export type AgentRuntimeGcSkipReason =
-  | 'worker_changed'
-  | 'tool_work_running'
-  | 'session_identity_unproven'
-  | 'process_completed'
-  | 'process_disappeared'
-  | 'process_owner_changed'
-  | 'termination_failed';
-
-export interface AgentRuntimeGcSkip {
-  candidate: AgentRuntimeGcCandidate;
-  processId: number | null;
-  reason: AgentRuntimeGcSkipReason;
+export interface AgentRuntimeGcDependencies {
+  listProcesses(): BackgroundTerminalInfo[];
+  execOwner(processId: number): string | null;
+  getSession(sessionId: string): Promise<SessionIdentity | null>;
+  agentInfo(conversationId: string): AgentInfo | null;
+  runningToolCalls(conversationId: string): number;
+  backgroundState(sessionId: string): BackgroundExecState;
+  terminateProcess(processId: number): Promise<boolean>;
+  forgetExecOwner(processId: number): void;
 }
 
-export interface AgentRuntimeGcSweepResult {
-  candidates: number;
-  terminated: number[];
-  skipped: AgentRuntimeGcSkip[];
+export interface AgentRuntimeGcSummary {
+  checked: number;
+  eligible: number;
+  terminated: number;
+  unowned: number;
+  ineligible: number;
+  busy: number;
+  changed: number;
+  completed: number;
+  missing: number;
+  failed: number;
 }
 
-interface BackgroundState {
-  running: number[];
-  exitedUnread: Array<{ processId: number; exitCode: number | null }>;
-}
-
-interface SessionIdentity {
-  id: string;
-  conversationId: string | null;
-}
-
-export interface AgentRuntimeGcDeps {
-  snapshot: () => SwarmSnapshot | null;
-  agentInfo: (conversationId: string) => AgentInfo | null;
-  findSession: (conversationId: string) => Promise<SessionIdentity | null>;
-  runningToolCalls: (conversationId: string) => number;
-  backgroundState: (sessionId: string) => BackgroundState;
-  execOwner: (processId: number) => string | null;
-  terminateProcess: (processId: number) => Promise<boolean>;
-  forgetExecOwner: (processId: number) => void;
-}
-
-const defaultDeps: AgentRuntimeGcDeps = {
-  snapshot: snapshotSwarm,
+const defaultDependencies: AgentRuntimeGcDependencies = {
+  listProcesses: () => unifiedExecManager.listProcesses(),
+  execOwner,
+  getSession,
   agentInfo: agentInfoForOwnedConversation,
-  findSession: async (conversationId) =>
-    findSessionByConversation(conversationId, { requireUnique: true }),
   runningToolCalls,
   backgroundState: backgroundExecObligations,
-  execOwner,
   terminateProcess: (processId) => unifiedExecManager.terminateProcess(processId),
   forgetExecOwner
 };
 
-function sameCandidate(info: AgentInfo | null, candidate: AgentRuntimeGcCandidate): boolean {
-  return Boolean(
-    info &&
-    info.role === 'worker' &&
-    info.state === 'sleeping' &&
-    info.revivable &&
-    info.runId === candidate.runId &&
-    info.primeConversationId === candidate.primeConversationId &&
-    info.id === candidate.agentId &&
-    info.conversationId === candidate.conversationId &&
-    info.sleptAt === candidate.sleptAt
-  );
+function emptySummary(): AgentRuntimeGcSummary {
+  return {
+    checked: 0,
+    eligible: 0,
+    terminated: 0,
+    unowned: 0,
+    ineligible: 0,
+    busy: 0,
+    changed: 0,
+    completed: 0,
+    missing: 0,
+    failed: 0
+  };
 }
 
-function candidateFrom(
-  info: AgentInfo,
-  owner: { runId: string | null; primeConversationId: string },
-  observedAt: number,
-  retentionMs: number
-): AgentRuntimeGcCandidate | null {
+function workerProof(info: AgentInfo | null, conversationId: string, cutoff: number): WorkerProof | null {
   if (
+    !info ||
     info.role !== 'worker' ||
     info.state !== 'sleeping' ||
     !info.revivable ||
-    !info.conversationId ||
-    !Number.isFinite(info.sleptAt) ||
+    info.conversationId !== conversationId ||
+    !info.runId ||
+    !info.primeConversationId ||
     info.sleptAt === null ||
-    info.sleptAt > observedAt ||
-    observedAt - info.sleptAt < retentionMs
+    !Number.isFinite(info.sleptAt) ||
+    info.sleptAt > cutoff
   ) {
     return null;
   }
-
-  const runId = info.runId ?? owner.runId;
-  const primeConversationId = info.primeConversationId ?? owner.primeConversationId;
-  if (!runId || !primeConversationId) return null;
-  if (owner.runId && runId !== owner.runId) return null;
-  if (primeConversationId !== owner.primeConversationId) return null;
-
   return {
-    runId,
-    primeConversationId,
+    runId: info.runId,
+    primeConversationId: info.primeConversationId,
     agentId: info.id,
-    conversationId: info.conversationId,
+    conversationId,
     sleptAt: info.sleptAt
   };
 }
 
-/**
- * Selects only old, revivable sleeping workers from committed broker state.
- * The top-level v6 compatibility projection is ignored to avoid double-counting active runs.
- */
-export function agentRuntimeGcCandidates(
-  snapshot: SwarmSnapshot | null,
-  observedAt: number,
-  retentionMs = AGENT_RUNTIME_RETENTION_MS
-): AgentRuntimeGcCandidate[] {
-  if (!snapshot || !Number.isFinite(observedAt) || !Number.isFinite(retentionMs) || retentionMs < 0) return [];
-
-  const candidates: AgentRuntimeGcCandidate[] = [];
-  const seen = new Set<string>();
-  const activeRuns = snapshot.activeRuns ?? (
-    snapshot.runId && snapshot.primeConversationId
-      ? [{ runId: snapshot.runId, primeConversationId: snapshot.primeConversationId, startedAt: snapshot.startedAt ?? 0, agents: snapshot.agents }]
-      : []
+function sameProof(left: WorkerProof | null, right: WorkerProof): boolean {
+  return Boolean(
+    left &&
+    left.runId === right.runId &&
+    left.primeConversationId === right.primeConversationId &&
+    left.agentId === right.agentId &&
+    left.conversationId === right.conversationId &&
+    left.sleptAt === right.sleptAt
   );
-
-  for (const run of activeRuns) {
-    for (const row of run.agents) {
-      const candidate = candidateFrom(row.info, {
-        runId: run.runId,
-        primeConversationId: run.primeConversationId
-      }, observedAt, retentionMs);
-      if (!candidate) continue;
-      const key = `${candidate.runId}\n${candidate.agentId}\n${candidate.conversationId}`;
-      if (seen.has(key)) continue;
-      seen.add(key);
-      candidates.push(candidate);
-    }
-  }
-
-  for (const dormant of snapshot.dormantRuns ?? []) {
-    for (const row of dormant.agents) {
-      const candidate = candidateFrom(row.info, {
-        runId: null,
-        primeConversationId: dormant.primeConversationId
-      }, observedAt, retentionMs);
-      if (!candidate) continue;
-      const key = `${candidate.runId}\n${candidate.agentId}\n${candidate.conversationId}`;
-      if (seen.has(key)) continue;
-      seen.add(key);
-      candidates.push(candidate);
-    }
-  }
-
-  return candidates;
 }
 
-function completed(state: BackgroundState, processId: number): boolean {
-  return state.exitedUnread.some((row) => row.processId === processId);
+function containsProcess(state: BackgroundExecState, processId: number): boolean {
+  return state.running.includes(processId) || state.exitedUnread.some((row) => row.processId === processId);
 }
 
 /**
- * Releases only live exec processes that still belong to an old sleeping worker.
+ * Releases live exec processes only when their exact durable session still belongs to the
+ * same long-sleeping, revivable worker.
  *
- * Candidate discovery is deliberately weak authority. Before each destructive call this sweep
- * synchronously re-reads the exact worker, current tool ownership, process state and process
- * owner. With no await between those final checks and `terminateProcess()`, a wake that has
- * already begun wins by changing the worker to `waking`; a later wake simply recreates runtime
- * resources on demand while durable worker/session state remains untouched.
- *
- * No scheduler lives here. Callers may place this sweep on an existing coarse maintenance lane.
+ * Discovery is not authority. After every await, the sweep re-reads durable session attachment,
+ * broker identity, current tool work, process state and process ownership before starting a
+ * destructive call. No worker/history/session state is mutated here, and no timer lives here;
+ * a caller may place this sweep on an existing coarse maintenance lane.
  */
 export async function sweepAgentRuntimeGc(
-  observedAt = Date.now(),
-  retentionMs = AGENT_RUNTIME_RETENTION_MS,
-  deps: AgentRuntimeGcDeps = defaultDeps
-): Promise<AgentRuntimeGcSweepResult> {
-  const candidates = agentRuntimeGcCandidates(deps.snapshot(), observedAt, retentionMs);
-  const result: AgentRuntimeGcSweepResult = { candidates: candidates.length, terminated: [], skipped: [] };
+  now = Date.now(),
+  dependencies: AgentRuntimeGcDependencies = defaultDependencies
+): Promise<AgentRuntimeGcSummary> {
+  const cutoff = now - AGENT_RUNTIME_RETENTION_MS;
+  const summary = emptySummary();
 
-  for (const candidate of candidates) {
-    if (!sameCandidate(deps.agentInfo(candidate.conversationId), candidate)) {
-      result.skipped.push({ candidate, processId: null, reason: 'worker_changed' });
-      continue;
-    }
-    if (deps.runningToolCalls(candidate.conversationId) > 0) {
-      result.skipped.push({ candidate, processId: null, reason: 'tool_work_running' });
+  for (const runtime of dependencies.listProcesses()) {
+    summary.checked += 1;
+    const sessionId = dependencies.execOwner(runtime.processId);
+    if (!sessionId) {
+      summary.unowned += 1;
       continue;
     }
 
-    const session = await deps.findSession(candidate.conversationId);
-    if (!session || session.conversationId !== candidate.conversationId) {
-      result.skipped.push({ candidate, processId: null, reason: 'session_identity_unproven' });
+    const firstSession = await dependencies.getSession(sessionId);
+    const conversationId = firstSession?.conversationId ?? null;
+    if (!conversationId) {
+      summary.ineligible += 1;
+      continue;
+    }
+    const proof = workerProof(dependencies.agentInfo(conversationId), conversationId, cutoff);
+    if (!proof) {
+      summary.ineligible += 1;
+      continue;
+    }
+    if (dependencies.runningToolCalls(conversationId) > 0) {
+      summary.busy += 1;
       continue;
     }
 
-    const processIds = [...deps.backgroundState(session.id).running];
-    for (const processId of processIds) {
-      // Final destructive boundary. Everything below this point is synchronous until
-      // terminateProcess() has started terminating the exact process entry.
-      if (!sameCandidate(deps.agentInfo(candidate.conversationId), candidate)) {
-        result.skipped.push({ candidate, processId, reason: 'worker_changed' });
-        continue;
-      }
-      if (deps.runningToolCalls(candidate.conversationId) > 0) {
-        result.skipped.push({ candidate, processId, reason: 'tool_work_running' });
-        continue;
-      }
-      const current = deps.backgroundState(session.id);
-      if (!current.running.includes(processId)) {
-        result.skipped.push({
-          candidate,
-          processId,
-          reason: completed(current, processId) ? 'process_completed' : 'process_disappeared'
-        });
-        continue;
-      }
-      if (deps.execOwner(processId) !== session.id) {
-        result.skipped.push({ candidate, processId, reason: 'process_owner_changed' });
-        continue;
-      }
-
-      try {
-        if (!(await deps.terminateProcess(processId))) {
-          result.skipped.push({ candidate, processId, reason: 'process_disappeared' });
-          continue;
-        }
-      } catch {
-        result.skipped.push({ candidate, processId, reason: 'termination_failed' });
-        continue;
-      }
-
-      // `terminateProcess()` may release the numeric id. Forget the old ownership row only if
-      // no process with that id has appeared again before this continuation resumes.
-      const after = deps.backgroundState(session.id);
-      if (
-        deps.execOwner(processId) === session.id &&
-        !after.running.includes(processId) &&
-        !completed(after, processId)
-      ) {
-        deps.forgetExecOwner(processId);
-      }
-      result.terminated.push(processId);
+    // Final async identity read. Everything after it is synchronous until terminateProcess()
+    // has begun against this exact process id, so a wake/owner move already in progress wins.
+    const currentSession = await dependencies.getSession(sessionId);
+    if (!currentSession || currentSession.conversationId !== conversationId) {
+      summary.changed += 1;
+      continue;
     }
+    if (!sameProof(workerProof(dependencies.agentInfo(conversationId), conversationId, cutoff), proof)) {
+      summary.changed += 1;
+      continue;
+    }
+    if (dependencies.runningToolCalls(conversationId) > 0) {
+      summary.busy += 1;
+      continue;
+    }
+
+    const currentState = dependencies.backgroundState(sessionId);
+    if (currentState.exitedUnread.some((row) => row.processId === runtime.processId)) {
+      // Completed output is an undelivered obligation, not garbage.
+      summary.completed += 1;
+      continue;
+    }
+    if (!currentState.running.includes(runtime.processId)) {
+      summary.missing += 1;
+      continue;
+    }
+    if (dependencies.execOwner(runtime.processId) !== sessionId) {
+      summary.changed += 1;
+      continue;
+    }
+
+    summary.eligible += 1;
+    let terminated = false;
+    try {
+      terminated = await dependencies.terminateProcess(runtime.processId);
+    } catch {
+      summary.failed += 1;
+      continue;
+    }
+    if (!terminated) {
+      summary.missing += 1;
+      continue;
+    }
+
+    // Numeric ids are reusable. Never erase attribution for a replacement process that appeared
+    // while process-tree termination was settling.
+    const after = dependencies.backgroundState(sessionId);
+    if (dependencies.execOwner(runtime.processId) === sessionId && !containsProcess(after, runtime.processId)) {
+      dependencies.forgetExecOwner(runtime.processId);
+    }
+    summary.terminated += 1;
   }
 
-  return result;
+  return summary;
 }
