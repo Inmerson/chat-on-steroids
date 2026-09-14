@@ -1,300 +1,286 @@
-import { describe, expect, it } from 'vitest';
-import type { AgentInfo } from '../src/shared/session.js';
-import type { SwarmSnapshot } from '../src/main/agents.js';
+import { describe, expect, it, vi } from 'vitest';
+import type { AgentInfo, AgentState } from '../src/shared/session.js';
 import {
   AGENT_RUNTIME_RETENTION_MS,
-  agentRuntimeGcCandidates,
   sweepAgentRuntimeGc,
-  type AgentRuntimeGcDeps
+  type AgentRuntimeGcDependencies
 } from '../src/main/runtime-gc.js';
 
-const NOW = 10_000_000;
-const OLD_SLEEP = NOW - AGENT_RUNTIME_RETENTION_MS - 1;
+const NOW = 2_000_000_000;
+const OLD = NOW - AGENT_RUNTIME_RETENTION_MS - 1;
+const PROCESS_ID = 101;
+const SESSION_ID = 'session-worker';
+const CONVERSATION_ID = 'chat-worker';
 
-function worker(overrides: Partial<AgentInfo> = {}): AgentInfo {
-  const conversationId = overrides.conversationId ?? 'c-worker-1';
+function workerInfo(
+  state: AgentState = 'sleeping',
+  overrides: Partial<AgentInfo> = {}
+): AgentInfo {
   return {
     runId: 'run-a',
-    primeConversationId: 'c-prime-a',
+    primeConversationId: 'chat-prime',
     id: 'worker-1',
     role: 'worker',
-    label: 'Worker 1',
-    task: 'task',
+    label: 'GC worker',
+    task: 'test runtime gc',
     reasoningEffort: null,
     model: null,
-    state: 'sleeping',
-    createdAt: 1,
-    activatedAt: 2,
+    state,
+    createdAt: OLD - 1_000,
+    activatedAt: OLD - 500,
     finishedAt: null,
     result: null,
     pending: 0,
     awaitingAck: 0,
     delivered: 0,
-    conversationId,
+    conversationId: CONVERSATION_ID,
     detachedAt: null,
-    lastSeenAt: 3,
+    lastSeenAt: OLD,
     revivable: true,
-    sleptAt: OLD_SLEEP,
+    sleptAt: OLD,
     contextTokens: 100,
     ...overrides
   };
 }
 
-function snapshotFor(infos: AgentInfo[]): SwarmSnapshot {
-  const grouped = new Map<string, { runId: string; primeConversationId: string; agents: Array<{ info: AgentInfo; queue: [] }> }>();
-  for (const info of infos) {
-    if (!info.runId || !info.primeConversationId) continue;
-    const group = grouped.get(info.runId) ?? {
-      runId: info.runId,
-      primeConversationId: info.primeConversationId,
-      agents: []
-    };
-    group.agents.push({ info: { ...info }, queue: [] });
-    grouped.set(info.runId, group);
-  }
-  const activeRuns = [...grouped.values()].map((run) => ({ ...run, startedAt: 1 }));
-  const sole = activeRuns.length === 1 ? activeRuns[0] : null;
+function runtime(processId = PROCESS_ID) {
   return {
-    version: 6,
-    savedAt: NOW,
-    runId: sole?.runId ?? null,
-    primeConversationId: sole?.primeConversationId ?? null,
-    startedAt: sole?.startedAt ?? null,
-    agents: sole?.agents ?? [],
-    activeRuns,
-    dormantRuns: []
-  } as SwarmSnapshot;
-}
-
-interface Harness {
-  deps: AgentRuntimeGcDeps;
-  infos: Map<string, AgentInfo>;
-  sessions: Map<string, { id: string; conversationId: string | null }>;
-  running: Map<string, Set<number>>;
-  exited: Map<string, Array<{ processId: number; exitCode: number | null }>>;
-  owners: Map<number, string>;
-  terminated: number[];
-  forgotten: number[];
-  toolCalls: Map<string, number>;
-}
-
-function harness(initial: AgentInfo[], processes: Array<{ conversationId: string; processId: number }> = []): Harness {
-  const infos = new Map(initial.map((info) => [info.conversationId as string, { ...info }]));
-  const sessions = new Map<string, { id: string; conversationId: string | null }>();
-  const running = new Map<string, Set<number>>();
-  const exited = new Map<string, Array<{ processId: number; exitCode: number | null }>>();
-  const owners = new Map<number, string>();
-  const terminated: number[] = [];
-  const forgotten: number[] = [];
-  const toolCalls = new Map<string, number>();
-
-  for (const info of initial) {
-    if (!info.conversationId) continue;
-    const id = `session:${info.conversationId}`;
-    sessions.set(info.conversationId, { id, conversationId: info.conversationId });
-    running.set(id, new Set());
-    exited.set(id, []);
-  }
-  for (const row of processes) {
-    const session = sessions.get(row.conversationId);
-    if (!session) continue;
-    running.get(session.id)?.add(row.processId);
-    owners.set(row.processId, session.id);
-  }
-
-  const deps: AgentRuntimeGcDeps = {
-    snapshot: () => snapshotFor([...infos.values()]),
-    agentInfo: (conversationId) => infos.get(conversationId) ?? null,
-    findSession: async (conversationId) => sessions.get(conversationId) ?? null,
-    runningToolCalls: (conversationId) => toolCalls.get(conversationId) ?? 0,
-    backgroundState: (sessionId) => ({
-      running: [...(running.get(sessionId) ?? new Set())],
-      exitedUnread: [...(exited.get(sessionId) ?? [])]
-    }),
-    execOwner: (processId) => owners.get(processId) ?? null,
-    terminateProcess: async (processId) => {
-      const sessionId = owners.get(processId);
-      if (!sessionId || !running.get(sessionId)?.has(processId)) return false;
-      running.get(sessionId)?.delete(processId);
-      terminated.push(processId);
-      return true;
-    },
-    forgetExecOwner: (processId) => {
-      forgotten.push(processId);
-      owners.delete(processId);
-    }
+    processId,
+    command: 'npm run dev',
+    cwd: '/repo',
+    pid: 1_001,
+    tty: true
   };
+}
 
-  return { deps, infos, sessions, running, exited, owners, terminated, forgotten, toolCalls };
+function fixture(): {
+  deps: AgentRuntimeGcDependencies;
+  setOwner: (owner: string | null) => void;
+  setAgent: (agent: AgentInfo | null) => void;
+  setSessionConversation: (conversationId: string | null) => void;
+  setToolCalls: (count: number) => void;
+  setAlive: (alive: boolean) => void;
+  setCompleted: (completed: boolean) => void;
+  terminateProcess: ReturnType<typeof vi.fn>;
+  forgetExecOwner: ReturnType<typeof vi.fn>;
+} {
+  let owner: string | null = SESSION_ID;
+  let agent: AgentInfo | null = workerInfo();
+  let sessionConversation: string | null = CONVERSATION_ID;
+  let toolCalls = 0;
+  let alive = true;
+  let completed = false;
+
+  const terminateProcess = vi.fn(async () => {
+    alive = false;
+    return true;
+  });
+  const forgetExecOwner = vi.fn(() => {
+    owner = null;
+  });
+
+  return {
+    deps: {
+      listProcesses: () => [runtime()],
+      execOwner: () => owner,
+      getSession: async (sessionId) => sessionId === SESSION_ID
+        ? { id: SESSION_ID, conversationId: sessionConversation }
+        : null,
+      agentInfo: () => agent,
+      runningToolCalls: () => toolCalls,
+      backgroundState: () => ({
+        running: alive && !completed ? [PROCESS_ID] : [],
+        exitedUnread: completed ? [{ processId: PROCESS_ID, exitCode: 0 }] : []
+      }),
+      terminateProcess,
+      forgetExecOwner
+    },
+    setOwner: (value) => { owner = value; },
+    setAgent: (value) => { agent = value; },
+    setSessionConversation: (value) => { sessionConversation = value; },
+    setToolCalls: (value) => { toolCalls = value; },
+    setAlive: (value) => { alive = value; },
+    setCompleted: (value) => { completed = value; },
+    terminateProcess,
+    forgetExecOwner
+  };
 }
 
 describe('sleeping worker runtime GC', () => {
-  it('selects only old revivable sleeping workers with exact durable identity', () => {
-    const eligible = worker();
-    const recent = worker({ id: 'worker-2', conversationId: 'c-recent', sleptAt: NOW - 1 });
-    const active = worker({ id: 'worker-3', conversationId: 'c-active', state: 'active' });
-    const terminal = worker({ id: 'worker-4', conversationId: 'c-terminal', state: 'finished', revivable: false });
-    const future = worker({ id: 'worker-5', conversationId: 'c-future', sleptAt: NOW + 1 });
-    const missingRun = worker({ id: 'worker-6', conversationId: 'c-missing-run', runId: undefined });
+  it('terminates only the exact old sleeping worker runtime and leaves broker identity untouched', async () => {
+    const fake = fixture();
+    const before = workerInfo();
+    fake.setAgent(before);
 
-    expect(agentRuntimeGcCandidates(snapshotFor([eligible, recent, active, terminal, future, missingRun]), NOW)).toEqual([
-      {
-        runId: 'run-a',
-        primeConversationId: 'c-prime-a',
-        agentId: 'worker-1',
-        conversationId: 'c-worker-1',
-        sleptAt: OLD_SLEEP
-      }
-    ]);
-  });
+    const summary = await sweepAgentRuntimeGc(NOW, fake.deps);
 
-  it('terminates an exact owned idle process without changing durable worker identity', async () => {
-    const info = worker();
-    const h = harness([info], [{ conversationId: info.conversationId as string, processId: 41 }]);
-
-    const result = await sweepAgentRuntimeGc(NOW, AGENT_RUNTIME_RETENTION_MS, h.deps);
-
-    expect(result.terminated).toEqual([41]);
-    expect(h.terminated).toEqual([41]);
-    expect(h.forgotten).toEqual([41]);
-    expect(h.infos.get('c-worker-1')).toMatchObject({
-      state: 'sleeping',
-      conversationId: 'c-worker-1',
+    expect(fake.terminateProcess).toHaveBeenCalledWith(PROCESS_ID);
+    expect(fake.forgetExecOwner).toHaveBeenCalledWith(PROCESS_ID);
+    expect(summary).toMatchObject({ checked: 1, eligible: 1, terminated: 1 });
+    expect(before).toMatchObject({
       runId: 'run-a',
-      id: 'worker-1'
+      id: 'worker-1',
+      state: 'sleeping',
+      conversationId: CONVERSATION_ID,
+      sleptAt: OLD
     });
   });
 
-  it('aborts when the candidate begins waking while session identity is being resolved', async () => {
-    const info = worker();
-    const h = harness([info], [{ conversationId: 'c-worker-1', processId: 42 }]);
-    const originalFind = h.deps.findSession;
-    h.deps.findSession = async (conversationId) => {
-      const current = h.infos.get(conversationId);
-      if (current) current.state = 'waking';
-      return originalFind(conversationId);
-    };
+  it('fails closed when the process has no proven durable-session owner', async () => {
+    const fake = fixture();
+    fake.setOwner(null);
 
-    const result = await sweepAgentRuntimeGc(NOW, AGENT_RUNTIME_RETENTION_MS, h.deps);
+    const summary = await sweepAgentRuntimeGc(NOW, fake.deps);
 
-    expect(result.terminated).toEqual([]);
-    expect(result.skipped).toEqual([
-      expect.objectContaining({ processId: 42, reason: 'worker_changed' })
-    ]);
-    expect(h.running.get('session:c-worker-1')?.has(42)).toBe(true);
+    expect(fake.terminateProcess).not.toHaveBeenCalled();
+    expect(summary.unowned).toBe(1);
   });
 
-  it('does not reclaim a worker while an exact MCP tool call is still running', async () => {
-    const info = worker();
-    const h = harness([info], [{ conversationId: 'c-worker-1', processId: 43 }]);
-    h.toolCalls.set('c-worker-1', 1);
+  it.each<AgentState>(['active', 'detached', 'waking', 'invited', 'failed', 'finished'])(
+    'does not collect a %s worker',
+    async (state) => {
+      const fake = fixture();
+      fake.setAgent(workerInfo(state));
+      const summary = await sweepAgentRuntimeGc(NOW, fake.deps);
+      expect(fake.terminateProcess).not.toHaveBeenCalled();
+      expect(summary.ineligible).toBe(1);
+    }
+  );
 
-    const result = await sweepAgentRuntimeGc(NOW, AGENT_RUNTIME_RETENTION_MS, h.deps);
-
-    expect(result.terminated).toEqual([]);
-    expect(result.skipped).toEqual([
-      expect.objectContaining({ processId: null, reason: 'tool_work_running' })
-    ]);
+  it('requires a revivable worker with an old sleep boundary and exact owner metadata', async () => {
+    for (const agent of [
+      workerInfo('sleeping', { revivable: false }),
+      workerInfo('sleeping', { sleptAt: null }),
+      workerInfo('sleeping', { sleptAt: NOW - AGENT_RUNTIME_RETENTION_MS + 1 }),
+      workerInfo('sleeping', { runId: undefined }),
+      workerInfo('sleeping', { primeConversationId: undefined }),
+      workerInfo('sleeping', { conversationId: 'other-chat' }),
+      workerInfo('sleeping', { role: 'prime', id: 'prime' })
+    ]) {
+      const fake = fixture();
+      fake.setAgent(agent);
+      const summary = await sweepAgentRuntimeGc(NOW, fake.deps);
+      expect(fake.terminateProcess).not.toHaveBeenCalled();
+      expect(summary.ineligible).toBe(1);
+    }
   });
 
-  it('preserves a process that completed after candidate scan so unread output is not discarded', async () => {
-    const info = worker();
-    const h = harness([info], [{ conversationId: 'c-worker-1', processId: 44 }]);
-    const baseState = h.deps.backgroundState;
+  it('preserves a sleeping worker runtime while exact MCP tool work is still running', async () => {
+    const fake = fixture();
+    fake.setToolCalls(1);
+
+    const summary = await sweepAgentRuntimeGc(NOW, fake.deps);
+
+    expect(fake.terminateProcess).not.toHaveBeenCalled();
+    expect(summary.busy).toBe(1);
+  });
+
+  it('rechecks durable session attachment after the async lookup boundary', async () => {
+    const fake = fixture();
     let reads = 0;
-    h.deps.backgroundState = (sessionId) => {
+    fake.deps.getSession = async () => {
       reads += 1;
-      if (reads === 1) return baseState(sessionId);
-      h.running.get(sessionId)?.delete(44);
-      h.exited.set(sessionId, [{ processId: 44, exitCode: 0 }]);
-      return baseState(sessionId);
+      return { id: SESSION_ID, conversationId: reads === 1 ? CONVERSATION_ID : 'replacement-chat' };
     };
 
-    const result = await sweepAgentRuntimeGc(NOW, AGENT_RUNTIME_RETENTION_MS, h.deps);
+    const summary = await sweepAgentRuntimeGc(NOW, fake.deps);
 
-    expect(result.terminated).toEqual([]);
-    expect(result.skipped).toEqual([
-      expect.objectContaining({ processId: 44, reason: 'process_completed' })
-    ]);
-    expect(h.forgotten).toEqual([]);
+    expect(fake.terminateProcess).not.toHaveBeenCalled();
+    expect(summary.changed).toBe(1);
   });
 
-  it('fails closed when exact process ownership changes before termination', async () => {
-    const info = worker();
-    const h = harness([info], [{ conversationId: 'c-worker-1', processId: 45 }]);
-    h.deps.execOwner = () => 'session:someone-else';
-
-    const result = await sweepAgentRuntimeGc(NOW, AGENT_RUNTIME_RETENTION_MS, h.deps);
-
-    expect(result.terminated).toEqual([]);
-    expect(result.skipped).toEqual([
-      expect.objectContaining({ processId: 45, reason: 'process_owner_changed' })
-    ]);
-  });
-
-  it('keeps identical local worker ids isolated by run, prime and conversation identity', async () => {
-    const a = worker({ runId: 'run-a', primeConversationId: 'prime-a', conversationId: 'worker-a' });
-    const b = worker({ runId: 'run-b', primeConversationId: 'prime-b', conversationId: 'worker-b' });
-    const h = harness([
-      a,
-      b
-    ], [
-      { conversationId: 'worker-a', processId: 51 },
-      { conversationId: 'worker-b', processId: 52 }
-    ]);
-    const owner = h.deps.execOwner;
-    h.deps.execOwner = (processId) => processId === 52 ? 'session:wrong-owner' : owner(processId);
-
-    const result = await sweepAgentRuntimeGc(NOW, AGENT_RUNTIME_RETENTION_MS, h.deps);
-
-    expect(result.terminated).toEqual([51]);
-    expect(result.skipped).toContainEqual(expect.objectContaining({ processId: 52, reason: 'process_owner_changed' }));
-    expect(h.running.get('session:worker-b')?.has(52)).toBe(true);
-  });
-
-  it('rechecks before each process so a wake after the first reclaim preserves the rest', async () => {
-    const info = worker();
-    const h = harness([info], [
-      { conversationId: 'c-worker-1', processId: 61 },
-      { conversationId: 'c-worker-1', processId: 62 }
-    ]);
-    const terminate = h.deps.terminateProcess;
-    h.deps.terminateProcess = async (processId) => {
-      const result = await terminate(processId);
-      if (processId === 61) {
-        const current = h.infos.get('c-worker-1');
-        if (current) current.state = 'waking';
-      }
-      return result;
+  it('rechecks worker lifecycle so a wake racing the sweep wins', async () => {
+    const fake = fixture();
+    let reads = 0;
+    fake.deps.agentInfo = () => {
+      reads += 1;
+      return workerInfo(reads === 1 ? 'sleeping' : 'waking');
     };
 
-    const result = await sweepAgentRuntimeGc(NOW, AGENT_RUNTIME_RETENTION_MS, h.deps);
+    const summary = await sweepAgentRuntimeGc(NOW, fake.deps);
 
-    expect(result.terminated).toEqual([61]);
-    expect(result.skipped).toContainEqual(expect.objectContaining({ processId: 62, reason: 'worker_changed' }));
-    expect(h.running.get('session:c-worker-1')?.has(62)).toBe(true);
+    expect(fake.terminateProcess).not.toHaveBeenCalled();
+    expect(summary.changed).toBe(1);
   });
 
-  it('requires the durable session to still be attached to the exact worker conversation', async () => {
-    const info = worker();
-    const h = harness([info], [{ conversationId: 'c-worker-1', processId: 71 }]);
-    h.sessions.set('c-worker-1', { id: 'session:c-worker-1', conversationId: 'replacement-chat' });
+  it('preserves completed unread output rather than treating it as garbage', async () => {
+    const fake = fixture();
+    fake.setCompleted(true);
 
-    const result = await sweepAgentRuntimeGc(NOW, AGENT_RUNTIME_RETENTION_MS, h.deps);
+    const summary = await sweepAgentRuntimeGc(NOW, fake.deps);
 
-    expect(result.terminated).toEqual([]);
-    expect(result.skipped).toEqual([
-      expect.objectContaining({ processId: null, reason: 'session_identity_unproven' })
-    ]);
+    expect(fake.terminateProcess).not.toHaveBeenCalled();
+    expect(fake.forgetExecOwner).not.toHaveBeenCalled();
+    expect(summary.completed).toBe(1);
   });
 
-  it('does nothing after restart when sleeping history exists but no runtime ownership was reconstructed', async () => {
-    const info = worker();
-    const h = harness([info]);
+  it('rechecks exact process ownership immediately before termination', async () => {
+    const fake = fixture();
+    let reads = 0;
+    fake.deps.execOwner = () => {
+      reads += 1;
+      return reads === 1 ? SESSION_ID : 'session-other';
+    };
 
-    const result = await sweepAgentRuntimeGc(NOW, AGENT_RUNTIME_RETENTION_MS, h.deps);
+    const summary = await sweepAgentRuntimeGc(NOW, fake.deps);
 
-    expect(result).toMatchObject({ candidates: 1, terminated: [], skipped: [] });
-    expect(h.forgotten).toEqual([]);
+    expect(fake.terminateProcess).not.toHaveBeenCalled();
+    expect(summary.changed).toBe(1);
+  });
+
+  it('does not erase attribution for a replacement numeric process id after termination settles', async () => {
+    const fake = fixture();
+    let owner = SESSION_ID;
+    fake.deps.execOwner = () => owner;
+    fake.deps.terminateProcess = vi.fn(async () => {
+      fake.setAlive(false);
+      owner = 'session-reused';
+      return true;
+    });
+
+    const summary = await sweepAgentRuntimeGc(NOW, fake.deps);
+
+    expect(summary.terminated).toBe(1);
+    expect(fake.forgetExecOwner).not.toHaveBeenCalled();
+  });
+
+  it('rechecks each live process independently, so waking after one reclaim preserves the next', async () => {
+    const first = runtime(201);
+    const second = runtime(202);
+    let state: AgentState = 'sleeping';
+    const owners = new Map<number, string>([[201, SESSION_ID], [202, SESSION_ID]]);
+    const alive = new Set([201, 202]);
+    const terminated: number[] = [];
+    const deps: AgentRuntimeGcDependencies = {
+      listProcesses: () => [first, second],
+      execOwner: (processId) => owners.get(processId) ?? null,
+      getSession: async () => ({ id: SESSION_ID, conversationId: CONVERSATION_ID }),
+      agentInfo: () => workerInfo(state),
+      runningToolCalls: () => 0,
+      backgroundState: () => ({ running: [...alive], exitedUnread: [] }),
+      terminateProcess: async (processId) => {
+        alive.delete(processId);
+        terminated.push(processId);
+        if (processId === 201) state = 'waking';
+        return true;
+      },
+      forgetExecOwner: (processId) => { owners.delete(processId); }
+    };
+
+    const summary = await sweepAgentRuntimeGc(NOW, deps);
+
+    expect(terminated).toEqual([201]);
+    expect(alive.has(202)).toBe(true);
+    expect(summary).toMatchObject({ terminated: 1, ineligible: 1 });
+  });
+
+  it('does nothing after restart when durable worker history exists but no runtime process was reconstructed', async () => {
+    const fake = fixture();
+    fake.deps.listProcesses = () => [];
+
+    const summary = await sweepAgentRuntimeGc(NOW, fake.deps);
+
+    expect(summary.checked).toBe(0);
+    expect(fake.terminateProcess).not.toHaveBeenCalled();
   });
 });
