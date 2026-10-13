@@ -115,6 +115,8 @@ export interface TunnelSettings {
   steromiTunnelId: string;
   /** Optional explicit path to tunnel-client / cloudflared. */
   binaryPath: string;
+  /** Publish the same loopback MCP server over Cloudflare while OpenAI Secure Tunnel runs. */
+  parallelCloudflare?: boolean;
 }
 
 export interface UiPrefs {
@@ -278,6 +280,8 @@ export interface ConnectionStatus {
   lastToolCallAt: number | null;
   /** The tunnel's own view of itself, or null when no tunnel is running. */
   health: TunnelHealth | null;
+  /** Independent Cloudflare route (OpenAI remains the primary connection). */
+  parallelCloudflare?: { state: ConnectionState; detail: string; publicUrl: string | null } | null;
   /**
    * One entry per model-facing connector, in setup order.
    *
