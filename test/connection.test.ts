@@ -20,7 +20,7 @@ const mocks = vi.hoisted(() => {
     roots: [{ name: 'workspace', path: 'C:\\workspace' }],
     readOnly: true,
     capabilities: caps,
-    tunnel: { kind: 'cloudflared', tunnelId: '', desktopTunnelId: '', steromiTunnelId: '', binaryPath: '' },
+    tunnel: { kind: 'cloudflared', tunnelId: '', desktopTunnelId: '', steromiTunnelId: '', binaryPath: '', parallelCloudflare: false },
     ui: { privacyScreenshots: false },
     sessions: { record: false },
     multiAgent: { enabled: false }
@@ -29,6 +29,7 @@ const mocks = vi.hoisted(() => {
     caps,
     config,
     report: null as null | ((report: Record<string, unknown>) => void),
+    transportReports: [] as Array<{ kind: string; report: (report: Record<string, unknown>) => void }>,
     starts: 0,
     prewarm: vi.fn(async () => undefined),
     endpointStop: vi.fn(async (_options?: { forceAfterMs?: number }) => undefined),
@@ -49,7 +50,7 @@ vi.mock('../src/main/config.js', () => ({
   effectiveCapabilities: () => mocks.caps
 }));
 
-vi.mock('../src/main/logger.js', () => ({ logError: vi.fn(), logInfo: vi.fn() }));
+vi.mock('../src/main/logger.js', () => ({ logError: vi.fn(), logInfo: vi.fn(), logWarn: vi.fn() }));
 
 vi.mock('../src/main/mcp/server.js', () => ({
   lastRequestAt: () => null,
@@ -79,9 +80,10 @@ vi.mock('../src/main/secrets.js', () => ({
   })
 }));
 vi.mock('../src/main/tunnel/index.js', () => ({
-  startTunnel: vi.fn(async (options: { report: (report: Record<string, unknown>) => void }) => {
+  startTunnel: vi.fn(async (options: { settings: { kind: string }; report: (report: Record<string, unknown>) => void }) => {
     mocks.starts += 1;
     mocks.report = options.report;
+    mocks.transportReports.push({ kind: options.settings.kind, report: options.report });
     mocks.tunnelStartReached();
     if (mocks.tunnelStartGate) await mocks.tunnelStartGate;
     options.report({
@@ -96,6 +98,7 @@ vi.mock('../src/main/tunnel/index.js', () => ({
 describe('connection surface state', () => {
   beforeEach(() => {
     mocks.report = null;
+    mocks.transportReports = [];
     mocks.starts = 0;
     mocks.prewarm.mockClear();
     mocks.endpointStop.mockClear();
@@ -128,6 +131,7 @@ describe('connection surface state', () => {
     mocks.config.tunnel.desktopTunnelId = '';
     mocks.config.tunnel.steromiTunnelId = '';
     mocks.config.tunnel.binaryPath = '';
+    mocks.config.tunnel.parallelCloudflare = false;
     vi.resetModules();
   });
 
@@ -171,6 +175,70 @@ describe('connection surface state', () => {
 
     expect(mocks.starts).toBe(2);
     expect(connection.getStatus().surfaces.find((surface) => surface.id === 'steromi')?.state).toBe('live');
+  });
+
+
+  it('keeps OpenAI, Cloudflare and the local MCP endpoint available together', async () => {
+    mocks.config.tunnel.kind = 'openai';
+    mocks.config.tunnel.parallelCloudflare = true;
+    const connection = await import('../src/main/connection.js');
+
+    await connection.connect();
+
+    expect(mocks.starts).toBe(2);
+    expect(mocks.transportReports.map((item) => item.kind)).toEqual(['openai', 'cloudflared']);
+    expect(mocks.endpointStartReached).toHaveBeenCalledTimes(1);
+    expect(connection.getStatus()).toMatchObject({
+      state: 'connected',
+      localUrl: 'http://127.0.0.1:45678/mcp/core/core-token',
+      publicUrl: 'https://example.trycloudflare.com/mcp/core/core-token',
+      parallelCloudflare: {
+        state: 'connected',
+        publicUrl: 'https://example.trycloudflare.com/mcp/core/core-token'
+      }
+    });
+    expect(connection.getStatus().surfaces.find((surface) => surface.id === 'steromi')?.publicUrl)
+      .toBe('https://example.trycloudflare.com/mcp/steromi/steromi-token');
+
+    await connection.disconnect();
+    expect(mocks.tunnelStop).toHaveBeenCalledTimes(2);
+    expect(connection.getStatus()).toMatchObject({
+      state: 'disconnected', publicUrl: null, localUrl: null, parallelCloudflare: null
+    });
+  });
+
+  it('does not disconnect OpenAI when the parallel Cloudflare route fails', async () => {
+    mocks.config.tunnel.kind = 'openai';
+    mocks.config.tunnel.parallelCloudflare = true;
+    const connection = await import('../src/main/connection.js');
+
+    await connection.connect();
+    mocks.transportReports.find((item) => item.kind === 'cloudflared')?.report({
+      state: 'tunnel-unavailable',
+      detail: 'Cloudflare stopped unexpectedly'
+    });
+
+    expect(connection.getStatus().state).toBe('connected');
+    expect(connection.getStatus().parallelCloudflare).toMatchObject({
+      state: 'tunnel-unavailable', publicUrl: null
+    });
+    expect(connection.getStatus().surfaces.find((surface) => surface.id === 'core')?.publicUrl).toBeNull();
+    expect(connection.getStatus().localUrl).not.toBeNull();
+  });
+
+  it('restarts the core transport group when parallel Cloudflare is disabled', async () => {
+    mocks.config.tunnel.kind = 'openai';
+    mocks.config.tunnel.parallelCloudflare = true;
+    const connection = await import('../src/main/connection.js');
+
+    await connection.connect();
+    mocks.config.tunnel.parallelCloudflare = false;
+    await connection.applySettings();
+
+    expect(mocks.starts).toBe(3);
+    expect(mocks.tunnelStop).toHaveBeenCalledTimes(2);
+    expect(connection.getStatus().parallelCloudflare).toBeNull();
+    expect(connection.getStatus().state).toBe('connected');
   });
 
   it('keeps ordinary disconnect graceful and reserves forced MCP drain for final shutdown', async () => {

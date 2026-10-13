@@ -59,7 +59,8 @@ const settingsPatch = z.object({
     tunnelId: z.string().max(128).refine((value) => value === '' || TUNNEL_ID_PATTERN.test(value)),
     desktopTunnelId: z.string().max(128).refine((value) => value === '' || TUNNEL_ID_PATTERN.test(value)),
     steromiTunnelId: z.string().max(128).refine((value) => value === '' || TUNNEL_ID_PATTERN.test(value)),
-    binaryPath: z.string().max(4096)
+    binaryPath: z.string().max(4096),
+    parallelCloudflare: z.boolean().optional().default(false)
   }),
   ui: z.object({
     minimizeToTray: z.boolean(),
@@ -105,7 +106,8 @@ function mergeSettings(current: Config, base: SettingsSnapshot, wanted: Settings
       tunnelId: pick(current.tunnel.tunnelId, base.tunnel.tunnelId, wanted.tunnel.tunnelId),
       desktopTunnelId: pick(current.tunnel.desktopTunnelId, base.tunnel.desktopTunnelId, wanted.tunnel.desktopTunnelId),
       steromiTunnelId: pick(current.tunnel.steromiTunnelId, base.tunnel.steromiTunnelId, wanted.tunnel.steromiTunnelId),
-      binaryPath: pick(current.tunnel.binaryPath, base.tunnel.binaryPath, wanted.tunnel.binaryPath)
+      binaryPath: pick(current.tunnel.binaryPath, base.tunnel.binaryPath, wanted.tunnel.binaryPath),
+      parallelCloudflare: pick(current.tunnel.parallelCloudflare ?? false, base.tunnel.parallelCloudflare, wanted.tunnel.parallelCloudflare)
     },
     ui: {
       minimizeToTray: pick(current.ui.minimizeToTray, base.ui.minimizeToTray, wanted.ui.minimizeToTray),
