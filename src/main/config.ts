@@ -219,7 +219,9 @@ const configSchema = z.object({
     desktopTunnelId: z.string().max(128).optional().default(''),
     // Optional third connector. Empty is normal until the user creates Steromi in ChatGPT.
     steromiTunnelId: z.string().max(128).optional().default(''),
-    binaryPath: z.string().max(4096)
+    binaryPath: z.string().max(4096),
+    // Older configs stay single-transport until the user explicitly opts in.
+    parallelCloudflare: z.boolean().optional().default(false)
   }),
   ui: z.object({
     minimizeToTray: z.boolean(),
@@ -325,7 +327,7 @@ export function defaultConfig(_platform: NodeJS.Platform = process.platform): Co
     readOnly: true,
     allComputer: false,
     previousRoots: [],
-    tunnel: { kind: 'openai', tunnelId: '', desktopTunnelId: '', steromiTunnelId: '', binaryPath: '' },
+    tunnel: { kind: 'openai', tunnelId: '', desktopTunnelId: '', steromiTunnelId: '', binaryPath: '', parallelCloudflare: false },
     ui: { minimizeToTray: true, autoConnect: false, privacyScreenshots: false, theme: 'dark' },
     sessions: { ...DEFAULT_SESSIONS },
     compaction: { ...DEFAULT_COMPACTION },
