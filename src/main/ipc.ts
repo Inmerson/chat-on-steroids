@@ -114,7 +114,8 @@ const settingsPatch = z.object({
       .string()
       .max(128)
       .refine((v) => v === '' || TUNNEL_ID_PATTERN.test(v), 'Expected tunnel_ followed by 32 hex characters'),
-    binaryPath: z.string().max(4096)
+    binaryPath: z.string().max(4096),
+    parallelCloudflare: z.boolean().optional().default(false)
   }),
   ui: z.object({
     minimizeToTray: z.boolean(),
@@ -196,7 +197,8 @@ function mergeSettings(current: Config, base: SettingsSnapshot, wanted: Settings
         base.tunnel.steromiTunnelId,
         wanted.tunnel.steromiTunnelId
       ),
-      binaryPath: pick(current.tunnel.binaryPath, base.tunnel.binaryPath, wanted.tunnel.binaryPath)
+      binaryPath: pick(current.tunnel.binaryPath, base.tunnel.binaryPath, wanted.tunnel.binaryPath),
+      parallelCloudflare: pick(current.tunnel.parallelCloudflare ?? false, base.tunnel.parallelCloudflare, wanted.tunnel.parallelCloudflare)
     },
     ui: {
       minimizeToTray: pick(current.ui.minimizeToTray, base.ui.minimizeToTray, wanted.ui.minimizeToTray),
