@@ -243,11 +243,11 @@ async function connectImpl(): Promise<void> {
       return;
     }
     tunnel = startedTunnel;
+    await startDesktopTunnel(generation, config.tunnel, apiKey);
+    await startSteromiTunnel(generation, config.tunnel, apiKey);
     if (config.tunnel.kind === 'openai' && config.tunnel.parallelCloudflare) {
       await startParallelCloudflare(generation, config.tunnel);
     }
-    await startDesktopTunnel(generation, config.tunnel, apiKey);
-    await startSteromiTunnel(generation, config.tunnel, apiKey);
   } catch (err) {
     if (shutdownRequested || generation !== connectionGeneration) {
       await disconnectImpl(30_000);
@@ -281,8 +281,15 @@ async function startParallelCloudflare(generation: number, settings: TunnelSetti
     // secret path. Never alter the OpenAI tunnel's state or overwrite its health.
     for (const surface of status.surfaces) {
       if (!surface.available) continue;
+      const cloudflareOnly = (surface.id === 'desktop' && !settings.desktopTunnelId)
+        || (surface.id === 'steromi' && !settings.steromiTunnelId);
       updateSurface(surface.id, {
-        publicUrl: siblingPublicUrl(publicUrl, surface.localUrl)
+        publicUrl: siblingPublicUrl(publicUrl, surface.localUrl),
+        ...(cloudflareOnly ? {
+          state: report.state === 'connected' ? 'live' as const
+            : report.state === 'connecting-tunnel' ? 'starting' as const : 'off' as const,
+          detail: report.detail
+        } : {})
       });
     }
   };
