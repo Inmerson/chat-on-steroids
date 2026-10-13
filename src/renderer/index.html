@@ -434,6 +434,11 @@
                 <p class="hint" id="methodHint"></p>
               </div>
 
+              <div class="field" id="parallelCloudflareSetting" hidden>
+                <label class="inline"><input type="checkbox" id="parallelCloudflare" /> Run Cloudflare alongside the OpenAI Secure Tunnel</label>
+                <p class="hint">Both routes share the same permission-controlled local MCP server. ChatGPT can use the OpenAI tunnel while compatible Gemini/API MCP clients use the Cloudflare HTTPS URL. Local clients continue to use localhost. The Cloudflare URL is a bearer secret; never share it.</p>
+              </div>
+
               <div class="field">
                 <label for="binaryPath">Tunnel program</label>
                 <div class="row-inline">
