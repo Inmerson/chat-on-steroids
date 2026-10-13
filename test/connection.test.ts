@@ -50,7 +50,7 @@ vi.mock('../src/main/config.js', () => ({
   effectiveCapabilities: () => mocks.caps
 }));
 
-vi.mock('../src/main/logger.js', () => ({ logError: vi.fn(), logInfo: vi.fn() }));
+vi.mock('../src/main/logger.js', () => ({ logError: vi.fn(), logInfo: vi.fn(), logWarn: vi.fn() }));
 
 vi.mock('../src/main/mcp/server.js', () => ({
   lastRequestAt: () => null,
