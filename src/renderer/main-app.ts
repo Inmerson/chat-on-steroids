@@ -1044,6 +1044,19 @@ function connectorCards(next: AppState): HTMLElement[] {
     card.append(copyRow('Name', surface.connectorName, 'Name'));
     card.append(copyRow('Description', surface.description, 'Description'));
 
+    if (config.tunnel.kind === 'openai' && config.tunnel.parallelCloudflare) {
+      const hasOpenAiId = surface.id === 'core'
+        ? Boolean(config.tunnel.tunnelId)
+        : surface.id === 'desktop'
+          ? Boolean(config.tunnel.desktopTunnelId)
+          : Boolean(config.tunnel.steromiTunnelId);
+      card.append(el('p', 'hint',
+        hasOpenAiId
+          ? 'ChatGPT: select this connector’s OpenAI Secure Tunnel. Cloudflare is a separate HTTPS route.'
+          : 'No OpenAI tunnel ID is configured for this optional connector; its Cloudflare URL can still be used.'
+      ));
+    }
+
     // On the OpenAI method the connector is picked from a list of tunnels instead of
     // pasted as a URL, so showing a loopback address there would only mislead.
     const url =
