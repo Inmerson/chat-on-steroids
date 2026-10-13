@@ -373,7 +373,8 @@ function save(over: { readOnly?: boolean; theme?: 'light' | 'dark' } = {}): Prom
       tunnelId: $<HTMLInputElement>('tunnelId').value.trim(),
       desktopTunnelId: $<HTMLInputElement>('desktopTunnelId').value.trim(),
       steromiTunnelId: $<HTMLInputElement>('steromiTunnelId').value.trim(),
-      binaryPath: $<HTMLInputElement>('binaryPath').value.trim()
+      binaryPath: $<HTMLInputElement>('binaryPath').value.trim(),
+      parallelCloudflare: $<HTMLInputElement>('parallelCloudflare').checked
     },
     ui: {
       autoConnect: $<HTMLInputElement>('autoConnect').checked,
@@ -444,7 +445,7 @@ const STATUS_TEXT: Record<AppState['status']['state'], string> = {
 
 const METHOD_HINT: Record<string, string> = {
   openai:
-    'ChatGPT reaches this computer through an OpenAI tunnel. Nothing is exposed to the open internet.',
+    'ChatGPT uses the private OpenAI tunnel. Optionally run a separate Cloudflare HTTPS URL for other MCP-compatible clients.',
   cloudflared:
     'Creates a temporary public https address with Cloudflare. The address changes on every restart.',
   manual: 'This app only listens on localhost. You are responsible for exposing it.'
@@ -838,6 +839,8 @@ function apply(next: AppState): void {
     previousState?.config.tunnel.steromiTunnelId
   );
   applyValue($<HTMLInputElement>('binaryPath'), config.tunnel.binaryPath, previousState?.config.tunnel.binaryPath);
+  applyChecked($<HTMLInputElement>('parallelCloudflare'), config.tunnel.parallelCloudflare ?? false, previousState?.config.tunnel.parallelCloudflare ?? false);
+  $('parallelCloudflareSetting').hidden = config.tunnel.kind !== 'openai';
   applyChecked($<HTMLInputElement>('autoConnect'), config.ui.autoConnect, previousState?.config.ui.autoConnect);
   applyChecked(
     $<HTMLInputElement>('minimizeToTray'),
@@ -1061,6 +1064,21 @@ function connectorCards(next: AppState): HTMLElement[] {
             : 'Choose Tunnel, then pick this connector’s tunnel.'
         )
       );
+    }
+
+    // Loopback is always available independently of both cloud tunnels.
+    if (surface.localUrl) {
+      card.append(copyRow('Local MCP URL (this computer only)', surface.localUrl, 'Local URL'));
+    }
+    if (config.tunnel.kind === 'openai' && config.tunnel.parallelCloudflare) {
+      const parallel = status.parallelCloudflare;
+      card.append(el(
+        'p',
+        parallel?.state === 'tunnel-unavailable' ? 'hint is-warn' : 'hint',
+        parallel?.state === 'connected'
+          ? 'Cloudflare route active. The OpenAI Secure Tunnel remains independent.'
+          : parallel?.detail ?? 'Starting the parallel Cloudflare route…'
+      ));
     }
 
     if (surface.detail && surface.state === 'error') card.append(el('p', 'hint is-warn', surface.detail));
@@ -1509,6 +1527,7 @@ for (const id of [
   'minimizeToTray',
   'privacyScreenshots',
   'tunnelKind',
+  'parallelCloudflare',
   'tunnelId',
   'desktopTunnelId',
   'steromiTunnelId'
