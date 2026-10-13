@@ -12,16 +12,18 @@ import { lastRequestAt, startMcpServer, tunnelProbeHeaders, type McpEndpoint } f
 import { lastToolCallAt } from './mcp/tools.js';
 import { SURFACE_LIST, surfaceIsUseful, type SurfaceId } from './mcp/surfaces.js';
 import { getSecret } from './secrets.js';
-import { startTunnel, TunnelError, type TunnelHandle } from './tunnel/index.js';
+import { startTunnel, TunnelError, type TunnelHandle, type TunnelReport } from './tunnel/index.js';
 import { desktopAutomationSupported } from './platform.js';
 
 let endpoint: McpEndpoint | null = null;
 let tunnel: TunnelHandle | null = null;
+let parallelCloudflareTunnel: TunnelHandle | null = null;
 let desktopTunnel: TunnelHandle | null = null;
 let desktopTunnelId: string | null = null;
 let steromiTunnel: TunnelHandle | null = null;
 let steromiTunnelId: string | null = null;
-let activeCoreTransport: Pick<TunnelSettings, 'kind' | 'tunnelId' | 'binaryPath'> | null = null;
+type CoreTransport = Pick<TunnelSettings, 'kind' | 'tunnelId' | 'binaryPath'> & { parallelCloudflare: boolean };
+let activeCoreTransport: CoreTransport | null = null;
 let status: ConnectionStatus = {
   state: 'disconnected',
   detail: '',
@@ -31,6 +33,7 @@ let status: ConnectionStatus = {
   lastRequestAt: null,
   lastToolCallAt: null,
   health: null,
+  parallelCloudflare: null,
   surfaces: []
 };
 
@@ -126,19 +129,20 @@ function surfaceStateForConnection(state: ConnectionStatus['state']): SurfaceSta
   return 'error';
 }
 
-function coreTransport(settings: TunnelSettings): Pick<TunnelSettings, 'kind' | 'tunnelId' | 'binaryPath'> {
+function coreTransport(settings: TunnelSettings): CoreTransport {
   return {
     kind: settings.kind,
     tunnelId: settings.kind === 'openai' ? settings.tunnelId : '',
-    binaryPath: settings.kind === 'manual' ? '' : settings.binaryPath
+    binaryPath: settings.kind === 'manual' ? '' : settings.binaryPath,
+    parallelCloudflare: settings.kind === 'openai' && settings.parallelCloudflare === true
   };
 }
 
 function sameCoreTransport(
-  left: Pick<TunnelSettings, 'kind' | 'tunnelId' | 'binaryPath'>,
-  right: Pick<TunnelSettings, 'kind' | 'tunnelId' | 'binaryPath'>
+  left: CoreTransport,
+  right: CoreTransport
 ): boolean {
-  return left.kind === right.kind && left.tunnelId === right.tunnelId && left.binaryPath === right.binaryPath;
+  return left.kind === right.kind && left.tunnelId === right.tunnelId && left.binaryPath === right.binaryPath && left.parallelCloudflare === right.parallelCloudflare;
 }
 
 function siblingPublicUrl(publicUrl: string | null, localUrl: string | null): string | null {
@@ -239,6 +243,9 @@ async function connectImpl(): Promise<void> {
       return;
     }
     tunnel = startedTunnel;
+    if (config.tunnel.kind === 'openai' && config.tunnel.parallelCloudflare) {
+      await startParallelCloudflare(generation, config.tunnel);
+    }
     await startDesktopTunnel(generation, config.tunnel, apiKey);
     await startSteromiTunnel(generation, config.tunnel, apiKey);
   } catch (err) {
@@ -250,6 +257,55 @@ async function connectImpl(): Promise<void> {
     logError(`connect failed: ${message}`);
     await disconnectImpl();
     setStatus({ state: err instanceof TunnelError ? 'tunnel-unavailable' : 'disconnected', detail: message });
+  }
+}
+
+/**
+ * A second public route to the SAME loopback server. The Cloudflare route has its own
+ * lifecycle and must never bring down a healthy OpenAI Secure Tunnel when it fails.
+ * The loopback endpoint always remains reachable by local MCP clients as well.
+ */
+async function startParallelCloudflare(generation: number, settings: TunnelSettings): Promise<void> {
+  if (!endpoint) return;
+  const reportCloudflare = (report: TunnelReport): void => {
+    if (shutdownRequested || generation !== connectionGeneration) return;
+    const previous = status.parallelCloudflare;
+    const publicUrl = report.state === 'tunnel-unavailable'
+      ? null
+      : report.publicUrl === undefined ? (previous?.publicUrl ?? null) : report.publicUrl;
+    setStatus({
+      parallelCloudflare: { state: report.state, detail: report.detail, publicUrl },
+      publicUrl
+    });
+    // A Cloudflare hostname exposes each surface through its existing independent
+    // secret path. Never alter the OpenAI tunnel's state or overwrite its health.
+    for (const surface of status.surfaces) {
+      if (!surface.available) continue;
+      updateSurface(surface.id, {
+        publicUrl: siblingPublicUrl(publicUrl, surface.localUrl)
+      });
+    }
+  };
+  try {
+    setStatus({
+      parallelCloudflare: { state: 'connecting-tunnel', detail: 'Starting Cloudflare…', publicUrl: null }
+    });
+    const started = await startTunnel({
+      localUrl: endpoint.url,
+      settings: { ...settings, kind: 'cloudflared' },
+      apiKey: null,
+      label: 'parallel-cloudflare',
+      report: reportCloudflare
+    });
+    if (shutdownRequested || generation !== connectionGeneration) {
+      await started.stop().catch(() => {});
+      return;
+    }
+    parallelCloudflareTunnel = started;
+  } catch (err) {
+    const detail = err instanceof Error ? err.message : String(err);
+    logWarn(`parallel Cloudflare connection failed: ${detail}`);
+    reportCloudflare({ state: 'tunnel-unavailable', detail, publicUrl: null });
   }
 }
 
@@ -433,6 +489,10 @@ async function disconnectImpl(endpointForceAfterMs?: number): Promise<void> {
     if (endpointForceAfterMs === undefined) await stopping.stop().catch(() => {});
     else await stopping.stop({ forceAfterMs: endpointForceAfterMs }).catch(() => {});
   }
+  if (parallelCloudflareTunnel) {
+    await parallelCloudflareTunnel.stop().catch(() => {});
+    parallelCloudflareTunnel = null;
+  }
   if (desktopTunnel) {
     await desktopTunnel.stop().catch(() => {});
     desktopTunnel = null;
@@ -456,6 +516,7 @@ async function disconnectImpl(endpointForceAfterMs?: number): Promise<void> {
     localUrl: null,
     handshakeAt: null,
     health: null,
+    parallelCloudflare: null,
     surfaces: describeSurfaces()
   });
 }
