@@ -94,6 +94,34 @@ The Setup tab tracks each hop and only marks it complete once that side of the c
 
 For OpenAI tunnels, Core and the optional **Windows-only** Desktop surface use separate tunnel IDs because ChatGPT addresses each custom app as one endpoint.
 
+### Parallel OpenAI + Cloudflare + local MCP routes
+
+**OpenAI Secure Tunnel and Cloudflare can run simultaneously.** Choose **OpenAI Secure MCP Tunnel**
+as the main connection method, then under **Advanced — method, program, startup** enable
+**Run Cloudflare alongside the OpenAI Secure Tunnel**. Press Connect (or reconnect).
+
+The app starts one permission-controlled loopback MCP server and attaches independent
+transport processes to the same endpoint:
+
+- **ChatGPT:** uses the OpenAI Secure MCP Tunnel ID(s), as before.
+- **Remote MCP clients, including compatible Gemini API/SDK clients:** use the Cloudflare
+  HTTPS MCP server URL copied from each connector card. This does **not** automatically
+  give the Gemini web chat at gemini.google.com custom MCP support; an independently
+  compatible Gemini integration is required.
+- **Local MCP clients:** use the Local MCP URL (this computer only). A loopback URL is
+  not reachable from a remote host or hosted model without another transport.
+
+If Cloudflare fails, its failure is reported separately without disconnecting OpenAI.
+Disabling the checkbox returns to the previous OpenAI-only setup. Existing profiles
+keep parallel Cloudflare off until explicitly enabled. The Cloudflare-only and manual
+connection methods remain available.
+
+**Security:** the OpenAI tunnel stays private to the configured workspace. The
+Cloudflare quick tunnel exposes a public HTTPS origin; the unpredictable full MCP path
+is a **bearer credential** granting access to any tools enabled locally. Do not disclose
+or log the full URL. It changes at restart. Both routes share the exact same local
+permission checks, but adding a remote route increases the ways those tools are reachable.
+
 ### Cloudflare quick tunnel
 
 Press **Connect**, copy the URL the app shows, and use it as the MCP server URL when creating the custom app in ChatGPT. The URL is public and its random path is the capability secret, so treat the complete URL like a password. It changes when the app restarts.

@@ -78,6 +78,7 @@ describe('settings migration', () => {
     expect(loaded.tunnel.tunnelId).toBe(oldConfig.tunnel.tunnelId);
     expect(loaded.tunnel.desktopTunnelId).toBe('');
     expect(loaded.tunnel.steromiTunnelId).toBe('');
+    expect(loaded.tunnel.parallelCloudflare).toBe(false);
   });
 
   it('folds a PowerShell-only permission into the single command permission', async () => {
@@ -144,13 +145,15 @@ describe('settings migration', () => {
         ...config.tunnel,
         tunnelId: 'tunnel_0123456789abcdef0123456789abcdef',
         desktopTunnelId: 'tunnel_fedcba9876543210fedcba9876543210',
-        steromiTunnelId: 'tunnel_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
+        steromiTunnelId: 'tunnel_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+        parallelCloudflare: true
       }
     });
     const loaded = await loadConfig();
     expect(loaded.tunnel.tunnelId).toBe('tunnel_0123456789abcdef0123456789abcdef');
     expect(loaded.tunnel.desktopTunnelId).toBe('tunnel_fedcba9876543210fedcba9876543210');
     expect(loaded.tunnel.steromiTunnelId).toBe('tunnel_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa');
+    expect(loaded.tunnel.parallelCloudflare).toBe(true);
   });
 
   /**
