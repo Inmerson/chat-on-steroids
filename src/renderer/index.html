@@ -454,6 +454,16 @@
 
         <!-- ============================================================ Chat -->
         <section class="panel" data-panel="chat">
+          <section class="workspace-bar" aria-label="Workspace context">
+            <div>
+              <span class="workspace-eyebrow">WORKSPACE</span>
+              <strong>Conversation history and agent execution, in one place.</strong>
+              <p><span id="workspacePulse" class="workspace-pulse-label">No active run</span><span id="workspacePulseDetail"> Session history is ready when you are.</span></p>
+            </div>
+            <button class="btn workspace-control-link" id="workspaceOpenControl" type="button">
+              <svg class="ico" viewBox="0 0 24 24"><use href="#i-control" /></svg>Open Control Center
+            </button>
+          </section>
           <!-- --------------------------------------------------- sessions -->
           <section class="card">
             <h2>
@@ -781,7 +791,7 @@
           <span class="badge" id="setupBadge" hidden></span>
         </button>
         <button data-tab="chat" type="button">
-          <svg class="ico" viewBox="0 0 24 24"><use href="#i-chat" /></svg>Chat
+          <svg class="ico" viewBox="0 0 24 24"><use href="#i-chat" /></svg>Workspace
         </button>
         <button data-tab="control" type="button">
           <svg class="ico" viewBox="0 0 24 24"><use href="#i-control" /></svg>Control

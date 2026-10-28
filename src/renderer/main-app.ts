@@ -29,6 +29,7 @@ import type { SwarmState } from '../shared/session.js';
 import { $, ago, el, icon, run, shortAgo, toast } from './dom.js';
 import { chatApply, chatSettingsPatch, chatVisible, initChat } from './chat.js';
 import { controlCenterVisible, initControlCenter } from './control-center.js';
+import { initWorkspaceShell, workspaceVisible } from './workspace-shell.js';
 
 declare global {
   interface Window {
@@ -119,6 +120,7 @@ function showTab(name: string): void {
   // Live panels only poll while they are on screen. Their modules own the cadence and
   // stale-result guards; the tab switcher owns visibility only.
   chatVisible(name === 'chat');
+  workspaceVisible(name === 'chat');
   controlCenterVisible(name === 'control');
   // A feed that was appended to while its panel was hidden could not be scrolled then —
   // a hidden element has no scroll height. Pin it now that it has one, so a panel always
@@ -1535,6 +1537,10 @@ async function refresh(): Promise<void> {
 buildGroups();
 initChat({ save: () => save(), state: () => state });
 initControlCenter(api);
+initWorkspaceShell(document, {
+  openControl: () => showTab('control'),
+  getStatus: () => run(api.getControlCenter())
+});
 
 void (async () => {
   await refresh();

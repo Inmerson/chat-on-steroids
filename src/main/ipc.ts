@@ -70,6 +70,7 @@ import { syncLoginStartup } from './background-startup.js';
 import { controlCenterStatus } from './orchestration/control-center.js';
 import { markInstallOnQuit, onUpdateChange, updateStatus } from './update.js';
 import { captureAgentRuntimeTargets, releaseCapturedAgentRuntimeTargets } from './runtime-gc.js';
+import { listWorkspaceDrafts, saveWorkspaceDraft } from './workspace-drafts.js';
 
 /** The only URLs the renderer may ask the OS to open. */
 const ALLOWED_LINKS = new Set([
@@ -662,6 +663,14 @@ export function registerIpc(getWindow: () => BrowserWindow | null, quitToInstall
   });
 
   handle('bridge:extensionPath', async () => extensionDir());
+
+  // Local drafts are deliberately separate from bridge commands: renderer input cannot type
+  // into a ChatGPT page through this channel.
+  handle('workspace:drafts', async () => listWorkspaceDrafts());
+  handle('workspace:saveDraft', async (payload) => {
+    const { sessionId, text } = z.object({ sessionId: z.string().min(8).max(64), text: z.string().max(16_000) }).parse(payload);
+    return saveWorkspaceDraft(sessionId, text);
+  });
 
   // A renderer can request only "install the verified artifact already staged". It cannot
   // choose a path, version or executable, and a request with nothing staged never quits.
